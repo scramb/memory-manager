@@ -5,16 +5,28 @@
 working `Repo` + `WriteQueue`, synced to the remote, with the derived
 Postgres index wired in when `DATABASE_URL` is set: a startup reindex brings
 the index in step with whatever the vault currently holds, a write-queue
-hook keeps it in step with every write this process makes, and a
-`vault.sync.poll_loop` keeps it in step with changes a human or another
-process pushes directly to the remote. Without `DATABASE_URL` the vault and
-write queue still come up - full-text/vector search and `memory_search`
-degrade, note read/write do not (`CLAUDE.md`: Postgres is a derived index,
-never the only place a client's data lives).
+hook keeps it in step with every write this process makes, a sync hook
+keeps it in step with every change a sync - any sync - picks up, and a
+`vault.sync.poll_loop` is what keeps triggering syncs on a timer. Without
+`DATABASE_URL` the vault and write queue still come up - full-text/vector
+search and `memory_search` degrade, note read/write do not (`CLAUDE.md`:
+Postgres is a derived index, never the only place a client's data lives).
 
 `Services` is what the MCP tool layer (`mcp/server.py`) and future write
 tools (#18/#19) are built against; nothing outside this module touches
 `asyncpg`/`Indexer` construction directly.
+
+Every `repo.sync()`/commit/push/rebase/reset in this process goes through
+`WriteQueue`'s one consumer (#33): the poll loop's timer tick, the HTTP
+transport's vault webhook (`Services.trigger_sync`, `http.py`), and the
+pre-write sync inside every `queue.submit()` all end up calling
+`queue.sync()`/being served by the same consumer task, so none of them
+ever runs a working-copy operation concurrently with another - the
+single-writer rule `docs/PLAN.md` describes, covering every operation on
+the clone, not just writes. `Services.trigger_sync` is `None` only on a
+`Services` built by hand rather than through `open_services` (stdio-era
+test fixtures); only the webhook calls it, and only on a `Services`
+`open_services` built.
 """
 
 from __future__ import annotations
@@ -33,15 +45,13 @@ from memory_manager.config import EmbeddingConfig, VaultConfig
 from memory_manager.db.migrate import migrate
 from memory_manager.index.embeddings import EmbeddingProvider, provider_from_config
 from memory_manager.index.indexer import Indexer
-from memory_manager.queue import WriteHook, WriteQueue
+from memory_manager.queue import SyncHook, WriteHook, WriteQueue
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
 __all__ = ["Services", "open_services"]
 
 _logger = logging.getLogger(__name__)
-
-_OnChange = Callable[[ChangeSet], Awaitable[None]]
 
 
 @dataclass
@@ -54,6 +64,7 @@ class Services:
     pool: asyncpg.Pool | None
     indexer: Indexer | None
     provider: EmbeddingProvider | None
+    trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
 
 
 @asynccontextmanager
@@ -82,19 +93,16 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     provider: EmbeddingProvider | None = None
 
     try:
-        on_change: _OnChange
         if database_url:
             pool, indexer, provider = await _open_index(
                 database_url, vault_config.dir, embedding_config
             )
             queue.add_hook(_index_write_hook(indexer))
-            on_change = _apply_changeset_hook(indexer)
-        else:
-            on_change = _noop_on_change
+            queue.add_sync_hook(_index_sync_hook(indexer))
 
         poll_stop = asyncio.Event()
         poll_task = asyncio.create_task(
-            poll_loop(repo, vault_config.poll_seconds, on_change, stop=poll_stop)
+            poll_loop(queue.sync, vault_config.poll_seconds, stop=poll_stop)
         )
         try:
             yield Services(
@@ -104,6 +112,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                 pool=pool,
                 indexer=indexer,
                 provider=provider,
+                trigger_sync=queue.sync,
             )
         finally:
             poll_stop.set()
@@ -116,17 +125,20 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
             await pool.close()
 
 
-async def _noop_on_change(change_set: ChangeSet) -> None:
-    """The poll loop's `on_change` when no Postgres index is configured."""
+def _index_sync_hook(indexer: Indexer) -> SyncHook:
+    """`WriteQueue.add_sync_hook`'s hook: keep the index in step with every sync (#33).
 
+    Registered on the queue, not passed to `poll_loop`: every sync the
+    consumer ever runs - the poll loop's timer tick, the webhook's
+    `trigger_sync()` (`queue.sync`), and the pre-write sync inside every
+    `submit()` - ends up here exactly once for a given human change,
+    whichever of those three happens to pick it up first.
+    """
 
-def _apply_changeset_hook(indexer: Indexer) -> _OnChange:
-    """`poll_loop`'s `on_change`, discarding `Indexer.apply_changeset`'s `IndexStats`."""
-
-    async def on_change(change_set: ChangeSet) -> None:
+    async def hook(change_set: ChangeSet) -> None:
         await indexer.apply_changeset(change_set)
 
-    return on_change
+    return hook
 
 
 async def _open_index(

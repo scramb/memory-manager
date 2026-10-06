@@ -14,8 +14,11 @@ overwrite silently"). `memory_search` (#30) ranks notes with
 falling back to `memory_manager.search_fallback.scan_search` over the plain
 working copy otherwise. `memory_index`/`memory_read`/`memory_search` all
 narrow their namespace handling through `mcp/authz.py`'s
-`readable_namespaces` hook - `None` until M4 gives it a real caller identity
-to derive a set from. `INSTRUCTIONS` (the server's `instructions`, sent on
+`readable_namespaces` hook, and every tool calls `mcp/authz.py`'s
+`require_scope` (write tools also `require_writable_namespace`) before
+doing anything else - both read a static token's scopes/namespaces off the
+current request (#34), and both are a no-op in stdio mode, which has no
+token at all. `INSTRUCTIONS` (the server's `instructions`, sent on
 every connection) and the `memory_guide` prompt registered below both come
 from `mcp/instructions.py` (#20); the error mapping every tool here uses
 lives in `mcp/errors.py`.
@@ -32,12 +35,22 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, NotRequired, TypedDict
 
+from mcp.server.auth.provider import TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent
 
 from memory_manager.app import Services
-from memory_manager.mcp.authz import readable_namespaces, restrict_namespaces
+from memory_manager.mcp.authz import (
+    READ_SCOPE,
+    WRITE_SCOPE,
+    current_access_token,
+    readable_namespaces,
+    require_scope,
+    require_writable_namespace,
+    restrict_namespaces,
+)
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.queue import NotFound, WriteError, WriteRequest
@@ -64,8 +77,8 @@ _NEW_VERSION = "new"
 _PLACEHOLDER_ID = "new"
 _PLACEHOLDER_TIMESTAMP = "1970-01-01T00:00:00Z"
 
-# Known to `vault.repo.author_for`; the only one a stdio session commits as
-# until M4 derives the client identity from the caller's token.
+# Known to `vault.repo.author_for`; what a stdio session commits as, and what
+# any static-token-authenticated HTTP request commits as too (`current_client`).
 _DEFAULT_CLIENT = "claude-code"
 _CLIENT_ENV_VAR = "MEMORY_CLIENT"
 
@@ -158,11 +171,15 @@ class MemoryArchiveResult(TypedDict):
 def current_client() -> str:
     """The client identity a write through this process commits as.
 
-    Stdio mode has no per-call auth yet, so every write from this process
-    commits as the same client, named by `MEMORY_CLIENT` (default
-    `"claude-code"`) - one of `vault.repo.author_for`'s known clients. M4
-    replaces this seam with the identity derived from the caller's token.
+    An HTTP request carrying a static token always commits as
+    `"claude-code"`, regardless of the token's own name or `MEMORY_CLIENT` -
+    static tokens authenticate human-driven clients (Claude Code, CI), not a
+    separate committer identity (#34). Stdio mode has no token at all, so it
+    commits as `MEMORY_CLIENT` (default `"claude-code"`) - one of
+    `vault.repo.author_for`'s known clients.
     """
+    if current_access_token() is not None:
+        return _DEFAULT_CLIENT
     return os.environ.get(_CLIENT_ENV_VAR, _DEFAULT_CLIENT)
 
 
@@ -290,9 +307,27 @@ an error result (`isError: true`) whose structured content carries enough to
 retry, the same way `memory_write` does."""
 
 
-def build_server(services: Services) -> MCPServer:
-    """Build the MCP server for `services`, with all memory tools and `memory_guide` registered."""
-    mcp = MCPServer(name="memory-manager", instructions=INSTRUCTIONS)
+def build_server(
+    services: Services,
+    *,
+    auth: AuthSettings | None = None,
+    token_verifier: TokenVerifier | None = None,
+) -> MCPServer:
+    """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
+
+    `auth`/`token_verifier` are `None` for stdio (no bearer auth at all) and
+    for an HTTP server with no `DATABASE_URL` configured (#33's
+    loopback-only mode); `http.py` builds both from
+    `memory_manager.auth.verifier.StaticTokenVerifier` whenever a database is
+    configured (#34). Passed straight to `MCPServer`, which is what actually
+    wires the SDK's bearer-auth middleware into `streamable_http_app()` -
+    nothing in this module reads either one directly; every tool below gets
+    the per-request token through `mcp/authz.py`'s `get_access_token()`
+    instead.
+    """
+    mcp = MCPServer(
+        name="memory-manager", instructions=INSTRUCTIONS, auth=auth, token_verifier=token_verifier
+    )
 
     @mcp.prompt(name="memory_guide")
     def memory_guide() -> str:
@@ -307,6 +342,7 @@ def build_server(services: Services) -> MCPServer:
         ctx: Context | None = None,
     ) -> list[MemoryIndexEntry]:
         """List every note in the vault: the table of contents to read first."""
+        require_scope(READ_SCOPE)
         readable = readable_namespaces(ctx)
         entries = [
             entry
@@ -324,6 +360,7 @@ def build_server(services: Services) -> MCPServer:
     @mcp.tool(description=_MEMORY_READ_DESCRIPTION)
     async def memory_read(items: list[str], ctx: Context | None = None) -> list[MemoryReadItem]:
         """Read one or more notes by vault path or id."""
+        require_scope(READ_SCOPE)
         if len(items) > _MAX_READ_ITEMS:
             raise ToolError(
                 f"memory_read accepts at most {_MAX_READ_ITEMS} items, got {len(items)}"
@@ -343,6 +380,7 @@ def build_server(services: Services) -> MCPServer:
         ctx: Context | None = None,
     ) -> MemorySearchResponse:
         """Search notes by `query`, ranked best match first."""
+        require_scope(READ_SCOPE)
         if types is not None:
             unknown = sorted(set(types) - set(NOTE_TYPES))
             if unknown:
@@ -398,6 +436,8 @@ def build_server(services: Services) -> MCPServer:
         message: str | None = None,
     ) -> Annotated[CallToolResult, MemoryWriteResult]:
         """Create or replace the note at `path`."""
+        require_scope(WRITE_SCOPE)
+        require_writable_namespace(path)
         try:
             prepared = _prepare_write_content(services.vault_root, path, content, if_version)
         except NoteFormatError as exc:
@@ -434,6 +474,8 @@ def build_server(services: Services) -> MCPServer:
         message: str | None = None,
     ) -> Annotated[CallToolResult, MemoryWriteResult]:
         """Replace one exact occurrence of `old_str` with `new_str` in the note at `path`."""
+        require_scope(WRITE_SCOPE)
+        require_writable_namespace(path)
         request = WriteRequest(
             op="edit",
             path=path,
@@ -462,9 +504,12 @@ def build_server(services: Services) -> MCPServer:
         message: str | None = None,
     ) -> Annotated[CallToolResult, MemorySupersedeResult]:
         """Replace the note `old` with a new note at `new_path`, keeping both."""
+        require_scope(WRITE_SCOPE)
         resolved_old = _resolve_path_or_id(services.vault_root, old)
         if resolved_old is None:
             return _error_result(NotFound(old))
+        require_writable_namespace(resolved_old)
+        require_writable_namespace(new_path)
 
         try:
             prepared = _prepare_write_content(
@@ -507,9 +552,11 @@ def build_server(services: Services) -> MCPServer:
         message: str | None = None,
     ) -> Annotated[CallToolResult, MemoryArchiveResult]:
         """Archive the note at `path`: move it to `_archive/`, never delete it."""
+        require_scope(WRITE_SCOPE)
         resolved = _resolve_path_or_id(services.vault_root, path)
         if resolved is None:
             return _error_result(NotFound(path))
+        require_writable_namespace(resolved)
 
         request = WriteRequest(
             op="archive",
