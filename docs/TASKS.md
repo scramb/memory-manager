@@ -142,7 +142,7 @@ Goal: complete docs, security review done, importers, first signed release.
 
 ### WP-14 — Import/export · Branch: `wp/14-import-export`
 
-- [ ] #48 `import` from Markdown folder
+- [x] #48 `import` from Markdown folder
 - [ ] #49 `import` from Claude / ChatGPT memory exports (formats researched first)
 - [ ] #50 `export`
 

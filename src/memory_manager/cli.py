@@ -17,12 +17,15 @@ from pathlib import Path
 
 import asyncpg
 
-from memory_manager.config import EmbeddingConfig, EmbeddingConfigError
+from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultConfigError
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
+from memory_manager.importers import ImportReport, open_queue, run_import
+from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
+from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
 
@@ -51,6 +54,19 @@ def main(argv: list[str] | None = None) -> int:
             baseline=args.baseline,
             update_baseline=args.update_baseline,
             k=args.k,
+        )
+
+    if args.command == "import":
+        if args.import_source != "markdown":
+            parser.print_help()
+            return 1
+        return asyncio.run(
+            _run_import_markdown(
+                args.dir,
+                namespace=args.namespace,
+                default_type=args.type,
+                apply=args.apply,
+            )
         )
 
     if args.command != "reindex":
@@ -107,6 +123,28 @@ def _build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         "--k", type=int, default=_DEFAULT_EVAL_K, help="cutoff for recall@k and the search limit"
     )
+
+    import_parser = subparsers.add_parser("import", help="import notes from an external source")
+    import_subparsers = import_parser.add_subparsers(dest="import_source")
+    markdown_parser = import_subparsers.add_parser(
+        "markdown", help="import a folder of Markdown files"
+    )
+    markdown_parser.add_argument("dir", type=Path, help="folder to walk recursively for *.md files")
+    markdown_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    markdown_parser.add_argument(
+        "--type",
+        default="reference",
+        choices=NOTE_TYPES,
+        help="note type used when a file's frontmatter does not set a valid one",
+    )
+    markdown_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
     return parser
 
 
@@ -125,6 +163,47 @@ def _print_doctor_report(report: DoctorReport) -> None:
     for warning in report.warnings:
         print(f"WARNING: {warning}")
     print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+
+
+async def _run_import_markdown(
+    directory: Path, *, namespace: str, default_type: str, apply: bool
+) -> int:
+    if not directory.is_dir():
+        print(f"'{directory}' is not a directory", file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_markdown(
+            directory, namespace=namespace, default_type=default_type
+        )
+        report = await run_import(items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+def _print_import_report(report: ImportReport, *, apply: bool) -> None:
+    verb = "created" if apply else "would_create"
+    print(
+        f"{verb}={len(report.created)} unchanged={len(report.unchanged)} "
+        f"skipped_existing={len(report.skipped_existing)} duplicates={len(report.duplicates)} "
+        f"flagged={len(report.flagged)} rejected={len(report.rejected)}"
+    )
+    for path, flags in report.flagged:
+        print(f"FLAGGED: {path}: {', '.join(flags)}")
+    for source_ref, reason in report.rejected:
+        print(f"REJECTED: {source_ref}: {reason}")
+    if not apply:
+        print("dry run - nothing was written, pass --apply to write")
 
 
 async def _reindex(
