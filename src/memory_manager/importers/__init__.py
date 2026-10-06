@@ -13,8 +13,16 @@ from memory_manager.importers.core import (
     ImportItem,
     ImportItemRejected,
     ImportReport,
+    dedupe_against_vault,
     open_queue,
     run_import,
 )
 
-__all__ = ["ImportItem", "ImportItemRejected", "ImportReport", "open_queue", "run_import"]
+__all__ = [
+    "ImportItem",
+    "ImportItemRejected",
+    "ImportReport",
+    "dedupe_against_vault",
+    "open_queue",
+    "run_import",
+]

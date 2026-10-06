@@ -11,22 +11,30 @@ silently") and the actual write - lives here, once.
 whole batch through the write queue (client `import`, CLAUDE.md: writes only
 through `WriteQueue`), reporting what happened without ever raising on a
 single bad item - a rejected file is reported, not fatal.
+
+`dedupe_against_vault` is the cross-run/cross-vault half of deduplication
+(`#49`): since ADR-0005 stays frozen and the Claude/ChatGPT importers add no
+`import_key`/`import_origin` frontmatter field, "has this memory already
+been imported" is answered by scanning the vault's working copy once for
+notes whose `source` already starts with `import:`, not by a dedicated key.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 from memory_manager.config import VaultConfig
 from memory_manager.queue import WriteError, WriteQueue, WriteRequest
-from memory_manager.vault.note import Note, NoteFormatError, serialize
+from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
 from memory_manager.vault.paths import PathRejected, parse_note_path
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.secrets import SecretFound, check
@@ -38,8 +46,12 @@ __all__ = [
     "ImportItemRejected",
     "ImportReport",
     "build_source",
+    "dedup_hash",
+    "dedupe_against_vault",
+    "normalize_for_dedup",
     "open_queue",
     "run_import",
+    "scan_vault_import_hashes",
     "slugify",
     "to_note_bytes",
 ]
@@ -55,6 +67,10 @@ _UMLAUT_MAP = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
 _SLUG_SEPARATOR_RE = re.compile(r"[^a-z0-9]+")
 _HEADING_RE = re.compile(r"^#{1,6}\s+(.*\S)\s*$")
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
+
+_IMPORT_SOURCE_PREFIX = "import:"
+_DEDUP_PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_DEDUP_WHITESPACE_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
@@ -240,6 +256,103 @@ def _body_hash(body: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def normalize_for_dedup(text: str) -> str:
+    """Fold `text` for cross-run/cross-vault duplicate detection.
+
+    Unicode-normalizes (NFKC), casefolds, drops every character that is
+    neither a "word" character nor whitespace (bullets, brackets, trailing
+    punctuation, inline markers such as `[stated]`), then collapses
+    whitespace runs to a single space. Two items that only differ in how
+    they happen to be decorated end up identical here, even though each
+    still keeps its own, undisturbed text in the note body.
+    """
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    stripped = _DEDUP_PUNCTUATION_RE.sub(" ", folded)
+    return _DEDUP_WHITESPACE_RE.sub(" ", stripped).strip()
+
+
+def _first_paragraph(text: str) -> str:
+    return text.strip().partition("\n\n")[0]
+
+
+def dedup_hash(text: str) -> str:
+    """The cross-run/cross-vault duplicate key for an item or note body.
+
+    Taken from the first paragraph only: every Claude/ChatGPT import item's
+    body is the memory text plus a blank line plus an "Imported from ... on
+    ..." footer (`#49`), and that footer's date must never be the reason two
+    runs of the same import look different.
+    """
+    return hashlib.sha256(normalize_for_dedup(_first_paragraph(text)).encode("utf-8")).hexdigest()
+
+
+def _walk_vault_markdown_files(vault_dir: Path) -> list[Path]:
+    """Every `*.md` file under `vault_dir`, never through a symlink.
+
+    Same safety rules as `importers.markdown`'s walk (CLAUDE.md path
+    safety): dotfiles/dirs and symlinked files or directories are skipped.
+    """
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(vault_dir, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not name.startswith(".") and not (current / name).is_symlink()
+        )
+        for filename in sorted(filenames):
+            if filename.startswith(".") or not filename.endswith(".md"):
+                continue
+            file_path = current / filename
+            if file_path.is_symlink():
+                continue
+            files.append(file_path)
+    return files
+
+
+def scan_vault_import_hashes(vault_dir: Path) -> set[str]:
+    """The `dedup_hash` of every note under `vault_dir` whose `source` is an import's.
+
+    Walks the vault's working copy once - never the Postgres index, "git is
+    the source of truth" - so `dedupe_against_vault` can recognize a memory
+    an earlier run (of this importer or a different one) already turned
+    into a note, without a dedicated frontmatter key.
+    """
+    hashes: set[str] = set()
+    for file_path in _walk_vault_markdown_files(vault_dir):
+        try:
+            note = parse(file_path.read_bytes())
+        except NoteFormatError:
+            continue
+        if note.source is not None and note.source.startswith(_IMPORT_SOURCE_PREFIX):
+            hashes.add(dedup_hash(note.body))
+    return hashes
+
+
+def dedupe_against_vault(
+    items: Iterable[ImportItem], vault_dir: Path
+) -> tuple[list[ImportItem], list[str]]:
+    """Drop items whose normalized text already exists, in this run or in the vault.
+
+    Returns `(kept, duplicate_sources)`. Within one run, the first item with
+    a given normalized text wins and keeps its own (usually earliest) date -
+    later occurrences are reported as duplicates, not written. Running the
+    very same import again drops every item, because the vault scan already
+    carries last run's hashes.
+    """
+    seen = scan_vault_import_hashes(vault_dir)
+    kept: list[ImportItem] = []
+    duplicates: list[str] = []
+    for item in items:
+        key = dedup_hash(item.body)
+        if key in seen:
+            duplicates.append(item.source)
+            continue
+        seen.add(key)
+        kept.append(item)
+    return kept, duplicates
+
+
 def _dedupe_slug(base: str, used: set[str]) -> str:
     if base not in used:
         used.add(base)
@@ -254,18 +367,21 @@ def _dedupe_slug(base: str, used: set[str]) -> str:
         suffix += 1
 
 
-async def open_queue(environ: Mapping[str, str]) -> tuple[Repo, WriteQueue]:
+async def open_queue(environ: Mapping[str, str]) -> tuple[Repo, WriteQueue, Path]:
     """Build a `Repo`/`WriteQueue` pair from `VAULT_*` environment variables.
 
     `memory_manager.app` (the shared service wiring) does not exist on this
     branch yet, so the importer CLI builds its own queue directly - the
-    only thing it needs from that future module is exactly this.
+    only thing it needs from that future module is exactly this. The third
+    return value is the vault's local working-copy directory, so a caller
+    can scan it directly (`scan_vault_import_hashes`) without reaching into
+    `Repo` internals.
     """
     config = VaultConfig.from_env(dict(environ))
     repo = Repo(config)
     write_queue = WriteQueue(repo)
     await write_queue.start()
-    return repo, write_queue
+    return repo, write_queue, config.dir
 
 
 async def run_import(

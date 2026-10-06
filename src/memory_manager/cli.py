@@ -21,7 +21,11 @@ from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultCo
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
-from memory_manager.importers import ImportReport, open_queue, run_import
+from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
+from memory_manager.importers.chatgpt import ChatGPTFormatError
+from memory_manager.importers.chatgpt import collect as collect_chatgpt
+from memory_manager.importers.claude import ClaudeFormatError
+from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
@@ -57,17 +61,36 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "import":
-        if args.import_source != "markdown":
-            parser.print_help()
-            return 1
-        return asyncio.run(
-            _run_import_markdown(
-                args.dir,
-                namespace=args.namespace,
-                default_type=args.type,
-                apply=args.apply,
+        if args.import_source == "markdown":
+            return asyncio.run(
+                _run_import_markdown(
+                    args.dir,
+                    namespace=args.namespace,
+                    default_type=args.type,
+                    apply=args.apply,
+                )
             )
-        )
+        if args.import_source == "claude":
+            return asyncio.run(
+                _run_import_claude(
+                    args.file,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    apply=args.apply,
+                )
+            )
+        if args.import_source == "chatgpt":
+            return asyncio.run(
+                _run_import_chatgpt(
+                    args.file,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    from_conversations=args.from_conversations,
+                    apply=args.apply,
+                )
+            )
+        parser.print_help()
+        return 1
 
     if args.command != "reindex":
         parser.print_help()
@@ -145,6 +168,56 @@ def _build_parser() -> argparse.ArgumentParser:
         help="actually write notes (default is a dry run that writes nothing)",
     )
 
+    claude_parser = import_subparsers.add_parser(
+        "claude", help="import a Claude memory export (zip, memories JSON, or a plain text list)"
+    )
+    claude_parser.add_argument(
+        "file", type=Path, help="export zip, a memories JSON file, or a plain text/Markdown list"
+    )
+    claude_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    claude_parser.add_argument(
+        "--type",
+        default="user",
+        choices=NOTE_TYPES,
+        help="note type for items the export does not map to a fixed type itself "
+        "(memory_files entries and a plain-text fallback; conversations_memory and "
+        "project_memories always become 'user'/'project')",
+    )
+    claude_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
+    chatgpt_parser = import_subparsers.add_parser(
+        "chatgpt", help="import a ChatGPT memory list, or 'bio' calls from a conversations export"
+    )
+    chatgpt_parser.add_argument(
+        "file",
+        type=Path,
+        help="a plain text/Markdown memory list, or (with --from-conversations) a "
+        "conversations.json export",
+    )
+    chatgpt_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    chatgpt_parser.add_argument(
+        "--type", default="user", choices=NOTE_TYPES, help="note type for every imported item"
+    )
+    chatgpt_parser.add_argument(
+        "--from-conversations",
+        action="store_true",
+        help="treat 'file' as a ChatGPT conversations.json export and extract 'bio' memory "
+        "calls from it, instead of a plain text memory list",
+    )
+    chatgpt_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
     return parser
 
 
@@ -173,7 +246,7 @@ async def _run_import_markdown(
         return 2
 
     try:
-        repo, queue = await open_queue(os.environ)
+        repo, queue, _vault_dir = await open_queue(os.environ)
     except VaultConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -184,6 +257,70 @@ async def _run_import_markdown(
         )
         report = await run_import(items, queue, repo, apply=apply)
         report.rejected = pre_rejected + report.rejected
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+async def _run_import_claude(file: Path, *, namespace: str, type_: str, apply: bool) -> int:
+    if not file.is_file():
+        print(f"'{file}' is not a file", file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_claude(file, namespace=namespace, type_=type_)
+    except ClaudeFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue, vault_dir = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        await asyncio.to_thread(repo.sync)
+        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
+        report = await run_import(kept_items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+        report.duplicates = duplicates + report.duplicates
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+async def _run_import_chatgpt(
+    file: Path, *, namespace: str, type_: str, from_conversations: bool, apply: bool
+) -> int:
+    if not file.is_file():
+        print(f"'{file}' is not a file", file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_chatgpt(
+            file, namespace=namespace, type_=type_, from_conversations=from_conversations
+        )
+    except ChatGPTFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue, vault_dir = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        await asyncio.to_thread(repo.sync)
+        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
+        report = await run_import(kept_items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+        report.duplicates = duplicates + report.duplicates
     finally:
         await queue.stop()
 
