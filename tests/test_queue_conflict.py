@@ -334,6 +334,60 @@ class TestQueueRecoversAfterConflict:
         )
 
 
+class TestSameNoteDifferentLinesIsStillAConflict:
+    async def test_human_edit_to_a_different_field_of_the_same_note_is_a_write_conflict(
+        self, repo: Repo, queue: WriteQueue, bare_remote: Path, vault_config: VaultConfig
+    ) -> None:
+        """A clean rebase is not proof there was no conflict (#16).
+
+        The human's concurrent edit below changes only the `title` line;
+        our own edit changes only the `body` line - two non-overlapping
+        single-line changes that a plain `git rebase` would happily
+        3-way-merge without ever reporting a conflict. The write queue must
+        still treat this as a `WriteConflict`: `if_version` was checked
+        against the note before the human's edit, so the remote having
+        moved on this exact note - on whichever line - makes the version
+        stale, independent of whether git's textual merge would be clean.
+        """
+        note_id = new_ulid(_CREATED)
+        first = _note_bytes(id=note_id, title="Original title", body="Original body.\n")
+        result = await queue.submit(
+            WriteRequest(
+                op="write",
+                path="personal/fact/a.md",
+                client="claude-code",
+                if_version="new",
+                content=first,
+            )
+        )
+
+        human_version = _note_bytes(id=note_id, title="Edited by a human", body="Original body.\n")
+        wrap_push_with_side_effect(
+            repo, lambda n: human_commit(bare_remote, "personal/fact/a.md", human_version)
+        )
+
+        with pytest.raises(WriteConflict) as excinfo:
+            await queue.submit(
+                WriteRequest(
+                    op="edit",
+                    path="personal/fact/a.md",
+                    client="claude-code",
+                    if_version=result.version,
+                    old_str="Original body.",
+                    new_str="New body from claude-code.",
+                )
+            )
+
+        exc = excinfo.value
+        assert exc.current_version == version(human_version)
+        assert exc.current_content == human_version.decode("utf-8")
+
+        # Nothing was silently 3-way-merged: the remote note is exactly the
+        # human's version, our body change never landed.
+        assert _remote_show(bare_remote, "personal/fact/a.md") == human_version
+        assert _is_clean_and_pushed(vault_config.dir, bare_remote)
+
+
 class TestConflictPathIsNotClientWritable:
     def test_parse_note_path_rejects_a_conflict_file_path(self) -> None:
         with pytest.raises(PathRejected):

@@ -15,15 +15,20 @@ silently (CLAUDE.md): it comes back as `VersionConflict`, carrying the
 current content and version so the caller can retry.
 
 A push rejected because the remote moved (a human or another writer pushed
-in between `sync()` and `push()`) is retried through a rebase (#15): if the
-rebase is clean, the push is retried; if it conflicts, the rebase is
+in between `sync()` and `push()`) is retried through a rebase (#15), but
+only when the remote's new commits left every path this write touches
+alone: a clean rebase does a real 3-way merge, so if the remote touched the
+exact note being written - on different lines, so there is no textual
+conflict - the rebase would otherwise report "clean" even though
+`if_version` no longer matches the remote (#16). That case, and an actual
+rebase conflict, are handled the same way: the rebase (if one happened) is
 aborted, the local commit discarded (`reset_to_remote()`), and both
 versions are written to `<path>.conflict.md` for a human to resolve - the
 write comes back as `WriteConflict`, never silently lost. A push that keeps
-getting rejected even after a clean rebase (the remote keeps moving) gives
-up after 3 attempts as `WriteFailed`. Audit log persistence lives in
-Postgres from M3; `add_hook()` is the seam an indexer/audit log subscribes
-through until then.
+getting rejected even after a clean, unrelated rebase (the remote keeps
+moving) gives up after 3 attempts as `WriteFailed`. Audit log persistence
+lives in Postgres from M3; `add_hook()` is the seam an indexer/audit log
+subscribes through until then.
 """
 
 from __future__ import annotations
@@ -319,6 +324,11 @@ class WriteQueue:
         except GitError as exc:
             raise WriteFailed(str(exc)) from exc
 
+        # The remote tip our commit is about to be built on - `_push` needs
+        # this to tell "the remote moved, but not on our path" from "the
+        # remote moved our exact note" after a rejected push (#16).
+        base = await asyncio.to_thread(self._repo.head_or_none)
+
         try:
             current = await asyncio.to_thread(self._repo.read_file, request.path)
         except PathRejected as exc:
@@ -332,7 +342,7 @@ class WriteQueue:
         else:
             result, changed_paths = await self._do_write_or_edit(request, current)
 
-        final_commit = await self._push(request, changed_paths)
+        final_commit = await self._push(request, changed_paths, base)
         if final_commit != result.commit:
             # A rebase retry rewrote our commit onto the remote's new tip,
             # so the sha captured at commit time no longer exists on the
@@ -425,8 +435,23 @@ class WriteQueue:
         result = WriteResult(path=archive_rel, version=version(archived_bytes), commit=commit_sha)
         return result, (request.path, archive_rel)
 
-    async def _push(self, request: WriteRequest, changed_paths: tuple[str, ...]) -> str:
+    async def _push(
+        self, request: WriteRequest, changed_paths: tuple[str, ...], base: str | None
+    ) -> str:
         """Push the queued commit(s), retrying a rejection through a rebase.
+
+        A rejected push's rebase is only trusted when the remote's new
+        commits left every path in `changed_paths` alone. A clean
+        `rebase_onto_remote()` is not enough on its own: git's rebase does
+        a real 3-way merge, so if the remote's rejecting commit touched the
+        exact note this write is committing - on different lines, so there
+        is no textual conflict - the rebase still reports "clean" even
+        though the write's `if_version` no longer matches what is on the
+        remote (#16). That case is treated exactly like a rebase conflict:
+        `_raise_conflict` discards our commit and writes `<path>.conflict.md`
+        instead of silently reporting success for content nobody actually
+        checked. Only when the remote's new commits changed other paths do
+        we rebase onto them and retry.
 
         Returns the commit sha that ended up on the remote - identical to
         the sha the caller committed with unless a rebase retry rewrote it
@@ -439,15 +464,31 @@ class WriteQueue:
                     await asyncio.to_thread(self._repo.push)
                     return await asyncio.to_thread(self._repo.head)
                 except PushRejected:
-                    rebased = await asyncio.to_thread(self._repo.rebase_onto_remote)
+                    new_remote_head = await asyncio.to_thread(self._repo.fetch)
+                    if await self._touches_changed_paths(base, new_remote_head, changed_paths):
+                        await self._raise_conflict(request, changed_paths[-1])
+                    # Rebase onto exactly the remote tip just checked above -
+                    # not `rebase_onto_remote()`, which would fetch again and
+                    # could silently rebase onto a newer tip nobody checked
+                    # `changed_paths` against.
+                    rebased = await asyncio.to_thread(self._repo.rebase_onto, new_remote_head)
                     if not rebased:
                         await self._raise_conflict(request, changed_paths[-1])
+                    base = new_remote_head
         except GitError as exc:
             await asyncio.to_thread(self._repo.reset_to_remote)
             raise WriteFailed(str(exc)) from exc
 
         await asyncio.to_thread(self._repo.reset_to_remote)
         raise WriteFailed("remote keeps moving, retry")
+
+    async def _touches_changed_paths(
+        self, old_rev: str | None, new_rev: str, changed_paths: tuple[str, ...]
+    ) -> bool:
+        for path in changed_paths:
+            if await asyncio.to_thread(self._repo.changed_between, old_rev, new_rev, path):
+                return True
+        return False
 
     async def _raise_conflict(self, request: WriteRequest, path: str) -> NoReturn:
         """The rebase onto the remote conflicted: give up on this write.
@@ -475,10 +516,18 @@ class WriteQueue:
             await asyncio.to_thread(self._repo.push)
         except PushRejected:
             rebased = await asyncio.to_thread(self._repo.rebase_onto_remote)
+            pushed = False
             if rebased:
                 with contextlib.suppress(GitError):
                     await asyncio.to_thread(self._repo.push)
-            else:
+                    pushed = True
+            if not pushed:
+                # Either the rebase itself conflicted, or it was clean but
+                # the retried push was rejected again (the remote moved once
+                # more while we were writing the conflict file) - either
+                # way the conflict-file commit never made it, so the clone
+                # must not be left carrying it (`reset_to_remote` is the
+                # only path back to "no unpushed commit").
                 await asyncio.to_thread(self._repo.reset_to_remote)
         except GitError:
             await asyncio.to_thread(self._repo.reset_to_remote)

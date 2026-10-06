@@ -100,6 +100,42 @@ class Repo:
         result = self._git().run("rev-parse", "HEAD")
         return _decode(result.stdout).strip()
 
+    def head_or_none(self) -> str | None:
+        """`head()`, or `None` if `HEAD` is unborn (a brand new, still-empty clone)."""
+        return self._current_head(self._git())
+
+    def fetch(self) -> str:
+        """Fetch `origin/<branch>` and return its current commit sha.
+
+        The write queue (#16) calls this right after a rejected push, to
+        learn the remote's new tip *before* deciding whether
+        `rebase_onto_remote()` is actually safe for the path(s) this write
+        touches - `remote_head()` alone would just report whatever was
+        fetched last.
+        """
+        git = self._git()
+        git.run(*self._auth_args(), "fetch", "origin", self._config.branch)
+        return self.remote_head()
+
+    def changed_between(self, old_rev: str | None, new_rev: str, rel: str) -> bool:
+        """Whether `rel` differs between `old_rev` and `new_rev`.
+
+        `old_rev=None` stands for "no commit yet" (the clone was still
+        empty) - diffed against the empty tree, so a `rel` that is new in
+        `new_rev` still counts as changed.
+
+        Used by the write queue (#16) to tell a push rejection caused by an
+        unrelated remote change from one where the remote touched the exact
+        note this write is in the middle of committing: a clean
+        `rebase_onto_remote()` can silently 3-way-merge the latter without
+        ever reporting a conflict, even though the write's `if_version` no
+        longer matches what is actually on the remote.
+        """
+        git = self._git()
+        base = old_rev if old_rev is not None else _EMPTY_TREE
+        result = git.run("diff", "--quiet", base, new_rev, "--", rel, check=False)
+        return result.returncode != 0
+
     def read_file(self, rel: str) -> bytes | None:
         """Return the bytes of `rel`, or `None` if it does not exist."""
         path = paths.resolve(self._config.dir, rel, allow_archive=True)
@@ -157,7 +193,21 @@ class Repo:
         git = self._git()
         branch = self._config.branch
         git.run(*self._auth_args(), "fetch", "origin", branch)
-        result = git.run("rebase", f"origin/{branch}", check=False)
+        return self.rebase_onto(f"origin/{branch}")
+
+    def rebase_onto(self, rev: str) -> bool:
+        """Rebase the local commit(s) onto `rev`, without fetching first.
+
+        Same clean/conflict contract as `rebase_onto_remote()`, for a
+        caller that already fetched and needs the rebase to happen against
+        the exact remote state it just inspected (the write queue, #16:
+        checking whether the remote touched the write's own path and then
+        rebasing must agree on which remote tip they are both talking
+        about - an extra fetch in between could silently move the target
+        past a change neither step ever checked).
+        """
+        git = self._git()
+        result = git.run("rebase", rev, check=False)
         if result.returncode == 0:
             return True
         git.run("rebase", "--abort", check=False)

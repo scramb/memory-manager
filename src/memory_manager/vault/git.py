@@ -37,7 +37,15 @@ _FIXED_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
 }
 
-_REJECTION_MARKERS = ("[rejected]", "non-fast-forward", "fetch first")
+_REJECTION_MARKERS = (
+    "[rejected]",
+    "non-fast-forward",
+    "fetch first",
+    "[remote rejected]",
+    "failed to update ref",
+    "cannot lock ref",
+    "stale info",
+)
 
 
 class GitError(RuntimeError):
