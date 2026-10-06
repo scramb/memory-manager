@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down image smoke
+.PHONY: fmt lint test check eval eval-baseline db-up db-down image smoke up down
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -51,3 +51,11 @@ image:
 
 smoke: image
 	scripts/smoke-container.sh memory-manager:dev
+
+# Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
+# vault-init one-shot seeding a local vault remote. See README.md.
+up:
+	podman compose up -d --build
+
+down:
+	podman compose down -v

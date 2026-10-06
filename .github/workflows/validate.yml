@@ -80,3 +80,12 @@ jobs:
           # actually has the image.
           CONTAINER_ENGINE: docker
         run: scripts/smoke-container.sh memory-manager:dev
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Quickstart smoke test (docker compose, no ollama profile)
+        env:
+          COMPOSE_ENGINE: docker compose
+        run: scripts/smoke-compose.sh
