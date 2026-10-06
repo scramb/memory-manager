@@ -70,7 +70,7 @@ One process, one replica for writes (single-writer). The process owns the local 
 
 ### Data model
 
-Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, `description` (required, ≤150 chars), `type`, `tags`, `aliases`, `created`, `updated`, `valid_from`, `valid_to`, `supersedes`, `source`. `[[slug]]` links become rows in `links`. File size cap (16 KB) forces consolidation. Postgres tables: `notes`, `chunks` (text, tsvector, embedding, model, dimension), `links`, `audit_log`, plus auth tables (`oauth_clients`, `tokens`, `static_tokens`). The note format is frozen by ADR-0005 at the start of M1 (O5).
+Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, `description` (required, ≤150 chars), `type`, `tags`, `aliases`, `created`, `updated`, `valid_from`, `valid_to`, `supersedes`, `source`. `[[slug]]` links become rows in `links`. File size cap (16 KB) forces consolidation. Postgres tables: `notes`, `chunks` (text, tsvector, embedding, model, dimension), `links`, `audit_log`, plus auth tables (`oauth_clients`, `tokens`, `static_tokens`). The exact format (charsets, canonical serialization, archive layout) is fixed in [ADR-0005](./adr/0005-note-format.md).
 
 ### Protocol targets
 
@@ -85,6 +85,7 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | License | AGPL-3.0-only + DCO | Apache-2.0, MIT | hosted derivatives must stay open | [ADR-0002](./adr/0002-license.md) |
 | Git access | git CLI wrapper | pygit2, GitPython | correct rebase/conflict behaviour for free | [ADR-0003](./adr/0003-git-access.md) |
 | Auth | embedded OAuth AS + static tokens; login via upstream OIDC or admin password | external AS (Hydra) | proven pattern; no IdP required for self-hosters | [ADR-0004](./adr/0004-auth-model.md) |
+| Note format | Markdown + canonical YAML frontmatter, `<namespace>/<type>/<slug>.md`, 16 KB cap | free-form YAML, TOML | byte-stable round trip makes `if_version` meaningful | [ADR-0005](./adr/0005-note-format.md) |
 | Database | PostgreSQL 16+ with pgvector, plain SQL + versioned migrations | ORM, dedicated vector DB | one well-known service for full text + vectors | — (set by brief) |
 | Deployment | repo ships its own generic deployment like bring--mcp: Kustomize base in `deploy/` + `deploy/README.md`, Helm chart, Flux example; no operator-specific values (hosts, secrets, cluster names) in this public repo — those live in the operator's own overlay | Helm only; owner-specific manifests in the repo | same pattern as bring--mcp, safe for a public repo ([reference](./research/bring-mcp-reference.md)) | — (owner 2026-10-06) |
 
@@ -112,7 +113,7 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O2 | License | — decided: AGPL-3.0-only (ADR-0002) | — | owner ✔ 2026-10-06 |
 | O3 | Git access | — decided: git CLI (ADR-0003) | — | owner ✔ 2026-10-06 |
 | O4 | Auth model incl. login | — decided: embedded AS, OIDC or admin-password login (ADR-0004) | — | owner ✔ 2026-10-06 |
-| O5 | Freeze note format (frontmatter fields, path scheme, size cap) as ADR-0005 | as in brief · adjusted | #6 → WP-02 | owner, start of M1 |
+| O5 | Note format | — decided: as drafted, types `user`/`feedback`/`project`/`reference`/`fact` (ADR-0005) | — | owner ✔ 2026-10-06 |
 | O6 | Final project / CLI name | — decided: keep `memory-manager` (package `memory_manager`, CLI `memory-manager`) | — | owner ✔ 2026-10-06 |
 | O7 | Track tasks as GitHub issues | — decided: yes, issues are the source of truth | — | owner ✔ 2026-10-06 |
 | O8 | Deployment artefacts | — decided: own generic deployment as in bring--mcp, public-safe (see Technology decisions) | — | owner ✔ 2026-10-06 |
