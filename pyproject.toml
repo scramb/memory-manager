@@ -45,13 +45,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "RUF"]
 [tool.mypy]
 strict = true
 files = ["src", "tests"]
-# `tests/vault` has its own `conftest.py` with helpers some of its test
-# modules import via a bare `from conftest import ...`; listed here so
-# mypy resolves that the same way Python's import system does (shared
-# fixtures live in the root `tests/conftest.py` instead, which needs no
-# special-casing).
+# `tests/conftest.py` and `tests/vault/conftest.py` are both non-package
+# modules (no `__init__.py`); without this, mypy reports a duplicate
+# module name instead of resolving each by its path.
 explicit_package_bases = true
-mypy_path = ["src", "tests/vault"]
+mypy_path = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

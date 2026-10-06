@@ -70,6 +70,10 @@ Unknown keys are rejected, so that typos cannot silently drop data.
 
 `[[slug]]` and `[[slug|label]]` in the body. Links inside code spans and code blocks are ignored.
 
+### Conflict files
+
+When a push is rejected and the rebase conflicts, the server writes `<namespace>/<type>/<slug>.conflict.md` next to the note (#15). It is **not** a note: there is no frontmatter, the indexer ignores it, and clients cannot write it. It holds both versions in fenced blocks with their commit SHAs. A human resolves the conflict and deletes the file.
+
 ### Supersede
 
 A superseding note lists the old `id` in `supersedes`. The old note gets `valid_to` set and stays in place; it is not deleted.

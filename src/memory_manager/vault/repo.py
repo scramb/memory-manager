@@ -4,9 +4,13 @@
 `Repo` owns exactly one local clone of the configured remote. Every write
 is a single commit authored by the client that made it; the committer
 identity (`memory-manager`) is the local git config, set once by
-`ensure_clone()`. Rebase, conflict handling (#15) and pulling human changes
-(#12) live elsewhere; `push()` here only has to recognize a non-fast-forward
-rejection and surface it as `PushRejected`.
+`ensure_clone()`. `push()` only recognizes a non-fast-forward rejection and
+surfaces it as `PushRejected`; `rebase_onto_remote()`/`reset_to_remote()`/
+`remote_head()`/`read_remote_file()`/`commit_internal_file()` are what the
+write queue (`queue.py`, #15) uses to rebase a rejected push and, on a
+rebase conflict, write a server-owned `*.conflict.md` beside the note.
+Pulling human changes into the live working tree outside a write (#12)
+lives elsewhere.
 """
 
 from __future__ import annotations
@@ -96,6 +100,42 @@ class Repo:
         result = self._git().run("rev-parse", "HEAD")
         return _decode(result.stdout).strip()
 
+    def head_or_none(self) -> str | None:
+        """`head()`, or `None` if `HEAD` is unborn (a brand new, still-empty clone)."""
+        return self._current_head(self._git())
+
+    def fetch(self) -> str:
+        """Fetch `origin/<branch>` and return its current commit sha.
+
+        The write queue (#16) calls this right after a rejected push, to
+        learn the remote's new tip *before* deciding whether
+        `rebase_onto_remote()` is actually safe for the path(s) this write
+        touches - `remote_head()` alone would just report whatever was
+        fetched last.
+        """
+        git = self._git()
+        git.run(*self._auth_args(), "fetch", "origin", self._config.branch)
+        return self.remote_head()
+
+    def changed_between(self, old_rev: str | None, new_rev: str, rel: str) -> bool:
+        """Whether `rel` differs between `old_rev` and `new_rev`.
+
+        `old_rev=None` stands for "no commit yet" (the clone was still
+        empty) - diffed against the empty tree, so a `rel` that is new in
+        `new_rev` still counts as changed.
+
+        Used by the write queue (#16) to tell a push rejection caused by an
+        unrelated remote change from one where the remote touched the exact
+        note this write is in the middle of committing: a clean
+        `rebase_onto_remote()` can silently 3-way-merge the latter without
+        ever reporting a conflict, even though the write's `if_version` no
+        longer matches what is actually on the remote.
+        """
+        git = self._git()
+        base = old_rev if old_rev is not None else _EMPTY_TREE
+        result = git.run("diff", "--quiet", base, new_rev, "--", rel, check=False)
+        return result.returncode != 0
+
     def read_file(self, rel: str) -> bytes | None:
         """Return the bytes of `rel`, or `None` if it does not exist."""
         path = paths.resolve(self._config.dir, rel, allow_archive=True)
@@ -141,6 +181,95 @@ class Repo:
         """
         git = self._git()
         git.run(*self._auth_args(), "push", "origin", f"HEAD:{self._config.branch}")
+
+    def rebase_onto_remote(self) -> bool:
+        """Fetch `origin/<branch>` and rebase the local commit(s) onto it.
+
+        Returns `True` on a clean rebase (the local commit(s) now sit on top
+        of the remote's current tip). Returns `False` if the rebase hits a
+        conflict - the rebase is aborted first, so the clone ends up exactly
+        where it started, just with `origin/<branch>` freshly fetched.
+        """
+        git = self._git()
+        branch = self._config.branch
+        git.run(*self._auth_args(), "fetch", "origin", branch)
+        return self.rebase_onto(f"origin/{branch}")
+
+    def rebase_onto(self, rev: str) -> bool:
+        """Rebase the local commit(s) onto `rev`, without fetching first.
+
+        Same clean/conflict contract as `rebase_onto_remote()`, for a
+        caller that already fetched and needs the rebase to happen against
+        the exact remote state it just inspected (the write queue, #16:
+        checking whether the remote touched the write's own path and then
+        rebasing must agree on which remote tip they are both talking
+        about - an extra fetch in between could silently move the target
+        past a change neither step ever checked).
+        """
+        git = self._git()
+        result = git.run("rebase", rev, check=False)
+        if result.returncode == 0:
+            return True
+        git.run("rebase", "--abort", check=False)
+        return False
+
+    def reset_to_remote(self) -> None:
+        """Fetch `origin/<branch>` and hard-reset the local clone to it.
+
+        Used whenever a local commit could not be pushed (persistent
+        rejection, a rebase conflict, or any other git error after commit):
+        the clone must never be left carrying a commit the remote does not
+        have (`vault.repo.SyncDiverged` guards exactly that invariant
+        elsewhere).
+        """
+        git = self._git()
+        branch = self._config.branch
+        git.run(*self._auth_args(), "fetch", "origin", branch)
+        git.run("reset", "--hard", f"origin/{branch}")
+
+    def remote_head(self) -> str:
+        """The commit SHA of `origin/<branch>`, as of the last `fetch`.
+
+        Callers fetch first (`rebase_onto_remote()` or `reset_to_remote()`
+        already did, on the usual conflict path) - this only reads the
+        already-fetched remote-tracking ref.
+        """
+        result = self._git().run("rev-parse", f"refs/remotes/origin/{self._config.branch}")
+        return _decode(result.stdout).strip()
+
+    def read_remote_file(self, rel: str) -> bytes | None:
+        """The bytes of `rel` at `origin/<branch>`, or `None` if it is not there.
+
+        Reads straight from the fetched remote-tracking ref via `git show`,
+        never the working tree, so it still sees the remote's version after
+        the caller has reset the working tree past it.
+        """
+        branch = self._config.branch
+        result = self._git().run("show", f"origin/{branch}:{rel}", check=False)
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def commit_internal_file(self, rel: str, content: bytes, message: str) -> str:
+        """Write `content` to `rel` and commit it as the `memory-manager` identity.
+
+        `rel` must resolve via `paths.resolve_internal` (a conflict-file
+        path) - this is for server-owned files, never a client write. If
+        `content` is byte-identical to what is already committed there,
+        does nothing and returns the current `head()` instead of failing on
+        "no changes": overwriting a conflict file with fresh content is the
+        normal case, not an error.
+        """
+        path = paths.resolve_internal(self._config.dir, rel)
+        _atomic_write(path, content)
+        git = self._git()
+        git.run("add", "--", rel)
+        diff = git.run("diff", "--cached", "--quiet", check=False)
+        if diff.returncode == 0:
+            return self.head()
+        committer = Author(name=_COMMITTER_NAME, email=_COMMITTER_EMAIL)
+        git.run("commit", "-m", message, f"--author={committer.name} <{committer.email}>")
+        return self.head()
 
     def sync(self) -> ChangeSet:
         """Fast-forward the local clone from `origin/<branch>` and report what changed.

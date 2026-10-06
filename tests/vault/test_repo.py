@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,34 @@ class TestPush:
         repo.commit_file("personal/fact/c.md", b"third\n", author_for("claude-code"), "add c")
         with pytest.raises(PushRejected):
             repo.push()
+
+    def test_push_rejected_via_ref_lock_race_is_also_a_push_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A racing push can be rejected server-side with wording other than
+        the usual client-side '[rejected] ... (non-fast-forward)': two pushes
+        landing at almost the same time on the remote can instead produce
+        '! [remote rejected] ... (failed to update ref)' plus a 'cannot lock
+        ref' detail line (#16) - still "the remote moved", must still be a
+        `PushRejected`, not a fatal `GitError`.
+        """
+        stderr = (
+            b"remote: error: cannot lock ref 'refs/heads/main': "
+            b"is at aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa but expected "
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            b"To /some/remote.git\n"
+            b" ! [remote rejected] HEAD -> main (failed to update ref)\n"
+            b"error: failed to push some refs to '/some/remote.git'\n"
+        )
+        fake_result = subprocess.CompletedProcess(
+            args=["git", "push", "origin", "HEAD:main"], returncode=1, stdout=b"", stderr=stderr
+        )
+        monkeypatch.setattr(
+            "memory_manager.vault.git.subprocess.run", lambda *args, **kwargs: fake_result
+        )
+
+        with pytest.raises(PushRejected):
+            Git(cwd=tmp_path).run("push", "origin", "HEAD:main")
 
 
 class TestSecurity:
