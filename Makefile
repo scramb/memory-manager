@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down
+.PHONY: fmt lint test check eval eval-baseline db-up db-down image smoke
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -40,3 +40,14 @@ db-up:
 
 db-down:
 	podman stop mm-pg 2>/dev/null || true
+
+# Builds the runtime image locally (#41). CI instead buildx-builds
+# linux/amd64,linux/arm64 - see .github/workflows/validate.yml.
+image:
+	podman build -t memory-manager:dev \
+		--build-arg MM_GIT_SHA=$$(git rev-parse HEAD) \
+		--build-arg MM_VERSION=$$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/') \
+		.
+
+smoke: image
+	scripts/smoke-container.sh memory-manager:dev
