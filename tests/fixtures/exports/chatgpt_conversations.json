@@ -1,0 +1,46 @@
+[
+  {
+    "title": "Fictional conversation one",
+    "mapping": {
+      "n1": {
+        "id": "n1",
+        "parent": null,
+        "children": ["n2"],
+        "message": {
+          "author": { "role": "user" },
+          "content": { "content_type": "text", "parts": ["Remember that I use Python for scripting."] }
+        }
+      },
+      "n2": {
+        "id": "n2",
+        "parent": "n1",
+        "children": [],
+        "message": {
+          "author": { "role": "assistant" },
+          "recipient": "bio",
+          "create_time": 1767225600.0,
+          "content": { "content_type": "text", "parts": ["The user prefers Python for scripting tasks."] }
+        }
+      }
+    }
+  },
+  {
+    "title": "Fictional conversation two",
+    "mapping": {
+      "n3": {
+        "id": "n3",
+        "parent": null,
+        "children": [],
+        "message": {
+          "author": { "role": "assistant" },
+          "recipient": "bio",
+          "create_time": 1767312000.0,
+          "content": {
+            "content_type": "text",
+            "parts": ["The user lives in a fictional city called Rivermouth."]
+          }
+        }
+      }
+    }
+  }
+]

@@ -1,0 +1,19 @@
+{
+  "conversations_memory": "## Work context\n- Alex is a backend engineer at a fictional startup.\n- Prefers Postgres over MySQL for new projects.\n\n## Top of mind\nAlex is thinking about rewriting the billing service in Rust.\n",
+  "project_memories": {
+    "0198aaaa-0000-7000-8000-000000000001": "- The demo project uses Postgres 16 with pgvector.\n- Deploys run through a fictional CI pipeline called Riverbed.\n"
+  },
+  "memory_files": [
+    {
+      "path": "/profile.md",
+      "content": "# Profile\n\nAlex prefers metric units and works in UTC+1.\n",
+      "updated_at": "2026-01-02T03:04:05.000000Z"
+    },
+    {
+      "path": "/preferences.md",
+      "content": "Alex likes short, direct answers without filler.\n",
+      "updated_at": "2026-01-05T09:00:00.000000Z"
+    }
+  ],
+  "account_uuid": "00000000-0000-4000-8000-0000000000aa"
+}

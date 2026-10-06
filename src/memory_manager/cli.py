@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The `memory-manager` command-line entry point (#26).
 
-`reindex`, `doctor` and `eval` exist so far. Other subcommands (vault sync,
-search, ...) are added as their own tasks wire the server together (M2/M4).
+`reindex`, `doctor`, `eval` and `export` exist so far. Other subcommands
+(vault sync, search, ...) are added as their own tasks wire the server
+together (M2/M4).
 """
 
 from __future__ import annotations
@@ -13,16 +14,25 @@ import json
 import os
 import secrets
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
 
-from memory_manager.config import EmbeddingConfig, EmbeddingConfigError
+from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultConfigError
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
+from memory_manager.exporter import ExportError, Manifest, export_vault
+from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
+from memory_manager.importers.chatgpt import ChatGPTFormatError
+from memory_manager.importers.chatgpt import collect as collect_chatgpt
+from memory_manager.importers.claude import ClaudeFormatError
+from memory_manager.importers.claude import collect as collect_claude
+from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
+from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
 
@@ -52,6 +62,43 @@ def main(argv: list[str] | None = None) -> int:
             update_baseline=args.update_baseline,
             k=args.k,
         )
+
+    if args.command == "export":
+        return _run_export_command(
+            args.vault, out=args.out, include_archive=args.include_archive, force=args.force
+        )
+
+    if args.command == "import":
+        if args.import_source == "markdown":
+            return asyncio.run(
+                _run_import_markdown(
+                    args.dir,
+                    namespace=args.namespace,
+                    default_type=args.type,
+                    apply=args.apply,
+                )
+            )
+        if args.import_source == "claude":
+            return asyncio.run(
+                _run_import_claude(
+                    args.file,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    apply=args.apply,
+                )
+            )
+        if args.import_source == "chatgpt":
+            return asyncio.run(
+                _run_import_chatgpt(
+                    args.file,
+                    namespace=args.namespace,
+                    type_=args.type,
+                    from_conversations=args.from_conversations,
+                    apply=args.apply,
+                )
+            )
+        parser.print_help()
+        return 1
 
     if args.command != "reindex":
         parser.print_help()
@@ -107,6 +154,111 @@ def _build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument(
         "--k", type=int, default=_DEFAULT_EVAL_K, help="cutoff for recall@k and the search limit"
     )
+
+    export_parser = subparsers.add_parser(
+        "export", help="export the vault to a tar.gz archive plus a manifest.json"
+    )
+    export_parser.add_argument(
+        "--vault",
+        default=os.environ.get("VAULT_DIR"),
+        help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    export_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="output archive path (default 'memory-export-<date>.tar.gz')",
+    )
+    export_parser.add_argument(
+        "--include-archive",
+        dest="include_archive",
+        action="store_true",
+        default=True,
+        help="include archived notes (_archive/) in the export (default)",
+    )
+    export_parser.add_argument(
+        "--no-include-archive",
+        dest="include_archive",
+        action="store_false",
+        help="exclude archived notes (_archive/) from the export",
+    )
+    export_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite --out if it already exists",
+    )
+
+    import_parser = subparsers.add_parser("import", help="import notes from an external source")
+    import_subparsers = import_parser.add_subparsers(dest="import_source")
+    markdown_parser = import_subparsers.add_parser(
+        "markdown", help="import a folder of Markdown files"
+    )
+    markdown_parser.add_argument("dir", type=Path, help="folder to walk recursively for *.md files")
+    markdown_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    markdown_parser.add_argument(
+        "--type",
+        default="reference",
+        choices=NOTE_TYPES,
+        help="note type used when a file's frontmatter does not set a valid one",
+    )
+    markdown_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
+    claude_parser = import_subparsers.add_parser(
+        "claude", help="import a Claude memory export (zip, memories JSON, or a plain text list)"
+    )
+    claude_parser.add_argument(
+        "file", type=Path, help="export zip, a memories JSON file, or a plain text/Markdown list"
+    )
+    claude_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    claude_parser.add_argument(
+        "--type",
+        default="user",
+        choices=NOTE_TYPES,
+        help="note type for items the export does not map to a fixed type itself "
+        "(memory_files entries and a plain-text fallback; conversations_memory and "
+        "project_memories always become 'user'/'project')",
+    )
+    claude_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
+    chatgpt_parser = import_subparsers.add_parser(
+        "chatgpt", help="import a ChatGPT memory list, or 'bio' calls from a conversations export"
+    )
+    chatgpt_parser.add_argument(
+        "file",
+        type=Path,
+        help="a plain text/Markdown memory list, or (with --from-conversations) a "
+        "conversations.json export",
+    )
+    chatgpt_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    chatgpt_parser.add_argument(
+        "--type", default="user", choices=NOTE_TYPES, help="note type for every imported item"
+    )
+    chatgpt_parser.add_argument(
+        "--from-conversations",
+        action="store_true",
+        help="treat 'file' as a ChatGPT conversations.json export and extract 'bio' memory "
+        "calls from it, instead of a plain text memory list",
+    )
+    chatgpt_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
     return parser
 
 
@@ -125,6 +277,136 @@ def _print_doctor_report(report: DoctorReport) -> None:
     for warning in report.warnings:
         print(f"WARNING: {warning}")
     print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+
+
+def _run_export_command(
+    vault: str | None, *, out: Path | None, include_archive: bool, force: bool
+) -> int:
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+    out_path = out or Path(f"memory-export-{datetime.now(UTC).date().isoformat()}.tar.gz")
+    if out_path.exists() and not force:
+        print(f"'{out_path}' already exists, pass --force to overwrite", file=sys.stderr)
+        return 2
+
+    try:
+        manifest = export_vault(Path(vault), out_path, include_archive=include_archive)
+    except ExportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    _print_export_manifest(manifest, out_path)
+    return 0
+
+
+def _print_export_manifest(manifest: Manifest, out_path: Path) -> None:
+    print(f"exported {manifest.note_count} note(s) to {out_path}")
+
+
+async def _run_import_markdown(
+    directory: Path, *, namespace: str, default_type: str, apply: bool
+) -> int:
+    if not directory.is_dir():
+        print(f"'{directory}' is not a directory", file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue, _vault_dir = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_markdown(
+            directory, namespace=namespace, default_type=default_type
+        )
+        report = await run_import(items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+async def _run_import_claude(file: Path, *, namespace: str, type_: str, apply: bool) -> int:
+    if not file.is_file():
+        print(f"'{file}' is not a file", file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_claude(file, namespace=namespace, type_=type_)
+    except ClaudeFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue, vault_dir = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        await asyncio.to_thread(repo.sync)
+        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
+        report = await run_import(kept_items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+        report.duplicates = duplicates + report.duplicates
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+async def _run_import_chatgpt(
+    file: Path, *, namespace: str, type_: str, from_conversations: bool, apply: bool
+) -> int:
+    if not file.is_file():
+        print(f"'{file}' is not a file", file=sys.stderr)
+        return 2
+
+    try:
+        items, pre_rejected = collect_chatgpt(
+            file, namespace=namespace, type_=type_, from_conversations=from_conversations
+        )
+    except ChatGPTFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        repo, queue, vault_dir = await open_queue(os.environ)
+    except VaultConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        await asyncio.to_thread(repo.sync)
+        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
+        report = await run_import(kept_items, queue, repo, apply=apply)
+        report.rejected = pre_rejected + report.rejected
+        report.duplicates = duplicates + report.duplicates
+    finally:
+        await queue.stop()
+
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+def _print_import_report(report: ImportReport, *, apply: bool) -> None:
+    verb = "created" if apply else "would_create"
+    print(
+        f"{verb}={len(report.created)} unchanged={len(report.unchanged)} "
+        f"skipped_existing={len(report.skipped_existing)} duplicates={len(report.duplicates)} "
+        f"flagged={len(report.flagged)} rejected={len(report.rejected)}"
+    )
+    for path, flags in report.flagged:
+        print(f"FLAGGED: {path}: {', '.join(flags)}")
+    for source_ref, reason in report.rejected:
+        print(f"REJECTED: {source_ref}: {reason}")
+    if not apply:
+        print("dry run - nothing was written, pass --apply to write")
 
 
 async def _reindex(
