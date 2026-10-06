@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The `memory-manager` command-line entry point (#17, #26).
+"""The `memory-manager` command-line entry point (#17, #26, #33).
 
 `reindex`, `doctor`, `eval`, `export` and `import` work on the vault and
 index; `serve --stdio` runs the MCP server for a local Claude Code
-connection. The HTTP transport and auth are added in M4.
+connection, `serve --http` runs it over Streamable HTTP (`http.py`). Auth
+for the HTTP transport is added in #34-#36; until then, `serve --http`
+refuses to bind to a non-loopback host unless `MM_ALLOW_UNAUTHENTICATED=1`
+is set - every MCP tool and the vault webhook would otherwise be reachable
+by anyone who can reach the port, with nothing in front of them.
 """
 
 from __future__ import annotations
@@ -19,13 +23,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
+import uvicorn
 
 from memory_manager.app import open_services
-from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultConfigError
+from memory_manager.config import (
+    EmbeddingConfig,
+    EmbeddingConfigError,
+    ServerConfig,
+    ServerConfigError,
+    VaultConfigError,
+)
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_vault
+from memory_manager.http import create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
 from memory_manager.importers.chatgpt import collect as collect_chatgpt
@@ -39,10 +51,15 @@ from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
 
+_logger = logging.getLogger(__name__)
+
 _DEFAULT_GOLDEN = Path("eval/golden.yaml")
 _DEFAULT_EVAL_VAULT = Path("examples/vault")
 _DEFAULT_BASELINE = Path("eval/baseline.json")
 _DEFAULT_EVAL_K = 5
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_ALLOW_UNAUTHENTICATED_ENV = "MM_ALLOW_UNAUTHENTICATED"
 
 
 class _MissingEnvironment(RuntimeError):
@@ -103,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
     if args.command == "serve":
-        return _serve(stdio=args.stdio)
+        return _serve(stdio=args.stdio, http=args.http)
 
     if args.command != "reindex":
         parser.print_help()
@@ -268,7 +285,12 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--stdio",
         action="store_true",
-        help="serve over stdio, for a local Claude Code connection (the only transport for now)",
+        help="serve over stdio, for a local Claude Code connection",
+    )
+    serve_parser.add_argument(
+        "--http",
+        action="store_true",
+        help="serve over Streamable HTTP, binding to $HOST:$PORT (default 127.0.0.1:8080)",
     )
     return parser
 
@@ -578,18 +600,22 @@ def _write_baseline(path: Path, report: EvalReport, provider: str) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def _serve(*, stdio: bool) -> int:
-    if not stdio:
-        print("serve: only --stdio is supported for now", file=sys.stderr)
+def _serve(*, stdio: bool, http: bool) -> int:
+    if stdio == http:
+        print("serve: pass exactly one of --stdio or --http", file=sys.stderr)
         return 2
 
     # stdout is the stdio transport's protocol channel - every log line must
     # go to stderr, never stdout (a stray `print()` would corrupt the wire).
+    # Harmless but kept the same for --http: nothing here relies on stdout
+    # staying clean, logs just belong together regardless of transport.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
     try:
-        return asyncio.run(_serve_stdio())
-    except (VaultConfigError, EmbeddingConfigError) as exc:
+        if stdio:
+            return asyncio.run(_serve_stdio())
+        return asyncio.run(_serve_http())
+    except (VaultConfigError, EmbeddingConfigError, ServerConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -599,6 +625,44 @@ async def _serve_stdio() -> int:
         server = build_server(services)
         await server.run_stdio_async()
     return 0
+
+
+async def _serve_http() -> int:
+    config = ServerConfig.from_env(dict(os.environ))
+
+    if not _is_loopback(config.host) and os.environ.get(_ALLOW_UNAUTHENTICATED_ENV) != "1":
+        print(
+            f"serve --http: refusing to bind to non-loopback host {config.host!r} - the HTTP "
+            f"transport has no authentication yet (#34-#36); set {_ALLOW_UNAUTHENTICATED_ENV}=1 "
+            "to bind anyway (every MCP tool and the vault webhook is then reachable by anyone "
+            "who can reach the port)",
+            file=sys.stderr,
+        )
+        return 2
+    if not _is_loopback(config.host):
+        _logger.warning(
+            "serve --http: binding to non-loopback host %r with %s=1 - no authentication is "
+            "implemented yet, every request reaches the MCP tools and the vault webhook",
+            config.host,
+            _ALLOW_UNAUTHENTICATED_ENV,
+        )
+
+    app = create_app(lambda: open_services(os.environ), config)
+    uvicorn_config = uvicorn.Config(
+        app,
+        host=config.host,
+        port=config.port,
+        log_config=None,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
+    server = uvicorn.Server(uvicorn_config)
+    await server.serve()
+    return 0
+
+
+def _is_loopback(host: str) -> bool:
+    return host in _LOOPBACK_HOSTS
 
 
 def _require_env(name: str) -> str:

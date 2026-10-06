@@ -103,7 +103,7 @@ Goal: Streamable HTTP with OAuth, verified as a claude.ai custom connector.
 
 ### WP-10 — Streamable HTTP · Branch: `wp/10-streamable-http`
 
-- [ ] #33 Streamable HTTP endpoint, Origin validation, protocol-version header, health/ready endpoints
+- [x] #33 Streamable HTTP endpoint, Origin validation, protocol-version header, health/ready endpoints
 - [ ] #34 Static bearer tokens (`token create`), hashed at rest, scopes `memory:read`/`memory:write`
 
 ### WP-11 — OAuth · Branch: `wp/11-oauth`
