@@ -21,6 +21,7 @@ __all__ = [
     "ServerConfigError",
     "VaultConfig",
     "VaultConfigError",
+    "canonical_resource_url",
 ]
 
 _DEFAULT_BRANCH = "main"
@@ -182,16 +183,30 @@ class ServerConfig:
     json_response: bool = True
 
     def resource_url(self) -> str:
-        """The MCP server's own URL, for `AuthSettings.resource_server_url`/`issuer_url`.
+        """The MCP server's own canonical URL (RFC 8707 "resource"), for
+        `AuthSettings.resource_server_url` and Protected Resource Metadata's
+        `resource` field (ADR-0004, #35).
 
-        `public_url` when set (the operator's own canonical URL - ADR-0004
-        requires it match exactly what a client is told); `http://{host}:{port}`
-        otherwise, so bearer-token auth (#34) can still turn on with nothing
-        beyond `DATABASE_URL` configured (there is no real authorization
-        server behind `issuer_url` yet, #35/#36 - this value is metadata, not
-        a reachable endpoint, until then).
+        Always `canonical_resource_url(public_url, mcp_path)` - a client is
+        told this exact value and must send it back unchanged as the RFC 8707
+        `resource` indicator, so it can never be derived from a request's
+        `Host` header (attacker- or proxy-controlled) or guessed from
+        `host`/`port` (not necessarily the externally reachable address).
+
+        Raises `ServerConfigError` if `public_url` is unset. This is only
+        ever called once bearer-token auth is turning on (`http.py`'s
+        lifespan, exactly when `services.pool is not None` - #34/ADR-0004),
+        so that is also where this enforces "`PUBLIC_URL` is required when
+        auth is enabled" - there is no safe default to invent instead.
         """
-        return self.public_url or f"http://{self.host}:{self.port}"
+        if self.public_url is None:
+            raise ServerConfigError(
+                "PUBLIC_URL is required once bearer-token auth is enabled "
+                "(DATABASE_URL is set): the canonical resource URL (ADR-0004) must "
+                "never be derived from a request's Host header; set PUBLIC_URL to "
+                "this server's externally reachable origin, e.g. https://memory.example.com"
+            )
+        return canonical_resource_url(self.public_url, self.mcp_path)
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
@@ -248,6 +263,37 @@ def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[s
 def _origin_of(url: str) -> str:
     parsed = urlsplit(url)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def canonical_resource_url(public_url: str, path: str) -> str:
+    """`public_url` plus `path`, normalized to the canonical form clients compare
+    against byte-for-byte (RFC 8707 `resource`; docs/research/mcp-auth-and-connectors.md
+    §3: "lowercase scheme/host, no trailing slash").
+
+    - scheme and host lowercased (`urlsplit().hostname` already lowercases; the
+      scheme is lowercased here too)
+    - the default port for the scheme (`:443` for `https`, `:80` for `http`) is
+      dropped; any other port is kept
+    - `path` is normalized to exactly one leading slash and no trailing slash,
+      regardless of how many slashes it arrived with - except the empty string,
+      which stays empty: `canonical_resource_url(public_url, "")` is the bare
+      origin (no path at all), used for the AS issuer (ADR-0004: "the issuer =
+      canonical origin"), as opposed to `canonical_resource_url(public_url,
+      mcp_path)` for the resource URL itself, which always has a path
+    - any path, query or fragment already present on `public_url` itself is
+      dropped - `PUBLIC_URL` is documented as the origin only (ADR-0004: "`PUBLIC_URL`
+      + `MCP_PATH` is canonicalised once at startup"), so `path` is the single
+      source of truth for what comes after the origin
+    """
+    parsed = urlsplit(public_url)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+    port = parsed.port
+    default_port = {"https": 443, "http": 80}.get(scheme)
+    netloc = hostname if port is None or port == default_port else f"{hostname}:{port}"
+    stripped_path = path.strip("/")
+    normalized_path = f"/{stripped_path}" if stripped_path else ""
+    return f"{scheme}://{netloc}{normalized_path}"
 
 
 def _parse_bool(raw: str | None, *, default: bool) -> bool:

@@ -16,8 +16,13 @@ nothing era-specific needs to happen in this module: mounting the one app
 `streamable_http_app()` returns is enough for both revisions.
 
 What this module adds on top of that app (none of it SDK-provided):
-`/healthz`, `/readyz`, the vault webhook (`/hooks/vault`), and Origin
-validation per the MCP spec's DNS-rebinding guidance. The last one is kept
+`/healthz`, `/readyz`, the vault webhook (`/hooks/vault`), Protected
+Resource Metadata at both well-known URLs (`/.well-known/oauth-protected-
+resource[/mcp]`, #35, see `memory_manager.auth.prm`'s module docstring for
+exactly what the SDK does and doesn't provide here on its own), the
+`scope` parameter on the 401 `WWW-Authenticate` challenge
+(`_ScopeChallengeMiddleware`), and Origin validation per the MCP spec's
+DNS-rebinding guidance. Origin validation is kept
 deliberately separate from the SDK's own `TransportSecuritySettings` (which
 checks `Host`, not just `Origin`, and is keyed off `host` looking like
 `127.0.0.1`/`localhost`/`::1`) - running both would mean two different
@@ -34,22 +39,27 @@ event - not before `Starlette(...)` is even constructed. The MCP sub-app
 built lazily too, and requests reach it through `_McpMount`, a one-line
 ASGI indirection that looks the built sub-app up from `app.state` on every
 request rather than capturing it as a constructor argument that does not
-exist yet. `custom_route`-free: #35/#36 add OAuth AS routes/middleware the same way
-this module adds the webhook - as plain Starlette routes/middleware around
-whatever `create_app` already builds, not as a dependency of it.
+exist yet. `custom_route`-free: #36 will add the OAuth AS's own routes/
+middleware the same way this module adds the webhook and PRM below - as
+plain Starlette routes/middleware around whatever `create_app` already
+builds, not as a dependency of it.
 
 Static-token bearer auth (#34, ADR-0004) turns on exactly when `services.pool`
 is set, i.e. `DATABASE_URL` is configured: the `static_tokens` table a token
 verifies against lives there, so there is nothing to verify a token against
-otherwise. `AuthSettings.resource_server_url`/`issuer_url` both come from
-`config.resource_url()` - there is no real authorization server behind
-`issuer_url` yet (no `auth_server_provider` is passed), so no `/authorize`/
-`/token` routes are mounted; only the bearer-token middleware and the
-Protected Resource Metadata route the SDK adds whenever `token_verifier` is
-set. `required_scopes` is left empty: which scope a call needs depends on
+otherwise. `AuthSettings.resource_server_url` comes from `config.resource_url()`,
+which requires `PUBLIC_URL` to be set once `services.pool is not None` -
+raising `ServerConfigError` (caught by `cli.py`'s `_serve`) otherwise, since
+#35/ADR-0004 forbid falling back to a guessed URL. `AuthSettings.issuer_url`
+is set to the same value for now even though it should, strictly, be the
+canonical *origin* without `mcp_path` (ADR-0004) - harmless today because no
+`auth_server_provider` is passed, so the SDK never mounts `/authorize`/
+`/token` off of it; #36 is what will make that distinction matter and fix
+it. `required_scopes` is left empty: which scope a call needs depends on
 the tool it calls (`memory:read` vs `memory:write`), not on reaching `/mcp`
 at all, so that check lives in `mcp/server.py`'s tools via `mcp/authz.py`,
-not here.
+not here - see `memory_manager.auth.prm`'s module docstring for why that
+also means the SDK's built-in `insufficient_scope` 403 branch never fires.
 """
 
 from __future__ import annotations
@@ -63,15 +73,21 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from memory_manager import __commit__, __version__
 from memory_manager.app import Services
+from memory_manager.auth.prm import (
+    SCOPE_CHALLENGE,
+    WELL_KNOWN_ROOT_PATH,
+    path_suffixed_well_known_path,
+    serve_protected_resource_metadata,
+)
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig
 from memory_manager.mcp.server import build_server
@@ -148,13 +164,31 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
         Route(READY_PATH, endpoint=_readyz, methods=["GET"]),
         Route(WEBHOOK_PATH, endpoint=_vault_webhook, methods=["POST"]),
+        # Both well-known PRM URLs (#35) are registered here, on the outer
+        # app, ahead of the `Mount` below - not left to the SDK's own
+        # (resource_name-less, path-suffixed-only) route inside `mcp_app`,
+        # see `memory_manager.auth.prm`'s module docstring for why.
+        Route(WELL_KNOWN_ROOT_PATH, endpoint=serve_protected_resource_metadata, methods=["GET"]),
+        Route(
+            path_suffixed_well_known_path(config.mcp_path),
+            endpoint=serve_protected_resource_metadata,
+            methods=["GET"],
+        ),
         # Mounted last (lowest route-matching precedence), same reasoning
         # `mcp/server/lowlevel/server.py` uses for its own custom routes:
-        # the three routes above must win their exact paths before this
+        # the routes above must win their exact paths before this
         # catch-all gets a chance to.
         Mount("/", app=_McpMount()),
     ]
-    middleware = [Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins)]
+    middleware = [
+        Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
+        # Wraps the whole app, including the `Mount` below, so it sees the
+        # `WWW-Authenticate` header `mcp_app`'s own `RequireAuthMiddleware`/
+        # `BearerAuthBackend` build on a 401 (see `memory_manager.auth.prm`'s
+        # module docstring) just as much as it would see one from a route
+        # defined directly on this outer app.
+        Middleware(_ScopeChallengeMiddleware, scope=SCOPE_CHALLENGE),
+    ]
     app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
     # Known synchronously (no vault/DB work needed), unlike `services`/`mcp_app`
     # above - set right away rather than deferred into `lifespan`.
@@ -205,6 +239,44 @@ class _OriginValidationMiddleware:
             return
 
         await self._app(scope, receive, send)
+
+
+_WWW_AUTHENTICATE_HEADER = "www-authenticate"
+
+
+class _ScopeChallengeMiddleware:
+    """Appends `scope="..."` to a `WWW-Authenticate: Bearer ...` 401 response header.
+
+    `mcp_app`'s own `RequireAuthMiddleware`/`BearerAuthBackend`
+    (`mcp.server.auth.middleware.bearer_auth`, read directly, see
+    `memory_manager.auth.prm`'s module docstring) build that header without
+    a `scope` parameter at all and give no hook to add one at the source -
+    so this rewrites it in flight instead, the same ASGI
+    `send`-message-rewriting idiom Starlette's own middleware use for
+    response headers. Only ever touches a response that already carries
+    `WWW-Authenticate` and is missing `scope=`; every other response,
+    including this app's own 401s that carry no such header at all (the
+    vault webhook's), passes through unchanged.
+    """
+
+    def __init__(self, app: ASGIApp, *, scope: str) -> None:
+        self._app = app
+        self._scope = scope
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        async def send_with_scope(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                challenge = headers.get(_WWW_AUTHENTICATE_HEADER)
+                if challenge is not None and "scope=" not in challenge:
+                    headers[_WWW_AUTHENTICATE_HEADER] = f'{challenge}, scope="{self._scope}"'
+            await send(message)
+
+        await self._app(scope, receive, send_with_scope)
 
 
 async def _healthz(_request: Request) -> Response:

@@ -197,6 +197,11 @@ async def test_verifier_returns_none_for_an_invalid_token(pool: asyncpg.Pool) ->
 
 # --- The HTTP transport end to end ------------------------------------------
 
+# `DATABASE_URL` set below turns bearer-token auth on (#34), which requires
+# `PUBLIC_URL` (#35, ADR-0004) - every `ServerConfig` in this section needs one
+# for the app to start at all, independent of what each test itself checks.
+_PUBLIC_URL = "https://mm.example.test"
+
 
 def _environ(bare_remote: Path, tmp_path: Path, database_url: str) -> dict[str, str]:
     return {
@@ -227,7 +232,7 @@ def _authed_mcp_client(app: Starlette, config: ServerConfig, token: str | None) 
 async def test_mcp_without_a_token_is_401(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -243,7 +248,7 @@ async def test_mcp_without_a_token_is_401(
 async def test_mcp_with_an_invalid_token_is_401(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -269,7 +274,7 @@ async def test_a_wildcard_read_write_token_can_read_and_write_every_namespace(
             _WORK_PATH: _note("01JBBBBBBBBBBBBBBBBBBBBBBB"),
         },
     )
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
         pool: asyncpg.Pool = app.state.services.pool
         plaintext, _info = await create_token(
@@ -297,7 +302,7 @@ async def test_a_read_only_token_can_search_but_not_write(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
     seed_notes(bare_remote, {_PERSONAL_PATH: _note("01JAAAAAAAAAAAAAAAAAAAAAAA")})
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
         pool: asyncpg.Pool = app.state.services.pool
         plaintext, _info = await create_token(
@@ -332,7 +337,7 @@ async def test_a_namespace_restricted_token_sees_only_its_namespace(
             _WORK_PATH: _note("01JBBBBBBBBBBBBBBBBBBBBBBB"),
         },
     )
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
         pool: asyncpg.Pool = app.state.services.pool
         plaintext, _info = await create_token(
