@@ -18,11 +18,20 @@ over-engineering a dependency graph: `_heal_dangling_links` runs after every
 target; `reindex_full` additionally recomputes links for every note once
 all of them are in the index, so a forward reference is correct the first
 time a vault is rebuilt from scratch.
+
+Embedding a note's chunks (#27) happens best-effort right after it is
+upserted, via the optional `provider` constructor argument. A missing
+provider or a failed embedding call both leave `chunks.embedding` `NULL` -
+indexing itself never blocks on it. `embed_pending`, called at the end of
+`reindex`, is the catch-up pass: it re-embeds every chunk still missing an
+embedding or stamped with a model other than the provider's current one,
+so a provider outage or a model change both self-heal on the next reindex.
 """
 
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -32,6 +41,7 @@ import asyncpg
 import asyncpg.pool
 
 from memory_manager.index.chunker import chunk_note
+from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
 from memory_manager.vault.links import (
     LinkRef,
     ResolvedLink,
@@ -51,6 +61,11 @@ _logger = logging.getLogger(__name__)
 # which - unlike a plain `asyncpg.connect()` - yields a `PoolConnectionProxy`,
 # not a `Connection`.
 _Conn = asyncpg.pool.PoolConnectionProxy
+
+# How many stale chunks `embed_pending` re-embeds per round trip to the
+# provider; keeps a single call's memory and request size bounded no matter
+# how many chunks are waiting.
+_EMBED_PENDING_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True)
@@ -76,9 +91,15 @@ class _Outcome(enum.Enum):
 class Indexer:
     """Builds and maintains the derived Postgres index from vault files."""
 
-    def __init__(self, pool: asyncpg.Pool, vault_root: Path) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        vault_root: Path,
+        provider: EmbeddingProvider | None = None,
+    ) -> None:
         self._pool = pool
         self._vault_root = vault_root
+        self._provider = provider
 
     async def index_paths(self, paths: Iterable[str]) -> IndexStats:
         """Index or remove each of `paths`, skipping unchanged files.
@@ -124,10 +145,12 @@ class Indexer:
         discovered = self._discover_paths()
         stats = await self.index_paths(discovered)
         if not full:
+            await self.embed_pending()
             return stats
 
         extra_deleted = await self._delete_stale(discovered)
         await self._recompute_all_links()
+        await self.embed_pending()
         return IndexStats(
             indexed=stats.indexed,
             unchanged=stats.unchanged,
@@ -179,6 +202,7 @@ class Indexer:
             return _Outcome.FAILED
 
         await self._upsert_note(rel, note, file_hash)
+        await self._embed_note(note.id)
         return _Outcome.INDEXED
 
     async def _delete_by_path(self, rel: str) -> bool:
@@ -273,6 +297,110 @@ class Indexer:
             await conn.executemany(
                 "insert into links (source_id, target_raw, target_path) values ($1, $2, $3)",
                 [(note_id, target_raw, target_path) for target_raw, target_path in rows],
+            )
+
+    async def _embed_note(self, note_id: str) -> None:
+        """Embed `note_id`'s chunks right after they were (re-)written.
+
+        A missing provider or an `EmbeddingError` both leave the chunks'
+        `embedding` column `NULL` - either is picked up later by
+        `embed_pending`, so an embedding outage never blocks indexing
+        (`CLAUDE.md`/PLAN: embedding APIs are optional and pluggable).
+        """
+        if self._provider is None:
+            return
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "select id, text from chunks where note_id = $1 order by ord", note_id
+            )
+        if not rows:
+            return
+
+        try:
+            vectors = await self._provider.embed([row["text"] for row in rows])
+        except EmbeddingError as exc:
+            _logger.warning("skipping embeddings for note %r: %s", note_id, exc)
+            return
+
+        await self._apply_embeddings(rows, vectors, self._provider.model)
+
+    async def embed_pending(self, limit: int | None = None) -> int:
+        """Re-embed every chunk with no embedding, or one from a stale model.
+
+        A no-op without a configured provider. Processes chunks in batches
+        of `_EMBED_PENDING_BATCH_SIZE` (bounded further by `limit`, if
+        given) and stops at the first `EmbeddingError`, leaving the
+        remaining stale chunks for the next call. Returns the number of
+        chunks re-embedded.
+        """
+        if self._provider is None:
+            return 0
+
+        model = self._provider.model
+        total = 0
+        while limit is None or total < limit:
+            batch_size = _EMBED_PENDING_BATCH_SIZE
+            if limit is not None:
+                batch_size = min(batch_size, limit - total)
+
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "select id, text from chunks "
+                    "where embedding is null or model is distinct from $1 "
+                    "order by id limit $2",
+                    model,
+                    batch_size,
+                )
+            if not rows:
+                break
+
+            try:
+                vectors = await self._provider.embed([row["text"] for row in rows])
+            except EmbeddingError as exc:
+                _logger.warning("embed_pending: stopping after a failed batch: %s", exc)
+                break
+
+            await self._apply_embeddings(rows, vectors, model)
+            total += len(rows)
+
+        return total
+
+    async def _apply_embeddings(
+        self, rows: Sequence[asyncpg.Record], vectors: Sequence[Sequence[float]], model: str
+    ) -> None:
+        if not vectors:
+            return
+        dimension = len(vectors[0])
+
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                "update chunks set embedding = $1::vector, model = $2, dimension = $3 "
+                "where id = $4",
+                [
+                    (_vector_literal(vector), model, dimension, row["id"])
+                    for row, vector in zip(rows, vectors, strict=True)
+                ],
+            )
+
+        await self.ensure_vector_index(model, dimension)
+
+    async def ensure_vector_index(self, model: str, dimension: int) -> None:
+        """Create the HNSW index for `(model, dimension)` if it doesn't exist yet.
+
+        One partial index per `(model, dimension)` pair, named after a hash
+        of `model` so switching models never collides with an index left
+        behind by the previous one. `model` is config-controlled, not user
+        input, but is still quoted through `_sql_string_literal` rather
+        than interpolated raw.
+        """
+        index_name = _hnsw_index_name(model, dimension)
+        model_literal = _sql_string_literal(model)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"create index if not exists {index_name} on chunks "
+                f"using hnsw ((embedding::vector({dimension})) vector_cosine_ops) "
+                f"where model = {model_literal} and dimension = {dimension}"
             )
 
     async def _heal_dangling_links(self) -> None:
@@ -382,3 +510,20 @@ def _dedup_links(resolved: Sequence[ResolvedLink]) -> list[tuple[str, str | None
 def _parse_affected(result: str) -> int:
     """Parse the row count out of an asyncpg command tag like `'DELETE 3'`."""
     return int(result.rsplit(" ", 1)[-1])
+
+
+def _vector_literal(vector: Sequence[float]) -> str:
+    """Render `vector` as the `'[1.0,2.0,...]'` text pgvector parses via `::vector`."""
+    return "[" + ",".join(str(float(value)) for value in vector) + "]"
+
+
+def _hnsw_index_name(model: str, dimension: int) -> str:
+    # Not a cryptographic use - just a short, stable, identifier-safe tag
+    # that is deterministic per model name.
+    digest = hashlib.sha1(model.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return f"chunks_hnsw_{digest}_{dimension}"
+
+
+def _sql_string_literal(value: str) -> str:
+    """Quote `value` as a SQL string literal; DDL has no parameter placeholders."""
+    return "'" + value.replace("'", "''") + "'"

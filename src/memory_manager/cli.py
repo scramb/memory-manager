@@ -15,7 +15,9 @@ from pathlib import Path
 
 import asyncpg
 
+from memory_manager.config import EmbeddingConfig, EmbeddingConfigError
 from memory_manager.db.migrate import migrate
+from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
 
 __all__ = ["main"]
@@ -37,11 +39,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         database_url = _require_env("DATABASE_URL")
         vault_dir = Path(_require_env("VAULT_DIR"))
-    except _MissingEnvironment as exc:
+        embedding_config = EmbeddingConfig.from_env(dict(os.environ))
+    except (_MissingEnvironment, EmbeddingConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    return asyncio.run(_reindex(database_url, vault_dir, full=args.full))
+    return asyncio.run(_reindex(database_url, vault_dir, embedding_config, full=args.full))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -58,7 +61,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _reindex(database_url: str, vault_dir: Path, *, full: bool) -> int:
+async def _reindex(
+    database_url: str, vault_dir: Path, embedding_config: EmbeddingConfig, *, full: bool
+) -> int:
     # A plain connection for the migration, not one from the pool below:
     # `migrate` takes an `asyncpg.Connection`, not a pool's connection proxy.
     migration_conn = await asyncpg.connect(database_url)
@@ -67,9 +72,10 @@ async def _reindex(database_url: str, vault_dir: Path, *, full: bool) -> int:
     finally:
         await migration_conn.close()
 
+    provider = provider_from_config(embedding_config)
     pool = await asyncpg.create_pool(database_url)
     try:
-        stats = await Indexer(pool, vault_dir).reindex(full=full)
+        stats = await Indexer(pool, vault_dir, provider).reindex(full=full)
     finally:
         await pool.close()
 
