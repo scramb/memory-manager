@@ -18,5 +18,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Planning skeleton
         run: scripts/check-docs.sh
-      # Language-specific build, lint, test and container steps are added
-      # by T-004 once ADR-0001 is accepted.
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: make check
+        run: make check

@@ -3,7 +3,7 @@
 Self-hosted long-term memory for Claude: Markdown notes in Git as the source of truth, a derived Postgres search index, and one remote MCP server that claude.ai and Claude Code share.
 Plan and architecture: [`docs/PLAN.md`](./docs/PLAN.md) · Work backlog: [`docs/TASKS.md`](./docs/TASKS.md)
 
-> Working name `memory-manager` (repo name). Final project/CLI name is open decision O6 in the PLAN.
+> Project and CLI name: `memory-manager` (O6, decided 2026-10-06).
 
 ## Stack
 
@@ -101,7 +101,7 @@ Refs #13
 - CI always runs: build, lint/vet, format check, tests, container build (once a Dockerfile exists).
 - Before ticking a box in `docs/TASKS.md`, **run** the task's verification. Ticked means verified.
 
-Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest; created in #4 — until then `scripts/check-docs.sh`).
+Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest).
 
 ## Documentation
 
