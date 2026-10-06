@@ -42,7 +42,7 @@ Goal: notes can be read, written and validated; every change is a Git commit; co
 ### WP-03 — Git vault · Branch: `wp/03-git-vault`
 
 - [x] #11 Vault clones a remote, commits one change per write with client as author, pushes (integration test against a local bare remote)
-- [ ] #12 Pull of human changes via poll + webhook endpoint, change set reported to the indexer hook
+- [x] #12 Pull of human changes via poll + webhook endpoint, change set reported to the indexer hook
 - [x] #13 Secret scan rejects a commit containing a token-like string with a clear error (gitleaks-style rules)
 
 ### WP-04 — Write queue · Branch: `wp/04-write-queue`

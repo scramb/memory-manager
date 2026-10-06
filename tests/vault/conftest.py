@@ -18,7 +18,14 @@ import pytest
 from memory_manager.config import VaultConfig
 from memory_manager.vault.git import Git
 
-__all__ = ["bare_remote", "human_commit", "vault_config"]
+__all__ = ["bare_remote", "human_commit", "human_delete", "human_rename", "vault_config"]
+
+_HUMAN_AUTHOR_ENV = {
+    "GIT_AUTHOR_NAME": "human",
+    "GIT_AUTHOR_EMAIL": "human@memory-manager.invalid",
+    "GIT_COMMITTER_NAME": "human",
+    "GIT_COMMITTER_EMAIL": "human@memory-manager.invalid",
+}
 
 
 def _run(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -66,4 +73,41 @@ def human_commit(remote: Path, rel: str, content: bytes) -> None:
 
         _run(["add", "--", rel], cwd=clone_dir)
         _run(["commit", "-m", f"human: write {rel}"], cwd=clone_dir, env=author_env)
+        _run(["push", "origin", "HEAD:main"], cwd=clone_dir)
+
+
+def human_delete(remote: Path, rel: str) -> None:
+    """Delete `rel` and push the removal directly to `remote`, as `human`.
+
+    Used to test sync's handling of a deletion, the same way `human_commit`
+    is used for additions/modifications.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        clone_dir = tmp_path / "clone"
+        _run(["clone", "--origin", "origin", str(remote), str(clone_dir)], cwd=tmp_path)
+
+        _run(["rm", "--", rel], cwd=clone_dir)
+        _run(["commit", "-m", f"human: delete {rel}"], cwd=clone_dir, env=_HUMAN_AUTHOR_ENV)
+        _run(["push", "origin", "HEAD:main"], cwd=clone_dir)
+
+
+def human_rename(remote: Path, src_rel: str, dst_rel: str) -> None:
+    """Rename `src_rel` to `dst_rel` and push it directly to `remote`, as `human`.
+
+    Used to test sync's rename handling (reported as delete(old) + add(new)).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        clone_dir = tmp_path / "clone"
+        _run(["clone", "--origin", "origin", str(remote), str(clone_dir)], cwd=tmp_path)
+
+        dst_path = clone_dir / dst_rel
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        _run(["mv", "--", src_rel, dst_rel], cwd=clone_dir)
+        _run(
+            ["commit", "-m", f"human: rename {src_rel} to {dst_rel}"],
+            cwd=clone_dir,
+            env=_HUMAN_AUTHOR_ENV,
+        )
         _run(["push", "origin", "HEAD:main"], cwd=clone_dir)

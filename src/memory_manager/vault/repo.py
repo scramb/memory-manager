@@ -21,14 +21,32 @@ from pathlib import Path
 from memory_manager.config import VaultConfig
 from memory_manager.vault import paths
 from memory_manager.vault.git import Git, GitError
+from memory_manager.vault.paths import PathRejected
+from memory_manager.vault.sync import ChangeSet
 
-__all__ = ["Author", "Repo", "author_for"]
+__all__ = ["Author", "Repo", "SyncDiverged", "author_for"]
 
 _COMMITTER_NAME = "memory-manager"
 _COMMITTER_EMAIL = "memory-manager@memory-manager.invalid"
 
 _CLIENT_DOMAIN = "memory-manager.invalid"
 _KNOWN_CLIENTS = ("claude-ai", "claude-code", "human", "import")
+
+# The SHA-1 of the empty tree: diffing against it turns "every file in
+# <new_head>" into the same add/modify/delete shape a normal diff produces,
+# so the fresh-clone case reuses the regular diff/classify code path.
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+class SyncDiverged(GitError):
+    """`sync()` found local commits that are not on the remote branch.
+
+    Single-writer: the local clone is never supposed to carry commits the
+    remote does not have except right after `commit_file`/`move_file`,
+    before the next `push()`. A genuine divergence means something wrote
+    to the local clone outside this process; `sync()` refuses to guess at
+    a resolution (no merge, no rebase) and surfaces it instead.
+    """
 
 
 @dataclass(frozen=True)
@@ -123,6 +141,93 @@ class Repo:
         """
         git = self._git()
         git.run(*self._auth_args(), "push", "origin", f"HEAD:{self._config.branch}")
+
+    def sync(self) -> ChangeSet:
+        """Fast-forward the local clone from `origin/<branch>` and report what changed.
+
+        - Remote branch does not exist yet (nothing pushed there): an empty
+          `ChangeSet`.
+        - Local `HEAD` is unborn (clone made while the remote was empty):
+          checks out the remote branch and reports every file in it as
+          `added` (or `ignored`, if it is not a note path).
+        - Local `HEAD` is an ancestor of the remote branch: fast-forwards
+          (`merge --ff-only`) and reports the diff between the old and new
+          `HEAD`, classified per `vault.paths.parse_note_path`. A rename is
+          reported as a delete of the old path plus an add of the new one.
+        - The remote branch is an ancestor of local `HEAD` (unpushed local
+          commits, nothing new to pull): an empty `ChangeSet`, no error -
+          the write queue pushes those commits later.
+        - Neither is an ancestor of the other (diverged): raises
+          `SyncDiverged`. Never merges, never rebases.
+        """
+        git = self._git()
+        old_head = self._current_head(git)
+        branch = self._config.branch
+
+        remote_check = git.run(
+            *self._auth_args(), "ls-remote", "--exit-code", "--heads", "origin", branch, check=False
+        )
+        if remote_check.returncode == 2:
+            return ChangeSet(old_head=old_head, new_head=old_head)
+        if remote_check.returncode != 0:
+            raise GitError(
+                ("ls-remote", "--exit-code", "--heads", "origin", branch),
+                remote_check.returncode,
+                _decode(remote_check.stderr),
+            )
+
+        git.run(*self._auth_args(), "fetch", "origin", branch)
+        remote_head = _decode(git.run("rev-parse", f"refs/remotes/origin/{branch}").stdout).strip()
+
+        if old_head is None:
+            git.run("checkout", "-B", branch, f"origin/{branch}")
+            new_head = self.head()
+            return self._diff_changeset(git, None, new_head, _EMPTY_TREE, new_head)
+
+        if old_head == remote_head:
+            return ChangeSet(old_head=old_head, new_head=old_head)
+
+        forward = git.run("merge-base", "--is-ancestor", old_head, remote_head, check=False)
+        if forward.returncode == 0:
+            git.run("merge", "--ff-only", f"origin/{branch}")
+            new_head = self.head()
+            return self._diff_changeset(git, old_head, new_head, old_head, new_head)
+
+        backward = git.run("merge-base", "--is-ancestor", remote_head, old_head, check=False)
+        if backward.returncode == 0:
+            return ChangeSet(old_head=old_head, new_head=old_head)
+
+        raise SyncDiverged(
+            ("merge-base", "--is-ancestor", old_head, remote_head),
+            1,
+            f"local HEAD {old_head} and origin/{branch} ({remote_head}) have diverged",
+        )
+
+    def _current_head(self, git: Git) -> str | None:
+        """The current `HEAD` commit SHA, or `None` if `HEAD` is unborn."""
+        result = git.run("rev-parse", "--verify", "-q", "HEAD", check=False)
+        if result.returncode != 0:
+            return None
+        return _decode(result.stdout).strip()
+
+    def _diff_changeset(
+        self,
+        git: Git,
+        old_head: str | None,
+        new_head: str,
+        diff_old_rev: str,
+        diff_new_rev: str,
+    ) -> ChangeSet:
+        result = git.run("diff", "--name-status", "-M", "-z", diff_old_rev, diff_new_rev)
+        added, modified, deleted, ignored = _classify_diff(result.stdout)
+        return ChangeSet(
+            old_head=old_head,
+            new_head=new_head,
+            added=added,
+            modified=modified,
+            deleted=deleted,
+            ignored=ignored,
+        )
 
     def _commit_staged(self, git: Git, author: Author, message: str) -> None:
         diff = git.run("diff", "--cached", "--quiet", check=False)
@@ -235,3 +340,77 @@ def _decode(data: bytes | None) -> str:
     if not data:
         return ""
     return data.decode("utf-8", errors="replace")
+
+
+def _classify_diff(
+    raw: bytes,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Split `git diff --name-status -M -z` output into note vs. ignored buckets.
+
+    A rename (`R...`) is reported as a delete of the old path plus an add
+    of the new one, so a caller never has to special-case renames: the
+    indexer just sees one path disappear and another appear.
+    """
+    added: list[str] = []
+    modified: list[str] = []
+    deleted: list[str] = []
+    ignored: list[str] = []
+
+    def bucket(rel: str, note_bucket: list[str]) -> None:
+        if _is_note_path(rel):
+            note_bucket.append(rel)
+        else:
+            ignored.append(rel)
+
+    for status, path, other_path in _parse_name_status_z(raw):
+        kind = status[0]
+        if kind == "R":
+            bucket(path, deleted)
+            if other_path is not None:
+                bucket(other_path, added)
+        elif kind == "A":
+            bucket(path, added)
+        elif kind == "D":
+            bucket(path, deleted)
+        else:
+            # "M" (modify) and everything else diff can report for a
+            # tracked path (e.g. "T" typechange) are treated as a
+            # modification - the file is still at the same path.
+            bucket(path, modified)
+
+    return tuple(added), tuple(modified), tuple(deleted), tuple(ignored)
+
+
+def _parse_name_status_z(raw: bytes) -> list[tuple[str, str, str | None]]:
+    """Parse the NUL-separated output of `git diff --name-status -z`.
+
+    Each record is `status\\0path\\0` except a rename/copy
+    (`R<score>`/`C<score>`), which is `status\\0old_path\\0new_path\\0`.
+    """
+    fields = raw.decode("utf-8").split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+
+    records: list[tuple[str, str, str | None]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        if status.startswith(("R", "C")):
+            old_path = fields[index]
+            new_path = fields[index + 1]
+            index += 2
+            records.append((status, old_path, new_path))
+        else:
+            path = fields[index]
+            index += 1
+            records.append((status, path, None))
+    return records
+
+
+def _is_note_path(rel: str) -> bool:
+    try:
+        paths.parse_note_path(rel, allow_archive=True)
+    except PathRejected:
+        return False
+    return True
