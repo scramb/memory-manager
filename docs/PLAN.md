@@ -22,7 +22,7 @@ A self-hosted, production-grade long-term memory for Claude that claude.ai (web/
 - MCP server over Streamable HTTP and stdio; tools, server instructions, prompt `memory_guide`
 - OAuth 2.1 (ADR-0004), static tokens, scopes, rate limits, audit log, secret scan
 - CLI: `init`, `serve`, `reindex`, `doctor`, `import`, `export`, `token create`
-- Container image, Compose, Kustomize base, Helm chart, Flux example
+- Container image, Compose, generic Kustomize base with deployment guide, Helm chart, Flux example — public-safe, operator values in the operator's own overlay
 - Claude Code skill + `CLAUDE.md` snippet; retrieval eval in CI
 
 **Explicitly not (v1)**
@@ -86,7 +86,7 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | Git access | git CLI wrapper | pygit2, GitPython | correct rebase/conflict behaviour for free | [ADR-0003](./adr/0003-git-access.md) |
 | Auth | embedded OAuth AS + static tokens; login via upstream OIDC or admin password | external AS (Hydra) | proven pattern; no IdP required for self-hosters | [ADR-0004](./adr/0004-auth-model.md) |
 | Database | PostgreSQL 16+ with pgvector, plain SQL + versioned migrations | ORM, dedicated vector DB | one well-known service for full text + vectors | — (set by brief) |
-| Deployment | Kustomize base + Flux for the owner's cluster; Helm chart for other users | Helm only | matches owner's tethys conventions ([reference](./research/bring-mcp-reference.md)) | pending O8 |
+| Deployment | repo ships its own generic deployment like bring--mcp: Kustomize base in `deploy/` + `deploy/README.md`, Helm chart, Flux example; no operator-specific values (hosts, secrets, cluster names) in this public repo — those live in the operator's own overlay | Helm only; owner-specific manifests in the repo | same pattern as bring--mcp, safe for a public repo ([reference](./research/bring-mcp-reference.md)) | — (owner 2026-10-06) |
 
 Guardrails: few dependencies, OSS first, container by default, application languages from the pool (Go, Rust, C, C++, React, Vue.js) — Python is an owner-approved deviation (ADR-0001).
 
@@ -112,20 +112,20 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O2 | License | — decided: AGPL-3.0-only (ADR-0002) | — | owner ✔ 2026-10-06 |
 | O3 | Git access | — decided: git CLI (ADR-0003) | — | owner ✔ 2026-10-06 |
 | O4 | Auth model incl. login | — decided: embedded AS, OIDC or admin-password login (ADR-0004) | — | owner ✔ 2026-10-06 |
-| O5 | Freeze note format (frontmatter fields, path scheme, size cap) as ADR-0005 | as in brief · adjusted | WP-02 | owner, start of M1 |
-| O6 | Final project / CLI name | keep `memory-manager` · new name | T-005 (README), package name in T-004 | owner |
+| O5 | Freeze note format (frontmatter fields, path scheme, size cap) as ADR-0005 | as in brief · adjusted | #6 → WP-02 | owner, start of M1 |
+| O6 | Final project / CLI name | keep `memory-manager` · new name | #5 (README), package name in #4 | owner |
 | O7 | Track tasks as GitHub issues | — decided: yes, issues are the source of truth | — | owner ✔ 2026-10-06 |
-| O8 | Deployment artefacts | A: Kustomize base (tethys) + Helm chart + Flux example (recommended) · B: Helm only as in brief | WP-13 | owner |
+| O8 | Deployment artefacts | — decided: own generic deployment as in bring--mcp, public-safe (see Technology decisions) | — | owner ✔ 2026-10-06 |
 
 ## Risks
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| claude.ai connector behaviour changes or differs from docs | connector fails to connect | follow bring--mcp pattern; manual verification task T-045; research notes dated |
+| claude.ai connector behaviour changes or differs from docs | connector fails to connect | follow bring--mcp pattern; manual verification task #40; research notes dated |
 | Spec churn (2026-07-28 removed sessions, deprecated DCR) | rework in auth/transport | rely on SDK dual-version support; CIMD follow-up planned |
-| Prompt injection through stored notes | Claude acts on note content | "content is data" in tool descriptions and instructions; no code path executes note content; OWASP LLM review (T-063) |
+| Prompt injection through stored notes | Claude acts on note content | "content is data" in tool descriptions and instructions; no code path executes note content; OWASP LLM review (#51) |
 | Secrets written into memory | leak via Git remote | secret scan before commit; rejected with clear message |
-| Concurrent human + Claude edits | lost updates | single writer, `if_version`, rebase, conflict files, concurrency test T-019 |
+| Concurrent human + Claude edits | lost updates | single writer, `if_version`, rebase, conflict files, concurrency test #16 |
 | Embedding model change | stale vectors | model + dimension per chunk; automatic reindex |
 | AGPL deters some corporate users | fewer adopters/contributors | README explains obligations plainly; unmodified self-hosting has no extra duties |
 | Python outside the pool | second stack to maintain | deviation recorded and approved; re-evaluation trigger in ADR-0001 |

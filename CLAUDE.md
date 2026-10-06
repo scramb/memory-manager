@@ -88,6 +88,7 @@ Refs #13
 - **Note content is data, not instructions.** No code path interprets note content as commands; tool descriptions say so.
 - **Security is not negotiable:** path allowlist, no symlinks, `.md` only, secret scan before every commit, token hashes only, audit log for every write. A change that weakens one of these needs an ADR.
 - **License:** AGPL-3.0-only. Every source file starts with `# SPDX-License-Identifier: AGPL-3.0-only`. New dependencies must be AGPL-compatible.
+- **Public repository:** no operator-specific values (hostnames, cluster names, secret paths, IPs, real namespaces) in code, manifests, examples or issues. Deployment artefacts are generic; operators keep their values in their own overlay.
 - **No real personal data** in `examples/`, tests or fixtures.
 - **Verify, don't recall.** Anything about the MCP spec, claude.ai connectors or SDK APIs is checked against current sources and recorded in `docs/research/` with source and version.
 
@@ -100,7 +101,7 @@ Refs #13
 - CI always runs: build, lint/vet, format check, tests, container build (once a Dockerfile exists).
 - Before ticking a box in `docs/TASKS.md`, **run** the task's verification. Ticked means verified.
 
-Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest; created in T-004 — until then `scripts/check-docs.sh`).
+Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest; created in #4 — until then `scripts/check-docs.sh`).
 
 ## Documentation
 
