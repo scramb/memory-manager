@@ -101,7 +101,7 @@ Refs #13
 - CI always runs: build, lint/vet, format check, tests, container build (once a Dockerfile exists).
 - Before ticking a box in `docs/TASKS.md`, **run** the task's verification. Ticked means verified.
 
-Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest; created in #4 — until then `scripts/check-docs.sh`).
+Locally before every commit: `make check` (ruff format/lint, mypy strict, pytest).
 
 ## Documentation
 
