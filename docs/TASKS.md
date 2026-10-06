@@ -34,7 +34,7 @@ Goal: notes can be read, written and validated; every change is a Git commit; co
 ### WP-02 — Note model · Branch: `wp/02-note-model`
 
 - [x] #6 ADR-0005 freezes the note format
-- [ ] #7 Note parser/serializer round-trips frontmatter + body byte-stable (`make test PKG=note`)
+- [x] #7 Note parser/serializer round-trips frontmatter + body byte-stable (`make test PKG=note`)
 - [ ] #8 Note validation rejects missing/long `description`, unknown `type`, size > limit, invalid ULID
 - [ ] #9 Path safety: allowlist `<namespace>/<type>/<slug>.md`, rejects traversal, symlinks, non-`.md`
 - [ ] #10 `[[slug]]` link extraction returns resolved and dangling links
@@ -100,12 +100,12 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 Goal: Streamable HTTP with OAuth, verified as a claude.ai custom connector.
 
-### WP-10 — Streamable HTTP · Branch: `wp/10-streamable-http` ⛔ blocked by O4 (ADR-0004)
+### WP-10 — Streamable HTTP · Branch: `wp/10-streamable-http`
 
 - [ ] #33 Streamable HTTP endpoint, Origin validation, protocol-version header, health/ready endpoints
 - [ ] #34 Static bearer tokens (`token create`), hashed at rest, scopes `memory:read`/`memory:write`
 
-### WP-11 — OAuth · Branch: `wp/11-oauth` ⛔ blocked by O4 (ADR-0004)
+### WP-11 — OAuth · Branch: `wp/11-oauth`
 
 - [ ] #35 Protected Resource Metadata + `WWW-Authenticate` challenge
 - [ ] #36 Embedded authorization server per ADR-0004: AS metadata, DCR, PKCE S256 only, audience check, rotating refresh, revocation
