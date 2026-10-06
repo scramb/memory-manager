@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The `memory-manager` command-line entry point (#26).
 
-Only `reindex` exists so far. Other subcommands (vault sync, search, ...)
-are added as their own tasks wire the server together (M2/M4).
+`reindex`, `doctor` and `eval` exist so far. Other subcommands (vault sync,
+search, ...) are added as their own tasks wire the server together (M2/M4).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -17,10 +19,17 @@ import asyncpg
 
 from memory_manager.config import EmbeddingConfig, EmbeddingConfigError
 from memory_manager.db.migrate import migrate
+from memory_manager.doctor import DoctorReport, run_doctor
+from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
 
 __all__ = ["main"]
+
+_DEFAULT_GOLDEN = Path("eval/golden.yaml")
+_DEFAULT_EVAL_VAULT = Path("examples/vault")
+_DEFAULT_BASELINE = Path("eval/baseline.json")
+_DEFAULT_EVAL_K = 5
 
 
 class _MissingEnvironment(RuntimeError):
@@ -31,6 +40,18 @@ def main(argv: list[str] | None = None) -> int:
     """Parse `argv` (`sys.argv[1:]` if omitted) and run the requested command."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        return _run_doctor_command(args.vault)
+
+    if args.command == "eval":
+        return _run_eval_command(
+            golden=args.golden,
+            vault_dir=args.vault,
+            baseline=args.baseline,
+            update_baseline=args.update_baseline,
+            k=args.k,
+        )
 
     if args.command != "reindex":
         parser.print_help()
@@ -58,7 +79,52 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also drop stale rows and recompute every link (full rebuild)",
     )
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check every note in the vault against ADR-0005"
+    )
+    doctor_parser.add_argument(
+        "--vault",
+        default=os.environ.get("VAULT_DIR"),
+        help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    eval_parser = subparsers.add_parser(
+        "eval", help="score retrieval quality against the golden query set"
+    )
+    eval_parser.add_argument(
+        "--golden", type=Path, default=_DEFAULT_GOLDEN, help="path to the golden query set"
+    )
+    eval_parser.add_argument(
+        "--vault", type=Path, default=_DEFAULT_EVAL_VAULT, help="vault to index and query against"
+    )
+    eval_parser.add_argument(
+        "--baseline", type=Path, default=_DEFAULT_BASELINE, help="path to the committed baseline"
+    )
+    eval_parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="overwrite --baseline with this run's metrics instead of comparing against it",
+    )
+    eval_parser.add_argument(
+        "--k", type=int, default=_DEFAULT_EVAL_K, help="cutoff for recall@k and the search limit"
+    )
     return parser
+
+
+def _run_doctor_command(vault: str | None) -> int:
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+    report = run_doctor(Path(vault))
+    _print_doctor_report(report)
+    return 1 if report.errors else 0
+
+
+def _print_doctor_report(report: DoctorReport) -> None:
+    for error in report.errors:
+        print(f"ERROR: {error}")
+    for warning in report.warnings:
+        print(f"WARNING: {warning}")
+    print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
 
 
 async def _reindex(
@@ -88,6 +154,135 @@ def _print_stats(stats: IndexStats) -> None:
         f"indexed={stats.indexed} unchanged={stats.unchanged} "
         f"deleted={stats.deleted} failed={stats.failed}"
     )
+
+
+def _run_eval_command(
+    golden: Path, vault_dir: Path, baseline: Path, *, update_baseline: bool, k: int
+) -> int:
+    admin_url = os.environ.get("MM_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not admin_url:
+        print("MM_TEST_DATABASE_URL or DATABASE_URL is required", file=sys.stderr)
+        return 2
+    if not update_baseline and not baseline.exists():
+        print(f"{baseline} does not exist; run with --update-baseline first", file=sys.stderr)
+        return 2
+
+    try:
+        embedding_config = EmbeddingConfig.from_env(dict(os.environ))
+    except EmbeddingConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    return asyncio.run(
+        _eval(
+            admin_url,
+            vault_dir,
+            golden,
+            baseline,
+            embedding_config,
+            update_baseline=update_baseline,
+            k=k,
+        )
+    )
+
+
+async def _eval(
+    admin_url: str,
+    vault_dir: Path,
+    golden_path: Path,
+    baseline_path: Path,
+    embedding_config: EmbeddingConfig,
+    *,
+    update_baseline: bool,
+    k: int,
+) -> int:
+    golden = load_golden(golden_path)
+    provider = provider_from_config(embedding_config)
+
+    eval_db_url = await _create_eval_database(admin_url)
+    try:
+        migration_conn = await asyncpg.connect(eval_db_url)
+        try:
+            await migrate(migration_conn)
+        finally:
+            await migration_conn.close()
+
+        pool = await asyncpg.create_pool(eval_db_url)
+        try:
+            await Indexer(pool, vault_dir, provider).reindex(full=True)
+            report = await run_eval(pool, golden, provider=provider, k=k)
+        finally:
+            await pool.close()
+    finally:
+        await _drop_eval_database(admin_url, eval_db_url)
+
+    _print_eval_report(report)
+
+    if update_baseline:
+        _write_baseline(baseline_path, report, embedding_config.provider)
+        print(f"baseline written to {baseline_path}")
+        return 0
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    regressions = compare(report, baseline)
+    for message in regressions:
+        print(f"REGRESSION: {message}")
+    return 1 if regressions else 0
+
+
+async def _create_eval_database(admin_url: str) -> str:
+    """Create a freshly named `mm_eval_<random>` database and return its URL."""
+    db_name = f"mm_eval_{secrets.token_hex(8)}"
+    admin_conn = await asyncpg.connect(admin_url)
+    try:
+        await admin_conn.execute(f'create database "{db_name}"')
+    finally:
+        await admin_conn.close()
+
+    base, _, _ = admin_url.rpartition("/")
+    return f"{base}/{db_name}"
+
+
+async def _drop_eval_database(admin_url: str, eval_db_url: str) -> None:
+    db_name = eval_db_url.rpartition("/")[-1]
+    admin_conn = await asyncpg.connect(admin_url)
+    try:
+        await admin_conn.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity "
+            "where datname = $1 and pid <> pg_backend_pid()",
+            db_name,
+        )
+        await admin_conn.execute(f'drop database if exists "{db_name}"')
+    finally:
+        await admin_conn.close()
+
+
+def _print_eval_report(report: EvalReport) -> None:
+    print(f"overall  recall@{report.k}={report.recall_at_k:.4f}  mrr={report.mrr:.4f}")
+    for kind, metrics in report.per_kind.items():
+        print(
+            f"  {kind:<14} n={metrics.count:<3} "
+            f"recall@{report.k}={metrics.recall_at_k:.4f}  mrr={metrics.mrr:.4f}"
+        )
+
+    misses = [result for result in report.per_query if result.recall < 1.0]
+    if misses:
+        print(f"misses ({len(misses)}):")
+        for result in misses:
+            print(
+                f"  {result.golden.id} [{result.golden.kind}] {result.golden.query!r} "
+                f"expected={list(result.golden.expected)} hits={list(result.hits)}"
+            )
+
+
+def _write_baseline(path: Path, report: EvalReport, provider: str) -> None:
+    data = {
+        "k": report.k,
+        "recall_at_k": round(report.recall_at_k, 4),
+        "mrr": round(report.mrr, 4),
+        "provider": provider,
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 def _require_env(name: str) -> str:

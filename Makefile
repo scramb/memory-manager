@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check db-up db-down
+.PHONY: fmt lint test check eval eval-baseline db-up db-down
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -21,6 +21,14 @@ endif
 
 check: lint test
 	scripts/check-docs.sh
+
+# Retrieval eval (recall@5, MRR) against examples/vault; fails the build on
+# a regression against eval/baseline.json.
+eval:
+	uv run memory-manager eval
+
+eval-baseline:
+	uv run memory-manager eval --update-baseline
 
 # Postgres 16 + pgvector for local/manual testing (CI uses a service
 # container instead, see .github/workflows/validate.yml).
