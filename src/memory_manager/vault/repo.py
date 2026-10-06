@@ -174,6 +174,22 @@ class Repo:
         self._commit_staged(git, author, message)
         return self.head()
 
+    def commit_files(self, files: dict[str, bytes], author: Author, message: str) -> str:
+        """Write every path in `files` and commit them all together, as one commit by `author`.
+
+        Used for a write that touches more than one note at once (`supersede`,
+        #19: the old note's `valid_to` and the new note's `supersedes`) -
+        every path is written and staged individually, but all land in the
+        same commit instead of one commit per note.
+        """
+        git = self._git()
+        for rel, content in files.items():
+            path = paths.resolve(self._config.dir, rel, allow_archive=True)
+            _atomic_write(path, content)
+            git.run("add", "--", rel)
+        self._commit_staged(git, author, message)
+        return self.head()
+
     def push(self) -> None:
         """Push the current branch to `origin`.
 

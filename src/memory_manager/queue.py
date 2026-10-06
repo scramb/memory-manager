@@ -47,7 +47,7 @@ from memory_manager.vault.note import NoteFormatError, parse, serialize, version
 from memory_manager.vault.paths import PathRejected, conflict_path, parse_note_path
 from memory_manager.vault.repo import Repo, author_for
 from memory_manager.vault.secrets import SecretFound, check
-from memory_manager.vault.validate import NoteInvalid, validate_bytes
+from memory_manager.vault.validate import NoteInvalid, validate, validate_bytes
 
 __all__ = [
     "EditMismatch",
@@ -70,7 +70,7 @@ _logger = logging.getLogger(__name__)
 _NEW = "new"
 _MAX_PUSH_ATTEMPTS = 3
 
-Op = Literal["write", "edit", "archive"]
+Op = Literal["write", "edit", "archive", "supersede"]
 
 
 @dataclass(frozen=True)
@@ -80,8 +80,10 @@ class WriteRequest:
     `if_version` is either the sha256 `vault.note.version` of the content
     the caller last saw, or the literal `"new"` meaning `path` must not
     exist yet. `content` is used by `write`; `old_str`/`new_str` by `edit`;
-    `archive` needs neither. `message` overrides the default commit
-    message (`"<op> <path>"`).
+    `archive` needs neither. `supersede` keeps `path` pointing at the old
+    note (`if_version` is its current version) and uses `new_path`/`content`
+    for the new note that replaces it - the two end up in one commit (#19).
+    `message` overrides the default commit message (`"<op> <path>"`).
     """
 
     op: Op
@@ -91,16 +93,23 @@ class WriteRequest:
     content: bytes | None = None
     old_str: str | None = None
     new_str: str | None = None
+    new_path: str | None = None
     message: str | None = None
 
 
 @dataclass(frozen=True)
 class WriteResult:
-    """What a successful write produced: where, at what version, in which commit."""
+    """What a successful write produced: where, at what version, in which commit.
+
+    `related` is set only by `supersede`: the old note's new path mapped to
+    its new version, for a caller that needs to report both notes' state
+    from one result.
+    """
 
     path: str
     version: str
     commit: str
+    related: dict[str, str] | None = None
 
 
 class WriteError(Exception):
@@ -339,6 +348,8 @@ class WriteQueue:
 
         if request.op == "archive":
             result, changed_paths = await self._do_archive(request, current)
+        elif request.op == "supersede":
+            result, changed_paths = await self._do_supersede(request, current)
         else:
             result, changed_paths = await self._do_write_or_edit(request, current)
 
@@ -435,6 +446,91 @@ class WriteQueue:
         result = WriteResult(path=archive_rel, version=version(archived_bytes), commit=commit_sha)
         return result, (request.path, archive_rel)
 
+    async def _do_supersede(
+        self, request: WriteRequest, current: bytes | None
+    ) -> tuple[WriteResult, tuple[str, ...]]:
+        if current is None:
+            raise NotFound(request.path)
+        if not request.new_path:
+            raise InvalidNote(request.path, "supersede requires new_path")
+        if request.content is None:
+            raise InvalidNote(request.new_path, "supersede requires content for the new note")
+
+        try:
+            old_note_path = parse_note_path(request.path)
+        except PathRejected as exc:
+            raise InvalidNote(request.path, str(exc)) from exc
+        try:
+            new_note_path = parse_note_path(request.new_path)
+        except PathRejected as exc:
+            raise InvalidNote(request.new_path, str(exc)) from exc
+
+        try:
+            new_target = await asyncio.to_thread(self._repo.read_file, request.new_path)
+        except PathRejected as exc:
+            raise InvalidNote(request.new_path, str(exc)) from exc
+        if new_target is not None:
+            raise InvalidNote(request.new_path, "already exists, supersede needs an unused path")
+
+        try:
+            old_note = parse(current)
+        except NoteFormatError as exc:
+            raise InvalidNote(request.path, str(exc)) from exc
+        try:
+            new_note = parse(request.content)
+        except NoteFormatError as exc:
+            raise InvalidNote(request.new_path, str(exc)) from exc
+
+        supersedes = new_note.supersedes
+        if old_note.id not in supersedes:
+            supersedes = (*supersedes, old_note.id)
+        new_note = replace(new_note, supersedes=supersedes)
+
+        now = self._clock().astimezone(UTC).replace(microsecond=0)
+        today = now.date()
+        if old_note.valid_to is not None and old_note.valid_to < today:
+            new_valid_to = old_note.valid_to
+        else:
+            new_valid_to = today
+        old_note = replace(old_note, valid_to=new_valid_to, updated=now)
+
+        try:
+            validate(new_note, expected_type=new_note_path.type)
+        except NoteInvalid as exc:
+            raise InvalidNote(request.new_path, str(exc)) from exc
+        try:
+            validate(old_note, expected_type=old_note_path.type)
+        except NoteInvalid as exc:
+            raise InvalidNote(request.path, str(exc)) from exc
+
+        new_final_bytes = serialize(new_note)
+        old_final_bytes = serialize(old_note)
+
+        try:
+            check(new_final_bytes.decode("utf-8"))
+        except SecretFound as exc:
+            raise SecretRejected(request.new_path, str(exc)) from exc
+
+        message = request.message or f"supersede {request.path} with {request.new_path}"
+        author = author_for(request.client)
+        try:
+            commit_sha = await asyncio.to_thread(
+                self._repo.commit_files,
+                {request.path: old_final_bytes, request.new_path: new_final_bytes},
+                author,
+                message,
+            )
+        except GitError as exc:
+            raise WriteFailed(str(exc)) from exc
+
+        result = WriteResult(
+            path=request.new_path,
+            version=version(new_final_bytes),
+            commit=commit_sha,
+            related={request.path: version(old_final_bytes)},
+        )
+        return result, (request.path, request.new_path)
+
     async def _push(
         self, request: WriteRequest, changed_paths: tuple[str, ...], base: str | None
     ) -> str:
@@ -465,8 +561,9 @@ class WriteQueue:
                     return await asyncio.to_thread(self._repo.head)
                 except PushRejected:
                     new_remote_head = await asyncio.to_thread(self._repo.fetch)
-                    if await self._touches_changed_paths(base, new_remote_head, changed_paths):
-                        await self._raise_conflict(request, changed_paths[-1])
+                    touched = await self._touched_path(base, new_remote_head, changed_paths)
+                    if touched is not None:
+                        await self._raise_conflict(request, touched)
                     # Rebase onto exactly the remote tip just checked above -
                     # not `rebase_onto_remote()`, which would fetch again and
                     # could silently rebase onto a newer tip nobody checked
@@ -482,13 +579,22 @@ class WriteQueue:
         await asyncio.to_thread(self._repo.reset_to_remote)
         raise WriteFailed("remote keeps moving, retry")
 
-    async def _touches_changed_paths(
+    async def _touched_path(
         self, old_rev: str | None, new_rev: str, changed_paths: tuple[str, ...]
-    ) -> bool:
+    ) -> str | None:
+        """The first of `changed_paths` the remote touched between the two revs, if any.
+
+        For `write`/`edit`/`archive`, `changed_paths` names one note (archive's two
+        paths both map to the same `conflict_path`), so which one is returned does
+        not matter. `supersede`'s two paths are two different notes: returning the
+        specific one that actually moved on the remote is what makes
+        `_raise_conflict` write the conflict file next to the right note instead of
+        always the new one.
+        """
         for path in changed_paths:
             if await asyncio.to_thread(self._repo.changed_between, old_rev, new_rev, path):
-                return True
-        return False
+                return path
+        return None
 
     async def _raise_conflict(self, request: WriteRequest, path: str) -> NoReturn:
         """The rebase onto the remote conflicted: give up on this write.

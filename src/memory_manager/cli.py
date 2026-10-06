@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The `memory-manager` command-line entry point (#26).
+"""The `memory-manager` command-line entry point (#17, #26).
 
-`reindex`, `doctor`, `eval` and `export` exist so far. Other subcommands
-(vault sync, search, ...) are added as their own tasks wire the server
-together (M2/M4).
+`reindex`, `doctor`, `eval`, `export` and `import` work on the vault and
+index; `serve --stdio` runs the MCP server for a local Claude Code
+connection. The HTTP transport and auth are added in M4.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import secrets
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import asyncpg
 
+from memory_manager.app import open_services
 from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultConfigError
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
@@ -32,6 +34,7 @@ from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
+from memory_manager.mcp.server import build_server
 from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
@@ -99,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         parser.print_help()
         return 1
+    if args.command == "serve":
+        return _serve(stdio=args.stdio)
 
     if args.command != "reindex":
         parser.print_help()
@@ -259,6 +264,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="actually write notes (default is a dry run that writes nothing)",
     )
 
+    serve_parser = subparsers.add_parser("serve", help="run the MCP server")
+    serve_parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="serve over stdio, for a local Claude Code connection (the only transport for now)",
+    )
     return parser
 
 
@@ -565,6 +576,29 @@ def _write_baseline(path: Path, report: EvalReport, provider: str) -> None:
         "provider": provider,
     }
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _serve(*, stdio: bool) -> int:
+    if not stdio:
+        print("serve: only --stdio is supported for now", file=sys.stderr)
+        return 2
+
+    # stdout is the stdio transport's protocol channel - every log line must
+    # go to stderr, never stdout (a stray `print()` would corrupt the wire).
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
+    try:
+        return asyncio.run(_serve_stdio())
+    except (VaultConfigError, EmbeddingConfigError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+async def _serve_stdio() -> int:
+    async with open_services(os.environ) as services:
+        server = build_server(services)
+        await server.run_stdio_async()
+    return 0
 
 
 def _require_env(name: str) -> str:
