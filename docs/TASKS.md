@@ -80,7 +80,7 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 - [x] #24 Versioned migrations: `notes`, `chunks`, `links`, `audit_log`
 - [x] #25 Heading-based chunker
-- [ ] #26 Incremental, idempotent indexer via file hashes; `reindex --full`
+- [x] #26 Incremental, idempotent indexer via file hashes; `reindex --full`
 - [ ] #27 Embedding provider interface: Ollama + OpenAI-compatible; model + dimension stored per chunk; model change triggers reindex
 
 ### WP-08 — Hybrid search · Branch: `wp/08-hybrid-search`

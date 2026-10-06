@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Fixtures for migration tests against a real Postgres.
+"""Fixtures for tests against a real Postgres, shared across test packages.
 
 These tests need a reachable Postgres 16 with pgvector, named by
 `MM_TEST_DATABASE_URL` (see `make db-up`). Without that variable they skip
@@ -9,6 +9,12 @@ never silently skip in CI (few dependencies: no testcontainers here).
 Each test gets its own fresh `mm_test_<random>` database, created from the
 admin connection named by `MM_TEST_DATABASE_URL` and dropped again
 afterwards, so tests never see each other's state.
+
+Lives at the `tests/` root (not under `tests/db/`) so every test package -
+`tests/db`, `tests/index`, ... - gets these fixtures without the
+same-named-`conftest.py`-in-sibling-directories trick `tests/vault` needs
+for its bare `from conftest import ...` imports (see the `mypy_path`
+comment in `pyproject.toml`).
 """
 
 from __future__ import annotations

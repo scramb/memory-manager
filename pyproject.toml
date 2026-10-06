@@ -10,6 +10,9 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.scripts]
+memory-manager = "memory_manager.cli:main"
+
 [dependency-groups]
 dev = [
     "ruff>=0.8",
@@ -41,10 +44,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "RUF"]
 [tool.mypy]
 strict = true
 files = ["src", "tests"]
-# `tests/vault` and `tests/db` each have their own `conftest.py`; without
-# this, mypy maps both to the same top-level "conftest" module and fails
-# with "Duplicate module named conftest". `tests/vault` is listed so its
-# existing bare `from conftest import ...` still resolves the same way.
+# `tests/vault` has its own `conftest.py` with helpers some of its test
+# modules import via a bare `from conftest import ...`; listed here so
+# mypy resolves that the same way Python's import system does (shared
+# fixtures live in the root `tests/conftest.py` instead, which needs no
+# special-casing).
 explicit_package_bases = true
 mypy_path = ["src", "tests/vault"]
 
