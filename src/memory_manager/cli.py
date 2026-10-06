@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The `memory-manager` command-line entry point (#17, #26, #33).
+"""The `memory-manager` command-line entry point (#17, #26, #33, #34).
 
 `reindex`, `doctor`, `eval`, `export` and `import` work on the vault and
 index; `serve --stdio` runs the MCP server for a local Claude Code
-connection, `serve --http` runs it over Streamable HTTP (`http.py`). Auth
-for the HTTP transport is added in #34-#36; until then, `serve --http`
-refuses to bind to a non-loopback host unless `MM_ALLOW_UNAUTHENTICATED=1`
-is set - every MCP tool and the vault webhook would otherwise be reachable
-by anyone who can reach the port, with nothing in front of them.
+connection, `serve --http` runs it over Streamable HTTP (`http.py`);
+`token create|list|revoke` manage the static bearer tokens `/mcp` accepts
+once `DATABASE_URL` is set (ADR-0004, #34).
+
+`serve --http` with `DATABASE_URL` set turns bearer-token auth on for
+`/mcp` (`http.py`); without it (no token to ever verify a request against)
+it instead refuses to bind to a non-loopback host unless
+`MM_ALLOW_UNAUTHENTICATED=1` is set - every MCP tool and the vault webhook
+would otherwise be reachable by anyone who can reach the port, with nothing
+in front of them. `/healthz`/`/readyz`/the vault webhook stay unauthenticated
+either way - the webhook has its own HMAC-signature check, and the health
+endpoints carry nothing sensitive.
 """
 
 from __future__ import annotations
@@ -19,13 +26,20 @@ import logging
 import os
 import secrets
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
 import uvicorn
 
 from memory_manager.app import open_services
+from memory_manager.auth.tokens import (
+    ALL_NAMESPACES,
+    TokenInfo,
+    create_token,
+    list_tokens,
+    revoke_token,
+)
 from memory_manager.config import (
     EmbeddingConfig,
     EmbeddingConfigError,
@@ -46,6 +60,7 @@ from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
+from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -121,6 +136,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "serve":
         return _serve(stdio=args.stdio, http=args.http)
+
+    if args.command == "token":
+        if args.subcommand == "create":
+            return asyncio.run(
+                _run_token_create(
+                    args.name,
+                    scopes=args.scopes,
+                    namespaces=args.namespaces or [ALL_NAMESPACES],
+                    expires_days=args.expires_days,
+                )
+            )
+        if args.subcommand == "list":
+            return asyncio.run(_run_token_list())
+        if args.subcommand == "revoke":
+            return asyncio.run(_run_token_revoke(args.name))
+        parser.print_help()
+        return 1
 
     if args.command != "reindex":
         parser.print_help()
@@ -292,6 +324,44 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="serve over Streamable HTTP, binding to $HOST:$PORT (default 127.0.0.1:8080)",
     )
+
+    token_parser = subparsers.add_parser(
+        "token", help="manage static bearer tokens for the HTTP transport (ADR-0004)"
+    )
+    token_subparsers = token_parser.add_subparsers(dest="subcommand")
+
+    token_create_parser = token_subparsers.add_parser(
+        "create", help="create a token and print it once - it is never shown again"
+    )
+    token_create_parser.add_argument("name", help="a unique name identifying the token")
+    token_create_parser.add_argument(
+        "--scope",
+        dest="scopes",
+        action="append",
+        choices=(READ_SCOPE, WRITE_SCOPE),
+        required=True,
+        help=f"repeatable; one of {READ_SCOPE!r}, {WRITE_SCOPE!r}",
+    )
+    token_create_parser.add_argument(
+        "--namespace",
+        dest="namespaces",
+        action="append",
+        default=None,
+        help=f"repeatable; namespace the token may read/write, or omit for every namespace "
+        f"({ALL_NAMESPACES!r})",
+    )
+    token_create_parser.add_argument(
+        "--expires-days",
+        type=int,
+        default=None,
+        help="the token stops verifying this many days from now (default: never expires)",
+    )
+
+    token_subparsers.add_parser("list", help="list every token's metadata (never the token itself)")
+
+    token_revoke_parser = token_subparsers.add_parser("revoke", help="revoke a token by name")
+    token_revoke_parser.add_argument("name", help="the token's name, as passed to 'token create'")
+
     return parser
 
 
@@ -440,6 +510,95 @@ def _print_import_report(report: ImportReport, *, apply: bool) -> None:
         print(f"REJECTED: {source_ref}: {reason}")
     if not apply:
         print("dry run - nothing was written, pass --apply to write")
+
+
+async def _open_migrated_pool() -> asyncpg.Pool | None:
+    """A connection pool to `DATABASE_URL`, migrated first. `None` if it is unset."""
+    try:
+        database_url = _require_env("DATABASE_URL")
+    except _MissingEnvironment as exc:
+        print(str(exc), file=sys.stderr)
+        return None
+
+    migration_conn = await asyncpg.connect(database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    return await asyncpg.create_pool(database_url)
+
+
+async def _run_token_create(
+    name: str, *, scopes: list[str], namespaces: list[str], expires_days: int | None
+) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        expires_at = (
+            datetime.now(UTC) + timedelta(days=expires_days) if expires_days is not None else None
+        )
+        try:
+            plaintext, info = await create_token(
+                pool, name, scopes=scopes, namespaces=namespaces, expires_at=expires_at
+            )
+        except asyncpg.UniqueViolationError:
+            print(f"a token named {name!r} already exists", file=sys.stderr)
+            return 2
+    finally:
+        await pool.close()
+
+    print(plaintext)
+    print(
+        f"^ token {info.name!r} created with scopes={list(info.scopes)} "
+        f"namespaces={list(info.namespaces)} - store it now, it will not be shown again",
+        file=sys.stderr,
+    )
+    return 0
+
+
+async def _run_token_list() -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        tokens = await list_tokens(pool)
+    finally:
+        await pool.close()
+
+    for info in tokens:
+        _print_token_info(info)
+    return 0
+
+
+def _print_token_info(info: TokenInfo) -> None:
+    status = "revoked" if info.revoked_at is not None else "active"
+    print(
+        f"{info.name}\tstatus={status}\tscopes={','.join(info.scopes)}\t"
+        f"namespaces={','.join(info.namespaces)}\tcreated_at={info.created_at.isoformat()}\t"
+        f"expires_at={info.expires_at.isoformat() if info.expires_at else '-'}\t"
+        f"last_used_at={info.last_used_at.isoformat() if info.last_used_at else '-'}"
+    )
+
+
+async def _run_token_revoke(name: str) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        revoked = await revoke_token(pool, name)
+    finally:
+        await pool.close()
+
+    if not revoked:
+        print(f"no active token named {name!r}", file=sys.stderr)
+        return 2
+    print(f"revoked {name!r}")
+    return 0
 
 
 async def _reindex(
@@ -629,20 +788,31 @@ async def _serve_stdio() -> int:
 
 async def _serve_http() -> int:
     config = ServerConfig.from_env(dict(os.environ))
+    # Mirrors `http.py`'s own condition for turning bearer-token auth on:
+    # `DATABASE_URL` is what `Services.pool` ends up set from, and `/mcp` is
+    # authenticated exactly when that is set (#34). Without it, there is no
+    # `static_tokens` table to verify a token against at all.
+    database_configured = bool(os.environ.get("DATABASE_URL"))
 
-    if not _is_loopback(config.host) and os.environ.get(_ALLOW_UNAUTHENTICATED_ENV) != "1":
+    if (
+        not database_configured
+        and not _is_loopback(config.host)
+        and os.environ.get(_ALLOW_UNAUTHENTICATED_ENV) != "1"
+    ):
         print(
-            f"serve --http: refusing to bind to non-loopback host {config.host!r} - the HTTP "
-            f"transport has no authentication yet (#34-#36); set {_ALLOW_UNAUTHENTICATED_ENV}=1 "
-            "to bind anyway (every MCP tool and the vault webhook is then reachable by anyone "
-            "who can reach the port)",
+            f"serve --http: refusing to bind to non-loopback host {config.host!r} - no "
+            f"DATABASE_URL is set, so the HTTP transport has no authentication at all "
+            f"(#34); set DATABASE_URL to turn bearer-token auth on for /mcp, or "
+            f"{_ALLOW_UNAUTHENTICATED_ENV}=1 to bind anyway (every MCP tool and the vault "
+            "webhook is then reachable by anyone who can reach the port)",
             file=sys.stderr,
         )
         return 2
-    if not _is_loopback(config.host):
+    if not database_configured and not _is_loopback(config.host):
         _logger.warning(
-            "serve --http: binding to non-loopback host %r with %s=1 - no authentication is "
-            "implemented yet, every request reaches the MCP tools and the vault webhook",
+            "serve --http: binding to non-loopback host %r with %s=1 and no DATABASE_URL - "
+            "no authentication is in effect, every request reaches the MCP tools and the "
+            "vault webhook",
             config.host,
             _ALLOW_UNAUTHENTICATED_ENV,
         )

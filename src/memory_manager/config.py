@@ -181,6 +181,18 @@ class ServerConfig:
     webhook_secret: str | None = field(default=None, repr=False)
     json_response: bool = True
 
+    def resource_url(self) -> str:
+        """The MCP server's own URL, for `AuthSettings.resource_server_url`/`issuer_url`.
+
+        `public_url` when set (the operator's own canonical URL - ADR-0004
+        requires it match exactly what a client is told); `http://{host}:{port}`
+        otherwise, so bearer-token auth (#34) can still turn on with nothing
+        beyond `DATABASE_URL` configured (there is no real authorization
+        server behind `issuer_url` yet, #35/#36 - this value is metadata, not
+        a reachable endpoint, until then).
+        """
+        return self.public_url or f"http://{self.host}:{self.port}"
+
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/

@@ -30,14 +30,21 @@ class TestMigrate:
     async def test_applies_0001_on_a_fresh_database(self, conn: asyncpg.Connection) -> None:
         applied = await migrate(conn)
 
-        assert applied == ["0001_index_schema"]
+        assert applied == ["0001_index_schema", "0002_static_tokens"]
         tables = {
             row["table_name"]
             for row in await conn.fetch(
                 "select table_name from information_schema.tables where table_schema = 'public'"
             )
         }
-        assert tables == {"schema_migrations", "notes", "chunks", "links", "audit_log"}
+        assert tables == {
+            "schema_migrations",
+            "notes",
+            "chunks",
+            "links",
+            "audit_log",
+            "static_tokens",
+        }
 
     async def test_running_twice_applies_nothing_the_second_time(
         self, conn: asyncpg.Connection
@@ -45,7 +52,7 @@ class TestMigrate:
         first = await migrate(conn)
         second = await migrate(conn)
 
-        assert first == ["0001_index_schema"]
+        assert first == ["0001_index_schema", "0002_static_tokens"]
         assert second == []
 
     async def test_concurrent_migrate_applies_each_migration_exactly_once(
@@ -59,7 +66,7 @@ class TestMigrate:
             await conn_a.close()
             await conn_b.close()
 
-        assert sorted(applied_a + applied_b) == ["0001_index_schema"]
+        assert sorted(applied_a + applied_b) == ["0001_index_schema", "0002_static_tokens"]
 
     async def test_tsv_lang_matches_german_and_english_stems(
         self, conn: asyncpg.Connection

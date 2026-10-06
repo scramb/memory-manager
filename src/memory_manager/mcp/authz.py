@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Namespace-authorization seam for the MCP tools (M4 placeholder, #30).
+"""Namespace- and scope-authorization seam for the MCP tools (#30, #34).
 
-`readable_namespaces` is the one function `mcp/server.py`'s tools call
-before applying a `namespaces` filter of their own: in stdio mode, with no
-per-call caller identity yet, every call is unrestricted (`None`). M4
-replaces this function's body with the real set derived from the caller's
-token, without changing its signature or any of its call sites.
+`readable_namespaces`/`writable_namespaces` are the functions `mcp/server.py`'s
+tools call before applying a `namespaces` filter or a write of their own:
+`None` means "every namespace", any other set is the exact, final set to
+narrow to. Both are derived from the calling request's access token -
+`current_access_token()` wraps the SDK's `get_access_token()`, which reads a
+contextvar the HTTP transport's `AuthContextMiddleware` sets per request
+(`http.py`); stdio mode never runs that middleware, so there `ctx` is
+unused and every call reads/writes as unrestricted, exactly as before #34.
+A token's namespaces live in `AccessToken.claims["namespaces"]`
+(`memory_manager.auth.verifier.StaticTokenVerifier`); `("*",)` there means
+"every namespace", the same literal `memory_manager.auth.tokens` uses.
 
 `restrict_namespaces` folds a tool's own `namespaces` argument together
 with what `readable_namespaces` allows, so `mcp/server.py` only has to call
@@ -17,26 +23,113 @@ readable" - a caller that collapses the empty list back into "no filter"
 reopens exactly the deny-all-becomes-allow-all hole `memory_search` was
 fixed for (#30); every call site must check for the empty list and return
 no results *before* building a filter or running a query.
+
+`require_scope`/`require_writable_namespace` are the write-tool side of the
+same token: a stdio call (no access token at all) always passes both, a
+token missing the needed scope or writing outside its namespaces raises
+`ToolError` - a client-facing, retryable mistake, not a crash.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 
-__all__ = ["readable_namespaces", "restrict_namespaces"]
+from memory_manager.auth.tokens import ALL_NAMESPACES
+from memory_manager.vault.paths import PathRejected, parse_note_path
+
+__all__ = [
+    "READ_SCOPE",
+    "WRITE_SCOPE",
+    "readable_namespaces",
+    "require_scope",
+    "require_writable_namespace",
+    "restrict_namespaces",
+    "writable_namespaces",
+]
+
+READ_SCOPE = "memory:read"
+WRITE_SCOPE = "memory:write"
+
+
+def current_access_token() -> AccessToken | None:
+    """The access token backing the request this call runs in, or `None`.
+
+    `None` both for stdio (no token concept at all) and for an HTTP request
+    whose `Authorization` header the transport never saw (unauthenticated
+    HTTP, #33's loopback-only mode) - both read the same as "unrestricted".
+    """
+    return get_access_token()
+
+
+def _token_namespaces(token: AccessToken) -> set[str] | None:
+    namespaces = (token.claims or {}).get("namespaces")
+    if not namespaces or ALL_NAMESPACES in namespaces:
+        return None
+    return set(namespaces)
 
 
 def readable_namespaces(ctx: Context | None) -> set[str] | None:
-    """The namespaces `ctx`'s caller may read, or `None` for "every namespace".
+    """The namespaces the current request's token may read, or `None` for "every namespace".
 
-    Stdio mode (`mcp/server.py`'s `current_client`) has no per-call caller
-    identity yet, so every call reads as unrestricted regardless of `ctx`.
-    M4 derives the real set from the caller's token here, once there is one
-    to derive it from.
+    `ctx` is accepted but unused: the token comes from `current_access_token()`'s
+    contextvar, not from `ctx` - kept so every existing call site
+    (`readable_namespaces(ctx)`) stays unchanged.
     """
-    return None
+    token = current_access_token()
+    if token is None:
+        return None
+    return _token_namespaces(token)
+
+
+def writable_namespaces() -> set[str] | None:
+    """The namespaces the current request's token may write to, or `None` for "every namespace".
+
+    The same set `readable_namespaces` reports for the same token (ADR-0004: a
+    token's namespaces gate both read and write, only the scope differs).
+    """
+    token = current_access_token()
+    if token is None:
+        return None
+    return _token_namespaces(token)
+
+
+def require_scope(scope: str) -> None:
+    """Raise `ToolError` if the current request's token lacks `scope`.
+
+    A stdio call (no token) always passes. An HTTP call without a token
+    never reaches a tool at all (the transport answers 401 first, #34); this
+    only ever fires for a token that *has* a scope list missing the one a
+    write tool needs.
+    """
+    token = current_access_token()
+    if token is None:
+        return
+    if scope not in token.scopes:
+        raise ToolError(f"token lacks {scope}")
+
+
+def require_writable_namespace(path: str) -> None:
+    """Raise `ToolError` if `path`'s namespace is outside the current token's namespaces.
+
+    Best-effort on `path`: a `path` that does not even parse is left alone -
+    the write/edit/supersede/archive call that is about to run its own
+    `parse_note_path`/`resolve` raises the sharper `PathRejected` for that,
+    not this namespace check.
+    """
+    writable = writable_namespaces()
+    if writable is None:
+        return
+    try:
+        note_path = parse_note_path(path, allow_archive=True)
+    except PathRejected:
+        return
+    if note_path.namespace not in writable:
+        raise ToolError(f"token may not write to namespace {note_path.namespace!r}")
 
 
 def restrict_namespaces(

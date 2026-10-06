@@ -34,10 +34,22 @@ event - not before `Starlette(...)` is even constructed. The MCP sub-app
 built lazily too, and requests reach it through `_McpMount`, a one-line
 ASGI indirection that looks the built sub-app up from `app.state` on every
 request rather than capturing it as a constructor argument that does not
-exist yet. `custom_route`-free: #34-#36 add bearer-token/OAuth routes and
-middleware the same way this module adds the webhook - as plain Starlette
-routes/middleware around whatever `create_app` already builds, not as a
-dependency of it.
+exist yet. `custom_route`-free: #35/#36 add OAuth AS routes/middleware the same way
+this module adds the webhook - as plain Starlette routes/middleware around
+whatever `create_app` already builds, not as a dependency of it.
+
+Static-token bearer auth (#34, ADR-0004) turns on exactly when `services.pool`
+is set, i.e. `DATABASE_URL` is configured: the `static_tokens` table a token
+verifies against lives there, so there is nothing to verify a token against
+otherwise. `AuthSettings.resource_server_url`/`issuer_url` both come from
+`config.resource_url()` - there is no real authorization server behind
+`issuer_url` yet (no `auth_server_provider` is passed), so no `/authorize`/
+`/token` routes are mounted; only the bearer-token middleware and the
+Protected Resource Metadata route the SDK adds whenever `token_verifier` is
+set. `required_scopes` is left empty: which scope a call needs depends on
+the tool it calls (`memory:read` vs `memory:write`), not on reaching `/mcp`
+at all, so that check lives in `mcp/server.py`'s tools via `mcp/authz.py`,
+not here.
 """
 
 from __future__ import annotations
@@ -48,6 +60,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -59,6 +72,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from memory_manager import __commit__, __version__
 from memory_manager.app import Services
+from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig
 from memory_manager.mcp.server import build_server
 
@@ -93,7 +107,27 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
-            mcp = build_server(services)
+            token_verifier = (
+                StaticTokenVerifier(services.pool) if services.pool is not None else None
+            )
+            auth = (
+                AuthSettings(
+                    issuer_url=config.resource_url(),  # type: ignore[arg-type]
+                    resource_server_url=config.resource_url(),  # type: ignore[arg-type]
+                    # Static tokens carry no RFC 8707 resource indicator of their
+                    # own (#34 is bearer tokens only, no OAuth flow to bind one
+                    # with yet) - checking it would reject every one of them.
+                    validate_token_resource=False,
+                )
+                if token_verifier is not None
+                else None
+            )
+            # `MCPServer.streamable_http_app` forwards `self.settings.auth`/
+            # `self._token_verifier` (set here, at construction) to the
+            # lowlevel `Server.streamable_http_app` below - passing them to
+            # that call instead would be a no-op, since it reads only its
+            # own `self`'s copies.
+            mcp = build_server(services, auth=auth, token_verifier=token_verifier)
             mcp_app = mcp.streamable_http_app(
                 streamable_http_path=config.mcp_path,
                 json_response=config.json_response,
