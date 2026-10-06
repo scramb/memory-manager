@@ -54,7 +54,10 @@ async def test_list_tools_exposes_both_tools_with_the_data_not_instructions_sent
     async with Client(build_server(services)) as client:
         listing = await client.list_tools()
         names = {tool.name for tool in listing.tools}
-        assert names == {"memory_index", "memory_read"}
+        # `<=` rather than `==`: `memory_write`/`memory_edit` (#18) and later
+        # tools register on the same server without making this assertion
+        # about the two read tools stale.
+        assert {"memory_index", "memory_read"} <= names
         for tool in listing.tools:
             assert sentence in (tool.description or "")
 
