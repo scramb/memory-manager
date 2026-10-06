@@ -80,6 +80,7 @@ import asyncpg
 import asyncpg.pool
 
 from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
+from memory_manager.observability.metrics import track_search
 
 __all__ = [
     "ChunkHit",
@@ -384,6 +385,37 @@ async def hybrid_search(
     candidates: int = 50,
 ) -> list[NoteHit]:
     """Rank notes by fusing full-text and (optional) vector chunk rankings.
+
+    A thin, timed wrapper (`mm_search_duration_seconds{mode}`, #43) around
+    `_hybrid_search_impl`, which carries the actual docstring and logic;
+    `mode` is `"hybrid"` when `provider` is given, `"fulltext"` otherwise -
+    the same distinction `mcp/server.py`'s `_search_mode` reports to a
+    caller.
+    """
+    mode = "hybrid" if provider is not None else "fulltext"
+    async with track_search(mode):
+        return await _hybrid_search_impl(
+            pool,
+            query,
+            provider=provider,
+            filters=filters,
+            limit=limit,
+            k=k,
+            candidates=candidates,
+        )
+
+
+async def _hybrid_search_impl(
+    pool: asyncpg.Pool,
+    query: str,
+    *,
+    provider: EmbeddingProvider | None = None,
+    filters: SearchFilters | None = None,
+    limit: int = 8,
+    k: int = 60,
+    candidates: int = 50,
+) -> list[NoteHit]:
+    """The ranking logic behind `hybrid_search`, timed by its thin wrapper above.
 
     Runs `fulltext_search` for up to `candidates` chunks, and - if
     `provider` is given - embeds `query` and runs `vector_search` for up to

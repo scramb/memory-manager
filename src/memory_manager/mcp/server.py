@@ -53,6 +53,7 @@ from memory_manager.mcp.authz import (
 )
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.observability import instrument_tool
 from memory_manager.queue import NotFound, WriteError, WriteRequest
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
@@ -335,6 +336,7 @@ def build_server(
         return GUIDE
 
     @mcp.tool(description=_MEMORY_INDEX_DESCRIPTION)
+    @instrument_tool("memory_index")
     async def memory_index(
         namespace: str | None = None,
         type: str | None = None,
@@ -358,6 +360,7 @@ def build_server(
         return _cap_index(entries)
 
     @mcp.tool(description=_MEMORY_READ_DESCRIPTION)
+    @instrument_tool("memory_read")
     async def memory_read(items: list[str], ctx: Context | None = None) -> list[MemoryReadItem]:
         """Read one or more notes by vault path or id."""
         require_scope(READ_SCOPE)
@@ -369,6 +372,7 @@ def build_server(
         return _read_items(services.vault_root, items, readable=readable)
 
     @mcp.tool(description=_MEMORY_SEARCH_DESCRIPTION)
+    @instrument_tool("memory_search")
     async def memory_search(
         query: str,
         types: list[str] | None = None,
@@ -429,6 +433,7 @@ def build_server(
         return {"results": results, "mode": mode}
 
     @mcp.tool(description=_MEMORY_WRITE_DESCRIPTION)
+    @instrument_tool("memory_write")
     async def memory_write(
         path: str,
         content: str,
@@ -466,6 +471,7 @@ def build_server(
         )
 
     @mcp.tool(description=_MEMORY_EDIT_DESCRIPTION)
+    @instrument_tool("memory_edit")
     async def memory_edit(
         path: str,
         old_str: str,
@@ -496,6 +502,7 @@ def build_server(
         )
 
     @mcp.tool(description=_MEMORY_SUPERSEDE_DESCRIPTION)
+    @instrument_tool("memory_supersede")
     async def memory_supersede(
         old: str,
         new_path: str,
@@ -546,6 +553,7 @@ def build_server(
         )
 
     @mcp.tool(description=_MEMORY_ARCHIVE_DESCRIPTION)
+    @instrument_tool("memory_archive")
     async def memory_archive(
         path: str,
         if_version: str,

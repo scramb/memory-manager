@@ -123,9 +123,9 @@ Goal: reproducible deployment in < 5 minutes locally and via Helm/Flux on Kubern
 
 ### WP-12 — Images and compose · Branch: `wp/12-container`
 
-- [ ] #41 Multi-arch minimal image, non-root, read-only root FS
-- [ ] #42 `docker-compose.yml` (server, Postgres+pgvector, Ollama) up in < 5 minutes
-- [ ] #43 `/metrics` (Prometheus), structured JSON logs, optional OTel traces
+- [x] #41 Multi-arch minimal image, non-root, read-only root FS
+- [x] #42 `docker-compose.yml` (server, Postgres+pgvector, Ollama) up in < 5 minutes
+- [x] #43 `/metrics` (Prometheus), structured JSON logs, optional OTel traces
 
 ### WP-13 — Kubernetes · Branch: `wp/13-kubernetes`
 
