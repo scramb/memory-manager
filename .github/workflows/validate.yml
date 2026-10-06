@@ -1,0 +1,22 @@
+name: validate
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Planning skeleton
+        run: scripts/check-docs.sh
+      # Language-specific build, lint, test and container steps are added
+      # by T-004 once ADR-0001 is accepted.
