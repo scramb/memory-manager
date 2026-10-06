@@ -14,11 +14,16 @@ value the caller computed earlier. A stale version never overwrites
 silently (CLAUDE.md): it comes back as `VersionConflict`, carrying the
 current content and version so the caller can retry.
 
-Push-conflict rebase and `*.conflict.md` files are #15; for now a rejected
-push (a human pushed in between `sync()` and `push()`) surfaces as
-`WriteFailed` and leaves cleaning up the local clone to the next `sync()`.
-Audit log persistence lives in Postgres from M3; `add_hook()` is the seam
-an indexer/audit log subscribes through until then.
+A push rejected because the remote moved (a human or another writer pushed
+in between `sync()` and `push()`) is retried through a rebase (#15): if the
+rebase is clean, the push is retried; if it conflicts, the rebase is
+aborted, the local commit discarded (`reset_to_remote()`), and both
+versions are written to `<path>.conflict.md` for a human to resolve - the
+write comes back as `WriteConflict`, never silently lost. A push that keeps
+getting rejected even after a clean rebase (the remote keeps moving) gives
+up after 3 attempts as `WriteFailed`. Audit log persistence lives in
+Postgres from M3; `add_hook()` is the seam an indexer/audit log subscribes
+through until then.
 """
 
 from __future__ import annotations
@@ -26,14 +31,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, NoReturn
 
 from memory_manager.vault.git import GitError, PushRejected
 from memory_manager.vault.note import NoteFormatError, parse, serialize, version
-from memory_manager.vault.paths import PathRejected, parse_note_path
+from memory_manager.vault.paths import PathRejected, conflict_path, parse_note_path
 from memory_manager.vault.repo import Repo, author_for
 from memory_manager.vault.secrets import SecretFound, check
 from memory_manager.vault.validate import NoteInvalid, validate_bytes
@@ -45,6 +51,7 @@ __all__ = [
     "Op",
     "SecretRejected",
     "VersionConflict",
+    "WriteConflict",
     "WriteError",
     "WriteFailed",
     "WriteHook",
@@ -56,6 +63,7 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 _NEW = "new"
+_MAX_PUSH_ATTEMPTS = 3
 
 Op = Literal["write", "edit", "archive"]
 
@@ -128,6 +136,42 @@ class VersionConflict(WriteError):
         return result
 
 
+class WriteConflict(WriteError):
+    """A push was rejected and rebasing it onto the remote conflicted.
+
+    Nothing was overwritten: the local commit was discarded and the remote
+    note is unchanged. Both the rejected write and the remote's current
+    version are preserved at `conflict_path` for a human to resolve.
+    `current_version`/`current_content` describe the remote's current state
+    the same way `VersionConflict` does - `None` exactly when the remote
+    side no longer has the note (it was deleted there).
+    """
+
+    def __init__(
+        self,
+        path: str,
+        conflict_path: str,
+        current_version: str | None,
+        current_content: str | None,
+    ) -> None:
+        self.path = path
+        self.conflict_path = conflict_path
+        self.current_version = current_version
+        self.current_content = current_content
+        super().__init__(
+            f"'{path}' could not be written: it changed on the remote at the same "
+            f"time, see '{conflict_path}'"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        result = super().to_dict()
+        result["path"] = self.path
+        result["conflict_path"] = self.conflict_path
+        result["current_version"] = self.current_version
+        result["current_content"] = self.current_content
+        return result
+
+
 class NotFound(WriteError):
     """`path` does not exist, for an operation that requires it to (archive)."""
 
@@ -188,10 +232,14 @@ class SecretRejected(WriteError):
 
 
 class WriteFailed(WriteError):
-    """A git operation failed (commit, or a push the remote rejected).
+    """A git operation failed, or a push the remote kept rejecting.
 
-    #15 replaces the push-rejection case with a rebase; for now the caller
-    just has to retry.
+    A single rejected push is retried through a rebase (see `WriteConflict`
+    for the case where that rebase conflicts); this is raised when the
+    rebase itself fails for a reason other than a conflict, when the remote
+    keeps moving faster than `_MAX_PUSH_ATTEMPTS` retries can catch up, or
+    for any other git error. Either way the local clone is reset to the
+    remote before this is raised, so it never carries an unpushed commit.
     """
 
 
@@ -284,7 +332,12 @@ class WriteQueue:
         else:
             result, changed_paths = await self._do_write_or_edit(request, current)
 
-        await self._push()
+        final_commit = await self._push(request, changed_paths)
+        if final_commit != result.commit:
+            # A rebase retry rewrote our commit onto the remote's new tip,
+            # so the sha captured at commit time no longer exists on the
+            # pushed history - report the one that does.
+            result = replace(result, commit=final_commit)
         await self._run_hooks(result, request, changed_paths)
         return result
 
@@ -372,13 +425,70 @@ class WriteQueue:
         result = WriteResult(path=archive_rel, version=version(archived_bytes), commit=commit_sha)
         return result, (request.path, archive_rel)
 
-    async def _push(self) -> None:
+    async def _push(self, request: WriteRequest, changed_paths: tuple[str, ...]) -> str:
+        """Push the queued commit(s), retrying a rejection through a rebase.
+
+        Returns the commit sha that ended up on the remote - identical to
+        the sha the caller committed with unless a rebase retry rewrote it
+        onto the remote's new tip, in which case the caller's `WriteResult`
+        must report this sha instead of the now-dangling original one.
+        """
         try:
-            await asyncio.to_thread(self._repo.push)
-        except PushRejected as exc:
-            raise WriteFailed("remote moved, retry") from exc
+            for _ in range(_MAX_PUSH_ATTEMPTS):
+                try:
+                    await asyncio.to_thread(self._repo.push)
+                    return await asyncio.to_thread(self._repo.head)
+                except PushRejected:
+                    rebased = await asyncio.to_thread(self._repo.rebase_onto_remote)
+                    if not rebased:
+                        await self._raise_conflict(request, changed_paths[-1])
         except GitError as exc:
+            await asyncio.to_thread(self._repo.reset_to_remote)
             raise WriteFailed(str(exc)) from exc
+
+        await asyncio.to_thread(self._repo.reset_to_remote)
+        raise WriteFailed("remote keeps moving, retry")
+
+    async def _raise_conflict(self, request: WriteRequest, path: str) -> NoReturn:
+        """The rebase onto the remote conflicted: give up on this write.
+
+        Captures what we tried to commit (`ours`, still on the local HEAD
+        that is about to be discarded), resets the clone to the remote,
+        then writes `<path>.conflict.md` with both versions and raises
+        `WriteConflict`. Reads `theirs`/`theirs_sha` only after the reset,
+        so they describe the remote exactly as the conflict file reports it.
+        """
+        ours = await asyncio.to_thread(self._repo.read_file, path)
+        await asyncio.to_thread(self._repo.reset_to_remote)
+        theirs = await asyncio.to_thread(self._repo.read_remote_file, path)
+        theirs_sha = await asyncio.to_thread(self._repo.remote_head)
+
+        note_path = parse_note_path(path, allow_archive=True)
+        conflict_rel = conflict_path(note_path)
+        content = _render_conflict_file(
+            path, request.client, self._clock(), ours, theirs, theirs_sha
+        )
+        message = f"conflict {conflict_rel}"
+
+        try:
+            await asyncio.to_thread(self._repo.commit_internal_file, conflict_rel, content, message)
+            await asyncio.to_thread(self._repo.push)
+        except PushRejected:
+            rebased = await asyncio.to_thread(self._repo.rebase_onto_remote)
+            if rebased:
+                with contextlib.suppress(GitError):
+                    await asyncio.to_thread(self._repo.push)
+            else:
+                await asyncio.to_thread(self._repo.reset_to_remote)
+        except GitError:
+            await asyncio.to_thread(self._repo.reset_to_remote)
+
+        raise WriteConflict(
+            path=path,
+            conflict_path=conflict_rel,
+            current_version=version(theirs) if theirs is not None else None,
+            current_content=_decode_for_conflict(theirs),
+        )
 
     async def _run_hooks(
         self, result: WriteResult, request: WriteRequest, changed_paths: tuple[str, ...]
@@ -420,3 +530,54 @@ def _new_content(request: WriteRequest, current: bytes | None) -> bytes:
         raise EditMismatch(request.path, count)
     new_text = current_text.replace(request.old_str, request.new_str, 1)
     return new_text.encode("utf-8")
+
+
+def _render_conflict_file(
+    path: str,
+    client: str,
+    at: datetime,
+    ours: bytes | None,
+    theirs: bytes | None,
+    theirs_sha: str,
+) -> bytes:
+    """The content of `<path>.conflict.md` (ADR-0005 "Conflict files").
+
+    Plain Markdown, not a note: no frontmatter, holds both versions in
+    fenced code blocks. The fence is chosen longer than any backtick run
+    already inside either version, so it can never be closed early by the
+    content it wraps.
+    """
+    ours_decoded = _decode_for_conflict(ours)
+    theirs_decoded = _decode_for_conflict(theirs)
+    ours_text = ours_decoded if ours_decoded is not None else "(deleted locally)"
+    theirs_text = theirs_decoded if theirs_decoded is not None else "(deleted on the remote)"
+    fence = _conflict_fence(ours_text, theirs_text)
+    timestamp = at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return (
+        f"# Write conflict: {path}\n"
+        "\n"
+        f"A write by {client} at {timestamp} could not be applied because the note "
+        "was changed on the remote at the same time. Nothing was overwritten. "
+        "Resolve by editing the note, then delete this file.\n"
+        "\n"
+        f"## Remote version ({theirs_sha[:7]})\n"
+        "\n"
+        f"{fence}markdown\n"
+        f"{theirs_text}\n"
+        f"{fence}\n"
+        "\n"
+        "## Rejected write\n"
+        "\n"
+        f"{fence}markdown\n"
+        f"{ours_text}\n"
+        f"{fence}\n"
+    ).encode()
+
+
+def _conflict_fence(*texts: str) -> str:
+    longest_run = 0
+    for text in texts:
+        for run in re.findall(r"`+", text):
+            longest_run = max(longest_run, len(run))
+    return "`" * max(3, longest_run + 1)

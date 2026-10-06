@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path, resolve
+from memory_manager.vault.paths import (
+    NotePath,
+    PathRejected,
+    conflict_path,
+    parse_note_path,
+    resolve,
+    resolve_internal,
+)
 
 
 class TestParseNotePathValid:
@@ -168,6 +175,10 @@ class TestParseNotePathRejections:
         with pytest.raises(PathRejected):
             parse_note_path("personal/fact/-ab.md")
 
+    def test_conflict_file_path_is_rejected(self) -> None:
+        with pytest.raises(PathRejected):
+            parse_note_path("personal/fact/x.conflict.md")
+
 
 class TestNotePathHelpers:
     def test_archive_path_adds_prefix(self) -> None:
@@ -263,3 +274,45 @@ class TestResolveRejections:
                 resolve(tmp_path, "personal/fact/x.md")
         finally:
             outside.rmdir()
+
+
+class TestConflictPath:
+    def test_live_note_path_has_conflict_suffix_beside_it(self) -> None:
+        note_path = parse_note_path("personal/fact/x.md")
+        assert conflict_path(note_path) == "personal/fact/x.conflict.md"
+
+    def test_archived_note_path_uses_the_live_shape(self) -> None:
+        note_path = parse_note_path("_archive/personal/fact/x.md", allow_archive=True)
+        assert conflict_path(note_path) == "personal/fact/x.conflict.md"
+
+
+class TestResolveInternal:
+    def test_resolves_a_note_path(self, tmp_path: Path) -> None:
+        resolved = resolve_internal(tmp_path, "personal/fact/x.md")
+        assert resolved == tmp_path / "personal" / "fact" / "x.md"
+
+    def test_resolves_a_conflict_file_path(self, tmp_path: Path) -> None:
+        resolved = resolve_internal(tmp_path, "personal/fact/x.conflict.md")
+        assert resolved == tmp_path / "personal" / "fact" / "x.conflict.md"
+
+    def test_resolves_an_archive_path(self, tmp_path: Path) -> None:
+        resolved = resolve_internal(tmp_path, "_archive/personal/fact/x.md")
+        assert resolved == tmp_path / "_archive" / "personal" / "fact" / "x.md"
+
+    def test_rejects_anything_that_is_neither(self, tmp_path: Path) -> None:
+        with pytest.raises(PathRejected):
+            resolve_internal(tmp_path, "personal/fact/x.txt")
+
+    def test_rejects_traversal_in_a_conflict_path(self, tmp_path: Path) -> None:
+        with pytest.raises(PathRejected):
+            resolve_internal(tmp_path, "../escape.conflict.md")
+
+    def test_symlinked_type_directory_is_rejected_for_a_conflict_path(self, tmp_path: Path) -> None:
+        namespace_dir = tmp_path / "personal"
+        namespace_dir.mkdir()
+        real_dir = tmp_path / "real-type"
+        real_dir.mkdir()
+        os.symlink(real_dir, namespace_dir / "fact")
+        with pytest.raises(PathRejected) as excinfo:
+            resolve_internal(tmp_path, "personal/fact/x.conflict.md")
+        assert "symlink" in str(excinfo.value)

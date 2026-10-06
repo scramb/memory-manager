@@ -13,6 +13,11 @@ symlink-free walk down to the resolved file.
 `resolve` additionally walks the filesystem and is what the read/write
 paths must call before opening a file - never build a path from client
 input any other way.
+
+`conflict_path`/`resolve_internal` are the server-internal counterpart for
+`*.conflict.md` files (ADR-0005 "Conflict files", #15): a client can never
+write one through `parse_note_path`/`resolve`, only the write queue through
+`resolve_internal` after a rebase conflict.
 """
 
 from __future__ import annotations
@@ -24,12 +29,20 @@ from pathlib import Path
 
 from memory_manager.vault.validate import NOTE_TYPES
 
-__all__ = ["NotePath", "PathRejected", "parse_note_path", "resolve"]
+__all__ = [
+    "NotePath",
+    "PathRejected",
+    "conflict_path",
+    "parse_note_path",
+    "resolve",
+    "resolve_internal",
+]
 
 _MAX_PATH_CHARS = 200
 _MAX_SLUG_CHARS = 80
 _ARCHIVE_SEGMENT = "_archive"
 _FILE_SUFFIX = ".md"
+_CONFLICT_SUFFIX = ".conflict.md"
 
 _NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -174,24 +187,66 @@ def resolve(
     additionally requires every path component to already exist.
     """
     note_path = parse_note_path(rel, allow_archive=allow_archive)
+    return _resolve_relative(vault_root, note_path.relative, must_exist=must_exist)
+
+
+def conflict_path(note_path: NotePath) -> str:
+    """The server-internal conflict-file path beside `note_path`'s note.
+
+    Always the live (non-archived) shape, `<namespace>/<type>/<slug>.conflict.md`
+    (ADR-0005 "Conflict files") - a conflict file is never itself archived.
+    """
+    live = note_path.live_path()
+    return f"{live.namespace}/{live.type}/{live.slug}{_CONFLICT_SUFFIX}"
+
+
+def resolve_internal(vault_root: Path, rel: str) -> Path:
+    """Resolve `rel` to an absolute path inside `vault_root`, server-writes only.
+
+    Accepts exactly a note path (per `parse_note_path`, archive included) or
+    its conflict-file counterpart (`conflict_path`) - nothing a client could
+    submit through `parse_note_path`. Applies the same symlink and
+    vault-root-escape protection as `resolve`.
+    """
+    relative = _parse_internal_relative(rel)
+    return _resolve_relative(vault_root, relative, must_exist=False)
+
+
+def _parse_internal_relative(rel: str) -> str:
+    try:
+        return parse_note_path(rel, allow_archive=True).relative
+    except PathRejected:
+        pass
+    if rel.endswith(_CONFLICT_SUFFIX):
+        note_rel = rel[: -len(_CONFLICT_SUFFIX)] + _FILE_SUFFIX
+        try:
+            note_path = parse_note_path(note_rel)
+        except PathRejected:
+            pass
+        else:
+            return conflict_path(note_path)
+    raise PathRejected(f"'{rel}' is not a valid note path or conflict-file path")
+
+
+def _resolve_relative(vault_root: Path, relative: str, *, must_exist: bool = False) -> Path:
     root = vault_root.resolve()
 
     candidate = root
-    for segment in note_path.relative.split("/"):
+    for segment in relative.split("/"):
         candidate = candidate / segment
         try:
             entry_stat = candidate.lstat()
         except FileNotFoundError:
             if must_exist:
-                raise PathRejected(f"'{note_path.relative}' does not exist in the vault") from None
+                raise PathRejected(f"'{relative}' does not exist in the vault") from None
             continue
         except NotADirectoryError as exc:
             raise PathRejected(
-                f"'{note_path.relative}' is invalid, a parent component is not a directory"
+                f"'{relative}' is invalid, a parent component is not a directory"
             ) from exc
         if stat.S_ISLNK(entry_stat.st_mode):
             raise PathRejected(
-                f"'{note_path.relative}' contains a symlink at {segment!r}, "
+                f"'{relative}' contains a symlink at {segment!r}, "
                 "symlinks are not allowed in the vault"
             )
 
@@ -199,9 +254,9 @@ def resolve(
     try:
         resolved.relative_to(root)
     except ValueError:
-        raise PathRejected(f"'{note_path.relative}' resolves outside the vault root") from None
+        raise PathRejected(f"'{relative}' resolves outside the vault root") from None
 
     if candidate.exists() and not candidate.is_file():
-        raise PathRejected(f"'{note_path.relative}' exists but is not a regular file")
+        raise PathRejected(f"'{relative}' exists but is not a regular file")
 
     return candidate
