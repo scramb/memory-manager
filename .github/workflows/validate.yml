@@ -44,3 +44,5 @@ jobs:
           enable-cache: true
       - name: make check
         run: make check
+      - name: make eval
+        run: make eval
