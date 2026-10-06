@@ -86,7 +86,7 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 ### WP-08 — Hybrid search · Branch: `wp/08-hybrid-search`
 
 - [x] #28 Full-text search (`tsvector`, `simple` + language configs for de/en)
-- [ ] #29 Vector search + RRF fusion, note-level dedup, snippet; full-text fallback without provider
+- [x] #29 Vector search + RRF fusion, note-level dedup, snippet; full-text fallback without provider
 - [ ] #30 `memory_search` tool with filters `type`, `tags`, `namespace`, `valid_at`
 
 ### WP-09 — Retrieval eval · Branch: `wp/09-retrieval-eval`
