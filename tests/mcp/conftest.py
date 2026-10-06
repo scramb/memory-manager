@@ -38,7 +38,7 @@ from git_fixtures import (
     vault_config,
 )
 
-from memory_manager.app import Services
+from memory_manager.app import Services, open_services
 from memory_manager.config import VaultConfig
 from memory_manager.queue import WriteQueue
 from memory_manager.vault.note import Note, serialize
@@ -52,6 +52,7 @@ __all__ = [
     "human_rename",
     "seed_notes",
     "services",
+    "services_with_db",
     "vault_config",
 ]
 
@@ -163,3 +164,30 @@ async def services(vault_config: VaultConfig, bare_remote: Path) -> AsyncIterato
         )
     finally:
         await queue.stop()
+
+
+@pytest_asyncio.fixture
+async def services_with_db(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> AsyncIterator[Services]:
+    """A `Services` seeded like `services`, but with a real Postgres index behind it.
+
+    Goes through `open_services` (not a hand-assembled `Services` like
+    `services` above) so the startup reindex actually runs, exercising
+    `memory_search`'s `hybrid`/`fulltext` modes the same way a real
+    `DATABASE_URL`-configured process would. `test_database_url` comes from
+    the root `tests/conftest.py`, available here without import (see this
+    module's docstring on why that import would be ambiguous).
+    """
+    notes = {note.path: note.content for note in SEEDED_NOTES}
+    notes[BROKEN_NOTE_PATH] = _BROKEN_NOTE_CONTENT
+    seed_notes(bare_remote, notes)
+
+    environ = {
+        "VAULT_REMOTE": str(bare_remote),
+        "VAULT_DIR": str(tmp_path / "db-vault"),
+        "VAULT_BRANCH": "main",
+        "DATABASE_URL": test_database_url,
+    }
+    async with open_services(environ) as services:
+        yield services
