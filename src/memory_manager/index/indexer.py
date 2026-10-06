@@ -268,7 +268,13 @@ class Indexer:
             )
 
             await conn.execute("delete from chunks where note_id = $1", note.id)
-            chunks = chunk_note(note.title, note.body)
+            chunks = chunk_note(
+                note.title,
+                note.body,
+                description=note.description,
+                aliases=note.aliases,
+                tags=note.tags,
+            )
             if chunks:
                 await conn.executemany(
                     "insert into chunks (note_id, ord, heading_path, text, lang) "

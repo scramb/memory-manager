@@ -14,11 +14,22 @@ code blocks are kept whole unless the block by itself exceeds the limit.
 
 `detect_lang` is a stopword-count heuristic, not a real language detector;
 it only has to be good enough to tag a chunk as "de", "en" or unknown.
+
+`description`, `aliases` and `tags` only ever reach the vault's full-text
+index through a note's chunks (#28's `fulltext_search` only ranks
+`chunks`, never `notes` directly), so `chunk_note` folds them into the
+note's first chunk - right after `title`/`heading_path`, before the
+content - rather than repeating them into every chunk (#63). A hyphenated
+alias like "auth-guide" is plain text here, so it gets indexed exactly
+like any other hyphenated compound word: as the whole token and its parts
+at consecutive positions (`to_tsvector` splits it that way), matching a
+query on either.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 __all__ = ["Chunk", "chunk_note", "detect_lang"]
@@ -39,13 +50,25 @@ class Chunk:
     lang: str | None
 
 
-def chunk_note(title: str, body: str, *, max_chars: int = 1500) -> list[Chunk]:
+def chunk_note(
+    title: str,
+    body: str,
+    *,
+    description: str = "",
+    aliases: Sequence[str] = (),
+    tags: Sequence[str] = (),
+    max_chars: int = 1500,
+) -> list[Chunk]:
     """Split `body` into `Chunk`s, prefixed with `title` and heading path.
 
     Text before the first heading becomes chunk 0 with an empty
     `heading_path`. A heading with no content (and no non-empty
     descendants) produces no chunk, but its title still appears in the
     `heading_path` of any content nested under it.
+
+    `description`, `aliases` and `tags` - the note's other searchable
+    metadata - are folded into the first chunk only (see module docstring),
+    right after its `title`/`heading_path` line(s).
     """
     chunks: list[Chunk] = []
     for heading_path, lines in _split_sections(body):
@@ -59,6 +82,8 @@ def chunk_note(title: str, body: str, *, max_chars: int = 1500) -> list[Chunk]:
                     ord=len(chunks), heading_path=heading_path, text=text, lang=detect_lang(piece)
                 )
             )
+    if chunks:
+        chunks[0] = _with_metadata(chunks[0], description, aliases, tags)
     return chunks
 
 
@@ -66,6 +91,37 @@ def _build_text(title: str, heading_path: str, content: str) -> str:
     if heading_path:
         return f"{title}\n{heading_path}\n\n{content}"
     return f"{title}\n\n{content}"
+
+
+def _with_metadata(
+    chunk: Chunk, description: str, aliases: Sequence[str], tags: Sequence[str]
+) -> Chunk:
+    """Insert `description`/`aliases`/`tags` lines into `chunk`'s preamble.
+
+    `chunk.text` is `_build_text(title, chunk.heading_path, content)`:
+    `title` (and `heading_path`, if any), then a blank line, then
+    `content`. The metadata lines go right before that blank line, so the
+    blank-line boundary `search._fallback_snippet` relies on to find where
+    real content starts still holds.
+    """
+    meta_lines = _metadata_lines(description, aliases, tags)
+    if not meta_lines:
+        return chunk
+    lines = chunk.text.split("\n")
+    preamble_len = 2 if chunk.heading_path else 1
+    new_text = "\n".join([*lines[:preamble_len], *meta_lines, *lines[preamble_len:]])
+    return Chunk(ord=chunk.ord, heading_path=chunk.heading_path, text=new_text, lang=chunk.lang)
+
+
+def _metadata_lines(description: str, aliases: Sequence[str], tags: Sequence[str]) -> list[str]:
+    lines: list[str] = []
+    if description:
+        lines.append(description)
+    if aliases:
+        lines.append("Aliases: " + ", ".join(aliases))
+    if tags:
+        lines.append("Tags: " + ", ".join(tags))
+    return lines
 
 
 def _split_sections(body: str) -> list[tuple[str, list[str]]]:

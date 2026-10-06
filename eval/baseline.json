@@ -1,6 +1,6 @@
 {
   "k": 5,
-  "recall_at_k": 0.08,
-  "mrr": 0.07,
+  "recall_at_k": 0.84,
+  "mrr": 0.7123,
   "provider": "none"
 }

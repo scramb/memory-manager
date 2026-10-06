@@ -6,15 +6,48 @@ columns the schema already maintains (`0001_index_schema.sql`):
 `tsv_simple`, generated with the `simple` config (exact tokens, language
 independent - proper names like `pgvector` or `bge-m3`), and `tsv_lang`,
 generated with `german`/`english` per chunk (`chunks.lang`, falling back to
-`simple` when unset). A chunk matches if either tsvector matches the
-corresponding `websearch_to_tsquery` query for `query`; its score is the
-better of the two ranks. `websearch_to_tsquery` also gives us phrase
-("..."), exclusion (-word) and `or` syntax for free.
+`simple` when unset). Its score is the better of the two ranks, normalized
+by chunk length (`ts_rank_cd(..., 33)`) so a longer chunk does not win on
+size alone. `websearch_to_tsquery` also gives us phrase ("..."), exclusion
+(-word) and `or` syntax for free.
 
-A query that is only stopwords in a chunk's language config parses to an
-empty tsquery; `@@`/`ts_rank_cd` treat that as "no match"/`0` rather than
-erroring (verified against Postgres 16), so such a query still matches via
-`tsv_simple` - `simple` has no stopword list - without special-casing here.
+`websearch_to_tsquery` ANDs plain words together by default, which would
+require every word of a natural-language question to appear in one chunk -
+almost never true for a real sentence (#63). Per config, `_FULLTEXT_SQL`
+rewrites a query that has no phrase/exclusion operator from an AND of its
+words into an OR, so a chunk matching any one word still ranks, with
+`ts_rank_cd` rewarding chunks that match more of them. A query using a
+quoted phrase or `-exclusion` keeps its original (necessarily more
+restrictive) semantics unchanged.
+
+`tsv_simple` only ever contributes to a *detected-language* chunk's
+score/match when its language's OR'd query has no lexemes at all (a
+stopword-only query, verified against Postgres 16 to parse to an empty
+tsquery that `@@`/`ts_rank_cd` treat as "no match"/`0` rather than
+erroring). Letting `tsv_simple` compete on every chunk regardless, now that
+it is OR'd too, backfires: `simple` has no stopword list, so common words
+like "the" or "is" - filtered out of the `german`/`english` OR for every
+other chunk - would literally match almost any chunk through it and drown
+out real matches (found empirically against this vault's eval set, #63).
+
+A chunk with `chunks.lang is null` needs the same protection but can't use
+the per-chunk check above - its `tsv_lang` falls back to `tsv_simple`
+itself when `lang` is unset (`0001_index_schema.sql`), so there is no
+"this chunk's own language" to compare `query` against. `chunks.lang` is a
+stopword-count heuristic (`chunker.detect_lang`) that gives up on plenty of
+short, perfectly ordinary sentences, not just genuinely undetectable text,
+so this is a common case, not an edge one - and simply trying both
+`german`'s and `english`'s stemming on the chunk text does not help: a
+word is dropped as a stopword by at most *one* of the two dictionaries
+("the" is English-only, "die" is German-only), so whichever language's
+pass is tried, the other one's filler words still slip through and
+pollute the match. `q.safe` (the `safe` CTE) sidesteps this: it is `query`'s
+own words, reduced to the ones neither dictionary drops, OR'd together and
+matched against `tsv_simple` literally - no per-chunk language guess
+needed. `tsv_simple`/`q.simple` is still the branch above's fallback
+(`query` itself being stopword-only in a chunk's *detected* language is a
+narrower, already-safe case: nothing in that single language's stopword
+list survives into `q.simple`'s matching chunk anyway).
 
 `vector_search` ranks chunks by cosine distance to a query embedding,
 restricted to the embedding's `(model, dimension)` pair - chunks embedded
@@ -67,11 +100,67 @@ _logger = logging.getLogger(__name__)
 _Queryable = asyncpg.Pool | asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 _FULLTEXT_SQL = """
-with q as (
+with q_and as (
     select
         websearch_to_tsquery('simple', $1) as simple,
         websearch_to_tsquery('german', $1) as german,
         websearch_to_tsquery('english', $1) as english
+),
+-- `websearch_to_tsquery` AND's plain words together, which makes a natural-
+-- language question ("Where is Elbblick?") require every one of its words
+-- - including ones the query's own language config never stems away, like
+-- an English "is" inside a German chunk's "german" query - to appear in
+-- the same chunk. That is almost never true for a real sentence, so plain
+-- words are OR'd instead below: a chunk matching any one of them still
+-- ranks, with `ts_rank_cd` rewarding chunks that match more of them.
+--
+-- `allow_or` keeps the user's own phrase/exclusion syntax (`"phrase"`,
+-- `-word`) required/excluded, by looking at the *raw* query text rather
+-- than the parsed tsquery: `websearch_to_tsquery` also renders a
+-- hyphenated compound word like "auth-guide" as a `<->` phrase of its own
+-- (verified against Postgres 16) with no exclusion or quoting on the
+-- user's part, so testing the parsed query for `<->`/`!` would wrongly
+-- keep plain, hyphen-containing questions AND-only.
+--
+-- The `&` -> `|` rewrite below casts the edited text straight to
+-- `tsquery` (`::tsquery`), not back through `to_tsquery(config, ...)`:
+-- the latter re-runs the config's parser/dictionary over every lexeme,
+-- including already-quoted ones - which re-triggers the very hyphen
+-- expansion above and corrupts it (verified against Postgres 16:
+-- `to_tsquery('simple', $$'bge-m3' <-> 'bge' <-> 'm3'$$)` yields a
+-- 5-lexeme chain, not the original 3). `::tsquery` parses quoted lexemes
+-- as literal and sidesteps that.
+flags as (
+    select ($1 !~ '"') and ($1 !~ '(^|\\s)-\\S') as allow_or
+),
+-- `safe` is a second, stricter OR query for the fallback below: only the
+-- query's words that survive (are not a stopword in) *both* `german` and
+-- `english` - derived straight from those two dictionaries, not a
+-- hand-maintained list. "the"/"me"/"is" fail that bar (at least one of
+-- the two configs drops them); "show"/"auth"/"guide" or any proper name
+-- pass it, same as before.
+safe as (
+    select coalesce(string_agg(quote_literal(word), ' | '), '')::tsquery as query
+    from (select distinct unnest(tsvector_to_array(to_tsvector('simple', $1))) as word) words
+    where to_tsvector('german', word) != ''::tsvector
+        and to_tsvector('english', word) != ''::tsvector
+),
+q as (
+    select
+        case
+            when flags.allow_or then (replace(q_and.simple::text, '&', '|'))::tsquery
+            else q_and.simple
+        end as simple,
+        case
+            when flags.allow_or then (replace(q_and.german::text, '&', '|'))::tsquery
+            else q_and.german
+        end as german,
+        case
+            when flags.allow_or then (replace(q_and.english::text, '&', '|'))::tsquery
+            else q_and.english
+        end as english,
+        safe.query as safe
+    from q_and cross join flags cross join safe
 )
 select
     n.id as note_id,
@@ -81,10 +170,27 @@ select
     c.heading_path as heading_path,
     c.text as text,
     greatest(
-        ts_rank_cd(c.tsv_simple, q.simple),
+        case
+            -- `chunks.lang` is a stopword-count heuristic (`chunker.detect_lang`)
+            -- that gives up (`null`) on many short, legitimate sentences - too
+            -- short to hit its confidence bar, not actually undetectable. Such
+            -- a chunk's `tsv_lang` falls back to `tsv_simple` itself
+            -- (`0001_index_schema.sql`), so it cannot tell "the chunk's own
+            -- language has no stopwords left in this query" from "we don't
+            -- know the chunk's language at all" the way the branch below
+            -- does - ranking it via plain `q.simple` would reintroduce the
+            -- same "the"/"is" pollution for every chunk this heuristic
+            -- merely failed to confidently tag. `q.safe` (see above) is the
+            -- cross-language-filtered stand-in for that unknown case.
+            when c.lang is null then ts_rank_cd(c.tsv_simple, q.safe, 33)
+            when (c.lang = 'de' and q.german::text = '')
+                or (c.lang = 'en' and q.english::text = '')
+                then ts_rank_cd(c.tsv_simple, q.simple, 33)
+            else 0
+        end,
         case c.lang
-            when 'de' then ts_rank_cd(c.tsv_lang, q.german)
-            when 'en' then ts_rank_cd(c.tsv_lang, q.english)
+            when 'de' then ts_rank_cd(c.tsv_lang, q.german, 33)
+            when 'en' then ts_rank_cd(c.tsv_lang, q.english, 33)
             else 0
         end
     ) as score
@@ -100,7 +206,14 @@ where ($2 or not n.archived)
         and (n.valid_to is null or n.valid_to >= $7)
     ))
     and (
-        c.tsv_simple @@ q.simple
+        (
+            (
+                c.lang is null
+                or (c.lang = 'de' and q.german::text = '')
+                or (c.lang = 'en' and q.english::text = '')
+            )
+            and c.tsv_simple @@ q.simple
+        )
         or (c.lang = 'de' and c.tsv_lang @@ q.german)
         or (c.lang = 'en' and c.tsv_lang @@ q.english)
     )

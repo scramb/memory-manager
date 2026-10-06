@@ -93,7 +93,7 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 - [x] #31 Fictional example vault in `examples/vault/` + golden set (~50 queries)
 - [x] #32 Eval runner reports recall@5 and MRR; CI fails on regression vs. baseline
-- [ ] #63 Full-text search finds notes for natural-language queries (recall@5 ≥ 0.6 full-text-only)
+- [x] #63 Full-text search finds notes for natural-language queries (recall@5 ≥ 0.6 full-text-only)
 
 ---
 
