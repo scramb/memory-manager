@@ -69,7 +69,7 @@ Goal: all tools usable from Claude Code over stdio, with server instructions, sk
 ### WP-06 — Claude Code integration · Branch: `wp/06-claude-code-integration`
 
 - [ ] #22 Claude Code skill + `CLAUDE.md` snippet in `integrations/claude-code/`
-- [ ] #23 Docs: `claude mcp add` for stdio, verified manually in Claude Code
+- [x] #23 Docs: `claude mcp add` for stdio, verified manually in Claude Code
 
 ---
 
