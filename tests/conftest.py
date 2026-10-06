@@ -15,6 +15,9 @@ Lives at the `tests/` root (not under `tests/db/`) so every test package -
 same-named-`conftest.py`-in-sibling-directories trick `tests/vault` needs
 for its bare `from conftest import ...` imports (see the `mypy_path`
 comment in `pyproject.toml`).
+
+Git fixtures live in `tests/git_fixtures.py` and are re-exported here, so
+every test package can use them.
 """
 
 from __future__ import annotations
@@ -26,8 +29,18 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 import pytest_asyncio
+from git_fixtures import bare_remote, human_commit, human_delete, human_rename, vault_config
 
-__all__ = ["admin_database_url", "conn", "test_database_url"]
+__all__ = [
+    "admin_database_url",
+    "bare_remote",
+    "conn",
+    "human_commit",
+    "human_delete",
+    "human_rename",
+    "test_database_url",
+    "vault_config",
+]
 
 
 @pytest.fixture(scope="session")

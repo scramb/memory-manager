@@ -47,7 +47,7 @@ Goal: notes can be read, written and validated; every change is a Git commit; co
 
 ### WP-04 — Write queue · Branch: `wp/04-write-queue`
 
-- [ ] #14 Serialized write queue with `if_version` (content hash) optimistic concurrency
+- [x] #14 Serialized write queue with `if_version` (content hash) optimistic concurrency
 - [ ] #15 Push conflict → rebase; on rebase failure a `*.conflict.md` is written and reported, nothing overwritten
 - [ ] #16 Concurrency test: two clients + a human `git push` in parallel, zero lost writes
 
