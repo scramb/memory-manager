@@ -5,7 +5,10 @@ description = "Self-hosted long-term memory for Claude: Markdown notes in Git, a
 readme = "README.md"
 license = "AGPL-3.0-only"
 requires-python = ">=3.12"
-dependencies = ["pyyaml>=6.0"]
+dependencies = [
+    "asyncpg>=0.31.0",
+    "pyyaml>=6.0",
+]
 
 [dependency-groups]
 dev = [
@@ -15,6 +18,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "types-PyYAML>=6.0",
+    "asyncpg-stubs>=0.31.3",
 ]
 
 [build-system]
@@ -37,6 +41,12 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "RUF"]
 [tool.mypy]
 strict = true
 files = ["src", "tests"]
+# `tests/vault` and `tests/db` each have their own `conftest.py`; without
+# this, mypy maps both to the same top-level "conftest" module and fails
+# with "Duplicate module named conftest". `tests/vault` is listed so its
+# existing bare `from conftest import ...` still resolves the same way.
+explicit_package_bases = true
+mypy_path = ["src", "tests/vault"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

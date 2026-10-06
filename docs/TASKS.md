@@ -78,7 +78,7 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 ### WP-07 — Index schema and indexer · Branch: `wp/07-indexer`
 
-- [ ] #24 Versioned migrations: `notes`, `chunks`, `links`, `audit_log`
+- [x] #24 Versioned migrations: `notes`, `chunks`, `links`, `audit_log`
 - [ ] #25 Heading-based chunker
 - [ ] #26 Incremental, idempotent indexer via file hashes; `reindex --full`
 - [ ] #27 Embedding provider interface: Ollama + OpenAI-compatible; model + dimension stored per chunk; model change triggers reindex
