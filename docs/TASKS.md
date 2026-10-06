@@ -23,7 +23,7 @@ Goal: planning files, accepted ADRs for language, license, git library and auth 
   - [x] ADR-0003 git access (git CLI)
   - [x] ADR-0004 auth model (embedded AS, OIDC or admin-password login)
 - [x] #4 Toolchain skeleton: `uv` project, `Makefile` with `check` (ruff, mypy strict, pytest), pre-commit, CI runs `make check` on an empty package
-- [ ] #5 OSS hygiene files: `README.md` pitch + architecture diagram, `CONTRIBUTING.md` (DCO), `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue/PR templates, Dependabot
+- [x] #5 OSS hygiene files: `README.md` pitch + architecture diagram, `CONTRIBUTING.md` (DCO), `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue/PR templates, Dependabot
 
 ---
 
