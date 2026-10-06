@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The `memory-manager` command-line entry point (#26).
 
-Only `reindex` exists so far. Other subcommands (vault sync, search, ...)
-are added as their own tasks wire the server together (M2/M4).
+`reindex` and `doctor` exist so far. Other subcommands (vault sync, search,
+...) are added as their own tasks wire the server together (M2/M4).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import asyncpg
 
 from memory_manager.config import EmbeddingConfig, EmbeddingConfigError
 from memory_manager.db.migrate import migrate
+from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
 
@@ -31,6 +32,9 @@ def main(argv: list[str] | None = None) -> int:
     """Parse `argv` (`sys.argv[1:]` if omitted) and run the requested command."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        return _run_doctor_command(args.vault)
 
     if args.command != "reindex":
         parser.print_help()
@@ -58,7 +62,32 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also drop stale rows and recompute every link (full rebuild)",
     )
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check every note in the vault against ADR-0005"
+    )
+    doctor_parser.add_argument(
+        "--vault",
+        default=os.environ.get("VAULT_DIR"),
+        help="path to the vault root (defaults to $VAULT_DIR)",
+    )
     return parser
+
+
+def _run_doctor_command(vault: str | None) -> int:
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+    report = run_doctor(Path(vault))
+    _print_doctor_report(report)
+    return 1 if report.errors else 0
+
+
+def _print_doctor_report(report: DoctorReport) -> None:
+    for error in report.errors:
+        print(f"ERROR: {error}")
+    for warning in report.warnings:
+        print(f"WARNING: {warning}")
+    print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
 
 
 async def _reindex(

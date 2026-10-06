@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Golden set for the retrieval eval (recall@5, MRR) against examples/vault.
+#
+# Each entry: {id, query, expected: [<note ULID>, ...], lang: de|en, kind}.
+# `kind` is one of:
+#   - exact: query closely echoes the note's title/description, same language
+#   - paraphrase: differently worded, same language, tests semantic recall
+#   - cross-language: query language differs from the note's language
+#   - alias: query uses a note's `aliases` entry, not its slug or title
+#   - supersede: a supersede chain exists; `expected` is the current note,
+#     never the superseded one, even though both could match on wording
+#
+# Note ids are taken from examples/vault/**/*.md frontmatter `id` fields.
+
+- id: q01
+  query: "Welchen Editor nutzt Mara aktuell?"
+  expected: [01KGCAKC7043CX4PHEBD0BS16H]
+  lang: de
+  kind: supersede
+- id: q02
+  query: "What is the current status of the Leuchtturm project?"
+  expected: [01KKBFW3K0G542A2FWNFHWYFYS]
+  lang: en
+  kind: supersede
+- id: q03
+  query: "How do API clients authenticate right now?"
+  expected: [01M1RD0RK09YQYHR5E12Z0KHPP]
+  lang: en
+  kind: supersede
+- id: q04
+  query: "Where is Elbblick?"
+  expected: [01K6Z1T48030M0FQ8HAKC41GTR]
+  lang: en
+  kind: alias
+- id: q05
+  query: "Tell me about Keks"
+  expected: [01K76WE4W00H8JJRK7017AG963]
+  lang: en
+  kind: alias
+- id: q06
+  query: "What is Hafenwind?"
+  expected: [01K7EQ25G0XC6T9747GYTTSH0V]
+  lang: en
+  kind: alias
+- id: q07
+  query: "What is Kompass?"
+  expected: [01KB2JYGG0VN4S1R0PQW0NQWAY]
+  lang: en
+  kind: alias
+- id: q08
+  query: "What is Nordlicht?"
+  expected: [01KBSHN880F4VZDHA497RJTHVC]
+  lang: en
+  kind: alias
+- id: q09
+  query: "Show me the auth-guide"
+  expected: [01M1RD0RK09YQYHR5E12Z0KHPP]
+  lang: en
+  kind: alias
+- id: q10
+  query: "What editor configuration does Mara currently use for Go?"
+  expected: [01KGCAKC7043CX4PHEBD0BS16H]
+  lang: en
+  kind: supersede
+- id: q11
+  query: "Is the Leuchtturm backend written yet?"
+  expected: [01KKBFW3K0G542A2FWNFHWYFYS]
+  lang: en
+  kind: supersede
+- id: q12
+  query: "What authentication method does the API use today?"
+  expected: [01M1RD0RK09YQYHR5E12Z0KHPP]
+  lang: en
+  kind: supersede
+- id: q13
+  query: "Wie stellt Mara den Testumfang auf einem Prototyp-Branch ein?"
+  expected: [01K9VYZQG0ZD7VCMPMP2E9TN17]
+  lang: de
+  kind: cross-language
+- id: q14
+  query: "When is Mara's birthday?"
+  expected: [01K7XV4WM0F9NBD0BY48GQCCRN]
+  lang: en
+  kind: cross-language
+- id: q15
+  query: "Where does Mara live in Hamburg?"
+  expected: [01K85NRX80YZ14ASN9Z9BHT8KK]
+  lang: en
+  kind: cross-language
+- id: q16
+  query: "Welchen Kommunikationsstil bevorzugt Mara?"
+  expected: [01K4HSWJ80S92PCPZ54T55XBKQ]
+  lang: de
+  kind: cross-language
+- id: q17
+  query: "What is Mara's commute like?"
+  expected: [01K8NB0YG0CG7BH04WNHRB2YT0]
+  lang: en
+  kind: cross-language
+- id: q18
+  query: "Welchen Tech-Stack nutzt Nordlicht GmbH?"
+  expected: [01KD8081W0K1XT40X9X9JXK8JT]
+  lang: de
+  kind: cross-language
+- id: q19
+  query: "When was Nordlicht GmbH founded?"
+  expected: [01KGVW4CW0KBRBVEQ87YQAN64H]
+  lang: en
+  kind: cross-language
+- id: q20
+  query: "Was ist Maras bevorzugte Tiefe beim Code-Review?"
+  expected: [01K8WMFN002WZWMHPRECMPDP81]
+  lang: de
+  kind: cross-language
+- id: q21
+  query: "Welche Standup-Zeit hat Maras Team?"
+  expected: [01K94F3NM0VNCWGFZWSE085KK6]
+  lang: de
+  kind: exact
+- id: q22
+  query: "What is Nordlicht GmbH's working agreement about deploys?"
+  expected: [01KDFTW2G0MG5RDNQ5D012TGVA]
+  lang: en
+  kind: exact
+- id: q23
+  query: "How long does the CI pipeline currently take?"
+  expected: [01KDYYYSM0BT6ME0XQ2HT2CK3Y]
+  lang: en
+  kind: exact
+- id: q24
+  query: "What caused the Kompass incident on 2026-08-14?"
+  expected: [01KF5JXJM044ADSG18M3RHWJQ4]
+  lang: en
+  kind: exact
+- id: q25
+  query: "Wer ist Maras Manager bei Nordlicht GmbH?"
+  expected: [01KD05M180PR8F0ZH8KCCQ7CDB]
+  lang: de
+  kind: exact
+- id: q26
+  query: "What does the Go coding style guide say about error wrapping?"
+  expected: [01KGC6WBM04CA3VX7SH027JWQK]
+  lang: en
+  kind: exact
+- id: q27
+  query: "What are the steps in the deploy runbook?"
+  expected: [01KC96X9G0A5T1ZNQQDEBCYN0X]
+  lang: en
+  kind: exact
+- id: q28
+  query: "Wie viele Mitarbeitende hat Nordlicht GmbH?"
+  expected: [01KH3PRDG0Q5CX2226XBA9QPPD]
+  lang: de
+  kind: exact
+- id: q29
+  query: "What products does Nordlicht GmbH build?"
+  expected: [01KHB07400SMF7M3TW34BD0J7G]
+  lang: en
+  kind: exact
+- id: q30
+  query: "Wo liegt das Hamburger Buero von Nordlicht GmbH?"
+  expected: [01KHJTV4M0RF2006B25Q2GKNE0]
+  lang: de
+  kind: exact
+- id: q31
+  query: "What feedback did Mara give about renaming variables?"
+  expected: [01KAB32EM09ZS5VR619SHMMT1R]
+  lang: en
+  kind: exact
+- id: q32
+  query: "What did Claude catch during review of the write queue?"
+  expected: [01KA38EE0053TGMDK9TRAF8P7G]
+  lang: en
+  kind: exact
+- id: q33
+  query: "Was darf man Mara beim Essen nicht vorschlagen?"
+  expected: [01K51F4KG0MNQHQT01QR494Z16]
+  lang: de
+  kind: exact
+- id: q34
+  query: "Wie heisst Maras Katze?"
+  expected: [01K76WE4W00H8JJRK7017AG963]
+  lang: de
+  kind: exact
+- id: q35
+  query: "What is Mara's current PR description template preference?"
+  expected: [01K9M4BPW0DGQX1SB1XWDBNW59]
+  lang: en
+  kind: exact
+- id: q36
+  query: "Does Mara want me to flag code style nits aggressively on quick config tweaks?"
+  expected: [01K8WMFN002WZWMHPRECMPDP81]
+  lang: en
+  kind: paraphrase
+- id: q37
+  query: "I'm about to rename some variables while fixing a bug - should I just do it?"
+  expected: [01KAB32EM09ZS5VR619SHMMT1R]
+  lang: en
+  kind: paraphrase
+- id: q38
+  query: "Wo bekommt Mara samstags morgens ihren Kaffee?"
+  expected: [01K6Z1T48030M0FQ8HAKC41GTR]
+  lang: de
+  kind: paraphrase
+- id: q39
+  query: "Welches Haustier hat Mara und wie sieht es aus?"
+  expected: [01K76WE4W00H8JJRK7017AG963]
+  lang: de
+  kind: paraphrase
+- id: q40
+  query: "What should I avoid mentioning in Mara's commit messages?"
+  expected: [01K608FBW0Q1CJTPJ12EHAPMMP]
+  lang: en
+  kind: paraphrase
+- id: q41
+  query: "Welche Rolle hat Mara im Hamburger Segelverein?"
+  expected: [01K7EQ25G0XC6T9747GYTTSH0V]
+  lang: de
+  kind: paraphrase
+- id: q42
+  query: "How does the team currently feel about pairing on the hard backend pieces?"
+  expected: [01KE6SJT80EXF9SZ5PKMG5KJ1V]
+  lang: en
+  kind: paraphrase
+- id: q43
+  query: "Was fiel Elif beim Einstieg bei der Architektur-Doku negativ auf?"
+  expected: [01KEEM6TW0XBKX93B49CC5Z0VW]
+  lang: de
+  kind: paraphrase
+- id: q44
+  query: "Who should I loop in about frontend UI decisions on Kompass?"
+  expected: [01KC1C98W0862K1WGBW2QRPTB9]
+  lang: en
+  kind: paraphrase
+- id: q45
+  query: "What's the rollback plan if a deploy goes badly?"
+  expected: [01KC96X9G0A5T1ZNQQDEBCYN0X]
+  lang: en
+  kind: paraphrase
+- id: q46
+  query: "Woran arbeitet Mara gerade, um neue Kolleginnen und Kollegen technisch einzurichten?"
+  expected: [01KB9WD70025WY6EA4MDTA7YAE]
+  lang: de
+  kind: paraphrase
+- id: q47
+  query: "Why is the database upgrade happening?"
+  expected: [01KBHQ17M0QB33PW6XG3M30YZ1]
+  lang: en
+  kind: paraphrase
+- id: q48
+  query: "Was baut Mara, um ihre Ausgaben im Blick zu behalten?"
+  expected: [01K6Q763M0Y611BY2Z3PZP8AEN]
+  lang: de
+  kind: paraphrase
+- id: q49
+  query: "What's blocking a faster CI pipeline?"
+  expected: [01KDYYYSM0BT6ME0XQ2HT2CK3Y]
+  lang: en
+  kind: paraphrase
+- id: q50
+  query: "Wie schaltet Mara ihr Balkonlicht automatisch?"
+  expected: [01K6FCJ300AJDVETG72B24A2X2]
+  lang: de
+  kind: paraphrase

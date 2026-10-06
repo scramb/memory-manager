@@ -91,7 +91,7 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 ### WP-09 — Retrieval eval · Branch: `wp/09-retrieval-eval`
 
-- [ ] #31 Fictional example vault in `examples/vault/` + golden set (~50 queries)
+- [x] #31 Fictional example vault in `examples/vault/` + golden set (~50 queries)
 - [ ] #32 Eval runner reports recall@5 and MRR; CI fails on regression vs. baseline
 
 ---
