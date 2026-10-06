@@ -695,6 +695,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "mcp" },
     { name = "pyyaml" },
@@ -714,6 +715,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.31.0" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "pyyaml", specifier = ">=6.0" },

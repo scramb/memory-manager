@@ -64,13 +64,17 @@ also means the SDK's built-in `insufficient_scope` 403 branch never fires.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import cast
 
-from mcp.server.auth.settings import AuthSettings
+import asyncpg
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.datastructures import Headers, MutableHeaders
@@ -82,14 +86,24 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from memory_manager import __commit__, __version__
 from memory_manager.app import Services
+from memory_manager.auth import store
+from memory_manager.auth.login import (
+    Authenticator,
+    AuthorizationCompleter,
+    PendingAuthorization,
+    PendingAuthorizationLookup,
+    login_routes,
+)
 from memory_manager.auth.prm import (
     SCOPE_CHALLENGE,
     WELL_KNOWN_ROOT_PATH,
     path_suffixed_well_known_path,
     serve_protected_resource_metadata,
 )
+from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.auth.verifier import StaticTokenVerifier
-from memory_manager.config import ServerConfig
+from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
+from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 
 __all__ = ["ServicesFactory", "create_app"]
@@ -108,8 +122,27 @@ _GITEA_SIGNATURE_HEADER = "x-gitea-signature"
 
 ServicesFactory = Callable[[], AbstractAsyncContextManager[Services]]
 
+#: How often the embedded OAuth authorization server's stale state (expired
+#: pending authorizations/codes, long-expired tokens, abandoned DCR clients)
+#: is swept (`auth.store.cleanup`). Only runs at all while the server is (#36).
+_OAUTH_CLEANUP_INTERVAL_SECONDS = 60 * 60
 
-def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starlette:
+
+class _OAuthProviderCell:
+    """Holds the one `MemoryManagerOAuthProvider` `lifespan` builds, for the `/login`
+    route closures below - built before that provider exists, the same reason
+    `_McpMount` exists for `mcp_app` (see its own docstring): both are filled in by
+    `lifespan`, after the route table referencing them already has to exist."""
+
+    provider: MemoryManagerOAuthProvider | None = None
+
+
+def create_app(
+    services_factory: ServicesFactory,
+    config: ServerConfig,
+    *,
+    authenticator: Authenticator | None = None,
+) -> Starlette:
     """Build the Streamable HTTP ASGI app: MCP, health/ready, the vault webhook.
 
     `services_factory` is called exactly once, inside this app's `lifespan`
@@ -118,32 +151,50 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
     (`config.allowed_origins`) wraps every route below, including
     `/healthz`/`/readyz` - a browser sending a disallowed `Origin` gets the
     same 403 everywhere, not just on the MCP endpoint.
+
+    `authenticator` turns the embedded OAuth authorization server on (#36):
+    with one given (and a database configured), `/authorize` parks requests
+    that `auth.login`'s `/login` route hands to it, and `/token`/`/register`/
+    `/revoke`/AS metadata all come from the SDK's own `auth_server_provider`
+    wiring (`memory_manager.mcp.server.build_server`). Without one, this
+    server runs exactly as it did before #36: static bearer tokens only, no
+    OAuth routes at all, no `authenticator`-shaped login UI to maintain.
+    Nothing in this codebase constructs a real `Authenticator` yet (ADR-0004's
+    login methods are #37) - today this parameter only exists for
+    `tests/auth/test_oauth_flow.py`'s `FakeAuthenticator`. `config.login_mode`
+    (`LOGIN_MODE`) is the forward-looking production knob for #37: set without
+    an `authenticator` given here, it is a startup error (`ServerConfigError`),
+    not a silent no-op - a deployment that asked for OAuth login must not end
+    up quietly running static-tokens-only instead.
     """
+
+    oauth_cell = _OAuthProviderCell()
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
+            oauth_provider = _build_oauth_provider(config, services, authenticator)
+            oauth_cell.provider = oauth_provider
+
             token_verifier = (
-                StaticTokenVerifier(services.pool) if services.pool is not None else None
-            )
-            auth = (
-                AuthSettings(
-                    issuer_url=config.resource_url(),  # type: ignore[arg-type]
-                    resource_server_url=config.resource_url(),  # type: ignore[arg-type]
-                    # Static tokens carry no RFC 8707 resource indicator of their
-                    # own (#34 is bearer tokens only, no OAuth flow to bind one
-                    # with yet) - checking it would reject every one of them.
-                    validate_token_resource=False,
-                )
-                if token_verifier is not None
+                StaticTokenVerifier(services.pool)
+                if services.pool is not None and oauth_provider is None
                 else None
             )
+            auth = _build_auth_settings(
+                config, token_verifier=token_verifier, oauth_provider=oauth_provider
+            )
             # `MCPServer.streamable_http_app` forwards `self.settings.auth`/
-            # `self._token_verifier` (set here, at construction) to the
-            # lowlevel `Server.streamable_http_app` below - passing them to
-            # that call instead would be a no-op, since it reads only its
-            # own `self`'s copies.
-            mcp = build_server(services, auth=auth, token_verifier=token_verifier)
+            # `self._token_verifier`/`self._auth_server_provider` (set here, at
+            # construction) to the lowlevel `Server.streamable_http_app` below -
+            # passing them to that call instead would be a no-op, since it reads
+            # only its own `self`'s copies.
+            mcp = build_server(
+                services,
+                auth=auth,
+                token_verifier=token_verifier,
+                auth_server_provider=oauth_provider,
+            )
             mcp_app = mcp.streamable_http_app(
                 streamable_http_path=config.mcp_path,
                 json_response=config.json_response,
@@ -157,10 +208,23 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
             )
             app.state.services = services
             app.state.mcp_app = mcp_app
-            async with mcp_app.router.lifespan_context(mcp_app):
-                yield
+            app.state.oauth_authorization_server_enabled = oauth_provider is not None
 
-    routes = [
+            cleanup_task = (
+                asyncio.create_task(_oauth_cleanup_loop(services.pool))
+                if oauth_provider is not None and services.pool is not None
+                else None
+            )
+            try:
+                async with mcp_app.router.lifespan_context(mcp_app):
+                    yield
+            finally:
+                if cleanup_task is not None:
+                    cleanup_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await cleanup_task
+
+    routes: list[Route | Mount] = [
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
         Route(READY_PATH, endpoint=_readyz, methods=["GET"]),
         Route(WEBHOOK_PATH, endpoint=_vault_webhook, methods=["POST"]),
@@ -174,12 +238,29 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
             endpoint=serve_protected_resource_metadata,
             methods=["GET"],
         ),
+    ]
+    if authenticator is not None:
+        # `/login` only exists when an `Authenticator` is actually configured - see this
+        # function's docstring for why that is never true in production yet (#37).
+        routes.extend(
+            login_routes(
+                lookup=_pending_authorization_lookup(oauth_cell),
+                complete=_authorization_completer(oauth_cell),
+                authenticator=authenticator,
+            )
+        )
+    routes.append(
         # Mounted last (lowest route-matching precedence), same reasoning
         # `mcp/server/lowlevel/server.py` uses for its own custom routes:
         # the routes above must win their exact paths before this
-        # catch-all gets a chance to.
-        Mount("/", app=_McpMount()),
-    ]
+        # catch-all gets a chance to. `/authorize`/`/token`/`/register`/`/revoke`
+        # and the AS metadata document - when `oauth_cell.provider` ends up set -
+        # are reachable through here too: the SDK mounts them directly on
+        # `mcp_app`, the same Starlette app `_McpMount` forwards every other
+        # request to (confirmed by reading `mcp/server/lowlevel/server.py`'s
+        # `streamable_http_app`).
+        Mount("/", app=_McpMount())
+    )
     middleware = [
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
         # Wraps the whole app, including the `Mount` below, so it sees the
@@ -194,6 +275,123 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
     # above - set right away rather than deferred into `lifespan`.
     app.state.config = config
     return app
+
+
+def _build_oauth_provider(
+    config: ServerConfig, services: Services, authenticator: Authenticator | None
+) -> MemoryManagerOAuthProvider | None:
+    """The embedded OAuth authorization server for this `services`, or `None` to run
+    without one.
+
+    Raises `ServerConfigError` if `config.login_mode` is set but no `authenticator` was
+    given - see `create_app`'s docstring for why that is a startup error, not a silent
+    fallback to static tokens.
+    """
+    if services.pool is None or authenticator is None:
+        if services.pool is not None and config.login_mode is not None:
+            raise ServerConfigError(
+                f"LOGIN_MODE={config.login_mode!r} is set, but no login method is wired in "
+                "yet (#37); unset LOGIN_MODE to run this server with static tokens only"
+            )
+        return None
+
+    if config.oauth_client_secret_key is None:
+        raise ServerConfigError(
+            "OAUTH_CLIENT_SECRET_KEY is required once the OAuth authorization server is "
+            "enabled: a DCR client's client_secret is encrypted with it at rest "
+            "(auth.store.ClientSecretCipher) - generate one with "
+            'python -c "from cryptography.fernet import Fernet; '
+            'print(Fernet.generate_key().decode())"'
+        )
+
+    resource = config.resource_url()
+    issuer = canonical_resource_url(cast(str, config.public_url), "")
+    return MemoryManagerOAuthProvider(
+        services.pool,
+        resource=resource,
+        issuer=issuer,
+        client_secret_key=config.oauth_client_secret_key,
+    )
+
+
+def _build_auth_settings(
+    config: ServerConfig,
+    *,
+    token_verifier: StaticTokenVerifier | None,
+    oauth_provider: MemoryManagerOAuthProvider | None,
+) -> AuthSettings | None:
+    if oauth_provider is not None:
+        return AuthSettings(
+            issuer_url=oauth_provider.issuer,  # type: ignore[arg-type]
+            resource_server_url=oauth_provider.resource,  # type: ignore[arg-type]
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=[READ_SCOPE, WRITE_SCOPE],
+                default_scopes=[READ_SCOPE, WRITE_SCOPE],
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+            # `auth.verifier.verify_bearer_token` enforces the RFC 8707 audience itself
+            # (ADR-0004: audience ENFORCED) - this SDK flag would also reject every static
+            # token merged in alongside OAuth ones, which carries no `resource` at all.
+            validate_token_resource=False,
+        )
+    if token_verifier is not None:
+        return AuthSettings(
+            issuer_url=config.resource_url(),  # type: ignore[arg-type]
+            resource_server_url=config.resource_url(),  # type: ignore[arg-type]
+            # Static tokens carry no RFC 8707 resource indicator of their
+            # own (#34 is bearer tokens only, no OAuth flow to bind one
+            # with yet) - checking it would reject every one of them.
+            validate_token_resource=False,
+        )
+    return None
+
+
+def _pending_authorization_lookup(cell: _OAuthProviderCell) -> PendingAuthorizationLookup:
+    async def lookup(pending_id: str) -> PendingAuthorization | None:
+        provider = _require_provider(cell)
+        return await provider.pending_authorization(pending_id)
+
+    return lookup
+
+
+def _authorization_completer(cell: _OAuthProviderCell) -> AuthorizationCompleter:
+    async def complete(pending_id: str, subject: str, namespaces: Sequence[str]) -> str | None:
+        provider = _require_provider(cell)
+        return await provider.complete_authorization(pending_id, subject, list(namespaces))
+
+    return complete
+
+
+def _require_provider(cell: _OAuthProviderCell) -> MemoryManagerOAuthProvider:
+    """`cell.provider`, narrowed - `/login` routes only ever exist (`create_app`) once
+    `_build_oauth_provider` actually produced one, so `None` here would be this module's
+    own wiring bug, not a client-facing condition."""
+    if cell.provider is None:  # pragma: no cover - defensive
+        raise RuntimeError("the /login route was mounted without an OAuth provider configured")
+    return cell.provider
+
+
+async def _oauth_cleanup_loop(pool: asyncpg.Pool) -> None:
+    """Sweep `auth.store`'s stale OAuth state every `_OAUTH_CLEANUP_INTERVAL_SECONDS`.
+
+    Runs for the lifetime of the app (cancelled by `create_app`'s `lifespan` on shutdown);
+    a failed sweep is logged and retried next interval, never allowed to crash the server.
+    """
+    while True:
+        await asyncio.sleep(_OAUTH_CLEANUP_INTERVAL_SECONDS)
+        try:
+            stats = await store.cleanup(pool)
+        except Exception:
+            _logger.exception("oauth cleanup run failed")
+            continue
+        _logger.info(
+            "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d",
+            stats.pending,
+            stats.codes,
+            stats.tokens,
+            stats.clients,
+        )
 
 
 class _McpMount:

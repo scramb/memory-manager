@@ -25,8 +25,11 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import Response
 
 from memory_manager.app import open_services
+from memory_manager.auth.login import Authenticator, BoundCompleter, PendingAuthorization
 from memory_manager.auth.prm import (
     RESOURCE_NAME,
     SCOPE_CHALLENGE,
@@ -82,19 +85,41 @@ def _environ(bare_remote: Path, tmp_path: Path, database_url: str | None = None)
     return environ
 
 
+class _UnusedAuthenticator:
+    """An `Authenticator` that only exists to turn the OAuth authorization server on
+    (`create_app`'s `authenticator` parameter) - none of this module's tests drive an
+    actual `/login` round trip, so `handle` being called at all would be a test bug."""
+
+    async def handle(
+        self, request: Request, pending: PendingAuthorization, complete: BoundCompleter
+    ) -> Response:
+        raise AssertionError("not expected to be called by these PRM-focused tests")
+
+
 @asynccontextmanager
 async def _running_app(
-    environ: dict[str, str], config: ServerConfig
+    environ: dict[str, str],
+    config: ServerConfig,
+    *,
+    authenticator: Authenticator | None = None,
 ) -> AsyncIterator[tuple[Starlette, httpx.AsyncClient]]:
-    app = create_app(lambda: open_services(environ), config)
+    app = create_app(lambda: open_services(environ), config, authenticator=authenticator)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             yield app, client
 
 
+#: A Fernet key (`Fernet.generate_key()`), required by `ServerConfig.oauth_client_secret_key`
+#: whenever a test here enables the OAuth authorization server (`_UnusedAuthenticator`) -
+#: harmless to set for the AS-disabled tests too, since it is then simply never read.
+_CLIENT_SECRET_KEY = "r8rGp30uQA9cx9egMfZk4ez3xkfaFzL0tCst-kNzrcI="  # noqa: S105 - a Fernet test key, not a credential protecting anything real
+
+
 def _authenticated_config() -> ServerConfig:
-    return ServerConfig(public_url=_PUBLIC_URL, mcp_path=_MCP_PATH)
+    return ServerConfig(
+        public_url=_PUBLIC_URL, mcp_path=_MCP_PATH, oauth_client_secret_key=_CLIENT_SECRET_KEY
+    )
 
 
 async def test_prm_startup_fails_without_public_url_when_database_url_is_set(
@@ -114,7 +139,8 @@ async def test_prm_is_identical_at_both_well_known_urls(
     bare_remote: Path, tmp_path: Path, test_database_url: str, well_known_path: str
 ) -> None:
     config = _authenticated_config()
-    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as (
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=_UnusedAuthenticator()) as (
         _app,
         client,
     ):
@@ -134,7 +160,8 @@ async def test_prm_both_urls_serve_byte_identical_json(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
     config = _authenticated_config()
-    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as (
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=_UnusedAuthenticator()) as (
         _app,
         client,
     ):
@@ -148,7 +175,8 @@ async def test_prm_requires_no_token(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
     config = _authenticated_config()
-    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as (
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=_UnusedAuthenticator()) as (
         _app,
         client,
     ):
@@ -169,6 +197,24 @@ async def test_prm_is_not_found_when_auth_is_disabled(bare_remote: Path, tmp_pat
     assert suffixed_response.status_code == 404
 
 
+async def test_prm_is_not_found_when_the_oauth_authorization_server_is_disabled(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    """#36: a database (so static tokens work) but no `authenticator` configured means
+    no OAuth authorization server either - `authorization_servers` is RFC 9728's one
+    *required* field, and this server has no honest value to put there without a
+    running AS behind it (no `/authorize`/`/token` at that issuer), so the whole
+    document is omitted rather than advertising one that would 404 if ever fetched."""
+    config = _authenticated_config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config) as (_app, client):
+        root_response = await client.get(WELL_KNOWN_ROOT_PATH)
+        suffixed_response = await client.get(_EXPECTED_PATH_SUFFIXED_URL)
+
+    assert root_response.status_code == 404
+    assert suffixed_response.status_code == 404
+
+
 # --- The 401 challenge on /mcp -----------------------------------------------
 
 
@@ -176,7 +222,8 @@ async def test_mcp_without_a_token_challenges_with_resource_metadata_and_scope(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
     config = _authenticated_config()
-    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as (
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=_UnusedAuthenticator()) as (
         _app,
         client,
     ):

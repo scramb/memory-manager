@@ -139,6 +139,17 @@ async def serve_protected_resource_metadata(request: Request) -> Response:
     get one would be misleading - the same reasoning `http.py`'s vault
     webhook already uses for its own 404-when-unconfigured case.
 
+    404 too when a database *is* configured but the embedded OAuth
+    authorization server is not (`app.state.oauth_authorization_server_enabled`,
+    #36 - `http.py` sets it once at startup): `authorization_servers` is a
+    RFC 9728 **required**, minimum-one-entry field, and this server has no
+    honest value to put there without a running AS - a static-token-only
+    deployment (today, every deployment: #37's login methods are not wired
+    up yet) must not advertise one that does not actually answer
+    `/authorize`/`/token`. The 401 on `/mcp` itself still carries a `scope`
+    challenge either way (`http.py`'s `_ScopeChallengeMiddleware`); it just
+    never carries `resource_metadata` pointing here.
+
     No `Authorization` required to reach this (RFC 9728 §3.1 metadata is
     public by design); `Access-Control-Allow-Origin: *` is set so a
     browser-based client (e.g. the MCP Inspector) can read it cross-origin
@@ -146,7 +157,7 @@ async def serve_protected_resource_metadata(request: Request) -> Response:
     it.
     """
     services: Services = request.app.state.services
-    if services.pool is None:
+    if services.pool is None or not request.app.state.oauth_authorization_server_enabled:
         return PlainTextResponse("not found", status_code=404)
 
     config: ServerConfig = request.app.state.config

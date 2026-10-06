@@ -33,9 +33,9 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
-from mcp.server.auth.provider import TokenVerifier
+from mcp.server.auth.provider import OAuthAuthorizationServerProvider, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -171,16 +171,23 @@ class MemoryArchiveResult(TypedDict):
 def current_client() -> str:
     """The client identity a write through this process commits as.
 
-    An HTTP request carrying a static token always commits as
-    `"claude-code"`, regardless of the token's own name or `MEMORY_CLIENT` -
-    static tokens authenticate human-driven clients (Claude Code, CI), not a
-    separate committer identity (#34). Stdio mode has no token at all, so it
-    commits as `MEMORY_CLIENT` (default `"claude-code"`) - one of
-    `vault.repo.author_for`'s known clients.
+    An OAuth access token (#36) carries its own committer identity in
+    `claims["client_label"]` - `"claude-ai"` when the token's client
+    registered a claude.ai/claude.com redirect URI, `"claude-code"`
+    otherwise (`auth.provider`'s `_client_label_for`, set once at issuance,
+    not re-derived here). A static token (#34) carries no such claim and
+    always commits as `"claude-code"`, regardless of the token's own name or
+    `MEMORY_CLIENT` - static tokens authenticate human-driven clients
+    (Claude Code, CI), not a separate committer identity. Stdio mode has no
+    token at all, so it commits as `MEMORY_CLIENT` (default `"claude-code"`)
+    - one of `vault.repo.author_for`'s known clients.
     """
-    if current_access_token() is not None:
-        return _DEFAULT_CLIENT
-    return os.environ.get(_CLIENT_ENV_VAR, _DEFAULT_CLIENT)
+    token = current_access_token()
+    if token is None:
+        return os.environ.get(_CLIENT_ENV_VAR, _DEFAULT_CLIENT)
+    if token.claims is not None and "client_label" in token.claims:
+        return str(token.claims["client_label"])
+    return _DEFAULT_CLIENT
 
 
 # Each tool's description is built from `TOOL_DATA_SENTENCE` rather than repeating the
@@ -312,21 +319,31 @@ def build_server(
     *,
     auth: AuthSettings | None = None,
     token_verifier: TokenVerifier | None = None,
+    auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
 ) -> MCPServer:
     """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
 
-    `auth`/`token_verifier` are `None` for stdio (no bearer auth at all) and
-    for an HTTP server with no `DATABASE_URL` configured (#33's
-    loopback-only mode); `http.py` builds both from
-    `memory_manager.auth.verifier.StaticTokenVerifier` whenever a database is
-    configured (#34). Passed straight to `MCPServer`, which is what actually
-    wires the SDK's bearer-auth middleware into `streamable_http_app()` -
-    nothing in this module reads either one directly; every tool below gets
-    the per-request token through `mcp/authz.py`'s `get_access_token()`
-    instead.
+    `auth` plus exactly one of `token_verifier`/`auth_server_provider` - or
+    neither - are `None` for stdio (no bearer auth at all) and for an HTTP
+    server with no `DATABASE_URL` configured (#33's loopback-only mode);
+    `http.py` passes a `memory_manager.auth.verifier.StaticTokenVerifier`
+    whenever a database is configured but no OAuth authorization server is
+    (#34), or a `memory_manager.auth.provider.MemoryManagerOAuthProvider`
+    once one is (#36 - `MCPServer` itself then derives the bearer-token
+    verifier from the provider, merging OAuth and static tokens; see that
+    provider's module docstring). Passed straight to `MCPServer`, which is
+    what actually wires the SDK's bearer-auth middleware (and, for a
+    provider, the `/authorize`/`/token`/... routes) into
+    `streamable_http_app()` - nothing in this module reads any of the three
+    directly; every tool below gets the per-request token through
+    `mcp/authz.py`'s `get_access_token()` instead.
     """
     mcp = MCPServer(
-        name="memory-manager", instructions=INSTRUCTIONS, auth=auth, token_verifier=token_verifier
+        name="memory-manager",
+        instructions=INSTRUCTIONS,
+        auth=auth,
+        token_verifier=token_verifier,
+        auth_server_provider=auth_server_provider,
     )
 
     @mcp.prompt(name="memory_guide")

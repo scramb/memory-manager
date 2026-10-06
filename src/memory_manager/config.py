@@ -172,6 +172,26 @@ class ServerConfig:
     header is checked against - `ALLOWED_ORIGINS` plus `public_url`'s own
     origin, never just the raw `ALLOWED_ORIGINS` env value - so `http.py`
     never has to re-derive it.
+
+    `login_mode` (`LOGIN_MODE`) names which `auth.login.Authenticator` the
+    embedded OAuth authorization server should log a human in with
+    (ADR-0004's L1/L2 - a single admin password or upstream OIDC). Neither
+    is implemented yet (#37): `http.py` only ever enables the authorization
+    server when it is handed an `Authenticator` directly (currently true
+    only in tests, via `create_app`'s `authenticator` parameter), and raises
+    `ServerConfigError` on startup if `login_mode` is set without one - a
+    clear refusal rather than silently running with no OAuth login at all.
+    `login_mode` unset is not an error: it means "no OAuth authorization
+    server", the same static-tokens-only behaviour this server already had
+    before #36.
+
+    `oauth_client_secret_key` (`OAUTH_CLIENT_SECRET_KEY`) is the Fernet key
+    `auth.store.ClientSecretCipher` encrypts a DCR client's `client_secret`
+    with at rest (see that module's docstring for why it is encrypted, not
+    hashed, unlike every other OAuth secret). Required only once the OAuth
+    authorization server actually turns on (`http.py`, same condition as
+    `public_url` above) - `http.py` raises `ServerConfigError` naming it if
+    it is missing then, never falls back to running without it.
     """
 
     host: str = _DEFAULT_HOST
@@ -181,6 +201,8 @@ class ServerConfig:
     allowed_origins: tuple[str, ...] = ()
     webhook_secret: str | None = field(default=None, repr=False)
     json_response: bool = True
+    login_mode: str | None = None
+    oauth_client_secret_key: str | None = field(default=None, repr=False)
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -223,6 +245,8 @@ class ServerConfig:
         allowed_origins = _resolve_allowed_origins(environ.get("ALLOWED_ORIGINS"), public_url)
         webhook_secret = environ.get("VAULT_WEBHOOK_SECRET") or None
         json_response = _parse_bool(environ.get("MCP_JSON_RESPONSE"), default=True)
+        login_mode = environ.get("LOGIN_MODE") or None
+        oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
 
         return cls(
             host=host,
@@ -232,6 +256,8 @@ class ServerConfig:
             allowed_origins=allowed_origins,
             webhook_secret=webhook_secret,
             json_response=json_response,
+            login_mode=login_mode,
+            oauth_client_secret_key=oauth_client_secret_key,
         )
 
 
