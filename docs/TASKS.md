@@ -35,7 +35,7 @@ Goal: notes can be read, written and validated; every change is a Git commit; co
 
 - [x] #6 ADR-0005 freezes the note format
 - [x] #7 Note parser/serializer round-trips frontmatter + body byte-stable (`make test PKG=note`)
-- [ ] #8 Note validation rejects missing/long `description`, unknown `type`, size > limit, invalid ULID
+- [x] #8 Note validation rejects missing/long `description`, unknown `type`, size > limit, invalid ULID
 - [ ] #9 Path safety: allowlist `<namespace>/<type>/<slug>.md`, rejects traversal, symlinks, non-`.md`
 - [ ] #10 `[[slug]]` link extraction returns resolved and dangling links
 
