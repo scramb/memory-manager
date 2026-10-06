@@ -113,7 +113,7 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O3 | Git access | — decided: git CLI (ADR-0003) | — | owner ✔ 2026-10-06 |
 | O4 | Auth model incl. login | — decided: embedded AS, OIDC or admin-password login (ADR-0004) | — | owner ✔ 2026-10-06 |
 | O5 | Freeze note format (frontmatter fields, path scheme, size cap) as ADR-0005 | as in brief · adjusted | #6 → WP-02 | owner, start of M1 |
-| O6 | Final project / CLI name | keep `memory-manager` · new name | #5 (README), package name in #4 | owner |
+| O6 | Final project / CLI name | — decided: keep `memory-manager` (package `memory_manager`, CLI `memory-manager`) | — | owner ✔ 2026-10-06 |
 | O7 | Track tasks as GitHub issues | — decided: yes, issues are the source of truth | — | owner ✔ 2026-10-06 |
 | O8 | Deployment artefacts | — decided: own generic deployment as in bring--mcp, public-safe (see Technology decisions) | — | owner ✔ 2026-10-06 |
 
