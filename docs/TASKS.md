@@ -37,7 +37,7 @@ Goal: notes can be read, written and validated; every change is a Git commit; co
 - [x] #7 Note parser/serializer round-trips frontmatter + body byte-stable (`make test PKG=note`)
 - [x] #8 Note validation rejects missing/long `description`, unknown `type`, size > limit, invalid ULID
 - [x] #9 Path safety: allowlist `<namespace>/<type>/<slug>.md`, rejects traversal, symlinks, non-`.md`
-- [ ] #10 `[[slug]]` link extraction returns resolved and dangling links
+- [x] #10 `[[slug]]` link extraction returns resolved and dangling links
 
 ### WP-03 — Git vault · Branch: `wp/03-git-vault`
 
