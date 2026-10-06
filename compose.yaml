@@ -23,6 +23,26 @@
 # Quickstart: see README.md.
 
 services:
+  # One-shot, root, fixes up ownership of the two named volumes `vault-init`/
+  # `memory-manager` write to as uid 10001 before either of them starts.
+  # Needed for Docker: a *fresh* named volume's mount point is created
+  # root:root 0755 (Docker only copies the image's own ownership into it
+  # when the mount target pre-exists as a directory *in the image* - true
+  # for neither volume here), which a non-root process cannot write into at
+  # all. Podman's rootless mode happens to auto-chown a fresh volume to
+  # match a container's non-root user on mount, which is exactly why this
+  # was invisible when this compose file was only ever run through podman
+  # locally - confirmed by reproducing both the root:root default and the
+  # podman-only auto-chown directly against a throwaway volume, not assumed.
+  volume-perms:
+    image: docker.io/library/busybox:1.37
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/perms/vault-clone", "/perms/vault-remote"]
+    volumes:
+      - vault-clone:/perms/vault-clone
+      - vault-remote:/perms/vault-remote
+    restart: "no"
+
   postgres:
     image: docker.io/pgvector/pgvector:pg16
     environment:
@@ -58,6 +78,9 @@ services:
     volumes:
       - vault-remote:/data/remote.git
       - ./scripts/compose-init.sh:/compose-init.sh:ro
+    depends_on:
+      volume-perms:
+        condition: service_completed_successfully
     restart: "no"
 
   memory-manager:
@@ -95,6 +118,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      volume-perms:
+        condition: service_completed_successfully
       vault-init:
         condition: service_completed_successfully
     # No container-level healthcheck: /healthz and /readyz are liveness/

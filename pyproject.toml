@@ -59,6 +59,17 @@ files = ["src", "tests"]
 explicit_package_bases = true
 mypy_path = ["src", "tests"]
 
+# `opentelemetry-sdk`/`opentelemetry-exporter-otlp` are the optional `otel`
+# extra (observability/tracing.py, #43) - not installed by `uv sync` without
+# `--extra otel`, which is how `make check`/CI run it (CLAUDE.md: few
+# dependencies, every external service optional). Without this, mypy fails
+# the whole run with "Cannot find implementation or library stub" instead of
+# just treating those imports (inside a guarded `try/except ImportError`,
+# never required) as untyped.
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

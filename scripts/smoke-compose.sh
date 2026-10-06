@@ -17,6 +17,11 @@
 # a one-off container under a fresh name instead, sidestepping that
 # limitation entirely while still exercising the same idempotent-seed code
 # path `up` ran the first time.
+#
+# Any failure before teardown dumps `vault-init`'s and `memory-manager`'s
+# own container logs to stderr (`dump_logs`) - CI only ever shows this
+# script's own stdout/stderr otherwise, never what the failing container
+# itself printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -48,8 +53,17 @@ trap down EXIT
 
 down # a stale stack from a previous, interrupted run must not linger
 
+dump_logs() {
+  echo "--- compose logs: vault-init, memory-manager ---" >&2
+  "${COMPOSE[@]}" logs vault-init memory-manager >&2 || true
+}
+
 start=$(date +%s)
-"${COMPOSE[@]}" up -d --build
+if ! "${COMPOSE[@]}" up -d --build; then
+  echo "FAIL: compose up did not bring the stack up" >&2
+  dump_logs
+  exit 1
+fi
 
 status=""
 elapsed=0
@@ -65,7 +79,7 @@ done
 
 if [[ "$status" != "200" ]]; then
   echo "FAIL: GET /readyz did not return 200 within ${TIMEOUT_SECONDS}s (got ${status:-<none>}, elapsed ${elapsed}s)" >&2
-  "${COMPOSE[@]}" logs >&2 || true
+  dump_logs
   exit 1
 fi
 
@@ -102,12 +116,17 @@ fi
 echo "OK: /mcp initialize + tools/list answered with a valid token"
 
 vault_remote_sha() {
-  "${COMPOSE[@]}" run --rm --entrypoint git vault-init \
+  # --no-deps: `volume-perms` (a one-shot dependency, just like vault-init
+  # itself) already ran during `up` above - without this, podman-compose
+  # tries to start it again for this `run` and errors with "container name
+  # already in use" (the same class of bug `up -d --build` run twice hits,
+  # see the module docstring) instead of just reusing the already-exited one.
+  "${COMPOSE[@]}" run --rm --no-deps --entrypoint git vault-init \
     --git-dir=/data/remote.git rev-parse refs/heads/main
 }
 
 before_sha=$(vault_remote_sha)
-"${COMPOSE[@]}" run --rm vault-init
+"${COMPOSE[@]}" run --rm --no-deps vault-init
 after_sha=$(vault_remote_sha)
 
 if [[ "$before_sha" != "$after_sha" ]]; then
