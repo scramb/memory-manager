@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Tests that the Claude Code skill and `CLAUDE.md` snippet stay in sync with the server's own
+`instructions` (#22).
+
+Both `integrations/claude-code/skills/memory/SKILL.md` and
+`integrations/claude-code/CLAUDE.snippet.md` embed `memory_manager.mcp.instructions.INSTRUCTIONS`
+verbatim between `<!-- BEGIN memory-manager instructions -->` / `<!-- END memory-manager
+instructions -->` markers, so the usage rules a Claude Code user sees can never drift from what
+the MCP server itself sends on connect (`tests/mcp/test_instructions.py` covers the constant
+itself). These tests extract that block from each file and compare it to the constant rather
+than re-deriving the rules a second time.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from memory_manager.mcp.instructions import INSTRUCTIONS
+
+_ROOT = Path(__file__).resolve().parent.parent
+_INTEGRATION_DIR = _ROOT / "integrations" / "claude-code"
+_SKILL_PATH = _INTEGRATION_DIR / "skills" / "memory" / "SKILL.md"
+_SNIPPET_PATH = _INTEGRATION_DIR / "CLAUDE.snippet.md"
+
+_BEGIN_MARKER = "<!-- BEGIN memory-manager instructions -->"
+_END_MARKER = "<!-- END memory-manager instructions -->"
+
+_FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+_MAX_SNIPPET_LINES = 25
+_MIN_DESCRIPTION_LENGTH = 40
+
+
+def _embedded_instructions(text: str) -> str:
+    """The text between the BEGIN/END markers, exactly as `INSTRUCTIONS` was written there."""
+    start = text.index(_BEGIN_MARKER) + len(_BEGIN_MARKER) + 1  # past the marker's own newline
+    end = text.index(_END_MARKER) - 1  # before the newline preceding the end marker
+    return text[start:end]
+
+
+def test_skill_md_embeds_instructions_verbatim() -> None:
+    text = _SKILL_PATH.read_text(encoding="utf-8")
+    assert _embedded_instructions(text) == INSTRUCTIONS
+
+
+def test_claude_snippet_embeds_instructions_verbatim() -> None:
+    text = _SNIPPET_PATH.read_text(encoding="utf-8")
+    assert _embedded_instructions(text) == INSTRUCTIONS
+
+
+def test_skill_md_frontmatter_names_the_skill_and_says_when_to_use_it() -> None:
+    text = _SKILL_PATH.read_text(encoding="utf-8")
+    match = _FRONTMATTER.match(text)
+    assert match is not None, "SKILL.md must start with a --- frontmatter block"
+    frontmatter = match.group(1)
+
+    assert "name: memory" in frontmatter
+
+    description_match = re.search(r"^description:\s*(.+)$", frontmatter, re.MULTILINE)
+    assert description_match is not None, "SKILL.md frontmatter must carry a description"
+    description = description_match.group(1)
+    assert len(description) > _MIN_DESCRIPTION_LENGTH
+    # The description is what Claude Code uses to decide when to invoke the skill; it must
+    # name the trigger (sharing a durable fact) rather than just the tool it wraps.
+    assert "fact" in description or "remember" in description
+
+
+def test_claude_snippet_stays_short_enough_to_paste_into_a_project_claude_md() -> None:
+    text = _SNIPPET_PATH.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert len(lines) <= _MAX_SNIPPET_LINES, (
+        f"CLAUDE.snippet.md has {len(lines)} lines, want <= {_MAX_SNIPPET_LINES}"
+    )
