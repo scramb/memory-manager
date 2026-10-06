@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Tests for the write queue: serialization and `if_version` conflicts (#14)."""
+"""Tests for the write queue: serialization and `if_version` conflicts (#14, #33)."""
 
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from memory_manager.queue import (
 )
 from memory_manager.vault.note import Note, parse, serialize, version
 from memory_manager.vault.repo import Repo
+from memory_manager.vault.sync import ChangeSet
 from memory_manager.vault.ulid import new_ulid
 
 _CREATED = datetime(2026, 1, 1, tzinfo=UTC)
@@ -601,3 +603,162 @@ class TestHooks:
             )
         )
         assert isinstance(result, WriteResult)
+
+
+class TestSync:
+    """`WriteQueue.sync()` and `add_sync_hook` (#33): every working-copy sync - a
+    standalone `sync()` job or the pre-write sync inside `submit()` - goes through
+    the one consumer, and hands a non-empty result to every sync hook exactly once.
+    """
+
+    async def test_sync_returns_the_change_set_and_notifies_the_hook(
+        self, queue: WriteQueue, bare_remote: Path
+    ) -> None:
+        human_commit(bare_remote, "personal/fact/a.md", b"first\n")
+
+        received: list[ChangeSet] = []
+
+        async def sync_hook(change_set: ChangeSet) -> None:
+            received.append(change_set)
+
+        queue.add_sync_hook(sync_hook)
+
+        change_set = await queue.sync()
+
+        assert change_set.added == ("personal/fact/a.md",)
+        assert received == [change_set]
+
+    async def test_an_empty_sync_does_not_call_the_hook(self, queue: WriteQueue) -> None:
+        received: list[ChangeSet] = []
+
+        async def sync_hook(change_set: ChangeSet) -> None:
+            received.append(change_set)
+
+        queue.add_sync_hook(sync_hook)
+
+        change_set = await queue.sync()
+
+        assert change_set.empty
+        assert received == []
+
+    async def test_a_human_commit_ahead_of_a_write_reaches_the_sync_hook_too(
+        self, queue: WriteQueue, bare_remote: Path
+    ) -> None:
+        """The bug this guards against (#33): a write's own pre-write sync fast-forwards
+        whatever a human pushed in the meantime, even on a path the write never touches -
+        that change set used to go nowhere. The sync hook must see it, not just the
+        write's own commit hook (`add_hook`, which only ever hears about this write's
+        own `changed_paths`).
+        """
+        human_commit(bare_remote, "personal/fact/human.md", b"from a human\n")
+
+        received: list[ChangeSet] = []
+
+        async def sync_hook(change_set: ChangeSet) -> None:
+            received.append(change_set)
+
+        queue.add_sync_hook(sync_hook)
+
+        await queue.submit(
+            WriteRequest(
+                op="write",
+                path="personal/fact/a.md",
+                client="human",
+                if_version="new",
+                content=_note_bytes(),
+            )
+        )
+
+        assert len(received) == 1
+        assert received[0].added == ("personal/fact/human.md",)
+
+    async def test_concurrent_sync_calls_coalesce(self, queue: WriteQueue) -> None:
+        """Calling `sync()` several times at once while the first is still queued
+        (not yet picked up by the consumer) must result in exactly one real
+        `repo.sync()` - everyone else shares its result rather than each enqueuing a
+        redundant sync.
+        """
+        calls = {"count": 0}
+        original_sync = queue._repo.sync
+
+        def counting_sync() -> ChangeSet:
+            calls["count"] += 1
+            return original_sync()
+
+        queue._repo.sync = counting_sync  # type: ignore[method-assign]
+
+        first, second, third = await asyncio.gather(queue.sync(), queue.sync(), queue.sync())
+
+        assert calls["count"] == 1
+        assert first is second is third
+
+    async def test_concurrent_sync_during_a_slow_write_is_serialized(
+        self, vault_config: VaultConfig, bare_remote: Path
+    ) -> None:
+        """A `sync()` call concurrent with an in-flight write must wait for that
+        write's own commit/push to finish before it runs its own `repo.sync()` -
+        before the fix, the two could run concurrently on the same working copy,
+        reproducibly hitting a `merge --ff-only` TOCTOU git error.
+        """
+        repo = Repo(vault_config)
+        write_queue = WriteQueue(repo)
+        await write_queue.start()
+        try:
+            commit_started = threading.Event()
+            release_commit = threading.Event()
+            order: list[str] = []
+            original_commit_file = repo.commit_file
+
+            def slow_commit_file(*args: object, **kwargs: object) -> str:
+                order.append("write:commit_start")
+                commit_started.set()
+                if not release_commit.wait(timeout=5):
+                    raise AssertionError("release_commit was never set")
+                order.append("write:commit_end")
+                return original_commit_file(*args, **kwargs)  # type: ignore[arg-type]
+
+            repo.commit_file = slow_commit_file  # type: ignore[method-assign]
+
+            async def do_write() -> None:
+                await write_queue.submit(
+                    WriteRequest(
+                        op="write",
+                        path="personal/fact/a.md",
+                        client="human",
+                        if_version="new",
+                        content=_note_bytes(),
+                    )
+                )
+                order.append("write:done")
+
+            async def do_sync() -> None:
+                order.append("sync:call")
+                await write_queue.sync()
+                order.append("sync:done")
+
+            write_task = asyncio.create_task(do_write())
+            while not commit_started.is_set():
+                await asyncio.sleep(0.01)
+
+            sync_task = asyncio.create_task(do_sync())
+            # Give `sync()` a chance to actually enqueue its job (the `await
+            # self._queue.put(...)` inside it) before the write's commit is
+            # released - otherwise this would not prove the sync job was still
+            # queued behind the in-flight write when the write finished.
+            await asyncio.sleep(0.05)
+            release_commit.set()
+
+            await asyncio.wait_for(asyncio.gather(write_task, sync_task), timeout=5)
+
+            assert order.index("write:commit_start") < order.index("sync:call")
+            assert order.index("write:commit_end") < order.index("sync:done")
+            assert order.index("write:done") < order.index("sync:done")
+
+            # Neither task raised (no GitError/SyncDiverged from a racing
+            # `merge --ff-only`), and the clone is left clean: a fresh sync
+            # afterwards is a true no-op, not a sign of a divergence nobody
+            # reported.
+            final = await write_queue.sync()
+            assert final.empty
+        finally:
+            await write_queue.stop()

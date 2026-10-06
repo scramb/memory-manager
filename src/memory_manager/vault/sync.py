@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The change set produced by a sync, and a loop that polls for them (#12).
+"""The change set produced by a sync, and a loop that triggers one on a timer (#12, #33).
 
 `ChangeSet` is what `Repo.sync()` returns: the note paths that changed
 between the previous and the new local `HEAD`, classified as added,
 modified or deleted, plus everything that changed but is not a note
 (`ignored`) so a stray non-note file in the vault never breaks a caller.
 
-`poll_loop` is the scheduler around `Repo.sync()`: it runs on a timer,
-hands non-empty change sets to `on_change`, and keeps going even if a
-single sync fails (`GitError`) so a transient remote problem does not kill
-the process. Pulling human changes is in scope here; what happens with a
-change set (indexing, #26) is the caller's problem via `on_change`.
+`poll_loop` only decides *when* to sync, not what runs the sync or what
+happens with its result: it calls the `sync` callable it is given on a
+timer and keeps going even if a single call raises `GitError` (e.g. a
+transient network failure), so a transient remote problem does not kill
+the process. `sync` is `memory_manager.queue.WriteQueue.sync` in
+production (#33) - the write queue's consumer is the one place every
+working-copy operation runs, and its sync hooks are what deliver a
+non-empty `ChangeSet` to a subscriber (the indexer) before `sync()` even
+returns, so this loop needs no `on_change` callback of its own to pass
+such a result anywhere.
 """
 
 from __future__ import annotations
@@ -21,12 +26,8 @@ import logging
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from memory_manager.vault.git import GitError
-
-if TYPE_CHECKING:
-    from memory_manager.vault.repo import Repo
 
 __all__ = ["ChangeSet", "poll_loop"]
 
@@ -61,15 +62,17 @@ class ChangeSet:
 
 
 async def poll_loop(
-    repo: Repo,
+    sync: Callable[[], Awaitable[ChangeSet]],
     interval_seconds: float,
-    on_change: Callable[[ChangeSet], Awaitable[None]],
     *,
     jitter: float = 0.1,
     stop: asyncio.Event,
 ) -> None:
-    """Call `repo.sync()` on a timer and hand non-empty results to `on_change`.
+    """Call `sync()` on a timer until `stop` is set.
 
+    `sync()`'s own caller-side effects (if any - `WriteQueue.sync()`'s
+    sync hooks in production) have already run by the time it returns;
+    this loop only triggers the call and otherwise ignores the result.
     Runs until `stop` is set, which it checks promptly: the wait between
     iterations is interruptible, not a plain `sleep`. A `GitError` from
     `sync()` (e.g. a transient network failure) is logged and the loop
@@ -77,12 +80,9 @@ async def poll_loop(
     """
     while not stop.is_set():
         try:
-            change_set = await asyncio.to_thread(repo.sync)
+            await sync()
         except GitError:
             _logger.exception("vault sync failed, retrying after the next interval")
-        else:
-            if not change_set.empty:
-                await on_change(change_set)
 
         if stop.is_set():
             return

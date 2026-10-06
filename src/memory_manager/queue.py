@@ -29,6 +29,18 @@ getting rejected even after a clean, unrelated rebase (the remote keeps
 moving) gives up after 3 attempts as `WriteFailed`. Audit log persistence
 lives in Postgres from M3; `add_hook()` is the seam an indexer/audit log
 subscribes through until then.
+
+`sync()` (#33) is the other way a caller reaches the working copy: a
+sync-only job, queued through the same consumer as every write, so the
+poll loop's timer tick, the vault webhook's on-demand sync, and the
+pre-write sync inside every `submit()` never run `repo.sync()`/commit/
+push/rebase/reset concurrently on the same clone - the single-writer rule
+`docs/PLAN.md` describes covers every working-copy operation, not just
+writes. `add_sync_hook()` is called with every non-empty `ChangeSet` the
+consumer produces this way, including the pre-write sync inside
+`submit()` - a human's change reaches a subscriber (the indexer) the
+first time any of those three paths happens to pick it up, not only when
+the poll loop's own timer does.
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ from memory_manager.vault.note import NoteFormatError, parse, serialize, version
 from memory_manager.vault.paths import PathRejected, conflict_path, parse_note_path
 from memory_manager.vault.repo import Repo, author_for
 from memory_manager.vault.secrets import SecretFound, check
+from memory_manager.vault.sync import ChangeSet
 from memory_manager.vault.validate import NoteInvalid, validate, validate_bytes
 
 __all__ = [
@@ -55,6 +68,7 @@ __all__ = [
     "NotFound",
     "Op",
     "SecretRejected",
+    "SyncHook",
     "VersionConflict",
     "WriteConflict",
     "WriteError",
@@ -258,29 +272,47 @@ class WriteFailed(WriteError):
 
 
 WriteHook = Callable[["WriteResult", "WriteRequest", tuple[str, ...]], Awaitable[None]]
+SyncHook = Callable[[ChangeSet], Awaitable[None]]
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+@dataclass(frozen=True)
+class _SyncJob:
+    """A queued sync-only job: no write, just `repo.sync()` plus the sync hooks (#33).
+
+    Shares the consumer's single `asyncio.Queue` with every `(WriteRequest,
+    Future)` write job (`WriteQueue._queue`'s other item shape) - the thing
+    that makes `sync()` and `submit()` never race each other onto the same
+    working copy.
+    """
+
+    future: asyncio.Future[ChangeSet]
+
+
+_QueueItem = tuple[WriteRequest, asyncio.Future[WriteResult]] | _SyncJob
+
+
 class WriteQueue:
-    """Serializes every vault write through one background consumer.
+    """Serializes every vault write - and every sync - through one background consumer.
 
     `start()` clones the vault (if needed) and starts the consumer task;
-    `submit()` is the only way in - it is safe to call from any number of
-    concurrent callers, who all get served one at a time, in submission
-    order.
+    `submit()` and `sync()` are the only two ways in - both are safe to call
+    from any number of concurrent callers, who all get served one at a
+    time, in submission order, on the same consumer task. No `repo`
+    operation (`sync`/commit/push/rebase/reset) ever runs anywhere else.
     """
 
     def __init__(self, repo: Repo, *, clock: Callable[[], datetime] = _utc_now) -> None:
         self._repo = repo
         self._clock = clock
-        self._queue: asyncio.Queue[tuple[WriteRequest, asyncio.Future[WriteResult]]] = (
-            asyncio.Queue()
-        )
+        self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
         self._consumer_task: asyncio.Task[None] | None = None
         self._hooks: list[WriteHook] = []
+        self._sync_hooks: list[SyncHook] = []
+        self._pending_sync: asyncio.Future[ChangeSet] | None = None
 
     def add_hook(self, hook: WriteHook) -> None:
         """Register `hook` to be awaited after every successful write.
@@ -289,6 +321,19 @@ class WriteQueue:
         the write it was notified about.
         """
         self._hooks.append(hook)
+
+    def add_sync_hook(self, hook: SyncHook) -> None:
+        """Register `hook` to be awaited after every sync that found a change (#33).
+
+        Covers every sync the consumer ever runs: a standalone `sync()`
+        job (the poll loop, the vault webhook's `trigger_sync()`) and the
+        pre-write sync inside every `submit()` alike - a human's change
+        reaches `hook` exactly once, through whichever of those happens to
+        pick it up first, never zero times and never twice. Same
+        failure contract as `add_hook`: a raising hook is logged, not
+        propagated.
+        """
+        self._sync_hooks.append(hook)
 
     async def start(self) -> None:
         """Make sure the vault is cloned and start the consumer task."""
@@ -315,21 +360,88 @@ class WriteQueue:
         await self._queue.put((request, future))
         return await future
 
+    async def sync(self) -> ChangeSet:
+        """Queue a sync-only job and wait for the consumer to run it (#33).
+
+        Goes through the same consumer every write does, so this never
+        races a write's own pre-write `repo.sync()`/commit/push/rebase/reset
+        - the single-writer rule the write queue exists for
+        (`docs/PLAN.md`) covers every `repo` operation, not just writes.
+        Any non-empty result is already handed to every `add_sync_hook`
+        subscriber by the time this returns.
+
+        Concurrent calls while one sync job is still waiting in the queue
+        (not yet picked up by the consumer) share its result instead of
+        each enqueuing a redundant sync.
+        """
+        pending = self._pending_sync
+        if pending is not None and not pending.done():
+            return await pending
+
+        future: asyncio.Future[ChangeSet] = asyncio.get_running_loop().create_future()
+        self._pending_sync = future
+        await self._queue.put(_SyncJob(future=future))
+        return await future
+
     async def _consume(self) -> None:
         while True:
-            request, future = await self._queue.get()
-            try:
-                result = await self._process(request)
-            except Exception as exc:  # routed to the submitter, not raised here
-                if not future.done():
-                    future.set_exception(exc)
+            item = await self._queue.get()
+            if isinstance(item, _SyncJob):
+                await self._run_sync_job(item)
             else:
-                if not future.done():
-                    future.set_result(result)
+                await self._run_write_job(item)
+
+    async def _run_write_job(self, item: tuple[WriteRequest, asyncio.Future[WriteResult]]) -> None:
+        request, future = item
+        try:
+            result = await self._process(request)
+        except Exception as exc:  # routed to the submitter, not raised here
+            if not future.done():
+                future.set_exception(exc)
+        else:
+            if not future.done():
+                future.set_result(result)
+
+    async def _run_sync_job(self, job: _SyncJob) -> None:
+        # A later concurrent `sync()` call must enqueue its own fresh job
+        # once this one has actually been picked up - only clear the slot
+        # if nobody else already replaced it (which `sync()` itself never
+        # does while this job is still pending, but a future instance
+        # check is cheap insurance against ever reading a reused slot).
+        if self._pending_sync is job.future:
+            self._pending_sync = None
+        try:
+            change_set = await self._sync_and_notify()
+        except Exception as exc:  # routed to the caller, not raised here
+            if not job.future.done():
+                job.future.set_exception(exc)
+        else:
+            if not job.future.done():
+                job.future.set_result(change_set)
+
+    async def _sync_and_notify(self) -> ChangeSet:
+        """`repo.sync()`, then hand any non-empty result to every sync hook.
+
+        The one place every working-copy sync goes through: the standalone
+        `sync()` job and the pre-write sync inside `_process` both call
+        this, so a sync hook (the indexer) sees a given human change
+        exactly once no matter which path picked it up.
+        """
+        change_set = await asyncio.to_thread(self._repo.sync)
+        if not change_set.empty:
+            await self._run_sync_hooks(change_set)
+        return change_set
+
+    async def _run_sync_hooks(self, change_set: ChangeSet) -> None:
+        for hook in self._sync_hooks:
+            try:
+                await hook(change_set)
+            except Exception:
+                _logger.exception("write queue sync hook failed")
 
     async def _process(self, request: WriteRequest) -> WriteResult:
         try:
-            await asyncio.to_thread(self._repo.sync)
+            await self._sync_and_notify()
         except GitError as exc:
             raise WriteFailed(str(exc)) from exc
 
