@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -22,7 +22,7 @@ from memory_manager.queue import (
     WriteRequest,
     WriteResult,
 )
-from memory_manager.vault.note import Note, serialize, version
+from memory_manager.vault.note import Note, parse, serialize, version
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.ulid import new_ulid
 
@@ -384,6 +384,153 @@ class TestArchive:
                     path="personal/fact/missing.md",
                     client="human",
                     if_version="new",
+                )
+            )
+
+
+class TestSupersede:
+    async def _write(self, queue: WriteQueue, path: str, **overrides: object) -> WriteResult:
+        return await queue.submit(
+            WriteRequest(
+                op="write",
+                path=path,
+                client="human",
+                if_version="new",
+                content=_note_bytes(**overrides),
+            )
+        )
+
+    async def test_happy_path_commits_both_notes_together(
+        self, queue: WriteQueue, vault_config: VaultConfig, bare_remote: Path
+    ) -> None:
+        old_id = new_ulid(_CREATED)
+        old_result = await self._write(queue, "personal/fact/old.md", id=old_id, body="Old.\n")
+
+        new_id = new_ulid(_CREATED)
+        fixed_now = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+        supersede_queue = WriteQueue(Repo(vault_config), clock=lambda: fixed_now)
+        await supersede_queue.start()
+        try:
+            result = await supersede_queue.submit(
+                WriteRequest(
+                    op="supersede",
+                    path="personal/fact/old.md",
+                    new_path="personal/fact/new.md",
+                    client="human",
+                    if_version=old_result.version,
+                    content=_note_bytes(id=new_id, body="New.\n"),
+                )
+            )
+        finally:
+            await supersede_queue.stop()
+
+        assert result.path == "personal/fact/new.md"
+        new_disk = parse((vault_config.dir / "personal/fact/new.md").read_bytes())
+        assert new_disk.supersedes == (old_id,)
+
+        old_disk = parse((vault_config.dir / "personal/fact/old.md").read_bytes())
+        assert old_disk.valid_to == fixed_now.date()
+        assert old_disk.updated == fixed_now
+        assert result.related == {"personal/fact/old.md": version(serialize(old_disk))}
+
+        log_with_commit = _log(bare_remote)
+        assert result.commit in log_with_commit
+
+        from memory_manager.vault.git import Git
+
+        changed = (
+            Git(cwd=bare_remote)
+            .run("diff-tree", "--no-commit-id", "--name-only", "-r", result.commit)
+            .stdout.decode()
+            .split()
+        )
+        assert set(changed) == {"personal/fact/old.md", "personal/fact/new.md"}
+
+    async def test_keeps_an_earlier_valid_to_already_set_on_the_old_note(
+        self, vault_config: VaultConfig
+    ) -> None:
+        write_queue = WriteQueue(Repo(vault_config))
+        await write_queue.start()
+        try:
+            old_result = await self._write(
+                write_queue,
+                "personal/fact/old.md",
+                valid_to=date(2025, 1, 1),
+            )
+        finally:
+            await write_queue.stop()
+
+        fixed_now = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+        supersede_queue = WriteQueue(Repo(vault_config), clock=lambda: fixed_now)
+        await supersede_queue.start()
+        try:
+            await supersede_queue.submit(
+                WriteRequest(
+                    op="supersede",
+                    path="personal/fact/old.md",
+                    new_path="personal/fact/new.md",
+                    client="human",
+                    if_version=old_result.version,
+                    content=_note_bytes(id=new_ulid(_CREATED)),
+                )
+            )
+        finally:
+            await supersede_queue.stop()
+
+        old_disk = parse((vault_config.dir / "personal/fact/old.md").read_bytes())
+        assert old_disk.valid_to == date(2025, 1, 1)
+
+    async def test_stale_old_version_is_a_conflict_and_nothing_committed(
+        self, queue: WriteQueue, bare_remote: Path
+    ) -> None:
+        await self._write(queue, "personal/fact/old.md")
+        before = _log(bare_remote)
+
+        with pytest.raises(VersionConflict) as excinfo:
+            await queue.submit(
+                WriteRequest(
+                    op="supersede",
+                    path="personal/fact/old.md",
+                    new_path="personal/fact/new.md",
+                    client="human",
+                    if_version="0" * 64,
+                    content=_note_bytes(id=new_ulid(_CREATED)),
+                )
+            )
+        assert excinfo.value.current_content is not None
+        assert _log(bare_remote) == before
+
+    async def test_new_path_already_existing_is_rejected(
+        self, queue: WriteQueue, bare_remote: Path
+    ) -> None:
+        old_result = await self._write(queue, "personal/fact/old.md")
+        await self._write(queue, "personal/fact/new.md", id=new_ulid(_CREATED))
+        before = _log(bare_remote)
+
+        with pytest.raises(InvalidNote) as excinfo:
+            await queue.submit(
+                WriteRequest(
+                    op="supersede",
+                    path="personal/fact/old.md",
+                    new_path="personal/fact/new.md",
+                    client="human",
+                    if_version=old_result.version,
+                    content=_note_bytes(id=new_ulid(_CREATED)),
+                )
+            )
+        assert "already exists" in str(excinfo.value)
+        assert _log(bare_remote) == before
+
+    async def test_supersede_of_missing_old_note_is_not_found(self, queue: WriteQueue) -> None:
+        with pytest.raises(NotFound):
+            await queue.submit(
+                WriteRequest(
+                    op="supersede",
+                    path="personal/fact/missing.md",
+                    new_path="personal/fact/new.md",
+                    client="human",
+                    if_version="new",
+                    content=_note_bytes(id=new_ulid(_CREATED)),
                 )
             )
 

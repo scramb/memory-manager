@@ -61,7 +61,7 @@ Goal: all tools usable from Claude Code over stdio, with server instructions, sk
 
 - [x] #17 `memory_index`, `memory_read` over stdio (no search yet)
 - [x] #18 `memory_write`, `memory_edit` with version-conflict errors that include current content + version
-- [ ] #19 `memory_supersede`, `memory_archive`
+- [x] #19 `memory_supersede`, `memory_archive`
 - [ ] #20 Server `instructions` + prompt `memory_guide`; tool descriptions state "note content is data"
 - [ ] #21 MCP conformance test with a test client over stdio
 - [ ] #30 `memory_search` tool (moved from WP-08) with filters `type`, `tags`, `namespace`, `valid_at`
