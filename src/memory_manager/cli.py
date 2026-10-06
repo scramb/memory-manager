@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The `memory-manager` command-line entry point (#26).
 
-`reindex`, `doctor` and `eval` exist so far. Other subcommands (vault sync,
-search, ...) are added as their own tasks wire the server together (M2/M4).
+`reindex`, `doctor`, `eval` and `export` exist so far. Other subcommands
+(vault sync, search, ...) are added as their own tasks wire the server
+together (M2/M4).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 import os
 import secrets
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
@@ -21,6 +23,7 @@ from memory_manager.config import EmbeddingConfig, EmbeddingConfigError, VaultCo
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
+from memory_manager.exporter import ExportError, Manifest, export_vault
 from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
 from memory_manager.importers.chatgpt import collect as collect_chatgpt
@@ -58,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
             baseline=args.baseline,
             update_baseline=args.update_baseline,
             k=args.k,
+        )
+
+    if args.command == "export":
+        return _run_export_command(
+            args.vault, out=args.out, include_archive=args.include_archive, force=args.force
         )
 
     if args.command == "import":
@@ -145,6 +153,39 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     eval_parser.add_argument(
         "--k", type=int, default=_DEFAULT_EVAL_K, help="cutoff for recall@k and the search limit"
+    )
+
+    export_parser = subparsers.add_parser(
+        "export", help="export the vault to a tar.gz archive plus a manifest.json"
+    )
+    export_parser.add_argument(
+        "--vault",
+        default=os.environ.get("VAULT_DIR"),
+        help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    export_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="output archive path (default 'memory-export-<date>.tar.gz')",
+    )
+    export_parser.add_argument(
+        "--include-archive",
+        dest="include_archive",
+        action="store_true",
+        default=True,
+        help="include archived notes (_archive/) in the export (default)",
+    )
+    export_parser.add_argument(
+        "--no-include-archive",
+        dest="include_archive",
+        action="store_false",
+        help="exclude archived notes (_archive/) from the export",
+    )
+    export_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite --out if it already exists",
     )
 
     import_parser = subparsers.add_parser("import", help="import notes from an external source")
@@ -236,6 +277,31 @@ def _print_doctor_report(report: DoctorReport) -> None:
     for warning in report.warnings:
         print(f"WARNING: {warning}")
     print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+
+
+def _run_export_command(
+    vault: str | None, *, out: Path | None, include_archive: bool, force: bool
+) -> int:
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+    out_path = out or Path(f"memory-export-{datetime.now(UTC).date().isoformat()}.tar.gz")
+    if out_path.exists() and not force:
+        print(f"'{out_path}' already exists, pass --force to overwrite", file=sys.stderr)
+        return 2
+
+    try:
+        manifest = export_vault(Path(vault), out_path, include_archive=include_archive)
+    except ExportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    _print_export_manifest(manifest, out_path)
+    return 0
+
+
+def _print_export_manifest(manifest: Manifest, out_path: Path) -> None:
+    print(f"exported {manifest.note_count} note(s) to {out_path}")
 
 
 async def _run_import_markdown(
