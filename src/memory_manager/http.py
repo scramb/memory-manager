@@ -75,6 +75,8 @@ from memory_manager.app import Services
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig
 from memory_manager.mcp.server import build_server
+from memory_manager.observability.logging import RequestIdMiddleware
+from memory_manager.observability.metrics import metrics_endpoint
 
 __all__ = ["ServicesFactory", "create_app"]
 
@@ -83,6 +85,7 @@ _logger = logging.getLogger(__name__)
 HEALTH_PATH = "/healthz"
 READY_PATH = "/readyz"
 WEBHOOK_PATH = "/hooks/vault"
+METRICS_PATH = "/metrics"
 
 _SOURCE_URL = "https://github.com/scramb/memory-manager"
 _MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
@@ -148,13 +151,17 @@ def create_app(services_factory: ServicesFactory, config: ServerConfig) -> Starl
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
         Route(READY_PATH, endpoint=_readyz, methods=["GET"]),
         Route(WEBHOOK_PATH, endpoint=_vault_webhook, methods=["POST"]),
+        Route(METRICS_PATH, endpoint=metrics_endpoint, methods=["GET"]),
         # Mounted last (lowest route-matching precedence), same reasoning
         # `mcp/server/lowlevel/server.py` uses for its own custom routes:
-        # the three routes above must win their exact paths before this
-        # catch-all gets a chance to.
+        # the routes above must win their exact paths before this catch-all
+        # gets a chance to.
         Mount("/", app=_McpMount()),
     ]
-    middleware = [Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins)]
+    middleware = [
+        Middleware(RequestIdMiddleware),
+        Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
+    ]
     app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
     # Known synchronously (no vault/DB work needed), unlike `services`/`mcp_app`
     # above - set right away rather than deferred into `lifespan`.

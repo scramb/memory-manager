@@ -20,6 +20,8 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from memory_manager.observability.metrics import track_git_operation
+
 __all__ = ["Git", "GitError", "PushRejected"]
 
 _DEFAULT_TIMEOUT = 60.0
@@ -96,29 +98,30 @@ class Git:
         Raises `GitError` (or `PushRejected` for a rejected `push`) if
         `check` is true and the process exits non-zero, or if it times out.
         """
-        env = {**os.environ, **_FIXED_ENV, **self._env_extra}
-        try:
-            result = subprocess.run(  # noqa: S603 - fixed executable, argument list, no shell
-                [_GIT_EXECUTABLE, *args],
-                cwd=self._cwd,
-                input=input,
-                capture_output=True,
-                env=env,
-                timeout=self._timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stderr = self._scrub(_decode(exc.stderr))
-            raise GitError(
-                self._redact(args), -1, f"timed out after {self._timeout}s - {stderr}".strip()
-            ) from exc
+        with track_git_operation(args):
+            env = {**os.environ, **_FIXED_ENV, **self._env_extra}
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed executable, argument list, no shell
+                    [_GIT_EXECUTABLE, *args],
+                    cwd=self._cwd,
+                    input=input,
+                    capture_output=True,
+                    env=env,
+                    timeout=self._timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                stderr = self._scrub(_decode(exc.stderr))
+                raise GitError(
+                    self._redact(args), -1, f"timed out after {self._timeout}s - {stderr}".strip()
+                ) from exc
 
-        if check and result.returncode != 0:
-            stderr = self._scrub(_decode(result.stderr))
-            if "push" in args and _looks_like_push_rejection(stderr):
-                raise PushRejected(self._redact(args), result.returncode, stderr)
-            raise GitError(self._redact(args), result.returncode, stderr)
-        return result
+            if check and result.returncode != 0:
+                stderr = self._scrub(_decode(result.stderr))
+                if "push" in args and _looks_like_push_rejection(stderr):
+                    raise PushRejected(self._redact(args), result.returncode, stderr)
+                raise GitError(self._redact(args), result.returncode, stderr)
+            return result
 
     def _scrub(self, text: str) -> str:
         for secret in self._secrets:

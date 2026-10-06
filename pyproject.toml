@@ -9,11 +9,18 @@ dependencies = [
     "asyncpg>=0.31.0",
     "httpx>=0.28.1",
     "mcp>=2.3,<3",
+    "prometheus-client>=0.26.0",
     "pyyaml>=6.0",
 ]
 
 [project.scripts]
 memory-manager = "memory_manager.cli:main"
+
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-exporter-otlp>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+]
 
 [dependency-groups]
 dev = [
