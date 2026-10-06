@@ -64,6 +64,7 @@ Goal: all tools usable from Claude Code over stdio, with server instructions, sk
 - [ ] #19 `memory_supersede`, `memory_archive`
 - [ ] #20 Server `instructions` + prompt `memory_guide`; tool descriptions state "note content is data"
 - [ ] #21 MCP conformance test with a test client over stdio
+- [ ] #30 `memory_search` tool (moved from WP-08) with filters `type`, `tags`, `namespace`, `valid_at`
 
 ### WP-06 — Claude Code integration · Branch: `wp/06-claude-code-integration`
 
@@ -87,7 +88,6 @@ Goal: hybrid search (full text + vector, RRF) over a derived, rebuildable Postgr
 
 - [x] #28 Full-text search (`tsvector`, `simple` + language configs for de/en)
 - [x] #29 Vector search + RRF fusion, note-level dedup, snippet; full-text fallback without provider
-- [ ] #30 `memory_search` tool with filters `type`, `tags`, `namespace`, `valid_at`
 
 ### WP-09 — Retrieval eval · Branch: `wp/09-retrieval-eval`
 
