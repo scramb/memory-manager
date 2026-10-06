@@ -59,7 +59,7 @@ Goal: all tools usable from Claude Code over stdio, with server instructions, sk
 
 ### WP-05 — MCP tools over stdio · Branch: `wp/05-mcp-stdio`
 
-- [ ] #17 `memory_index`, `memory_read` over stdio (no search yet)
+- [x] #17 `memory_index`, `memory_read` over stdio (no search yet)
 - [ ] #18 `memory_write`, `memory_edit` with version-conflict errors that include current content + version
 - [ ] #19 `memory_supersede`, `memory_archive`
 - [ ] #20 Server `instructions` + prompt `memory_guide`; tool descriptions state "note content is data"
