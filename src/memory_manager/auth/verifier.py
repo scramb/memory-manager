@@ -11,7 +11,11 @@ revoked or expired token (the SDK answers 401), an `AccessToken` otherwise.
 A static token has no OAuth `resource`/`subject` of its own, so those stay
 unset; its namespaces are not an `AccessToken` field either, so they travel
 in `AccessToken.claims["namespaces"]` - `mcp/authz.py` reads them back out
-through `mcp.server.auth.middleware.auth_context.get_access_token()`.
+through `mcp.server.auth.middleware.auth_context.get_access_token()`. A
+token with an owner principal (`owner_oid` + `roles`, ADR-0008 addendum
+2026-10-07, #115) adds `claims["oid"]`/`claims["roles"]`; a legacy token
+without one carries exactly `{"namespaces": [...]}`, as before (#116 wires
+either into the request path).
 
 `verify_bearer_token` is the merge the module docstring of `auth.provider`
 talks about: once the embedded OAuth authorization server is enabled, the
@@ -74,12 +78,16 @@ async def _verify_static_token(pool: asyncpg.Pool, token: str) -> AccessToken | 
     info = await verify(pool, token)
     if info is None:
         return None
+    claims: dict[str, object] = {"namespaces": list(info.namespaces)}
+    if info.owner_oid is not None:
+        claims["oid"] = info.owner_oid
+        claims["roles"] = list(info.roles)
     return AccessToken(
         token=token,
         client_id=f"{_CLIENT_ID_PREFIX}{info.name}",
         scopes=list(info.scopes),
         expires_at=int(info.expires_at.timestamp()) if info.expires_at is not None else None,
-        claims={"namespaces": list(info.namespaces)},
+        claims=claims,
     )
 
 

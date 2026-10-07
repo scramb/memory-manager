@@ -169,6 +169,97 @@ async def test_list_tokens_never_exposes_the_plaintext_or_its_hash(pool: asyncpg
     assert plaintext not in rendered
 
 
+# --- Owner principal (`owner_oid` + `roles`, #115) --------------------------
+
+
+async def test_create_token_with_owner_and_roles_sets_the_token_info_fields(
+    pool: asyncpg.Pool,
+) -> None:
+    _plaintext, info = await create_token(
+        pool,
+        "ci",
+        scopes=[READ_SCOPE],
+        namespaces=["personal"],
+        owner_oid="oid-alice",
+        roles=["Memory.User", "Memory.Curator"],
+    )
+
+    assert info.owner_oid == "oid-alice"
+    assert info.roles == ("Memory.User", "Memory.Curator")
+
+
+async def test_create_token_deduplicates_roles_keeping_order(pool: asyncpg.Pool) -> None:
+    _plaintext, info = await create_token(
+        pool,
+        "ci",
+        scopes=[READ_SCOPE],
+        namespaces=["personal"],
+        owner_oid="oid-alice",
+        roles=["Memory.Curator", "Memory.User", "Memory.Curator"],
+    )
+
+    assert info.roles == ("Memory.Curator", "Memory.User")
+
+
+async def test_create_token_without_owner_or_roles_leaves_both_unset(pool: asyncpg.Pool) -> None:
+    _plaintext, info = await create_token(pool, "ci", scopes=[READ_SCOPE], namespaces=["personal"])
+
+    assert info.owner_oid is None
+    assert info.roles == ()
+
+
+async def test_create_token_rejects_an_unknown_role(pool: asyncpg.Pool) -> None:
+    with pytest.raises(ValueError, match=r"Memory\.Bogus"):
+        await create_token(
+            pool,
+            "ci",
+            scopes=[READ_SCOPE],
+            namespaces=["personal"],
+            owner_oid="oid-alice",
+            roles=["Memory.Bogus"],
+        )
+
+    assert await list_tokens(pool) == []
+
+
+async def test_create_token_rejects_roles_without_an_owner(pool: asyncpg.Pool) -> None:
+    with pytest.raises(ValueError, match="owner_oid"):
+        await create_token(
+            pool, "ci", scopes=[READ_SCOPE], namespaces=["personal"], roles=["Memory.User"]
+        )
+
+    assert await list_tokens(pool) == []
+
+
+async def test_create_token_rejects_an_owner_without_roles(pool: asyncpg.Pool) -> None:
+    with pytest.raises(ValueError, match="role"):
+        await create_token(
+            pool, "ci", scopes=[READ_SCOPE], namespaces=["personal"], owner_oid="oid-alice"
+        )
+
+    assert await list_tokens(pool) == []
+
+
+async def test_direct_sql_insert_with_an_invalid_role_fails_the_db_check(
+    pool: asyncpg.Pool,
+) -> None:
+    with pytest.raises(asyncpg.CheckViolationError):
+        await pool.execute(
+            "insert into static_tokens (name, token_hash, scopes, namespaces, owner_oid, roles) "
+            "values ('direct', 'hash', '{}', '{}', 'oid-alice', '{Memory.Bogus}')"
+        )
+
+
+async def test_direct_sql_insert_with_an_empty_owner_oid_fails_the_db_check(
+    pool: asyncpg.Pool,
+) -> None:
+    with pytest.raises(asyncpg.CheckViolationError):
+        await pool.execute(
+            "insert into static_tokens (name, token_hash, scopes, namespaces, owner_oid, roles) "
+            "values ('direct', 'hash', '{}', '{}', '', '{Memory.User}')"
+        )
+
+
 # --- `memory_manager.auth.verifier.StaticTokenVerifier` --------------------
 
 
@@ -187,6 +278,41 @@ async def test_verifier_returns_an_access_token_with_scopes_and_namespaces(
     assert set(access_token.scopes) == {READ_SCOPE, WRITE_SCOPE}
     assert access_token.claims is not None
     assert set(access_token.claims["namespaces"]) == {"personal", "work"}
+
+
+async def test_verifier_claims_are_exactly_namespaces_for_a_legacy_token_without_an_owner(
+    pool: asyncpg.Pool,
+) -> None:
+    plaintext, _info = await create_token(
+        pool, "claude-code", scopes=[READ_SCOPE], namespaces=["personal"]
+    )
+    verifier = StaticTokenVerifier(pool)
+
+    access_token = await verifier.verify_token(plaintext)
+
+    assert access_token is not None
+    assert access_token.claims == {"namespaces": ["personal"]}
+
+
+async def test_verifier_adds_oid_and_roles_claims_for_a_token_with_an_owner(
+    pool: asyncpg.Pool,
+) -> None:
+    plaintext, _info = await create_token(
+        pool,
+        "claude-code",
+        scopes=[READ_SCOPE],
+        namespaces=["personal"],
+        owner_oid="oid-alice",
+        roles=["Memory.User"],
+    )
+    verifier = StaticTokenVerifier(pool)
+
+    access_token = await verifier.verify_token(plaintext)
+
+    assert access_token is not None
+    assert access_token.claims is not None
+    assert access_token.claims["oid"] == "oid-alice"
+    assert access_token.claims["roles"] == ["Memory.User"]
 
 
 async def test_verifier_returns_none_for_an_invalid_token(pool: asyncpg.Pool) -> None:
@@ -403,3 +529,52 @@ def test_cli_token_list_and_revoke_round_trip(
 
     assert main(["token", "revoke", "ci"]) == 0
     assert main(["token", "revoke", "ci"]) == 2
+
+
+def test_cli_token_create_with_owner_and_role_shows_up_in_token_list(
+    monkeypatch: pytest.MonkeyPatch, test_database_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", test_database_url)
+
+    create_exit = main(
+        [
+            "token",
+            "create",
+            "ci",
+            "--scope",
+            READ_SCOPE,
+            "--namespace",
+            "personal",
+            "--owner",
+            "oid-alice",
+            "--role",
+            "Memory.User",
+        ]
+    )
+    assert create_exit == 0
+    capsys.readouterr()
+
+    assert main(["token", "list"]) == 0
+    listed_out = capsys.readouterr().out
+    assert "owner_oid=oid-alice" in listed_out
+    assert "roles=Memory.User" in listed_out
+
+
+def test_cli_token_create_rejects_an_unknown_role_before_touching_the_database(
+    test_database_url: str,
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "token",
+                "create",
+                "ci",
+                "--scope",
+                READ_SCOPE,
+                "--owner",
+                "oid-alice",
+                "--role",
+                "Memory.Bogus",
+            ]
+        )
+    assert excinfo.value.code == 2

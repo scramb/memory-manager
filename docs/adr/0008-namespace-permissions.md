@@ -89,3 +89,13 @@ ADR-0008 did not say how trusted cross-namespace paths reach the data once every
 - **The bypass is tied to the owner credential, not to a setting any code can flip.** Request code must never use a connection that has not switched roles. #101 closes this structurally by pinning the request path to the helper, and a test enforces it.
 
 Rejected: requiring a session marker such as `app.system = 'on'` in addition to ownership. A forgotten marker fails closed, but the bypass becomes a settable GUC, every Git-mode pool creation site has to change, and a missing marker silently empties search in Git mode.
+
+## Addendum 2026-10-07 — identity sources and curate (#101, #115, #116)
+
+Owner decisions on 2026-10-07, taken while #101 was split:
+
+- **Static tokens carry a principal now.** `static_tokens` gets `owner_oid` and `roles` (#115). This pulls the owner part of ADR-0006 §7 forward from WP-24, so that Postgres mode can be tested end-to-end over HTTP before the Entra login exists.
+- **`serve --stdio` refuses `STORAGE_BACKEND=postgres`.** Enterprise mode is remote only. A local process holding the owner credentials could bypass RLS anyway, so a claimed stdio identity would protect nothing.
+- **Group memberships are never written in the request path.** `user_groups` is filled by the login (WP-22) or by the operator; tests seed it. The app computes access from token claims, RLS computes it from `user_groups`. When the two disagree, the request fails closed.
+- **The personal namespace is created lazily.** On a principal's first request, a `SECURITY DEFINER` function inserts only the row for `app.oid`. The app role gets no general `INSERT` on `namespaces`.
+- **Curate is author-based.** Archiving your own note in a shared namespace counts as a write; archiving someone else's note counts as curate. To make the author reliable, `vault_revisions` records `author_oid`, and a note's author is the `author_oid` of its revision 1.

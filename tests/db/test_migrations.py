@@ -39,6 +39,7 @@ class TestMigrate:
             "0004_vault",
             "0005_rls",
             "0006_shared_state",
+            "0007_token_principal",
         ]
         tables = {
             row["table_name"]
@@ -81,6 +82,7 @@ class TestMigrate:
             "0004_vault",
             "0005_rls",
             "0006_shared_state",
+            "0007_token_principal",
         ]
         assert second == []
 
@@ -102,6 +104,7 @@ class TestMigrate:
             "0004_vault",
             "0005_rls",
             "0006_shared_state",
+            "0007_token_principal",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -161,6 +164,7 @@ class TestMigrate:
                 "0004_vault",
                 "0005_rls",
                 "0006_shared_state",
+                "0007_token_principal",
             ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
