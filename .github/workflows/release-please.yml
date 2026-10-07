@@ -13,6 +13,8 @@ name: release-please
 on:
   push:
     branches: [main]
+  # Manual re-run, e.g. after closing a stale release PR.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
