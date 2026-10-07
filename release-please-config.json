@@ -8,8 +8,14 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
-        "charts/memory-manager/Chart.yaml",
-        "deploy/kustomization.yaml"
+        {
+          "type": "generic",
+          "path": "charts/memory-manager/Chart.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "deploy/kustomization.yaml"
+        }
       ]
     }
   }
