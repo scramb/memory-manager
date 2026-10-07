@@ -182,7 +182,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: open
 
-- [ ] #100 RLS limits every content table to the caller's namespaces even without a WHERE clause ⛔ blocked by #96
+- [x] #100 RLS limits every content table to the caller's namespaces even without a WHERE clause
 - [ ] #101 Principal and alias resolution enforce the namespace permission matrix in application code ⛔ blocked by #95, #100
 - [ ] #102 Search and index results carry `namespace_kind` ⛔ blocked by #101
 

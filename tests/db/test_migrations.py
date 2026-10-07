@@ -37,6 +37,7 @@ class TestMigrate:
             "0002_static_tokens",
             "0003_oauth",
             "0004_vault",
+            "0005_rls",
             "0006_shared_state",
         ]
         tables = {
@@ -60,6 +61,11 @@ class TestMigrate:
             "vault_notes",
             "vault_revisions",
             "namespaces",
+            "users",
+            "user_groups",
+            "project_members",
+            "namespace_settings",
+            "break_glass_grants",
         }
 
     async def test_running_twice_applies_nothing_the_second_time(
@@ -73,6 +79,7 @@ class TestMigrate:
             "0002_static_tokens",
             "0003_oauth",
             "0004_vault",
+            "0005_rls",
             "0006_shared_state",
         ]
         assert second == []
@@ -93,6 +100,7 @@ class TestMigrate:
             "0002_static_tokens",
             "0003_oauth",
             "0004_vault",
+            "0005_rls",
             "0006_shared_state",
         ]
 
@@ -151,6 +159,7 @@ class TestMigrate:
                 "0002_static_tokens",
                 "0003_oauth",
                 "0004_vault",
+                "0005_rls",
                 "0006_shared_state",
             ]
         finally:

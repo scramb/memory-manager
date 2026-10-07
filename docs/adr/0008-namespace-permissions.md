@@ -79,3 +79,13 @@ Checked against the guardrails:
 ## Reversibility
 
 Expensive once data exists. Aliases and the registry end up in exports, audit entries and users' habits. RLS policies themselves are cheap to change.
+
+## Addendum 2026-10-07 — system identity under FORCE RLS (#100)
+
+ADR-0008 did not say how trusted cross-namespace paths reach the data once every content table has `ENABLE` + `FORCE ROW LEVEL SECURITY`: the Git-mode index, `reindex --full`, and later the worker, erasure and the Git-to-Postgres import. The owner decided on 2026-10-07:
+
+- **The owner role is the system identity.** Migration `0005_rls.sql` adds an explicit owner-only policy (`TO` the migrating role, `USING`/`WITH CHECK` true) on each content table, next to the identity policies. Git mode and system jobs keep connecting as the owner and are unchanged.
+- **Request transactions in Postgres mode switch roles.** Each one switches to a non-owner, non-`BYPASSRLS` `NOLOGIN` role with `set_config('role', …, true)` and sets the identity in the same transaction. Both happen in one helper. The operator creates that role and grants it to the owner; there is still a single `DATABASE_URL`.
+- **The bypass is tied to the owner credential, not to a setting any code can flip.** Request code must never use a connection that has not switched roles. #101 closes this structurally by pinning the request path to the helper, and a test enforces it.
+
+Rejected: requiring a session marker such as `app.system = 'on'` in addition to ownership. A forgotten marker fails closed, but the bypass becomes a settable GUC, every Git-mode pool creation site has to change, and a missing marker silently empties search in Git mode.
