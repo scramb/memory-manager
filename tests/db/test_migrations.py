@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from datetime import UTC, datetime
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
@@ -75,6 +77,62 @@ class TestMigrate:
             "0002_static_tokens",
             "0003_oauth",
         ]
+
+    async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
+        self, admin_database_url: str
+    ) -> None:
+        """Mirrors the CNPG deployment shape (`deploy/database.yaml`, `charts/
+        memory-manager/templates/cnpg-cluster.yaml`): `bootstrap.initdb.
+        postInitApplicationSQL` creates the `vector` extension as the bootstrap
+        (superuser) role; the app's own migration role is never a superuser.
+        `create extension if not exists vector` must still succeed for that role
+        once the extension already exists - a no-op requires no privilege a
+        non-superuser role would be missing, confirmed against the local
+        pgvector image before this test existed (`CREATE EXTENSION` ... NOTICE:
+        extension "vector" already exists, skipping ... exit 0)."""
+        db_name = f"mm_test_nonsuper_{secrets.token_hex(8)}"
+        role_name = f"mm_test_role_{secrets.token_hex(8)}"
+        role_password = secrets.token_urlsafe(16)
+
+        admin_conn = await asyncpg.connect(admin_database_url)
+        try:
+            await admin_conn.execute(
+                f"create role \"{role_name}\" login password '{role_password}' nosuperuser"
+            )
+            await admin_conn.execute(f'create database "{db_name}" owner "{role_name}"')
+
+            parsed = urlsplit(admin_database_url)
+            base, _, _ = admin_database_url.rpartition("/")
+            bootstrap_url = f"{base}/{db_name}"
+
+            # The bootstrap step a superuser performs once, up front - CNPG's own
+            # `postInitApplicationSQL`, not this test's migration role.
+            bootstrap_conn = await asyncpg.connect(bootstrap_url)
+            try:
+                await bootstrap_conn.execute("create extension if not exists vector")
+            finally:
+                await bootstrap_conn.close()
+
+            role_url = urlunsplit(
+                (
+                    parsed.scheme,
+                    f"{role_name}:{role_password}@{parsed.hostname}:{parsed.port}",
+                    f"/{db_name}",
+                    "",
+                    "",
+                )
+            )
+            role_conn = await asyncpg.connect(role_url)
+            try:
+                applied = await migrate(role_conn)
+            finally:
+                await role_conn.close()
+
+            assert applied == ["0001_index_schema", "0002_static_tokens", "0003_oauth"]
+        finally:
+            await admin_conn.execute(f'drop database if exists "{db_name}"')
+            await admin_conn.execute(f'drop role if exists "{role_name}"')
+            await admin_conn.close()
 
     async def test_tsv_lang_matches_german_and_english_stems(
         self, conn: asyncpg.Connection

@@ -154,7 +154,10 @@ database:
     # external Postgres instead.
     enabled: true
     instances: 1
-    imageName: docker.io/pgvector/pgvector:pg16
+    # Must be a CNPG operand image, not a stock Postgres image - see
+    # templates/cnpg-cluster.yaml's comment. This one ships the `vector`
+    # extension compiled in.
+    imageName: ghcr.io/cloudnative-pg/postgresql:16-standard-trixie
     storage:
       size: 5Gi
       storageClassName: ""
