@@ -200,7 +200,8 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 - [ ] #106 Two server processes serve one Postgres dataset consistently ⛔ blocked by #101
 - [x] #107 A deterministic generator produces a synthetic vault of configurable size
-- [ ] #108 k6 scenarios measure search, read and write latency against one replica
+- [x] #117 Search stays fast for queries with very frequent terms
+- [ ] #108 k6 scenarios measure search, read and write latency against one replica ⛔ blocked by #117
 - [ ] #109 A 100k-note baseline records per-tool latency and the RLS function cost ⛔ blocked by #100, #108
 
 ---
