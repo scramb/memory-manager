@@ -23,6 +23,9 @@ otel = [
     "opentelemetry-exporter-otlp>=1.45.1",
     "opentelemetry-sdk>=1.45.1",
 ]
+valkey = [
+    "redis>=8.1",
+]
 
 [dependency-groups]
 dev = [
@@ -33,6 +36,7 @@ dev = [
     "pytest-cov>=6.0",
     "types-PyYAML>=6.0",
     "asyncpg-stubs>=0.31.3",
+    "redis>=8.1",
 ]
 
 [build-system]

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The single-admin-password `Authenticator` (ADR-0004 L1, #37).
+"""The single-admin-password `Authenticator` (ADR-0004 L1, #37; brute-force state
+moved to `SharedState`, ADR-0009 §2, #103).
 
 `PasswordAuthenticator` is the quickstart login method: one password,
 hashed with argon2id (`argon2-cffi`, accepted in ADR-0004's addendum and
@@ -12,33 +13,33 @@ hash-password` once, at setup time. The subject is always `ADMIN_SUBJECT`
 ("admin") - there is exactly one account in this mode.
 
 Brute-force protection (ADR-0004: "brute-force protection needed as in
-bring") is two independent in-process, single-replica sliding windows
-(`_FailureWindow`, same ADR-0004 caveat the OAuth rate limiting already
-carries: "in-process, same as bring"): one per client IP, one global for the
-one subject this mode ever has - a failure anywhere counts against both, so
-an attacker spreading guesses across source IPs is still capped by the
-global window, and a legitimate user behind a shared/rotating IP is still
-capped by the global window too, not just their own. Either window at
-`_MAX_FAILURES` blocks the *next* attempt outright, even a correct password -
-"the 6th attempt is blocked even if it is right" is the point, not an
-accident: a correct guess during an active brute-force run must not reset
-the clock for the attacker still trying.
+bring") is two fixed windows on a `SharedState` (`_shared_state`, `bind_
+shared_state` - defaults to an `InMemorySharedState`, today's single-replica
+behaviour, until `http.py`'s `create_app`/`lifespan` binds a shared one once
+a database is configured): one keyed by client IP, one global for the one
+subject this mode ever has - a failure anywhere counts against both, so an
+attacker spreading guesses across source IPs is still capped by the global
+window, and a legitimate user behind a shared/rotating IP is still capped by
+the global window too, not just their own. Either window at `_MAX_FAILURES`
+blocks the *next* attempt outright, even a correct password - "the 6th
+attempt is blocked even if it is right" is the point, not an accident: a
+correct guess during an active brute-force run must not reset the clock for
+the attacker still trying. `handle` checks both windows with `window_peek`
+(no increment) *before* ever calling `_verify_password`, and only calls
+`window_hit` (the one that counts) for an actual wrong-password failure -
+never for a request already blocked, and never for a successful login.
 
-Per-IP windows live in `_window_for`'s `by_ip`, bounded to `_MAX_TRACKED_IPS`
-entries with the same LRU eviction `auth.ratelimit.RateLimiter` uses for the
-same reason: `POST /login` carries no rate limit of its own ahead of this
-(`http.py`'s `_LimitsMiddleware` only meters `mcp_path`/`webhook_path`/the
-OAuth AS endpoints, not `LOGIN_PATH`), so an unbounded `dict` keyed by
-client IP would let an attacker cycling through source addresses grow this
-process's memory without ever triggering a single block.
+`POST /login` carries no rate limit of its own ahead of this (`http.py`'s
+`_LimitsMiddleware` only meters `mcp_path`/`webhook_path`/the OAuth AS
+endpoints, not `LOGIN_PATH`) - the `SharedState` backend's own bound on
+distinct keys (`InMemorySharedState`'s `max_keys`) is what keeps an attacker
+cycling through source IPs from growing this unboundedly, the same reason
+`auth.ratelimit.RateLimiter` needed one.
 """
 
 from __future__ import annotations
 
-import time
-from collections import OrderedDict
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerifyMismatchError
@@ -52,6 +53,7 @@ from memory_manager.auth.login import (
     parse_namespaces,
     resolve_namespaces,
 )
+from memory_manager.auth.shared_state import InMemorySharedState, SharedState
 from memory_manager.auth.templates import html_response, login_error_page, login_password_page
 from memory_manager.config import ServerConfigError
 
@@ -64,9 +66,9 @@ _PASSWORD_FIELD = "password"  # noqa: S105 - a form field name, not a credential
 _MAX_FAILURES = 5
 _WINDOW_SECONDS = 10 * 60.0
 
-#: Bound on `_by_ip`'s size - same default and eviction policy as
-#: `auth.ratelimit.RateLimiter`'s `max_keys` (see the module docstring).
-_MAX_TRACKED_IPS = 10_000
+#: The global (not per-IP) brute-force window's `SharedState` key - there is only
+#: ever one, this mode has exactly one subject.
+_GLOBAL_FAILURE_KEY = "login:password:global"
 
 _hasher = PasswordHasher()
 
@@ -88,39 +90,6 @@ def _verify_password(password_hash: str, password: str) -> bool:
     return True
 
 
-@dataclass
-class _FailureWindow:
-    """A plain list of failure timestamps (`time.monotonic()`), trimmed to the last
-    `_WINDOW_SECONDS` on every check - good enough for "in-process, single replica"
-    (ADR-0004); nothing here survives a restart or is shared across processes."""
-
-    _failures: list[float] = field(default_factory=list)
-
-    def record(self, now: float) -> None:
-        self._failures.append(now)
-
-    def blocked(self, now: float) -> bool:
-        self._failures[:] = [moment for moment in self._failures if now - moment < _WINDOW_SECONDS]
-        return len(self._failures) >= _MAX_FAILURES
-
-
-def _window_for(
-    by_ip: OrderedDict[str, _FailureWindow], client_ip: str, *, max_tracked: int = _MAX_TRACKED_IPS
-) -> _FailureWindow:
-    """`by_ip[client_ip]`, creating it on first use - bounded to `max_tracked` entries,
-    least-recently-used evicted first, the same policy `auth.ratelimit.RateLimiter`
-    uses and for the same reason (see this module's docstring)."""
-    window = by_ip.get(client_ip)
-    if window is None:
-        window = _FailureWindow()
-        by_ip[client_ip] = window
-        if len(by_ip) > max_tracked:
-            by_ip.popitem(last=False)
-    else:
-        by_ip.move_to_end(client_ip)
-    return window
-
-
 class PasswordAuthenticator:
     """`LOGIN_MODE=password`: one admin password, subject always `ADMIN_SUBJECT`."""
 
@@ -129,8 +98,14 @@ class PasswordAuthenticator:
     def __init__(self, *, password_hash: str, namespaces: list[str]) -> None:
         self._password_hash = password_hash
         self._namespaces = namespaces
-        self._by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
-        self._global = _FailureWindow()
+        self._shared_state: SharedState = InMemorySharedState()
+
+    def bind_shared_state(self, state: SharedState) -> None:
+        """Swap in a shared `SharedState` (a `PostgresSharedState`, once a database is
+        configured) - called once by `http.py`'s `create_app` lifespan. Until then, or
+        without a database at all, this authenticator's own `InMemorySharedState` keeps
+        today's single-replica behaviour unchanged."""
+        self._shared_state = state
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> PasswordAuthenticator:
@@ -168,10 +143,13 @@ class PasswordAuthenticator:
         form = await request.form()
         password = str(form.get(_PASSWORD_FIELD, ""))
         client_ip = request.client.host if request.client is not None else "unknown"
-        now = time.monotonic()
-        window = _window_for(self._by_ip, client_ip)
+        ip_key = f"login:password:ip:{client_ip}"
 
-        if window.blocked(now) or self._global.blocked(now):
+        ip_count, _ = await self._shared_state.window_peek(ip_key, window_seconds=_WINDOW_SECONDS)
+        global_count, _ = await self._shared_state.window_peek(
+            _GLOBAL_FAILURE_KEY, window_seconds=_WINDOW_SECONDS
+        )
+        if ip_count >= _MAX_FAILURES or global_count >= _MAX_FAILURES:
             return html_response(
                 login_password_page(
                     pending_id=pending.id,
@@ -183,8 +161,8 @@ class PasswordAuthenticator:
             )
 
         if not _verify_password(self._password_hash, password):
-            window.record(now)
-            self._global.record(now)
+            await self._shared_state.window_hit(ip_key, window_seconds=_WINDOW_SECONDS)
+            await self._shared_state.window_hit(_GLOBAL_FAILURE_KEY, window_seconds=_WINDOW_SECONDS)
             return html_response(
                 login_password_page(
                     pending_id=pending.id,

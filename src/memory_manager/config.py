@@ -54,6 +54,12 @@ _DEFAULT_WEBHOOK_PER_MINUTE = 30.0
 _DEFAULT_WEBHOOK_BURST = 10.0
 _DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
 
+# Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
+# `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
+# value instead, so `SIGKILL` from an orchestrator is never what actually ends
+# a draining process.
+_DEFAULT_SHUTDOWN_GRACE_SECONDS = 20
+
 
 class VaultConfigError(ValueError):
     """A required `VAULT_*` environment variable is missing or invalid."""
@@ -243,6 +249,21 @@ class ServerConfig:
     `public_url` above) - `http.py` raises `ServerConfigError` naming it if
     it is missing then, never falls back to running without it.
 
+    `valkey_url` (`VALKEY_URL`) names a Valkey/Redis instance for
+    `auth.shared_state.SharedState` to use instead of Postgres (ADR-0009 §2,
+    #104) - optional; unset means "Postgres once a database is configured,
+    in-process otherwise", the pre-#104 behaviour. When set, `http.py`'s
+    `create_app` builds a `ValkeySharedState` on top of it, which then takes
+    precedence over Postgres regardless of whether a database is configured
+    too - rate limiting and pending login state are loss-tolerant either
+    way (ADR-0009 §2), so there is nothing to migrate when switching between
+    them. `from_env` only checks the scheme (`redis://`, `rediss://` or
+    `unix://`, the three `redis.asyncio.Redis.from_url` accepts) is one of
+    those three - never the URL itself, which may carry a password - and
+    raises `ServerConfigError` naming the variable, not the value, if it is
+    not. `http.py` raises a separate `ServerConfigError` at startup if the
+    `redis` package (the optional `valkey` extra) is not installed.
+
     `cimd_enabled` (`CIMD_ENABLED`, default on) turns Client ID Metadata
     Document registration (SEP-991, #38) on or off alongside DCR: `http.py`
     only builds a `cimd.ClientMetadataFetcher` for `auth.provider.
@@ -261,14 +282,19 @@ class ServerConfig:
     `oauth_per_minute`/`oauth_burst` and `webhook_per_minute`/`webhook_burst`
     (`RATE_LIMIT_MCP_PER_MINUTE`/`RATE_LIMIT_MCP_BURST`/... ) feed one
     `auth.ratelimit.RateLimiter` each (#39), all built once in `http.py`'s
-    `create_app`: every request to `mcp_path` against the `mcp_*` pair,
-    keyed by the hashed bearer token (or the client IP, unauthenticated);
-    every `memory_write`/`memory_edit`/`memory_supersede`/`memory_archive`
-    tool call *additionally* against the tighter `write_*` pair, same key;
-    every request to `/register`/`/token`/`/authorize` against `oauth_*`,
-    keyed by client IP; every request to the vault webhook against
-    `webhook_*`, keyed by client IP. A key over its limit gets a 429 with
-    `Retry-After`.
+    `create_app`, on a shared `auth.shared_state.SharedState` (Valkey once
+    `valkey_url` is set, Postgres once a database is configured otherwise,
+    in-process if neither is - ADR-0009 §2, #103/#104): `burst`
+    calls (`max(1, floor(burst))`) within a fixed window of `burst * 60 /
+    per_minute` seconds, the average throughput a token bucket of that
+    capacity and refill rate would allow. Every request to `mcp_path` counts
+    against the `mcp_*` pair, keyed by the hashed bearer token (or the client
+    IP, unauthenticated); every `memory_write`/`memory_edit`/
+    `memory_supersede`/`memory_archive` tool call *additionally* against the
+    tighter `write_*` pair, same key; every request to `/register`/`/token`/
+    `/authorize` against `oauth_*`, keyed by client IP; every request to the
+    vault webhook against `webhook_*`, keyed by client IP. A key over its
+    limit gets a 429 with `Retry-After`.
 
     `forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) names
     the proxy IPs/CIDRs this server should trust `X-Forwarded-For` from when
@@ -282,6 +308,17 @@ class ServerConfig:
     (`"*"`, this field's pre-#39 default) would let any caller spoof
     `X-Forwarded-For` to pick its own rate-limit bucket, or collapse every
     real client behind a reverse proxy onto that proxy's one bucket.
+
+    `shutdown_grace_seconds` (`SHUTDOWN_GRACE_SECONDS`, default 20) is how
+    long `cli.py`'s `_serve_http` tells uvicorn
+    (`Config(timeout_graceful_shutdown=...)`) to keep draining in-flight
+    requests after `SIGTERM`/`SIGINT` before cancelling whatever is still
+    running (ADR-0009 §1/§5). `http.py`'s `GracefulShutdownServer` flips
+    `/readyz` to 503 on that same signal, before this grace period even
+    starts, so a load balancer stops routing new requests here while the
+    ones already in flight still get the full grace period to finish.
+    Kubernetes `preStop`/`terminationGracePeriodSeconds` (WP-29) sit outside
+    this value entirely, on top of it.
     """
 
     host: str = _DEFAULT_HOST
@@ -293,6 +330,7 @@ class ServerConfig:
     json_response: bool = True
     login_mode: str | None = None
     oauth_client_secret_key: str | None = field(default=None, repr=False)
+    valkey_url: str | None = field(default=None, repr=False)
     cimd_enabled: bool = True
     max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES
     mcp_per_minute: float = _DEFAULT_MCP_PER_MINUTE
@@ -304,6 +342,7 @@ class ServerConfig:
     webhook_per_minute: float = _DEFAULT_WEBHOOK_PER_MINUTE
     webhook_burst: float = _DEFAULT_WEBHOOK_BURST
     forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
+    shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -335,7 +374,8 @@ class ServerConfig:
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
-        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS` entries of `environ`.
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS` entries of
+        `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
         variable if `PORT` is not a valid port number, or any size/rate
@@ -350,6 +390,7 @@ class ServerConfig:
         json_response = _parse_bool(environ.get("MCP_JSON_RESPONSE"), default=True)
         login_mode = environ.get("LOGIN_MODE") or None
         oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
+        valkey_url = _parse_valkey_url(environ.get("VALKEY_URL"))
         cimd_enabled = _parse_bool(environ.get("CIMD_ENABLED"), default=True)
         max_request_bytes = _parse_positive_int(
             environ, "MAX_REQUEST_BYTES", _DEFAULT_MAX_REQUEST_BYTES
@@ -373,6 +414,9 @@ class ServerConfig:
             environ, "RATE_LIMIT_WEBHOOK_BURST", _DEFAULT_WEBHOOK_BURST
         )
         forwarded_allow_ips = environ.get("FORWARDED_ALLOW_IPS") or _DEFAULT_FORWARDED_ALLOW_IPS
+        shutdown_grace_seconds = _parse_positive_int(
+            environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
+        )
 
         return cls(
             host=host,
@@ -384,6 +428,7 @@ class ServerConfig:
             json_response=json_response,
             login_mode=login_mode,
             oauth_client_secret_key=oauth_client_secret_key,
+            valkey_url=valkey_url,
             cimd_enabled=cimd_enabled,
             max_request_bytes=max_request_bytes,
             mcp_per_minute=mcp_per_minute,
@@ -395,6 +440,7 @@ class ServerConfig:
             webhook_per_minute=webhook_per_minute,
             webhook_burst=webhook_burst,
             forwarded_allow_ips=forwarded_allow_ips,
+            shutdown_grace_seconds=shutdown_grace_seconds,
         )
 
 
@@ -434,6 +480,23 @@ def _parse_positive_float(environ: dict[str, str], name: str, default: float) ->
     if value <= 0:
         raise ServerConfigError(f"{name} must be positive, got {value}")
     return value
+
+
+#: Schemes `redis.asyncio.Redis.from_url` accepts (confirmed by reading `redis-py`'s
+#: `from_url`, #104) - `VALKEY_URL` is checked against these without ever including
+#: the value itself in an error message, since it may carry a password.
+_VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
+
+
+def _parse_valkey_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    scheme = urlsplit(raw).scheme
+    if scheme not in _VALKEY_URL_SCHEMES:
+        raise ServerConfigError(
+            f"VALKEY_URL must start with redis://, rediss:// or unix://, got a scheme of {scheme!r}"
+        )
+    return raw
 
 
 def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[str, ...]:

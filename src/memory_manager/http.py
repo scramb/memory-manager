@@ -73,9 +73,11 @@ import logging
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from types import FrameType
 from typing import cast
 
 import asyncpg
+import uvicorn
 from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
@@ -110,6 +112,13 @@ from memory_manager.auth.prm import (
 )
 from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.auth.ratelimit import RateLimiter
+from memory_manager.auth.shared_state import (
+    InMemorySharedState,
+    PostgresSharedState,
+    SharedState,
+    ValkeySharedState,
+    build_valkey_shared_state,
+)
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -117,7 +126,7 @@ from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
 from memory_manager.observability.metrics import metrics_endpoint
 
-__all__ = ["ServicesFactory", "build_authenticator", "create_app"]
+__all__ = ["GracefulShutdownServer", "ServicesFactory", "build_authenticator", "create_app"]
 
 _logger = logging.getLogger(__name__)
 
@@ -157,6 +166,67 @@ class _OAuthProviderCell:
     `lifespan`, after the route table referencing them already has to exist."""
 
     provider: MemoryManagerOAuthProvider | None = None
+
+
+class _SharedStateHandle:
+    """Forwards every `SharedState` call to whatever `backend` is currently set.
+
+    Built once by `create_app` (default `InMemorySharedState` - today's
+    single-replica behaviour, in effect until and unless it is swapped) and
+    handed, as this one object, to every `RateLimiter` and to `bind_shared_state` on
+    a `PasswordAuthenticator`/`OidcAuthenticator` - the same "build now, fill in
+    later" shape `_OAuthProviderCell` uses for the OAuth provider: `create_app`
+    itself sets `backend` to a `ValkeySharedState` once `config.valkey_url` is set
+    (ADR-0009 §2, #104 - does not depend on `services`, so there is no need to wait
+    for `lifespan`), and `lifespan` sets it to a `PostgresSharedState` once
+    `services.pool` exists and no Valkey backend won already; every holder of this
+    handle picks either up on its next call, with nothing re-wired.
+    """
+
+    def __init__(self) -> None:
+        self.backend: SharedState = InMemorySharedState()
+
+    async def window_hit(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        return await self.backend.window_hit(key, window_seconds=window_seconds)
+
+    async def window_peek(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        return await self.backend.window_peek(key, window_seconds=window_seconds)
+
+    async def put_pending(self, key: str, payload: str, *, ttl_seconds: float) -> None:
+        await self.backend.put_pending(key, payload, ttl_seconds=ttl_seconds)
+
+    async def take_pending(self, key: str) -> str | None:
+        return await self.backend.take_pending(key)
+
+
+class GracefulShutdownServer(uvicorn.Server):
+    """A `uvicorn.Server` that flips this ASGI app's `draining` flag the instant
+    `SIGTERM`/`SIGINT` arrives (ADR-0009 §1/§5), so `/readyz` fails fast and a load
+    balancer stops routing new requests here *before* uvicorn's own grace period
+    (`Config.timeout_graceful_shutdown`, `ServerConfig.shutdown_grace_seconds`,
+    `cli.py`'s `_serve_http`) even starts draining in-flight ones.
+
+    `handle_exit` is overridden as a real method, not a per-instance closure or
+    attribute: `sse_starlette` patches `uvicorn.Server.handle_exit` at import time
+    (`AppStatus.handle_exit`) and, on signal, finds *the* running server by reading
+    `signal.getsignal(signal.SIGTERM).__self__` - `uvicorn.Server.
+    install_signal_handlers` registers exactly `self.handle_exit` as the handler, so
+    that only resolves to this instance if `handle_exit` stays a bound method on
+    this class. `super().handle_exit(sig, frame)` is what still runs uvicorn's own
+    `should_exit`/`force_exit` bookkeeping and sse_starlette's patched behaviour
+    (draining any open legacy GET stream) - this override only adds the one extra
+    side effect, never replaces it.
+
+    Reads the app straight off `self.config.app` instead of a constructor
+    parameter: `cli.py` always builds this with the already-constructed `Starlette`
+    app (never a string/factory), and `uvicorn.Config.__init__` assigns that value
+    to `.app` verbatim, before `.load()` ever runs - so it is already the right
+    object the moment this server exists.
+    """
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        cast(Starlette, self.config.app).state.draining = True
+        super().handle_exit(sig, frame)
 
 
 def create_app(
@@ -201,11 +271,52 @@ def create_app(
     `config.cimd_enabled` is false.
     """
 
+    # Only needed for pending OIDC login state (`put_pending`); `None` when no
+    # `OAUTH_CLIENT_SECRET_KEY` is configured still lets rate limiting work, both
+    # `PostgresSharedState.put_pending` and `ValkeySharedState.put_pending` refuse to
+    # run without one. Built once, here, rather than separately inside each backend's
+    # own branch below.
+    cipher = (
+        store.ClientSecretCipher(config.oauth_client_secret_key)
+        if config.oauth_client_secret_key is not None
+        else None
+    )
+
     oauth_cell = _OAuthProviderCell()
+    shared_state = _SharedStateHandle()
+    if config.valkey_url is not None:
+        # Valkey takes precedence over Postgres (ADR-0009 §2, #104) and does not
+        # depend on `services.pool`, so it is built right here rather than inside
+        # `lifespan` - a missing `redis` package is a startup error before this
+        # server ever binds a port, not something discovered only once `lifespan`
+        # runs.
+        try:
+            shared_state.backend = build_valkey_shared_state(config.valkey_url, cipher=cipher)
+        except ImportError as exc:
+            raise ServerConfigError(
+                "VALKEY_URL is set, but the 'redis' package is not installed: install "
+                "the 'valkey' extra to use Valkey-backed shared state, e.g. "
+                "`uv sync --extra valkey` or `pip install 'memory-manager[valkey]'`"
+            ) from exc
+    if isinstance(authenticator, (PasswordAuthenticator, OidcAuthenticator)):
+        # Bound now, against the handle - not the backend it starts with: `lifespan`
+        # below may still swap `shared_state.backend` to a `PostgresSharedState` once
+        # `services.pool` exists (unless Valkey already won, just above), and this
+        # authenticator (built outside `create_app`, by `build_authenticator`) picks
+        # that up on its next call without being touched again.
+        authenticator.bind_shared_state(shared_state)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
+            if config.valkey_url is None and services.pool is not None:
+                # Rate limits, the login brute-force window and pending OIDC login
+                # state move to Postgres once a database is configured (ADR-0009 §2,
+                # #103) - the same condition `_build_oauth_provider`/`token_verifier`
+                # already gate on below. Skipped when a `ValkeySharedState` already
+                # won above (#104): the two are never combined.
+                shared_state.backend = PostgresSharedState(services.pool, cipher=cipher)
+
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
 
@@ -263,6 +374,10 @@ def create_app(
                     # pass their own mocked one, which stays theirs to close) - otherwise
                     # that client, and its connection pool, outlives this app's lifespan.
                     await authenticator.aclose()
+                if isinstance(shared_state.backend, ValkeySharedState):
+                    # Closes the `redis.asyncio.Redis` connection pool `create_app`
+                    # built above - otherwise it outlives this app's lifespan.
+                    await shared_state.backend.aclose()
 
     routes: list[Route | Mount] = [
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
@@ -325,11 +440,19 @@ def create_app(
             mcp_path=config.mcp_path,
             webhook_path=WEBHOOK_PATH,
             max_request_bytes=config.max_request_bytes,
-            mcp_limiter=RateLimiter(per_minute=config.mcp_per_minute, burst=config.mcp_burst),
-            write_limiter=RateLimiter(per_minute=config.write_per_minute, burst=config.write_burst),
-            oauth_limiter=RateLimiter(per_minute=config.oauth_per_minute, burst=config.oauth_burst),
+            mcp_limiter=RateLimiter(
+                state=shared_state, per_minute=config.mcp_per_minute, burst=config.mcp_burst
+            ),
+            write_limiter=RateLimiter(
+                state=shared_state, per_minute=config.write_per_minute, burst=config.write_burst
+            ),
+            oauth_limiter=RateLimiter(
+                state=shared_state, per_minute=config.oauth_per_minute, burst=config.oauth_burst
+            ),
             webhook_limiter=RateLimiter(
-                per_minute=config.webhook_per_minute, burst=config.webhook_burst
+                state=shared_state,
+                per_minute=config.webhook_per_minute,
+                burst=config.webhook_burst,
             ),
         ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
@@ -344,6 +467,9 @@ def create_app(
     # Known synchronously (no vault/DB work needed), unlike `services`/`mcp_app`
     # above - set right away rather than deferred into `lifespan`.
     app.state.config = config
+    # Flipped to `True` by `GracefulShutdownServer.handle_exit` on `SIGTERM`/
+    # `SIGINT` (ADR-0009 §5) - `_readyz` checks this before anything else.
+    app.state.draining = False
     return app
 
 
@@ -513,7 +639,8 @@ class _McpMount:
 
 
 class _LimitsMiddleware:
-    """Body-size cap plus per-key token-bucket rate limiting (#39).
+    """Body-size cap plus per-key fixed-window rate limiting on a shared backend
+    (#39, #103).
 
     Three route classes, matched on `scope["path"]` directly (the same
     style `_OriginValidationMiddleware` below uses, not a Starlette
@@ -538,6 +665,13 @@ class _LimitsMiddleware:
     Every other path (health/ready, PRM, login, the AS metadata document)
     passes through unlimited; none of them is a meaningful target for
     either abuse this middleware defends against.
+
+    Every limiter call goes through `_allow`, which fails *open* (allows the
+    request, logs a warning) if the shared `SharedState` backend raises -
+    once a database or `VALKEY_URL` is configured (`create_app`), a limiter
+    check is a Postgres or Valkey round trip, and a transient outage of
+    either must never itself turn into "every request gets rejected" on top
+    of whatever else that outage already breaks.
     """
 
     def __init__(
@@ -586,7 +720,7 @@ class _LimitsMiddleware:
         limiter: RateLimiter,
         key_of: Callable[[Scope], str],
     ) -> None:
-        allowed, retry_after = limiter.allow(key_of(scope))
+        allowed, retry_after = await _allow_or_fail_open(limiter, key_of(scope))
         if not allowed:
             await _send_rate_limited(scope, receive, send, retry_after)
             return
@@ -607,18 +741,31 @@ class _LimitsMiddleware:
             body = b""
             effective_receive = receive
 
-        allowed, retry_after = self._mcp_limiter.allow(key)
+        allowed, retry_after = await _allow_or_fail_open(self._mcp_limiter, key)
         if not allowed:
             await _send_rate_limited(scope, receive, send, retry_after)
             return
 
         if _is_write_tool_call(body):
-            allowed, retry_after = self._write_limiter.allow(key)
+            allowed, retry_after = await _allow_or_fail_open(self._write_limiter, key)
             if not allowed:
                 await _send_rate_limited(scope, receive, send, retry_after)
                 return
 
         await self._app(scope, effective_receive, send)
+
+
+async def _allow_or_fail_open(limiter: RateLimiter, key: str) -> tuple[bool, float]:
+    """`limiter.allow(key)`, but `(True, 0.0)` instead of raising if the underlying
+    `SharedState` backend fails (e.g. Postgres unreachable) - see `_LimitsMiddleware`'s
+    docstring for why failing open, not closed, is the right default here."""
+    try:
+        return await limiter.allow(key)
+    except Exception:
+        _logger.warning(
+            "rate-limit backend unavailable; failing open for key=%r", key, exc_info=True
+        )
+        return True, 0.0
 
 
 def _client_ip(scope: Scope) -> str:
@@ -821,7 +968,17 @@ async def _healthz(_request: Request) -> Response:
 
 
 async def _readyz(request: Request) -> Response:
-    """503 when the vault clone is missing, or a configured database is unreachable."""
+    """503 when draining (ADR-0009 §5), the vault clone is missing, or a configured
+    database is unreachable.
+
+    The draining check runs first and skips the database round trip entirely -
+    once `GracefulShutdownServer.handle_exit` has set `app.state.draining`, this
+    process is shutting down regardless of what the database says, so there is
+    nothing to gain from asking it.
+    """
+    if request.app.state.draining:
+        return JSONResponse({"ready": False, "draining": True}, status_code=503)
+
     services: Services = request.app.state.services
     vault_ready = (services.vault_root / ".git").is_dir()
 
@@ -834,7 +991,12 @@ async def _readyz(request: Request) -> Response:
             database_ready = False
 
     ready = vault_ready and database_ready
-    body = {"ready": ready, "vault": vault_ready, "database": database_ready}
+    body = {
+        "ready": ready,
+        "vault": vault_ready,
+        "database": database_ready,
+        "draining": False,
+    }
     return JSONResponse(body, status_code=200 if ready else 503)
 
 

@@ -32,7 +32,12 @@ class TestMigrate:
     async def test_applies_0001_on_a_fresh_database(self, conn: asyncpg.Connection) -> None:
         applied = await migrate(conn)
 
-        assert applied == ["0001_index_schema", "0002_static_tokens", "0003_oauth"]
+        assert applied == [
+            "0001_index_schema",
+            "0002_static_tokens",
+            "0003_oauth",
+            "0006_shared_state",
+        ]
         tables = {
             row["table_name"]
             for row in await conn.fetch(
@@ -50,6 +55,7 @@ class TestMigrate:
             "oauth_pending",
             "oauth_auth_codes",
             "oauth_tokens",
+            "rate_limits",
         }
 
     async def test_running_twice_applies_nothing_the_second_time(
@@ -58,7 +64,12 @@ class TestMigrate:
         first = await migrate(conn)
         second = await migrate(conn)
 
-        assert first == ["0001_index_schema", "0002_static_tokens", "0003_oauth"]
+        assert first == [
+            "0001_index_schema",
+            "0002_static_tokens",
+            "0003_oauth",
+            "0006_shared_state",
+        ]
         assert second == []
 
     async def test_concurrent_migrate_applies_each_migration_exactly_once(
@@ -76,6 +87,7 @@ class TestMigrate:
             "0001_index_schema",
             "0002_static_tokens",
             "0003_oauth",
+            "0006_shared_state",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -128,7 +140,12 @@ class TestMigrate:
             finally:
                 await role_conn.close()
 
-            assert applied == ["0001_index_schema", "0002_static_tokens", "0003_oauth"]
+            assert applied == [
+                "0001_index_schema",
+                "0002_static_tokens",
+                "0003_oauth",
+                "0006_shared_state",
+            ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
             await admin_conn.execute(f'drop role if exists "{role_name}"')

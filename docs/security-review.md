@@ -25,7 +25,7 @@ actually reading the referenced code, not recalled from the architecture docs.
 | A-01 | GitHub Actions pinned by major version tag, not commit SHA | Low | accepted | [§ A-01](#a-01-actions-pinned-by-tag) |
 | A-02 | Note content leaves the vault's trust boundary when an external embedding API is configured | Informational | accepted | [§ A-02](#a-02-note-content-sent-to-an-external-embedding-api) |
 | A-03 | Prompt injection via stored note content is mitigated only by instruction text, not enforced in code | Informational | accepted | [§ A-03](#a-03-prompt-injection-through-stored-notes) |
-| A-04 | Rate limiting and brute-force state is in-process, lost on restart, not shared across replicas | Low | accepted | [§ A-04](#a-04-in-process-only-abuse-state) |
+| A-04 | Rate limiting, brute-force and pending-login state fall back to in-process, lost on restart, only in a database-less (single-replica) deployment | Low | accepted | [§ A-04](#a-04-in-process-only-abuse-state-without-a-database) |
 | A-05 | Container base image pinned by tag, not digest | Low | accepted | [§ A-05](#a-05-base-image-pinned-by-tag) |
 
 No `open` items remain.
@@ -231,11 +231,15 @@ Compliant, with one fixed finding:
 - HTTP request bodies are capped at `max_request_bytes` (default 1 MiB,
   `config.py:42`), counted against actual bytes received rather than a
   spoofable `Content-Length` (`http.py:658-678`).
-- Per-key token-bucket rate limiting on every meaningful route class — MCP
+- Per-key fixed-window rate limiting on every meaningful route class — MCP
   calls, write-tool calls specifically, the OAuth AS endpoints, the webhook
-  (`http.py:515-621`) — each bounded to `_DEFAULT_MAX_KEYS = 10_000` distinct
-  keys with LRU eviction (`auth/ratelimit.py:27,65-115`), confirmed by
-  `tests/auth/test_limits_audit.py::test_rate_limiter_evicts_the_least_recently_used_key_beyond_max_keys`.
+  (`http.py:515-621`) — on a shared `auth.shared_state.SharedState` (Postgres
+  once a database is configured, in-process otherwise, ADR-0009 §2, #103);
+  the in-process fallback is bounded to `_DEFAULT_MAX_KEYS = 10_000` distinct
+  keys with LRU eviction (`auth/shared_state.py`), confirmed by
+  `tests/auth/test_shared_state.py::TestInMemorySharedStateBoundedLru`. The
+  Postgres-backed `rate_limits` table has no equivalent sweep of its own yet
+  (#106).
 - A note is capped at 16 KiB (`vault/validate.py:30`); `title`/`description`/
   `tags`/`aliases`/`source`/`supersedes` all carry their own length/count caps
   (`vault/validate.py:34-39`).
@@ -511,20 +515,26 @@ of refusing to return note content at all, which would defeat the product's
 purpose. Accepted as inherent to any tool that returns user-authored text to
 an LLM client.
 
-### A-04: In-process-only abuse state
+### A-04: In-process-only abuse state without a database
 
 **Severity:** Low · **Status:** accepted
 
-Both `auth/ratelimit.py::RateLimiter` and `auth/login_password.py`'s
-brute-force windows live in process memory: a restart clears them, and a
-second replica of this server would track its own, independent state rather
-than sharing one. ADR-0004 already states this trade-off explicitly ("Rate
-limiting state is in-process (single replica), same as bring"), and
-`docs/PLAN.md`'s architecture is single-writer/single-replica by design
-("One process, one replica for writes"). **Rationale for accepting:** adding
-a shared store (Redis or similar) for this alone would be a new dependency
-for a deployment shape this project does not target; revisit if/when a
-multi-replica deployment mode is ever added.
+ADR-0004 originally accepted this as "in-process (single replica), same as
+bring", with `docs/PLAN.md`'s single-writer/single-replica architecture as
+the reason it was low-severity to begin with. ADR-0009 §2 (#103) has since
+moved `auth/ratelimit.py::RateLimiter`, `auth/login_password.py`'s
+brute-force windows and `auth/login_oidc.py`'s pending login state onto one
+`auth.shared_state.SharedState`: `PostgresSharedState` once a database is
+configured (`rate_limits`, an UNLOGGED table, plus `oauth_pending` for
+pending logins), sharing the same state across however many replicas use it
+- the deployment shape ADR-0009 actually targets, and the one in which this
+risk mattered. **Residual, still accepted:** a deployment with no database
+at all (static tokens only) still keeps this state in
+`InMemorySharedState`, in this one process - but that deployment shape is
+single-replica by construction (no OAuth login, no multi-replica support
+without Postgres, ADR-0007), so the original finding does not apply to it.
+Revisit once Valkey (#104) or a sweep of stale `rate_limits` rows (#106)
+land.
 
 ### A-05: Base image pinned by tag
 
