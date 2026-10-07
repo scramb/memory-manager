@@ -25,8 +25,9 @@ deliberately tight one):
   count against the same Postgres-backed window regardless of which replica
   answers them (`auth.shared_state.PostgresSharedState`, ADR-0009 §2). Only
   read-only tools (`memory_index`/`memory_read`/`memory_search`) are ever
-  called here - #122 (the MCP and write limiters still collide in the same
-  key space) would otherwise make a write call's accounting unpredictable.
+  called here, keeping this scenario about the MCP limiter alone - a write
+  call would also spend the separately keyed write limiter's own budget
+  (#122), a second limiter this scenario has no interest in.
 - `test_cleanup_sweep_is_a_singleton_across_replicas`: the periodic cleanup
   sweep's advisory lock (`http._run_cleanup_iteration`, #106) - exercised
   directly against `_replica_db.pool`, not through a subprocess pair: the
@@ -141,28 +142,28 @@ async def _replica_db(admin_database_url: str) -> AsyncIterator[_ReplicaDb]:
         await admin_conn.close()
 
 
-#: Generous enough that neither limiter this module's non-rate-limit scenario
-#: exercises (`RATE_LIMIT_MCP_*`/`RATE_LIMIT_WRITE_*`) ever trips on the handful
-#: of calls that scenario makes - deliberately set here, on both, rather than
-#: left at `ServerConfig`'s own defaults: #122 (the MCP and write limiters still
-#: share one key space) means a run of reads *and* writes against the same
-#: token - exactly what "consistency + kill" below does - would otherwise be
-#: able to trip the tighter default write limit well before this module's own
-#: `limit` requests are anywhere close to it, for a reason that has nothing to
-#: do with what that scenario tests. The rate-limit scenario below overrides
-#: `RATE_LIMIT_MCP_*` back down to its own deliberately tight pair; it never
-#: calls a write tool, so `RATE_LIMIT_WRITE_*` staying generous there too is
-#: harmless.
+#: Generous enough that the MCP limiter this module's non-rate-limit scenario
+#: exercises (`RATE_LIMIT_MCP_*`) never trips on the handful of calls that
+#: scenario makes - deliberately set here rather than left at `ServerConfig`'s
+#: own default (`mcp_burst=30`), since "consistency + kill" below runs well
+#: past that on reads alone (the `memory_index` loop). `RATE_LIMIT_WRITE_*`
+#: stays at `ServerConfig`'s own default (30): since #122 (every `RateLimiter`
+#: now keys its own, separately prefixed window - module docstring) the write
+#: limiter's budget is no longer inflated by this scenario's read calls, and
+#: the two `memory_write` calls it actually makes are nowhere close to 30. The
+#: rate-limit scenario below overrides `RATE_LIMIT_MCP_*` back down to its own
+#: deliberately tight pair; it never calls a write tool.
 _GENEROUS_RATE_LIMIT = "1000"
 
 
 def _replica_env(db: _ReplicaDb, **overrides: str) -> dict[str, str]:
     """The `"postgres"`-backend env every replica in this module starts with
     (`STORAGE_BACKEND`/`DATABASE_URL`/`DATABASE_APP_ROLE`/`PUBLIC_URL`, the shape
-    `tests/conformance/test_http.py:256-266`'s `http_env` builds), generous
-    rate limits by default (`_GENEROUS_RATE_LIMIT`'s own docstring), plus
-    whatever `overrides` a scenario needs on top instead (the rate-limit
-    scenario's own, deliberately tight `RATE_LIMIT_MCP_*` pair).
+    `tests/conformance/test_http.py:256-266`'s `http_env` builds), a generous MCP
+    rate limit by default (`_GENEROUS_RATE_LIMIT`'s own docstring - the write
+    limiter stays at `ServerConfig`'s own default), plus whatever `overrides` a
+    scenario needs on top instead (the rate-limit scenario's own, deliberately
+    tight `RATE_LIMIT_MCP_*` pair).
     """
     env = {
         "STORAGE_BACKEND": "postgres",
@@ -171,8 +172,6 @@ def _replica_env(db: _ReplicaDb, **overrides: str) -> dict[str, str]:
         "PUBLIC_URL": _PUBLIC_URL,
         "RATE_LIMIT_MCP_PER_MINUTE": _GENEROUS_RATE_LIMIT,
         "RATE_LIMIT_MCP_BURST": _GENEROUS_RATE_LIMIT,
-        "RATE_LIMIT_WRITE_PER_MINUTE": _GENEROUS_RATE_LIMIT,
-        "RATE_LIMIT_WRITE_BURST": _GENEROUS_RATE_LIMIT,
     }
     env.update(overrides)
     return env
@@ -365,9 +364,9 @@ async def test_rate_limit_is_shared_across_replicas(_replica_db: _ReplicaDb) -> 
     cross-replica property, not one replica racing through the whole budget
     before the other is ever asked.
 
-    Read-only tool only (`memory_index`): #122 (the MCP and write limiters still
-    share one key space) would otherwise make a write call's accounting here
-    unpredictable.
+    Read-only tool only (`memory_index`): a write call would also spend the
+    separately keyed write limiter's own budget (#122), a second limiter this
+    scenario, about the MCP limiter alone, has no interest in.
     """
     limit = 5
     total_requests = 4 * limit

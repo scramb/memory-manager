@@ -199,6 +199,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 ### WP-21 — Latency baseline · F-01 · Branch: `wp/21-load-baseline` · PR: open
 
 - [x] #106 Two server processes serve one Postgres dataset consistently
+- [x] #122 Rate limiters count in separate key spaces
 - [x] #107 A deterministic generator produces a synthetic vault of configurable size
 - [x] #117 Search stays fast for queries with very frequent terms
 - [x] #120 One API replica sustains the modelled load within the latency targets

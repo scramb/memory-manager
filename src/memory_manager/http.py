@@ -479,18 +479,28 @@ def create_app(
             webhook_path=WEBHOOK_PATH,
             max_request_bytes=config.max_request_bytes,
             mcp_limiter=RateLimiter(
-                state=shared_state, per_minute=config.mcp_per_minute, burst=config.mcp_burst
+                state=shared_state,
+                per_minute=config.mcp_per_minute,
+                burst=config.mcp_burst,
+                name="mcp",
             ),
             write_limiter=RateLimiter(
-                state=shared_state, per_minute=config.write_per_minute, burst=config.write_burst
+                state=shared_state,
+                per_minute=config.write_per_minute,
+                burst=config.write_burst,
+                name="write",
             ),
             oauth_limiter=RateLimiter(
-                state=shared_state, per_minute=config.oauth_per_minute, burst=config.oauth_burst
+                state=shared_state,
+                per_minute=config.oauth_per_minute,
+                burst=config.oauth_burst,
+                name="oauth",
             ),
             webhook_limiter=RateLimiter(
                 state=shared_state,
                 per_minute=config.webhook_per_minute,
                 burst=config.webhook_burst,
+                name="webhook",
             ),
         ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
