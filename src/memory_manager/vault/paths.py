@@ -21,7 +21,7 @@ write one through `parse_note_path`/`resolve`, only the write queue through
 
 `iter_md_files` is the same symlink safety for the other direction: a caller
 that needs every note-shaped file on disk (`doctor.run_doctor`,
-`mcp.server._iter_vault_notes`, `search_fallback.scan_search`) rather than
+`storage.git.GitBackend.list`, `search_fallback.scan_search`) rather than
 one path a client asked for by name. A plain `Path.rglob("*.md")` follows a
 symlink transparently - a `*.md` symlink committed to the vault (nothing in
 the write path can ever create one, but a human pushing straight to the git

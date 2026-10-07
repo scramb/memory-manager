@@ -42,7 +42,7 @@ from pathlib import Path
 import asyncpg
 
 from memory_manager.audit import AuditWriter
-from memory_manager.config import EmbeddingConfig, VaultConfig
+from memory_manager.config import EmbeddingConfig, VaultConfig, storage_backend_from_env
 from memory_manager.db.migrate import migrate
 from memory_manager.index.embeddings import EmbeddingProvider, provider_from_config
 from memory_manager.index.indexer import Indexer
@@ -62,10 +62,12 @@ from memory_manager.queue import (
     WriteRequest,
     WriteResult,
 )
+from memory_manager.storage.base import StorageBackend
+from memory_manager.storage.git import GitBackend
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
-__all__ = ["Services", "open_services"]
+__all__ = ["Services", "open_services", "open_storage"]
 
 _logger = logging.getLogger(__name__)
 
@@ -80,22 +82,27 @@ class Services:
     pool: asyncpg.Pool | None
     indexer: Indexer | None
     provider: EmbeddingProvider | None
+    storage: StorageBackend
     trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
 
 
 @asynccontextmanager
-async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
-    """Build `Services` from `environ` and tear everything down on exit.
+async def _open_backend(
+    backend_name: str, vault_config: VaultConfig
+) -> AsyncIterator[tuple[StorageBackend, Repo, WriteQueue]]:
+    """Build the `STORAGE_BACKEND` named by `backend_name`, torn down on exit.
 
-    Raises `VaultConfigError`/`EmbeddingConfigError` if the matching `VAULT_*`/
-    `EMBEDDING_*` variables are missing or malformed; these surface before
-    anything is started. With `environ["DATABASE_URL"]` set, also migrates
-    and reindexes the Postgres index before yielding, so the index is never
-    stale behind the vault for the first request.
+    Only `"git"` exists today - `storage_backend_from_env` already rejected
+    anything else before this is ever called. `repo`/`queue` are `GitBackend`'s
+    own innards, handed back alongside it so `open_services`'s hooks, indexer,
+    poll loop and webhook can keep reaching the working copy directly
+    (ADR-0007 §1: the Git backend is unchanged, single-writer, derived index).
+    A future `"postgres"` branch (WP-18) would yield its own pool-backed
+    handle here instead; `open_storage`'s callers, which only ever use the
+    `StorageBackend` itself, would not change at all.
     """
-    vault_config = VaultConfig.from_env(dict(environ))
-    embedding_config = EmbeddingConfig.from_env(dict(environ))
-    database_url = environ.get("DATABASE_URL")
+    if backend_name != "git":  # pragma: no cover - storage_backend_from_env already rejected this
+        raise AssertionError(f"unknown storage backend {backend_name!r}")
 
     repo = Repo(vault_config)
     await asyncio.to_thread(repo.ensure_clone)
@@ -103,43 +110,82 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
 
     queue = WriteQueue(repo)
     await queue.start()
-
-    pool: asyncpg.Pool | None = None
-    indexer: Indexer | None = None
-    provider: EmbeddingProvider | None = None
-
     try:
-        if database_url:
-            pool, indexer, provider = await _open_index(
-                database_url, vault_config.dir, embedding_config
-            )
-            queue.add_hook(_index_write_hook(indexer))
-            queue.add_sync_hook(_index_sync_hook(indexer))
-            queue.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
-
-        poll_stop = asyncio.Event()
-        poll_task = asyncio.create_task(
-            poll_loop(queue.sync, vault_config.poll_seconds, stop=poll_stop)
-        )
-        try:
-            yield Services(
-                repo=repo,
-                queue=queue,
-                vault_root=vault_config.dir,
-                pool=pool,
-                indexer=indexer,
-                provider=provider,
-                trigger_sync=queue.sync,
-            )
-        finally:
-            poll_stop.set()
-            poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await poll_task
+        yield GitBackend(queue, repo, vault_config.dir), repo, queue
     finally:
         await queue.stop()
-        if pool is not None:
-            await pool.close()
+
+
+@asynccontextmanager
+async def open_storage(environ: Mapping[str, str]) -> AsyncIterator[StorageBackend]:
+    """Build the configured `StorageBackend` from `environ`, torn down on exit.
+
+    The import CLI's (`memory-manager import ...`) entry point into the
+    vault: just read/write access to `STORAGE_BACKEND`, synced once on entry
+    - no Postgres index, audit log or poll loop, unlike `open_services`.
+    Raises `VaultConfigError`/`StorageConfigError` if the matching
+    environment variables are missing or malformed, before anything is
+    cloned.
+    """
+    vault_config = VaultConfig.from_env(dict(environ))
+    storage_backend_name = storage_backend_from_env(dict(environ))
+    async with _open_backend(storage_backend_name, vault_config) as (storage, _repo, _queue):
+        yield storage
+
+
+@asynccontextmanager
+async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
+    """Build `Services` from `environ` and tear everything down on exit.
+
+    Raises `VaultConfigError`/`EmbeddingConfigError`/`StorageConfigError` if the
+    matching `VAULT_*`/`EMBEDDING_*`/`STORAGE_BACKEND` variables are missing or
+    malformed; these surface before anything is started. With
+    `environ["DATABASE_URL"]` set, also migrates and reindexes the Postgres
+    index before yielding, so the index is never stale behind the vault for
+    the first request.
+    """
+    vault_config = VaultConfig.from_env(dict(environ))
+    embedding_config = EmbeddingConfig.from_env(dict(environ))
+    storage_backend_name = storage_backend_from_env(dict(environ))
+    database_url = environ.get("DATABASE_URL")
+
+    async with _open_backend(storage_backend_name, vault_config) as (storage, repo, queue):
+        pool: asyncpg.Pool | None = None
+        indexer: Indexer | None = None
+        provider: EmbeddingProvider | None = None
+
+        try:
+            if database_url:
+                pool, indexer, provider = await _open_index(
+                    database_url, vault_config.dir, embedding_config
+                )
+                queue.add_hook(_index_write_hook(indexer))
+                queue.add_sync_hook(_index_sync_hook(indexer))
+                queue.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
+
+            poll_stop = asyncio.Event()
+            poll_task = asyncio.create_task(
+                poll_loop(queue.sync, vault_config.poll_seconds, stop=poll_stop)
+            )
+            try:
+                yield Services(
+                    repo=repo,
+                    queue=queue,
+                    vault_root=vault_config.dir,
+                    pool=pool,
+                    indexer=indexer,
+                    provider=provider,
+                    storage=storage,
+                    trigger_sync=queue.sync,
+                )
+            finally:
+                poll_stop.set()
+                poll_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await poll_task
+        finally:
+            if pool is not None:
+                await pool.close()
 
 
 def _index_sync_hook(indexer: Indexer) -> SyncHook:

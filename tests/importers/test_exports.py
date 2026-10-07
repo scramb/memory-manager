@@ -22,6 +22,8 @@ from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.core import dedupe_against_vault, run_import
 from memory_manager.importers.textlist import parse_items
 from memory_manager.queue import WriteQueue
+from memory_manager.storage.base import StorageBackend
+from memory_manager.storage.git import GitBackend
 from memory_manager.vault.git import Git
 from memory_manager.vault.note import parse as parse_note
 from memory_manager.vault.repo import Repo
@@ -71,14 +73,15 @@ def _remote_file(remote: Path, rel: str) -> bytes | None:
 
 
 @pytest.fixture
-async def queue(vault_config: VaultConfig) -> AsyncIterator[WriteQueue]:
+async def backend(vault_config: VaultConfig) -> AsyncIterator[StorageBackend]:
+    """A `GitBackend` over a fresh clone, following `tests/storage/test_git_backend.py`."""
     repo = Repo(vault_config)
-    write_queue = WriteQueue(repo)
-    await write_queue.start()
+    queue = WriteQueue(repo)
+    await queue.start()
     try:
-        yield write_queue
+        yield GitBackend(queue, repo, vault_config.dir)
     finally:
-        await write_queue.stop()
+        await queue.stop()
 
 
 @pytest.fixture
@@ -396,7 +399,7 @@ class TestRunImportIntegration:
     async def test_dry_run_writes_nothing(
         self,
         tmp_path: Path,
-        queue: WriteQueue,
+        backend: StorageBackend,
         repo: Repo,
         vault_config: VaultConfig,
         bare_remote: Path,
@@ -406,8 +409,8 @@ class TestRunImportIntegration:
 
         before = _log(bare_remote)
         items, rejected = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        kept, duplicates = dedupe_against_vault(items, vault_config.dir)
-        report = await run_import(kept, queue, repo, apply=False)
+        kept, duplicates = await dedupe_against_vault(items, backend)
+        report = await run_import(kept, backend, apply=False)
 
         assert rejected == []
         assert duplicates == []
@@ -417,7 +420,7 @@ class TestRunImportIntegration:
     async def test_apply_creates_one_commit_per_note_authored_import(
         self,
         tmp_path: Path,
-        queue: WriteQueue,
+        backend: StorageBackend,
         repo: Repo,
         vault_config: VaultConfig,
         bare_remote: Path,
@@ -426,8 +429,8 @@ class TestRunImportIntegration:
         path.write_text(_read_fixture("chatgpt_list.txt"), encoding="utf-8")
 
         items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        kept, duplicates = dedupe_against_vault(items, vault_config.dir)
-        report = await run_import(kept, queue, repo, apply=True)
+        kept, duplicates = await dedupe_against_vault(items, backend)
+        report = await run_import(kept, backend, apply=True)
 
         assert duplicates == []
         assert len(report.created) == 3
@@ -440,30 +443,30 @@ class TestRunImportIntegration:
         assert len(_log(bare_remote)) == 3
 
     async def test_rerunning_the_same_import_creates_nothing_new(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, vault_config: VaultConfig
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, vault_config: VaultConfig
     ) -> None:
         path = tmp_path / "list.txt"
         path.write_text(_read_fixture("chatgpt_list.txt"), encoding="utf-8")
 
         first_items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        first_kept, _ = dedupe_against_vault(first_items, vault_config.dir)
-        first_report = await run_import(first_kept, queue, repo, apply=True)
+        first_kept, _ = await dedupe_against_vault(first_items, backend)
+        first_report = await run_import(first_kept, backend, apply=True)
         assert len(first_report.created) == 3
 
         await asyncio.to_thread(repo.sync)
         second_items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        second_kept, second_duplicates = dedupe_against_vault(second_items, vault_config.dir)
+        second_kept, second_duplicates = await dedupe_against_vault(second_items, backend)
 
         assert second_kept == []
         assert len(second_duplicates) == 3
 
-        second_report = await run_import(second_kept, queue, repo, apply=True)
+        second_report = await run_import(second_kept, backend, apply=True)
         assert second_report.created == []
 
     async def test_fake_secret_item_is_rejected_others_are_imported(
         self,
         tmp_path: Path,
-        queue: WriteQueue,
+        backend: StorageBackend,
         repo: Repo,
         vault_config: VaultConfig,
         bare_remote: Path,
@@ -476,8 +479,8 @@ class TestRunImportIntegration:
         )
 
         items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        kept, duplicates = dedupe_against_vault(items, vault_config.dir)
-        report = await run_import(kept, queue, repo, apply=True)
+        kept, duplicates = await dedupe_against_vault(items, backend)
+        report = await run_import(kept, backend, apply=True)
 
         assert duplicates == []
         assert len(report.created) == 1
@@ -489,7 +492,7 @@ class TestRunImportIntegration:
     async def test_dedupe_against_vault_skips_a_memory_already_imported_by_claude(
         self,
         tmp_path: Path,
-        queue: WriteQueue,
+        backend: StorageBackend,
         repo: Repo,
         vault_config: VaultConfig,
         bare_remote: Path,
@@ -514,7 +517,7 @@ class TestRunImportIntegration:
 
         items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
         await asyncio.to_thread(repo.sync)
-        kept, duplicates = dedupe_against_vault(items, vault_config.dir)
+        kept, duplicates = await dedupe_against_vault(items, backend)
 
         assert len(duplicates) == 1
         assert len(kept) == 2
@@ -525,7 +528,7 @@ class TestEndToEndCommittedNote:
     async def test_imported_note_parses_and_has_expected_source(
         self,
         tmp_path: Path,
-        queue: WriteQueue,
+        backend: StorageBackend,
         repo: Repo,
         vault_config: VaultConfig,
         bare_remote: Path,
@@ -534,8 +537,8 @@ class TestEndToEndCommittedNote:
         path.write_text("The user prefers dark mode in every app.\n", encoding="utf-8")
 
         items, _ = collect_chatgpt(path, namespace="personal", today=_TODAY)
-        kept, _ = dedupe_against_vault(items, vault_config.dir)
-        report = await run_import(kept, queue, repo, apply=True)
+        kept, _ = await dedupe_against_vault(items, backend)
+        report = await run_import(kept, backend, apply=True)
 
         assert len(report.created) == 1
         note_path = report.created[0]

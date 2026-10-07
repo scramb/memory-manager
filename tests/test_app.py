@@ -15,9 +15,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from git_fixtures import human_commit
 
 from memory_manager.app import open_services
+from memory_manager.config import StorageConfigError
 from memory_manager.queue import WriteRequest
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
@@ -98,3 +100,20 @@ async def test_trigger_sync_indexes_a_human_commit_without_any_write(
             "select count(*) from notes where path = $1", _HUMAN_PATH
         )
         assert indexed == 1
+
+
+async def test_an_unknown_storage_backend_fails_before_the_vault_dir_is_created(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    vault_dir = tmp_path / "vault"
+    environ = {
+        "VAULT_REMOTE": str(bare_remote),
+        "VAULT_DIR": str(vault_dir),
+        "STORAGE_BACKEND": "postgres",
+    }
+
+    with pytest.raises(StorageConfigError):
+        async with open_services(environ):
+            pass
+
+    assert not vault_dir.exists()

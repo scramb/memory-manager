@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from memory_manager.config import VaultConfig
 from memory_manager.importers.core import build_source, run_import
 from memory_manager.importers.markdown import collect
 from memory_manager.queue import WriteQueue
+from memory_manager.storage.base import StorageBackend
+from memory_manager.storage.git import GitBackend
 from memory_manager.vault.git import Git
 from memory_manager.vault.note import parse
 from memory_manager.vault.repo import Repo
@@ -37,14 +40,15 @@ def _remote_file(remote: Path, rel: str) -> bytes | None:
 
 
 @pytest.fixture
-async def queue(vault_config: VaultConfig) -> AsyncIterator[WriteQueue]:
+async def backend(vault_config: VaultConfig) -> AsyncIterator[StorageBackend]:
+    """A `GitBackend` over a fresh clone, following `tests/storage/test_git_backend.py`."""
     repo = Repo(vault_config)
-    write_queue = WriteQueue(repo)
-    await write_queue.start()
+    queue = WriteQueue(repo)
+    await queue.start()
     try:
-        yield write_queue
+        yield GitBackend(queue, repo, vault_config.dir)
     finally:
-        await write_queue.stop()
+        await queue.stop()
 
 
 @pytest.fixture
@@ -176,7 +180,7 @@ class TestCollect:
 
 class TestRunImport:
     async def test_dry_run_writes_nothing(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -184,14 +188,14 @@ class TestRunImport:
 
         before = _log(bare_remote)
         items, rejected = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=False)
+        report = await run_import(items, backend, apply=False)
 
         assert rejected == []
         assert report.created == ["personal/reference/note.md"]
         assert _log(bare_remote) == before
 
     async def test_apply_creates_one_commit_per_file_authored_import(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -199,7 +203,7 @@ class TestRunImport:
         (source / "second.md").write_text("# Second\n\nSecond body.\n", encoding="utf-8")
 
         items, rejected = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert rejected == []
         assert sorted(report.created) == [
@@ -219,7 +223,7 @@ class TestRunImport:
         assert note.source == "import:markdown:first.md"
 
     async def test_fake_secret_is_rejected_and_reported_not_fatal(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -229,7 +233,7 @@ class TestRunImport:
         (source / "clean.md").write_text("# Clean\n\nNothing secret here.\n", encoding="utf-8")
 
         items, _ = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert report.created == ["personal/reference/clean.md"]
         assert len(report.rejected) == 1
@@ -239,7 +243,7 @@ class TestRunImport:
         assert _remote_file(bare_remote, "personal/reference/leaky.md") is None
 
     async def test_oversized_file_is_rejected_not_truncated(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -247,7 +251,7 @@ class TestRunImport:
         (source / "huge.md").write_text(f"# Huge\n\n{huge_body}\n", encoding="utf-8")
 
         items, _ = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert report.created == []
         assert len(report.rejected) == 1
@@ -256,7 +260,7 @@ class TestRunImport:
         assert "too large" in reason
 
     async def test_duplicate_content_is_deduped(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -264,13 +268,13 @@ class TestRunImport:
         (source / "two.md").write_text("# Shared\n\nIdentical content.\n", encoding="utf-8")
 
         items, _ = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert len(report.created) == 1
         assert report.duplicates == ["import:markdown:two.md"]
 
     async def test_existing_target_path_is_skipped_not_overwritten(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         existing_note = (
             b"---\n"
@@ -284,20 +288,21 @@ class TestRunImport:
             b"Original content.\n"
         )
         human_commit(bare_remote, "personal/reference/clash.md", existing_note)
+        await asyncio.to_thread(repo.sync)
 
         source = tmp_path / "source"
         source.mkdir()
         (source / "clash.md").write_text("# Clash\n\nDifferent content.\n", encoding="utf-8")
 
         items, _ = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert report.created == []
         assert report.skipped_existing == ["personal/reference/clash.md"]
         assert _remote_file(bare_remote, "personal/reference/clash.md") == existing_note
 
     async def test_derived_description_is_flagged_and_within_limit(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         source = tmp_path / "source"
         source.mkdir()
@@ -307,7 +312,7 @@ class TestRunImport:
         )
 
         items, _ = collect(source, namespace="personal")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert report.created == ["personal/reference/nodesc.md"]
         assert len(report.flagged) == 1
@@ -322,7 +327,7 @@ class TestRunImport:
 
 class TestEndToEnd:
     async def test_collect_and_import_full_batch(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo, bare_remote: Path
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo, bare_remote: Path
     ) -> None:
         source = tmp_path / "source"
         (source / "nested").mkdir(parents=True)
@@ -330,7 +335,7 @@ class TestEndToEnd:
         (source / "nested" / "b.md").write_text("---\ntitle: B\n---\nBody B.\n", encoding="utf-8")
 
         items, rejected = collect(source, namespace="team", default_type="project")
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert rejected == []
         assert sorted(report.created) == [
@@ -339,7 +344,7 @@ class TestEndToEnd:
         ]
 
     async def test_very_deep_path_imports_successfully_with_shortened_source(
-        self, tmp_path: Path, queue: WriteQueue, repo: Repo
+        self, tmp_path: Path, backend: StorageBackend, repo: Repo
     ) -> None:
         # A relative path long enough that "import:markdown:" + rel alone
         # would blow past the ADR-0005 200-char `source` cap.
@@ -358,7 +363,7 @@ class TestEndToEnd:
         assert rejected == []
         assert len(items[0].source) <= 200
 
-        report = await run_import(items, queue, repo, apply=True)
+        report = await run_import(items, backend, apply=True)
 
         assert rejected == []
         assert report.rejected == []

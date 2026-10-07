@@ -61,10 +61,12 @@ class GitBackend:
     async def list(self, *, include_archived: bool = False) -> list[StoredNote]:
         """Every note in the vault, in path order (`vault.paths.iter_md_files`).
 
-        Follows the same filter `mcp.server._iter_vault_notes` uses: every
-        `*.md` file shaped like `<namespace>/<type>/<slug>.md` (optionally
-        `_archive/`-prefixed), skipping anything else silently. Archived
-        notes are included only when `include_archived` is set.
+        Filters to every `*.md` file shaped like `<namespace>/<type>/<slug>.md`
+        (optionally `_archive/`-prefixed), skipping anything else silently -
+        the one place that filter lives now that callers such as
+        `mcp.server` read the vault through this interface instead of
+        walking the working copy themselves. Archived notes are included
+        only when `include_archived` is set.
         """
         entries: list[StoredNote] = []
         for file in iter_md_files(self._vault_root):

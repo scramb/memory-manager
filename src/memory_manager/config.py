@@ -19,9 +19,11 @@ __all__ = [
     "EmbeddingConfigError",
     "ServerConfig",
     "ServerConfigError",
+    "StorageConfigError",
     "VaultConfig",
     "VaultConfigError",
     "canonical_resource_url",
+    "storage_backend_from_env",
 ]
 
 _DEFAULT_BRANCH = "main"
@@ -29,6 +31,8 @@ _DEFAULT_POLL_SECONDS = 60
 _DEFAULT_EMBEDDING_PROVIDER = "none"
 _EMBEDDING_PROVIDERS = ("none", "ollama", "openai")
 _DEFAULT_OLLAMA_MODEL = "bge-m3"
+_DEFAULT_STORAGE_BACKEND = "git"
+_STORAGE_BACKENDS = ("git",)
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8080
@@ -111,6 +115,32 @@ def _require(environ: dict[str, str], name: str, error: type[ValueError]) -> str
     if not value:
         raise error(f"{name} is required but not set")
     return value
+
+
+class StorageConfigError(VaultConfigError):
+    """`STORAGE_BACKEND` is set to a backend this build does not implement.
+
+    A subclass of `VaultConfigError` (not a sibling `ValueError`), so every
+    caller that already catches `VaultConfigError` to report a config
+    problem with exit code 2 (`cli.py`'s `serve`/`import` commands) keeps
+    doing so unchanged for this error too.
+    """
+
+
+def storage_backend_from_env(environ: dict[str, str]) -> str:
+    """The configured storage backend's name (`STORAGE_BACKEND`, default `"git"`).
+
+    Only `"git"` (`memory_manager.storage.git.GitBackend`) is implemented
+    today; `"postgres"` is enterprise scope (WP-18, ADR-0007). Raises
+    `StorageConfigError` for any other value - the same
+    `EMBEDDING_PROVIDER` pattern `EmbeddingConfig.from_env` uses above.
+    """
+    backend = environ.get("STORAGE_BACKEND", _DEFAULT_STORAGE_BACKEND)
+    if backend not in _STORAGE_BACKENDS:
+        raise StorageConfigError(
+            f"STORAGE_BACKEND must be one of {_STORAGE_BACKENDS}, got {backend!r}"
+        )
+    return backend
 
 
 class EmbeddingConfigError(ValueError):
