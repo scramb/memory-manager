@@ -50,3 +50,38 @@ create table namespaces (
     alias text unique,
     unique (kind, external_key)
 );
+
+-- Indexes for the Postgres-backend write path, see #98.
+--
+-- `index_on_connection` runs `indexer.py`'s `_upsert_note_rows`,
+-- `_refresh_links` and `_heal_dangling_for_note` (via `_entries_for`) inside
+-- the same transaction as a write, so every `notes`/`links` query on that
+-- path must stay index-backed - never a sequential scan over either table -
+-- for a write to stay cheap regardless of vault size. `notes.path` (unique),
+-- `notes.id` (primary key) and `links`' own primary key `(source_id,
+-- target_raw)` already cover the delete-by-path, upsert-by-id and
+-- delete-by-source_id statements in those functions; only the link
+-- resolution lookups below need new indexes.
+
+-- `_entries_for`'s `lower(slug) = any($1)` branch.
+create index notes_slug_lower_idx on notes (lower(slug));
+
+-- `_entries_for`'s alias branch. `lower_array` folds every alias to lower
+-- case once, so a GIN index on the result can be probed with `&&` instead
+-- of the per-row `unnest`/`exists` the planner could never push through an
+-- index. Semantically identical to "does any alias, lower-cased, appear in
+-- the target list"; `strict` is safe because `notes.aliases` is `not null
+-- default '{}'`, so it is never actually passed a `null`.
+create or replace function lower_array(text[]) returns text[]
+    language sql immutable strict as
+$$
+    select array_agg(lower(element)) from unnest($1) as element
+$$;
+
+create index notes_aliases_lower_gin_idx on notes using gin (lower_array(aliases));
+
+-- `_heal_dangling_for_note`'s `target_path is null and
+-- lower(trim(target_raw)) = any($1)`. Partial on `target_path is null` to
+-- match the predicate exactly and stay small as links resolve over time.
+create index links_dangling_target_raw_idx on links (lower(trim(target_raw)))
+    where target_path is null;

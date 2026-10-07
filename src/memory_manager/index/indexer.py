@@ -721,9 +721,10 @@ async def _entries_for(conn: _Conn, targets: Sequence[str]) -> list[VaultEntry]:
     ever match a reference to, so neither `_refresh_links` (one note's own
     outgoing links) nor `_heal_dangling_links`/`_heal_dangling_for_note` (the
     index's currently-dangling links) ever has to read the whole `notes` table
-    to resolve a link (#98) - `notes` has no index on `slug`/`aliases` today, so
-    this still costs a sequential scan per call, just over a result set bounded
-    by `len(targets)` rather than every row read back into Python.
+    to resolve a link (#98). Both branches are index-backed (`notes_slug_lower_idx`,
+    `notes_aliases_lower_gin_idx`, migration 0004, see #98): `lower_array` folds
+    `aliases` to lower case the same way the dropped `unnest`/`exists` form did,
+    just as a `&&` the GIN index can be probed with instead of a per-row subplan.
     """
     if not targets:
         return []
@@ -732,9 +733,7 @@ async def _entries_for(conn: _Conn, targets: Sequence[str]) -> list[VaultEntry]:
         select path, namespace, slug, aliases
         from notes
         where lower(slug) = any($1::text[])
-           or exists (
-                select 1 from unnest(aliases) as alias where lower(alias) = any($1::text[])
-           )
+           or lower_array(aliases) && $1::text[]
         """,
         list(targets),
     )
