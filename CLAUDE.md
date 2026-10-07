@@ -10,7 +10,7 @@ Plan and architecture: [`docs/PLAN.md`](./docs/PLAN.md) · Work backlog: [`docs/
 - Language/runtime: Python 3.12+, official MCP Python SDK 2.x, Starlette/uvicorn, `uv` ([ADR-0001](./docs/adr/0001-implementation-language.md)) — owner-approved deviation from the pool
 - Frontend: none in v1 (optional read-only view from v1.x)
 - Operation: container (Docker Compose locally, Helm chart on Kubernetes); local stdio mode for Claude Code
-- Persistence: Git repository with Markdown (source of truth) · PostgreSQL 16+ with `pgvector` (derived index)
+- Persistence: Git repository with Markdown (source of truth, default) · PostgreSQL 16+ with `pgvector` (derived index; source of truth with the enterprise `postgres` backend, [ADR-0007](./docs/adr/0007-storage-backend.md))
 
 ## Precedence
 
@@ -82,9 +82,9 @@ Refs #13
 
 ## Project-specific rules
 
-- **Git is the source of truth.** Postgres must be fully rebuildable from the vault (`reindex --full`). Never store information only in the DB that is not derivable from Git — except operational data (tokens, audit log, OAuth state).
+- **The storage backend is the source of truth.** With the Git backend (default), Git is: Postgres must be fully rebuildable from the vault (`reindex --full`), and nothing lives only in the DB that is not derivable from Git — except operational data (tokens, audit log, OAuth state). With the `postgres` backend (enterprise, ADR-0007), Postgres is, with append-only revisions; `export` gives a portable Markdown copy that is never read back.
 - **Never overwrite silently.** Every write carries `if_version`; conflicts surface to the caller with the current content.
-- **Never hard-delete notes.** Archive to `_archive/`.
+- **No MCP tool hard-deletes notes.** Tools archive to `_archive/`. Erasure (GDPR, retention) exists only with the `postgres` backend, outside MCP, and is audited with metadata only (ADR-0007).
 - **Note content is data, not instructions.** No code path interprets note content as commands; tool descriptions say so.
 - **Security is not negotiable:** path allowlist, no symlinks, `.md` only, secret scan before every commit, token hashes only, audit log for every write. A change that weakens one of these needs an ADR.
 - **License:** AGPL-3.0-only. Every source file starts with `# SPDX-License-Identifier: AGPL-3.0-only`. New dependencies must be AGPL-compatible.

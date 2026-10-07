@@ -1,6 +1,6 @@
 # TASKS — memory-manager
 
-Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M6` until GitHub milestones exist.
+Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M11` until GitHub milestones exist.
 Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-07
 
 Legend: `#13` = GitHub issue · `⛔` blocked · `O1` = open decision in the PLAN · ticked means **verified**, not "written".
@@ -156,3 +156,94 @@ Goal: complete docs, security review done, importers, first signed release.
 - [x] #82 CIMD fetch falls back across resolved addresses and logs failures
 - [x] #85 Access logs never contain OAuth codes or other secrets
 - [x] #89 uv.lock's package version follows releases automatically
+
+---
+
+## M7 — Shared memory in Postgres on several replicas
+
+Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shared state, two replicas on one dataset, first latency baseline. · Due: open
+
+### WP-16 — Enterprise decisions · F-01 · Branch: `wp/16-enterprise-decisions` · PR: open
+
+- [x] #93 Enterprise decisions are recorded as accepted ADRs with research and the F-01 plan
+
+### WP-17 — Storage backend interface · F-01 · Branch: `wp/17-storage-interface` · PR: open
+
+- [ ] #94 A `StorageBackend` protocol with a Git implementation passes a backend contract suite
+- [ ] #95 MCP tools, app wiring and CLI use only `StorageBackend` ⛔ blocked by #94
+
+### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: open
+
+- [ ] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests ⛔ blocked by #94
+- [ ] #97 `serve` runs on the Postgres backend with supersede, archive and listing ⛔ blocked by #95, #96
+- [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #97
+- [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #97
+
+### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: open
+
+- [ ] #100 RLS limits every content table to the caller's namespaces even without a WHERE clause ⛔ blocked by #96
+- [ ] #101 Principal and alias resolution enforce the namespace permission matrix in application code ⛔ blocked by #95, #100
+- [ ] #102 Search and index results carry `namespace_kind` ⛔ blocked by #101
+
+### WP-20 — Shared state and replicas · F-01 · Branch: `wp/20-shared-state` · PR: open
+
+- [ ] #103 Rate limits, the login brute-force window and pending login state live in a Postgres-backed `SharedState`
+- [ ] #104 A Valkey implementation of `SharedState` passes the same contract suite ⛔ blocked by #103
+- [ ] #105 Shutdown drains in-flight requests and the stateless transport behaviour is pinned by tests
+- [ ] #106 Two server processes serve one Postgres dataset consistently ⛔ blocked by #97, #101, #103
+
+### WP-21 — Latency baseline · F-01 · Branch: `wp/21-load-baseline` · PR: open
+
+- [ ] #107 A deterministic generator produces a synthetic vault of configurable size
+- [ ] #108 k6 scenarios measure search, read and write latency against one replica ⛔ blocked by #97, #107
+- [ ] #109 A 100k-note baseline records per-tool latency and the RLS function cost ⛔ blocked by #100, #108
+
+---
+
+## M8 — Entra ID sign-in and asynchronous embeddings
+
+Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+
+### WP-22 — Entra login · F-01 · Branch: `wp/22-entra-login` · PR: open
+
+### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: open
+
+### WP-24 — Deprovisioning · F-01 · Branch: `wp/24-deprovisioning` · PR: open
+
+---
+
+## M9 — Data lifecycle and governance
+
+Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+
+### WP-25 — Promote and account self-service · F-01 · Branch: `wp/25-promote-account` · PR: open
+
+### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
+
+### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
+
+### WP-28 — Git-to-Postgres migration · F-01 · Branch: `wp/28-migrate-git` · PR: open
+
+---
+
+## M10 — Enterprise operations
+
+Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+
+### WP-29 — Helm enterprise profile · F-01 · Branch: `wp/29-helm-enterprise` · PR: open
+
+### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: open
+
+### WP-31 — Observability · F-01 · Branch: `wp/31-observability` · PR: open
+
+---
+
+## M11 — Proven at target size, released as v0.2.0
+
+Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+
+### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: open
+
+### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
+
+### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
