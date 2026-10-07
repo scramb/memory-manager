@@ -68,7 +68,7 @@ Goal: all tools usable from Claude Code over stdio, with server instructions, sk
 
 ### WP-06 — Claude Code integration · Branch: `wp/06-claude-code-integration`
 
-- [ ] #22 Claude Code skill + `CLAUDE.md` snippet in `integrations/claude-code/`
+- [x] #22 Claude Code skill + `CLAUDE.md` snippet in `integrations/claude-code/`
 - [x] #23 Docs: `claude mcp add` for stdio, verified manually in Claude Code
 
 ---
@@ -113,7 +113,7 @@ Goal: Streamable HTTP with OAuth, verified as a claude.ai custom connector.
 - [x] #37 Login at `/authorize`: upstream OIDC and admin-password modes
 - [x] #38 CIMD support (advertise + fetch client metadata documents with SSRF guards)
 - [x] #39 Rate limits per token/client, request/file size caps, audit log for every write
-- [ ] #40 Manual verification: claude.ai custom connector + `claude mcp add --transport http`, documented
+- [x] #40 Manual verification: claude.ai custom connector + `claude mcp add --transport http`, documented
 
 ---
 
@@ -132,7 +132,7 @@ Goal: reproducible deployment in < 5 minutes locally and via Helm/Flux on Kubern
 - [x] #44 Generic Kustomize base in `deploy/` + deployment guide, consumable by any Flux setup via an operator overlay (HTTPRoute, CNPG, ExternalSecret)
 - [x] #45 Helm chart (restricted PSS, NetworkPolicy, optional CNPG Postgres, single-writer)
 - [x] #46 Flux example with HelmRelease + SOPS secrets in `deploy/flux/`
-- [ ] #47 Docs: Cloudflare Tunnel as ingress alternative
+- [x] #47 Docs: Cloudflare Tunnel as ingress alternative
 
 ---
 
@@ -151,4 +151,7 @@ Goal: complete docs, security review done, importers, first signed release.
 - [x] #51 Security review against OWASP Top 10 for LLM apps, findings fixed or documented
 - [x] #52 Release pipeline: GHCR push, cosign signing, SBOM, chart-releaser, release-please
 - [x] #53 README comparison with mem0, Basic Memory, Zep; tag v0.1.0
-- [ ] #77 A deploy key without a trailing newline still loads
+- [x] #77 A deploy key without a trailing newline still loads
+- [x] #80 claude.ai connects through CIMD without a scope in its metadata
+- [x] #82 CIMD fetch falls back across resolved addresses and logs failures
+- [ ] #85 Access logs never contain OAuth codes or other secrets
