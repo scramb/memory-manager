@@ -69,7 +69,7 @@ import contextlib
 import hashlib
 import hmac
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
 
@@ -94,6 +94,8 @@ from memory_manager.auth.login import (
     PendingAuthorizationLookup,
     login_routes,
 )
+from memory_manager.auth.login_oidc import OidcAuthenticator, oidc_routes
+from memory_manager.auth.login_password import PasswordAuthenticator
 from memory_manager.auth.prm import (
     SCOPE_CHALLENGE,
     WELL_KNOWN_ROOT_PATH,
@@ -106,7 +108,7 @@ from memory_manager.config import ServerConfig, ServerConfigError, canonical_res
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 
-__all__ = ["ServicesFactory", "create_app"]
+__all__ = ["ServicesFactory", "build_authenticator", "create_app"]
 
 _logger = logging.getLogger(__name__)
 
@@ -159,13 +161,14 @@ def create_app(
     wiring (`memory_manager.mcp.server.build_server`). Without one, this
     server runs exactly as it did before #36: static bearer tokens only, no
     OAuth routes at all, no `authenticator`-shaped login UI to maintain.
-    Nothing in this codebase constructs a real `Authenticator` yet (ADR-0004's
-    login methods are #37) - today this parameter only exists for
-    `tests/auth/test_oauth_flow.py`'s `FakeAuthenticator`. `config.login_mode`
-    (`LOGIN_MODE`) is the forward-looking production knob for #37: set without
-    an `authenticator` given here, it is a startup error (`ServerConfigError`),
-    not a silent no-op - a deployment that asked for OAuth login must not end
-    up quietly running static-tokens-only instead.
+    `build_authenticator` is what turns `config.login_mode` (`LOGIN_MODE`)
+    into a real one (ADR-0004's L1/L2, #37) - `cli.py`'s `_serve_http` calls
+    it and passes the result in here; `tests/auth/test_oauth_flow.py`'s
+    `FakeAuthenticator` is a third, test-only implementation of the same
+    `Authenticator` protocol. `config.login_mode` set without an
+    `authenticator` given here is a startup error (`ServerConfigError`), not
+    a silent no-op - a deployment that asked for OAuth login must not end up
+    quietly running static-tokens-only instead.
     """
 
     oauth_cell = _OAuthProviderCell()
@@ -223,6 +226,12 @@ def create_app(
                     cleanup_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await cleanup_task
+                if isinstance(authenticator, OidcAuthenticator):
+                    # Closes the `httpx.AsyncClient` `OidcAuthenticator.__init__` creates
+                    # itself when no `http_client` is given (production; tests always
+                    # pass their own mocked one, which stays theirs to close) - otherwise
+                    # that client, and its connection pool, outlives this app's lifespan.
+                    await authenticator.aclose()
 
     routes: list[Route | Mount] = [
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
@@ -240,8 +249,7 @@ def create_app(
         ),
     ]
     if authenticator is not None:
-        # `/login` only exists when an `Authenticator` is actually configured - see this
-        # function's docstring for why that is never true in production yet (#37).
+        # `/login` only exists when an `Authenticator` is actually configured.
         routes.extend(
             login_routes(
                 lookup=_pending_authorization_lookup(oauth_cell),
@@ -249,6 +257,16 @@ def create_app(
                 authenticator=authenticator,
             )
         )
+        if isinstance(authenticator, OidcAuthenticator):
+            # `{CALLBACK_PATH}` is its own route, not part of `login_routes` - the upstream
+            # IdP redirects the browser straight back here, with no `pending` query
+            # parameter of its own (`auth.login_oidc`'s module docstring: `state` is what
+            # carries the pending authorization across that round trip instead).
+            routes.extend(
+                oidc_routes(
+                    complete=_authorization_completer(oauth_cell), authenticator=authenticator
+                )
+            )
     routes.append(
         # Mounted last (lowest route-matching precedence), same reasoning
         # `mcp/server/lowlevel/server.py` uses for its own custom routes:
@@ -290,8 +308,10 @@ def _build_oauth_provider(
     if services.pool is None or authenticator is None:
         if services.pool is not None and config.login_mode is not None:
             raise ServerConfigError(
-                f"LOGIN_MODE={config.login_mode!r} is set, but no login method is wired in "
-                "yet (#37); unset LOGIN_MODE to run this server with static tokens only"
+                f"LOGIN_MODE={config.login_mode!r} is set, but create_app was not given an "
+                "authenticator (build_authenticator(config, environ) builds one from "
+                "LOGIN_MODE - cli.py's _serve_http is expected to call it); unset LOGIN_MODE "
+                "to run this server with static tokens only"
             )
         return None
 
@@ -312,6 +332,24 @@ def _build_oauth_provider(
         issuer=issuer,
         client_secret_key=config.oauth_client_secret_key,
     )
+
+
+def build_authenticator(config: ServerConfig, environ: Mapping[str, str]) -> Authenticator | None:
+    """The production `Authenticator` for `config.login_mode` (ADR-0004 L1/L2, #37) -
+    `None` if `login_mode` is unset (no OAuth authorization server at all).
+
+    `cli.py`'s `_serve_http` calls this and passes the result into `create_app` as
+    `authenticator`; `PasswordAuthenticator.from_env`/`OidcAuthenticator.from_env` raise
+    `ServerConfigError` for a missing or inconsistent `LOGIN_MODE=password`/`oidc`
+    configuration, which `cli.py`'s `_serve` already turns into a clean startup refusal.
+    """
+    if config.login_mode is None:
+        return None
+    if config.login_mode == "password":
+        return PasswordAuthenticator.from_env(environ)
+    if config.login_mode == "oidc":
+        return OidcAuthenticator.from_env(environ)
+    raise ServerConfigError(f"LOGIN_MODE must be 'password' or 'oidc', got {config.login_mode!r}")
 
 
 def _build_auth_settings(

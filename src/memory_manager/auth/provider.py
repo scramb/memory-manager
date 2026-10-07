@@ -169,7 +169,13 @@ class MemoryManagerOAuthProvider(
         return f"{self._issuer}/login?pending={pending_id}"
 
     async def pending_authorization(self, pending_id: str) -> PendingAuthorization | None:
-        """The parked `/authorize` call behind `pending_id`, for `auth.login.login_routes`."""
+        """The parked `/authorize` call behind `pending_id`, for `auth.login.login_routes`.
+
+        `redirect_uri` is `row.redirect_uri` unchanged - the exact, already-validated
+        (by the SDK, against the registered client's `redirect_uris`) URI `authorize`
+        parked, so `auth.templates`'s "you will be redirected to <host>" notice always
+        names the real destination, never a guess.
+        """
         row = await store.get_pending(self._pool, pending_id)
         if row is None:
             return None
@@ -183,6 +189,7 @@ class MemoryManagerOAuthProvider(
             client_name=client_name if isinstance(client_name, str) else None,
             scopes=row.scopes,
             resource=row.resource,
+            redirect_uri=row.redirect_uri,
         )
 
     async def complete_authorization(
