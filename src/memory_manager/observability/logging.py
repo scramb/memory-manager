@@ -40,6 +40,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 __all__ = [
     "REQUEST_ID_HEADER",
+    "AccessLogQueryRedactionFilter",
     "JsonFormatter",
     "RequestIdMiddleware",
     "configure_logging",
@@ -52,6 +53,27 @@ REQUEST_ID_HEADER = "x-request-id"
 _RESPONSE_HEADER_NAME = b"x-request-id"
 
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+#: Query-string keys whose value never belongs in a log line, even redirected
+#: through `uvicorn.access` - OAuth/OIDC authorization codes, tokens and the
+#: Hydra/OIDC login and consent challenges (#85), plus a plain `password`.
+#: Matched case-insensitively; every other query parameter passes through.
+_REDACTED_QUERY_KEYS = frozenset(
+    {
+        "code",
+        "state",
+        "code_verifier",
+        "code_challenge",
+        "token",
+        "access_token",
+        "refresh_token",
+        "pending",
+        "login_challenge",
+        "consent_challenge",
+        "client_secret",
+        "password",
+    }
+)
 
 #: Set by `RequestIdMiddleware` for the lifetime of one HTTP request; `None`
 #: outside any request (stdio mode, startup/shutdown code, background tasks).
@@ -104,11 +126,73 @@ def _timestamp(created: float) -> str:
     return datetime.fromtimestamp(created, tz=UTC).isoformat(timespec="milliseconds")
 
 
+def _redact_query_string(full_path: str) -> str:
+    """`full_path` with every `_REDACTED_QUERY_KEYS` value replaced by `[redacted]`.
+
+    `full_path` is the `path?query` uvicorn logs (`get_path_with_query_string`
+    in its protocol implementations) - split on the first `?`, each
+    `key=value` pair in the query is redacted independently, so a path with
+    no query string or an unrelated query (`/login?pending=P` vs.
+    `/static/app.js`) is affected exactly where it has a matching key.
+    """
+    path, sep, query = full_path.partition("?")
+    if not sep:
+        return full_path
+    parts = []
+    for part in query.split("&"):
+        key, eq, _value = part.partition("=")
+        if eq and key.lower() in _REDACTED_QUERY_KEYS:
+            parts.append(f"{key}=[redacted]")
+        else:
+            parts.append(part)
+    return f"{path}?{'&'.join(parts)}"
+
+
+class AccessLogQueryRedactionFilter(logging.Filter):
+    """Redacts OAuth/OIDC secrets from `uvicorn.access` request lines (#85).
+
+    uvicorn logs one access line per request as
+    `'%s - "%s %s HTTP/%s" %d'` with
+    `args = (client_addr, method, full_path, http_version, status_code)`
+    (`uvicorn.protocols.http.*`) - `full_path` (`args[2]`) carries the raw
+    query string, which is exactly where an OAuth code or a Hydra login
+    challenge would otherwise end up verbatim in every access log line.
+    Rewriting `record.args` here (rather than the formatted message) keeps
+    this working for any `Formatter`, including `JsonFormatter`, whose
+    `getMessage()` call is what actually interpolates `record.msg %
+    record.args`.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) > 2 and isinstance(args[2], str):
+            redacted = _redact_query_string(args[2])
+            if redacted != args[2]:
+                record.args = (*args[:2], redacted, *args[3:])
+        return True
+
+
+def _attach_access_log_redaction() -> None:
+    """Attach `AccessLogQueryRedactionFilter` to `uvicorn.access` exactly once.
+
+    Idempotent, so it does not matter whether `configure_logging` runs
+    before or after uvicorn creates its own `uvicorn.access` logger
+    (`logging.getLogger` always returns the same singleton) or whether
+    `configure_logging` itself is called more than once (e.g. across tests).
+    """
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(f, AccessLogQueryRedactionFilter) for f in access_logger.filters):
+        return
+    access_logger.addFilter(AccessLogQueryRedactionFilter())
+
+
 def configure_logging(*, level: str = _DEFAULT_LEVEL, json_format: bool = True) -> None:
     """Replace the root logger's handlers with exactly one stderr handler.
 
     Safe to call more than once (e.g. across tests): always starts from a
-    clean handler list rather than accumulating one per call.
+    clean handler list rather than accumulating one per call. Also attaches
+    `AccessLogQueryRedactionFilter` to the `uvicorn.access` logger (#85), so
+    secrets in the query string never reach either handler this sets up.
     """
     handler = logging.StreamHandler(stream=sys.stderr)
     handler.setFormatter(JsonFormatter() if json_format else logging.Formatter(_TEXT_FORMAT))
@@ -116,6 +200,7 @@ def configure_logging(*, level: str = _DEFAULT_LEVEL, json_format: bool = True) 
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level.upper())
+    _attach_access_log_redaction()
 
 
 def configure_logging_from_env(environ: Mapping[str, str]) -> None:

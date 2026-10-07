@@ -34,7 +34,11 @@ from memory_manager.config import ServerConfig
 from memory_manager.http import METRICS_PATH, WEBHOOK_PATH, create_app
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.observability import tracing
-from memory_manager.observability.logging import JsonFormatter
+from memory_manager.observability.logging import (
+    AccessLogQueryRedactionFilter,
+    JsonFormatter,
+    configure_logging,
+)
 from memory_manager.observability.metrics import (
     GIT_OPERATIONS_TOTAL,
     QUEUE_DEPTH,
@@ -338,6 +342,87 @@ async def test_log_line_outside_a_request_has_no_request_id(
     records = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
     assert records
     assert all("request_id" not in record for record in records)
+
+
+# --- Access log query-string redaction ------------------------------------------
+
+
+def _access_log_record(full_path: str, *, status_code: int = 200) -> logging.LogRecord:
+    """A `logging.LogRecord` shaped exactly like uvicorn's `uvicorn.access` line.
+
+    Matches `args = (client_addr, method, full_path, http_version,
+    status_code)` from `uvicorn.protocols.http.*` (`h11_impl.py` et al.), so
+    `AccessLogQueryRedactionFilter` sees the same record shape it does in
+    production, without going through a real ASGI connection.
+    """
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:12345", "GET", full_path, "1.1", status_code),
+        exc_info=None,
+    )
+
+
+def _filtered_json_msg(full_path: str) -> str:
+    record = _access_log_record(full_path)
+    assert AccessLogQueryRedactionFilter().filter(record) is True
+    payload = json.loads(JsonFormatter().format(record))
+    return cast(str, payload["msg"])
+
+
+def test_access_log_filter_redacts_oauth_code_and_state() -> None:
+    msg = _filtered_json_msg("/oidc/callback?code=SECRET1&state=SECRET2&x=1")
+
+    assert "SECRET1" not in msg
+    assert "SECRET2" not in msg
+    assert "code=[redacted]" in msg
+    assert "state=[redacted]" in msg
+    assert "x=1" in msg
+
+
+def test_access_log_filter_redacts_the_login_challenge() -> None:
+    msg = _filtered_json_msg("/login?pending=P")
+
+    assert "pending=P" not in msg
+    assert "pending=[redacted]" in msg
+
+
+def test_access_log_filter_leaves_non_sensitive_paths_untouched() -> None:
+    full_path = "/static/app.js?v=3"
+    record = _access_log_record(full_path)
+
+    assert AccessLogQueryRedactionFilter().filter(record) is True
+    assert cast(tuple[object, ...], record.args)[2] == full_path
+
+
+def test_access_log_filter_leaves_a_path_without_a_query_string_untouched() -> None:
+    full_path = "/metrics"
+    record = _access_log_record(full_path)
+
+    assert AccessLogQueryRedactionFilter().filter(record) is True
+    assert cast(tuple[object, ...], record.args)[2] == full_path
+
+
+def test_configure_logging_attaches_the_filter_to_uvicorn_access_exactly_once() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    previous_filters = access_logger.filters[:]
+    root = logging.getLogger()
+    previous_handlers = root.handlers[:]
+    previous_level = root.level
+    try:
+        configure_logging()
+        configure_logging()
+        matches = [f for f in access_logger.filters if isinstance(f, AccessLogQueryRedactionFilter)]
+        assert len(matches) == 1
+    finally:
+        access_logger.filters[:] = previous_filters
+        root.handlers.clear()
+        for h in previous_handlers:
+            root.addHandler(h)
+        root.setLevel(previous_level)
 
 
 # --- No secrets or note content in logs ----------------------------------------
