@@ -10,6 +10,7 @@ own planner-facing fixture, just over `chunks` instead of `notes`/`links`.
 from __future__ import annotations
 
 import json
+import time
 
 import asyncpg
 import pytest_asyncio
@@ -88,6 +89,51 @@ def _cte_scan_rows(node: object, cte_name: str) -> list[int]:
     return found
 
 
+def _frequent_lexemes_call_loops(node: object) -> list[int]:
+    """`Actual Loops` of every plan node that calls `mm_frequent_lexemes`.
+
+    Looks at a node's `Output`/`Filter` text (needs `verbose`, not just
+    `analyze`) rather than its `Node Type`, because where Postgres ends up
+    evaluating the call depends on the plan: materialized, it shows up in
+    a `CTE Scan`'s `Output`; inlined into `candidates`' per-row filter
+    (the regression this guards against), it shows up in a `Function
+    Scan`'s `Filter` instead - evaluated once per candidate row, not once
+    overall.
+    """
+    found: list[int] = []
+    if isinstance(node, dict):
+        for field in ("Output", "Filter"):
+            value = node.get(field)
+            if value is not None and "mm_frequent_lexemes" in str(value):
+                found.append(int(node["Actual Loops"]))
+        for value in node.values():
+            found.extend(_frequent_lexemes_call_loops(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_frequent_lexemes_call_loops(item))
+    return found
+
+
+async def _explain_verbose(
+    conn: asyncpg.Connection, query: str, *, limit: int = 50, use_selective: bool = True
+) -> object:
+    """Run `EXPLAIN (ANALYZE, FORMAT JSON, VERBOSE)` for `query`'s plan, as a dict."""
+    sql, args = _build_fulltext_query(
+        query,
+        include_archived=False,
+        limit=limit,
+        types=None,
+        tags=None,
+        namespaces=None,
+        valid_at=None,
+        use_selective=use_selective,
+    )
+    rows = await conn.fetch(f"explain (analyze, format json, verbose) {sql}", *args)
+    raw_plan = rows[0]["QUERY PLAN"]
+    plan = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+    return plan[0]["Plan"]
+
+
 async def _explain_candidates(conn: asyncpg.Connection, query: str, *, limit: int = 50) -> int:
     """Run `EXPLAIN (ANALYZE, FORMAT JSON)` for `query` and return the `candidates`
     CTE's actual row count - the number of rows that ever reach scoring/sorting.
@@ -144,6 +190,56 @@ class TestBoundedCandidates:
         # empty even though "note or zzznonexistentzzz" should hit on "note".
         hits = await fulltext_search(seeded_conn, "note or zzznonexistentzzz", limit=5)
         assert hits
+
+
+class TestFrequentLexemesLookupIsBounded:
+    """`lexemes`/`frequent`/`selective` must run once per search, not once per
+    candidate row (#117 follow-up).
+
+    Left unmaterialized, Postgres is free to inline these CTEs into
+    `candidates`' own per-row join filter - `mm_frequent_lexemes` (and the
+    `selective` computation built from its result) then re-runs once for
+    every one of the up to 50k rows `candidates`' join considers before its
+    own `limit` kicks in, rather than the single time its result actually
+    needs computing. That is the slow path this fixture is built to expose:
+    "note" is the most common lexeme in the fixture, so the un-fixed query
+    evaluates `mm_frequent_lexemes` tens of thousands of times before
+    returning.
+    """
+
+    async def test_frequent_lexemes_lookup_runs_once_not_per_candidate_row(
+        self, seeded_conn: asyncpg.Connection
+    ) -> None:
+        plan = await _explain_verbose(seeded_conn, "note")
+        loops = _frequent_lexemes_call_loops(plan)
+
+        assert loops, "no plan node calls mm_frequent_lexemes - fixture or query changed?"
+        # Two config branches (`tsv_simple`, `tsv_lang`) share the one call
+        # site each; `<= 2` stays far under "once per candidate row" while
+        # still catching the regression (25,000 loops against the
+        # unmaterialized CTEs, on this fixture).
+        assert max(loops) <= 2, f"mm_frequent_lexemes ran per-row, not once: loops={loops}"
+
+    async def test_frequent_term_search_is_fast_on_a_50k_chunk_vault(
+        self, seeded_conn: asyncpg.Connection
+    ) -> None:
+        # A marker query (rare lexeme) stays comparatively fast even with
+        # the unmaterialized CTEs, since the candidate stage's `tsv_simple
+        # @@ q.simple` filter alone already narrows the scan to ~1 row
+        # before `mm_frequent_lexemes` gets re-evaluated per surviving row.
+        # "note" - every chunk's lexeme - does not narrow anything, so it
+        # is what actually exposes the per-row cost (tens of seconds
+        # un-fixed on this fixture, measured while diagnosing #117's
+        # follow-up) without flaking on an otherwise-fast query.
+        start = time.monotonic()
+        hits = await fulltext_search(seeded_conn, "note", limit=5)
+        elapsed = time.monotonic() - start
+
+        assert len(hits) == 5
+        # Generous enough not to flake on a loaded machine (fixed: ~150ms
+        # measured locally), tight enough that re-running
+        # `mm_frequent_lexemes` per candidate row unmistakably fails it.
+        assert elapsed < 1.0, f"fulltext_search('note') took {elapsed:.3f}s"
 
 
 class TestFrequentLexemesFunctionUnderANonOwnerRole:

@@ -214,7 +214,16 @@ q as (
 -- from this check. Removing a lexeme below only shrinks the *candidate*
 -- match (`candidates`, further down); `q.*`/`q.safe` still rank every
 -- candidate exactly as before.
-lexemes as (
+-- `materialized`: without it, Postgres is free to inline `lexemes` (and,
+-- downstream, `frequent`/`selective` below) into `candidates`' join tree
+-- rather than computing it once - verified against Postgres 16 to turn
+-- into a per-row re-evaluation of everything downstream of it, including
+-- the `mm_frequent_lexemes` call `frequent` makes (#117 follow-up: at 50k
+-- chunks, that call ran 25,000 times instead of once, dominating the
+-- query's cost). None of the three CTEs references `c`/`n`, so forcing
+-- materialization changes no result, only when the (cheap, one-row) work
+-- happens.
+lexemes as materialized (
     select
         (select coalesce(array_agg(distinct word), '{}')
             from unnest(tsvector_to_array(to_tsvector('simple', $1))) as word) as simple,
@@ -230,7 +239,10 @@ lexemes as (
 -- the other, since stemming differs per chunk; `german`/`english` share
 -- one call, since both feed `tsv_lang`, the one physical column whose
 -- statistics the function reads.
-frequent as (
+-- `materialized` for the same reason as `lexemes` above - this is the CTE
+-- that actually calls `mm_frequent_lexemes`, so it is the one that most
+-- needs to run exactly once rather than once per candidate row.
+frequent as materialized (
     select
         mm_frequent_lexemes('tsv_simple', lexemes.simple, $8) as simple,
         mm_frequent_lexemes('tsv_lang', lexemes.german || lexemes.english, $8) as lang
@@ -242,7 +254,10 @@ frequent as (
 -- to filter that branch's match on and falls back to its own unfiltered
 -- condition, the same fallback `$10 = false` forces for every branch at
 -- once (`fulltext_search`'s retry - see the module docstring).
-selective as (
+-- `materialized` for the same reason as `lexemes`/`frequent` above - left
+-- inlined, `candidates`' own join tree re-evaluates this CTE (and thus
+-- `frequent`/`mm_frequent_lexemes`) once per row it filters, not once.
+selective as materialized (
     select
         (select coalesce(string_agg(quote_literal(word), ' | '), '')
             from unnest(lexemes.simple) as word
