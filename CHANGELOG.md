@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1](https://github.com/scramb/memory-manager/compare/v0.1.0...v0.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* CIMD clients without scope and deploy keys without trailing newline ([#81](https://github.com/scramb/memory-manager/issues/81)) ([773e6ae](https://github.com/scramb/memory-manager/commit/773e6aefd426d9d4c6ddb31b323666ba4999a8f4)), closes [#80](https://github.com/scramb/memory-manager/issues/80) [#77](https://github.com/scramb/memory-manager/issues/77)
+
+
+### Documentation
+
+* record the v0.1.0 release state in TASKS and the handoff ([#78](https://github.com/scramb/memory-manager/issues/78)) ([6a9f507](https://github.com/scramb/memory-manager/commit/6a9f50713a92e6bd53c22a027af6bfc6b3703144)), closes [#40](https://github.com/scramb/memory-manager/issues/40)
+
 ## 0.1.0 (2026-10-07)
 
 
