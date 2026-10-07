@@ -38,6 +38,7 @@ from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.config import ServerConfig
 from memory_manager.db.migrate import migrate
 from memory_manager.http import create_app
+from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
 # --- Shared fixtures for a fake CIMD document server -------------------------------
 
@@ -121,6 +122,23 @@ async def test_fetch_happy_path_pins_to_the_resolved_address_and_sets_host_and_s
     assert request.url.host == _PUBLIC_ADDRESS
     assert request.headers["host"] == "client.example.test"
     assert request.extensions.get("sni_hostname") == "client.example.test"
+
+
+async def test_fetch_reads_no_scope_as_none_not_as_empty() -> None:
+    # claude.ai's own document has no `scope` field at all (#80) - `_parse_document`
+    # must leave it `None`, not coerce a missing field into `""`, since the two mean
+    # opposite things to `auth.provider._cimd_scope_for`.
+    fetcher = ClientMetadataFetcher(transport=_ok_handler(), resolver=_public_resolver)
+    document = await fetcher.fetch_client_metadata(_CLIENT_URL)
+    assert document.scope is None
+
+
+async def test_fetch_reads_a_present_scope() -> None:
+    fetcher = ClientMetadataFetcher(
+        transport=_ok_handler(extra={"scope": "memory:read"}), resolver=_public_resolver
+    )
+    document = await fetcher.fetch_client_metadata(_CLIENT_URL)
+    assert document.scope == "memory:read"
 
 
 async def test_fetch_rejects_a_client_id_mismatch() -> None:
@@ -309,6 +327,34 @@ async def test_get_client_fetches_and_upserts_a_cimd_client(pool: asyncpg.Pool) 
     assert '"cimd": true' in row["client_info"]
 
 
+async def test_get_client_without_a_document_scope_gets_every_supported_scope(
+    pool: asyncpg.Pool,
+) -> None:
+    # claude.ai's document shape (#80): no `scope` field at all.
+    fetcher = ClientMetadataFetcher(transport=_ok_handler(), resolver=_public_resolver)
+    provider = _provider(pool, cimd_fetcher=fetcher)
+
+    client = await provider.get_client(_CLIENT_URL)
+
+    assert client is not None
+    assert client.scope == f"{READ_SCOPE} {WRITE_SCOPE}"
+
+
+async def test_get_client_with_a_document_scope_intersects_with_the_supported_scopes(
+    pool: asyncpg.Pool,
+) -> None:
+    fetcher = ClientMetadataFetcher(
+        transport=_ok_handler(extra={"scope": f"{READ_SCOPE} unsupported:scope"}),
+        resolver=_public_resolver,
+    )
+    provider = _provider(pool, cimd_fetcher=fetcher)
+
+    client = await provider.get_client(_CLIENT_URL)
+
+    assert client is not None
+    assert client.scope == READ_SCOPE
+
+
 async def test_get_client_returns_none_for_an_unfetchable_cimd_url(pool: asyncpg.Pool) -> None:
     fetcher = ClientMetadataFetcher(transport=_ok_handler(), resolver=_private_resolver)
     provider = _provider(pool, cimd_fetcher=fetcher)
@@ -477,6 +523,83 @@ async def test_cimd_client_authorize_login_token_with_loopback_any_port(
         assert token_response.status_code == 200, token_response.text
         body = token_response.json()
         assert body["access_token"]
+
+
+async def test_cimd_client_with_claude_ai_document_shape_authorizes_and_refreshes(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    # claude.ai's real document (fetched 2026-10-07, #80): no `scope` field, and an
+    # extra grant type (`urn:ietf:params:oauth:grant-type:jwt-bearer`) this server does
+    # not otherwise support - neither must stop `authorize` requesting
+    # `scope=memory:read memory:write`, or the token/refresh exchange that follows.
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    fetcher = ClientMetadataFetcher(
+        transport=_ok_handler(
+            redirect_uris=("https://claude.ai/api/mcp/auth_callback",),
+            extra={
+                "grant_types": [
+                    "authorization_code",
+                    "refresh_token",
+                    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                ],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        ),
+        resolver=_public_resolver,
+    )
+    redirect_uri = "https://claude.ai/api/mcp/auth_callback"
+    code_verifier, code_challenge = _pkce_pair()
+
+    async with _running_app(environ, config, cimd_fetcher=fetcher) as (_app, client):
+        authorize_response = await client.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": _CLIENT_URL,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "state": "xyz",
+                "scope": f"{READ_SCOPE} {WRITE_SCOPE}",
+                "resource": f"{_PUBLIC_URL}{_MCP_PATH}",
+            },
+        )
+        assert authorize_response.status_code == 302, authorize_response.text
+        login_response = await client.get(_location(authorize_response))
+        assert login_response.status_code == 302, login_response.text
+
+        callback_url = _location(login_response)
+        parsed = urlsplit(callback_url)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == redirect_uri
+        code = parse_qs(parsed.query)["code"][0]
+
+        token_response = await client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": _CLIENT_URL,
+                "code_verifier": code_verifier,
+            },
+        )
+        assert token_response.status_code == 200, token_response.text
+        body = token_response.json()
+        assert body["access_token"]
+        assert body["scope"] == f"{READ_SCOPE} {WRITE_SCOPE}"
+
+        refresh_response = await client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": body["refresh_token"],
+                "client_id": _CLIENT_URL,
+            },
+        )
+        assert refresh_response.status_code == 200, refresh_response.text
+        assert refresh_response.json()["access_token"]
 
 
 async def test_cimd_disabled_rejects_a_url_client_id_as_unknown(
