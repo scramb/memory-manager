@@ -192,6 +192,14 @@ class ServerConfig:
     authorization server actually turns on (`http.py`, same condition as
     `public_url` above) - `http.py` raises `ServerConfigError` naming it if
     it is missing then, never falls back to running without it.
+
+    `cimd_enabled` (`CIMD_ENABLED`, default on) turns Client ID Metadata
+    Document registration (SEP-991, #38) on or off alongside DCR: `http.py`
+    only builds a `cimd.ClientMetadataFetcher` for `auth.provider.
+    MemoryManagerOAuthProvider` when this is true, and the AS metadata
+    document (`auth.metadata`) only advertises `client_id_metadata_document_
+    supported`/`"none"` then too. Off has no effect on DCR, which is
+    unconditional once the OAuth authorization server is enabled at all.
     """
 
     host: str = _DEFAULT_HOST
@@ -203,6 +211,7 @@ class ServerConfig:
     json_response: bool = True
     login_mode: str | None = None
     oauth_client_secret_key: str | None = field(default=None, repr=False)
+    cimd_enabled: bool = True
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -247,6 +256,7 @@ class ServerConfig:
         json_response = _parse_bool(environ.get("MCP_JSON_RESPONSE"), default=True)
         login_mode = environ.get("LOGIN_MODE") or None
         oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
+        cimd_enabled = _parse_bool(environ.get("CIMD_ENABLED"), default=True)
 
         return cls(
             host=host,
@@ -258,6 +268,7 @@ class ServerConfig:
             json_response=json_response,
             login_mode=login_mode,
             oauth_client_secret_key=oauth_client_secret_key,
+            cimd_enabled=cimd_enabled,
         )
 
 

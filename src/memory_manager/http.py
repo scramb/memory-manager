@@ -74,6 +74,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
 
 import asyncpg
+from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -87,6 +88,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from memory_manager import __commit__, __version__
 from memory_manager.app import Services
 from memory_manager.auth import store
+from memory_manager.auth.cimd import ClientMetadataFetcher
 from memory_manager.auth.login import (
     Authenticator,
     AuthorizationCompleter,
@@ -96,6 +98,8 @@ from memory_manager.auth.login import (
 )
 from memory_manager.auth.login_oidc import OidcAuthenticator, oidc_routes
 from memory_manager.auth.login_password import PasswordAuthenticator
+from memory_manager.auth.metadata import WELL_KNOWN_PATH as OAUTH_METADATA_PATH
+from memory_manager.auth.metadata import build_authorization_server_metadata
 from memory_manager.auth.prm import (
     SCOPE_CHALLENGE,
     WELL_KNOWN_ROOT_PATH,
@@ -144,6 +148,7 @@ def create_app(
     config: ServerConfig,
     *,
     authenticator: Authenticator | None = None,
+    cimd_fetcher: ClientMetadataFetcher | None = None,
 ) -> Starlette:
     """Build the Streamable HTTP ASGI app: MCP, health/ready, the vault webhook.
 
@@ -157,18 +162,27 @@ def create_app(
     `authenticator` turns the embedded OAuth authorization server on (#36):
     with one given (and a database configured), `/authorize` parks requests
     that `auth.login`'s `/login` route hands to it, and `/token`/`/register`/
-    `/revoke`/AS metadata all come from the SDK's own `auth_server_provider`
-    wiring (`memory_manager.mcp.server.build_server`). Without one, this
-    server runs exactly as it did before #36: static bearer tokens only, no
-    OAuth routes at all, no `authenticator`-shaped login UI to maintain.
-    `build_authenticator` is what turns `config.login_mode` (`LOGIN_MODE`)
-    into a real one (ADR-0004's L1/L2, #37) - `cli.py`'s `_serve_http` calls
-    it and passes the result in here; `tests/auth/test_oauth_flow.py`'s
-    `FakeAuthenticator` is a third, test-only implementation of the same
-    `Authenticator` protocol. `config.login_mode` set without an
-    `authenticator` given here is a startup error (`ServerConfigError`), not
-    a silent no-op - a deployment that asked for OAuth login must not end up
-    quietly running static-tokens-only instead.
+    `/revoke` come from the SDK's own `auth_server_provider` wiring
+    (`memory_manager.mcp.server.build_server`); AS metadata is this module's
+    own route instead (`auth.metadata`, #38 - see `_authorization_server_metadata`'s
+    docstring for why). Without an `authenticator`, this server runs exactly
+    as it did before #36: static bearer tokens only, no OAuth routes at all,
+    no `authenticator`-shaped login UI to maintain. `build_authenticator` is
+    what turns `config.login_mode` (`LOGIN_MODE`) into a real one (ADR-0004's
+    L1/L2, #37) - `cli.py`'s `_serve_http` calls it and passes the result in
+    here; `tests/auth/test_oauth_flow.py`'s `FakeAuthenticator` is a third,
+    test-only implementation of the same `Authenticator` protocol.
+    `config.login_mode` set without an `authenticator` given here is a
+    startup error (`ServerConfigError`), not a silent no-op - a deployment
+    that asked for OAuth login must not end up quietly running
+    static-tokens-only instead.
+
+    `cimd_fetcher` is a test seam (#38): given, it is used verbatim instead
+    of the production `ClientMetadataFetcher()` `_build_oauth_provider` would
+    otherwise build when `config.cimd_enabled` - a test builds one with an
+    `httpx.MockTransport` and a fake `Resolver` instead of either touching
+    real DNS or opening a real socket. Ignored entirely when
+    `config.cimd_enabled` is false.
     """
 
     oauth_cell = _OAuthProviderCell()
@@ -176,7 +190,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
-            oauth_provider = _build_oauth_provider(config, services, authenticator)
+            oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
 
             token_verifier = (
@@ -187,6 +201,7 @@ def create_app(
             auth = _build_auth_settings(
                 config, token_verifier=token_verifier, oauth_provider=oauth_provider
             )
+            app.state.oauth_auth_settings = auth if oauth_provider is not None else None
             # `MCPServer.streamable_http_app` forwards `self.settings.auth`/
             # `self._token_verifier`/`self._auth_server_provider` (set here, at
             # construction) to the lowlevel `Server.streamable_http_app` below -
@@ -247,6 +262,10 @@ def create_app(
             endpoint=serve_protected_resource_metadata,
             methods=["GET"],
         ),
+        # Shadows the SDK's own (CIMD-less) AS metadata route inside `mcp_app`, the
+        # same way the two routes above shadow its PRM route - see `auth.metadata`'s
+        # module docstring for why.
+        Route(OAUTH_METADATA_PATH, endpoint=_authorization_server_metadata, methods=["GET"]),
     ]
     if authenticator is not None:
         # `/login` only exists when an `Authenticator` is actually configured.
@@ -296,7 +315,10 @@ def create_app(
 
 
 def _build_oauth_provider(
-    config: ServerConfig, services: Services, authenticator: Authenticator | None
+    config: ServerConfig,
+    services: Services,
+    authenticator: Authenticator | None,
+    cimd_fetcher: ClientMetadataFetcher | None,
 ) -> MemoryManagerOAuthProvider | None:
     """The embedded OAuth authorization server for this `services`, or `None` to run
     without one.
@@ -326,11 +348,19 @@ def _build_oauth_provider(
 
     resource = config.resource_url()
     issuer = canonical_resource_url(cast(str, config.public_url), "")
+    # `cimd_fetcher` (the test seam) is only ever honoured while CIMD is actually on -
+    # `config.cimd_enabled=False` means "no CIMD, whatever was passed in".
+    resolved_cimd_fetcher = None
+    if config.cimd_enabled:
+        resolved_cimd_fetcher = (
+            cimd_fetcher if cimd_fetcher is not None else ClientMetadataFetcher()
+        )
     return MemoryManagerOAuthProvider(
         services.pool,
         resource=resource,
         issuer=issuer,
         client_secret_key=config.oauth_client_secret_key,
+        cimd_fetcher=resolved_cimd_fetcher,
     )
 
 
@@ -513,6 +543,23 @@ class _ScopeChallengeMiddleware:
             await send(message)
 
         await self._app(scope, receive, send_with_scope)
+
+
+async def _authorization_server_metadata(request: Request) -> Response:
+    """GET handler for `auth.metadata.WELL_KNOWN_PATH`, shadowing the SDK's own
+    (CIMD-less) route on `mcp_app` underneath (see that module's docstring for why).
+
+    404 under the exact same condition the SDK's own route would not exist at all:
+    no OAuth authorization server configured (`lifespan` only sets
+    `app.state.oauth_auth_settings` when `oauth_provider is not None`).
+    """
+    auth: AuthSettings | None = request.app.state.oauth_auth_settings
+    if auth is None:
+        return PlainTextResponse("not found", status_code=404)
+
+    config: ServerConfig = request.app.state.config
+    metadata = build_authorization_server_metadata(auth, cimd_enabled=config.cimd_enabled)
+    return PydanticJSONResponse(metadata, headers={"Cache-Control": "public, max-age=3600"})
 
 
 async def _healthz(_request: Request) -> Response:

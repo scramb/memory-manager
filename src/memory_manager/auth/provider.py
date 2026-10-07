@@ -32,6 +32,21 @@ exact same token is recognized here as a replay - not a "token not found" -
 and revokes the whole `family_id` (every access and refresh token the grant
 has ever produced), per ADR-0004's "rotating refresh with family
 revocation".
+
+`get_client` also carries CIMD (#38): when `cimd_fetcher` is given and
+`client_id` is an https URL, the SDK's registered-client lookup
+(`auth.store.get_client`, DCR only) is skipped in favour of fetching that
+URL's document (`auth.cimd.ClientMetadataFetcher`, cached there) and
+building an `OAuthClientInformationFull` from it on the fly - no
+`register_client` call ever happens for one of these, but a row is still
+upserted into `oauth_clients` (marked `"cimd": true`) because `oauth_pending`/
+`oauth_auth_codes`/`oauth_tokens` all carry a foreign key to it
+(`db/migrations/0003_oauth.sql`). `_CimdClientInformation.validate_redirect_uri`
+is the one behavioural difference from a DCR client: RFC 8252 loopback
+redirect URIs match on scheme/host/path only, ignoring the port, exactly as
+Claude Code's own CIMD declares `http://localhost/callback` and
+`http://127.0.0.1/callback` with no fixed port at all
+(docs/research/mcp-auth-and-connectors.md §4).
 """
 
 from __future__ import annotations
@@ -56,6 +71,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
 
 from memory_manager.auth import store
+from memory_manager.auth.cimd import CimdError, ClientMetadataFetcher
 from memory_manager.auth.login import PendingAuthorization
 from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_bearer_token
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -85,6 +101,53 @@ class _AuthorizationCode(AuthorizationCode):
     namespaces: list[str]
 
 
+#: RFC 8252 loopback hosts - a CIMD client's redirect URI on one of these matches a
+#: registered redirect URI regardless of port (`_CimdClientInformation.validate_redirect_uri`).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+#: `client_info["cimd"]` - a marker only, never read back out: it exists purely so a
+#: row in `oauth_clients` is tellable apart from a DCR registration when looking at the
+#: database directly (`CleanupStats`/an operator's `select` are the only readers).
+_CIMD_CLIENT_INFO_MARKER = "cimd"
+
+
+class _CimdClientInformation(OAuthClientInformationFull):
+    """A CIMD client's `OAuthClientInformationFull`, with RFC 8252 loopback redirect
+    matching instead of the SDK's own exact-match-only `validate_redirect_uri` - every
+    other validation (scope, non-loopback redirect URIs) is unchanged, inherited as-is."""
+
+    def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
+        if redirect_uri is not None:
+            for registered in self.redirect_uris or ():
+                if _loopback_redirect_matches(registered, redirect_uri):
+                    return redirect_uri
+        return super().validate_redirect_uri(redirect_uri)
+
+
+def _loopback_redirect_matches(registered: AnyUrl, requested: AnyUrl) -> bool:
+    """Whether `requested` matches `registered` under RFC 8252's loopback rule: same
+    scheme, same loopback host, same path, any port - exact equality (any port
+    included) is also accepted, since it is a strict superset of this rule."""
+    if registered == requested:
+        return True
+    if registered.scheme != "http" or requested.scheme != "http":
+        return False
+    registered_host = registered.host
+    if registered_host is None or registered_host != requested.host:
+        return False
+    if registered_host not in _LOOPBACK_HOSTS:
+        return False
+    return (registered.path or "") == (requested.path or "")
+
+
+def _is_cimd_client_id(client_id: str) -> bool:
+    """A CIMD `client_id` is an https URL (SEP-991) - the one shape a DCR-issued
+    `client_id` (`mcp/server/auth/handlers/register.py`: `str(uuid4())`) never takes,
+    so routing on this alone is unambiguous."""
+    parsed = urlsplit(client_id)
+    return parsed.scheme == "https" and bool(parsed.netloc)
+
+
 class _RefreshToken(RefreshToken):
     """`RefreshToken` plus everything `exchange_refresh_token` needs without a second query."""
 
@@ -106,7 +169,13 @@ class MemoryManagerOAuthProvider(
     """
 
     def __init__(
-        self, pool: asyncpg.Pool, *, resource: str, issuer: str, client_secret_key: str
+        self,
+        pool: asyncpg.Pool,
+        *,
+        resource: str,
+        issuer: str,
+        client_secret_key: str,
+        cimd_fetcher: ClientMetadataFetcher | None = None,
     ) -> None:
         self._pool = pool
         self._resource = resource
@@ -115,6 +184,9 @@ class MemoryManagerOAuthProvider(
         # `http.py` is expected to let it surface as a startup failure, the same way a bad
         # `PUBLIC_URL` does, not something this provider should paper over.
         self._client_secret_cipher = store.ClientSecretCipher(client_secret_key)
+        # `None` means CIMD is off (`CIMD_ENABLED=false`) - `get_client` then falls straight
+        # through to the DCR-only lookup for every `client_id`, URL-shaped or not.
+        self._cimd_fetcher = cimd_fetcher
 
     @property
     def resource(self) -> str:
@@ -129,8 +201,40 @@ class MemoryManagerOAuthProvider(
     # ---- clients --------------------------------------------------------
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        cimd_fetcher = self._cimd_fetcher
+        if cimd_fetcher is not None and _is_cimd_client_id(client_id):
+            return await self._get_cimd_client(client_id, cimd_fetcher)
         info = await store.get_client(self._pool, client_id, cipher=self._client_secret_cipher)
         return OAuthClientInformationFull.model_validate(info) if info is not None else None
+
+    async def _get_cimd_client(
+        self, client_id: str, cimd_fetcher: ClientMetadataFetcher
+    ) -> OAuthClientInformationFull | None:
+        """`client_id`'s CIMD document (SEP-991), or `None` if it cannot be fetched or
+        fails validation - the same "client not found" outcome `get_client` already
+        gives an unregistered DCR `client_id`, so `AuthorizationHandler`/
+        `ClientAuthenticator` need no CIMD-specific branch of their own.
+
+        Upserts a row into `oauth_clients` on every call (cheap: `self._cimd_fetcher`
+        is what actually caches the upstream fetch) - `oauth_pending`/`oauth_auth_codes`/
+        `oauth_tokens` all carry a foreign key to it, so one has to exist by the time
+        `authorize`/`exchange_authorization_code` save a row under this `client_id`.
+        """
+        try:
+            document = await cimd_fetcher.fetch_client_metadata(client_id)
+        except CimdError:
+            return None
+        info: dict[str, object] = {
+            "client_id": document.client_id,
+            "client_name": document.client_name,
+            "redirect_uris": list(document.redirect_uris),
+            "token_endpoint_auth_method": "none",
+            _CIMD_CLIENT_INFO_MARKER: True,
+        }
+        await store.save_client(
+            self._pool, document.client_id, info, cipher=self._client_secret_cipher
+        )
+        return _CimdClientInformation.model_validate(info)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         info = client_info.model_dump(mode="json")
