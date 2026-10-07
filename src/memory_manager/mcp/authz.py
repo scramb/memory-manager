@@ -45,6 +45,7 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 
+from memory_manager.auth.scopes import READ_SCOPE, WRITE_SCOPE
 from memory_manager.auth.tokens import ALL_NAMESPACES
 from memory_manager.vault.paths import PathRejected, parse_note_path
 
@@ -57,9 +58,6 @@ __all__ = [
     "restrict_namespaces",
     "writable_namespaces",
 ]
-
-READ_SCOPE = "memory:read"
-WRITE_SCOPE = "memory:write"
 
 
 def current_access_token() -> AccessToken | None:

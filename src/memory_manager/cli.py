@@ -5,10 +5,11 @@
 index; `serve --stdio` runs the MCP server for a local Claude Code
 connection, `serve --http` runs it over Streamable HTTP (`http.py`);
 `token create|list|revoke` manage the static bearer tokens `/mcp` accepts
-once `DATABASE_URL` is set (ADR-0004, #34); `hash-password` is the operator
-helper for `LOGIN_MODE=password` (ADR-0004 L1, #37) - it never takes the
-password as an argument (it would then show up in shell history and
-`ps`), only ever reading it from stdin.
+once `DATABASE_URL` is set (ADR-0004, #34); `token create --owner --role`
+gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
+`hash-password` is the operator helper for `LOGIN_MODE=password` (ADR-0004
+L1, #37) - it never takes the password as an argument (it would then show
+up in shell history and `ps`), only ever reading it from stdin.
 
 `serve --http` with `DATABASE_URL` set turns bearer-token auth on for
 `/mcp` (`http.py`); without it (no token to ever verify a request against)
@@ -39,6 +40,7 @@ from memory_manager.app import open_services, open_storage
 from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
+    MEMORY_ROLES,
     TokenInfo,
     create_token,
     list_tokens,
@@ -155,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
                     scopes=args.scopes,
                     namespaces=args.namespaces or [ALL_NAMESPACES],
                     expires_days=args.expires_days,
+                    owner_oid=args.owner,
+                    roles=args.roles or [],
                 )
             )
         if args.subcommand == "list":
@@ -367,6 +371,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the token stops verifying this many days from now (default: never expires)",
     )
+    token_create_parser.add_argument(
+        "--owner",
+        dest="owner",
+        default=None,
+        help="the token's owner principal (an oid); required together with --role (#115)",
+    )
+    token_create_parser.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        choices=MEMORY_ROLES,
+        help=f"repeatable; one of {MEMORY_ROLES!r}; required together with --owner",
+    )
 
     token_subparsers.add_parser("list", help="list every token's metadata (never the token itself)")
 
@@ -542,7 +559,13 @@ async def _open_migrated_pool() -> asyncpg.Pool | None:
 
 
 async def _run_token_create(
-    name: str, *, scopes: list[str], namespaces: list[str], expires_days: int | None
+    name: str,
+    *,
+    scopes: list[str],
+    namespaces: list[str],
+    expires_days: int | None,
+    owner_oid: str | None,
+    roles: list[str],
 ) -> int:
     pool = await _open_migrated_pool()
     if pool is None:
@@ -554,10 +577,19 @@ async def _run_token_create(
         )
         try:
             plaintext, info = await create_token(
-                pool, name, scopes=scopes, namespaces=namespaces, expires_at=expires_at
+                pool,
+                name,
+                scopes=scopes,
+                namespaces=namespaces,
+                expires_at=expires_at,
+                owner_oid=owner_oid,
+                roles=roles,
             )
         except asyncpg.UniqueViolationError:
             print(f"a token named {name!r} already exists", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             return 2
     finally:
         await pool.close()
@@ -565,7 +597,8 @@ async def _run_token_create(
     print(plaintext)
     print(
         f"^ token {info.name!r} created with scopes={list(info.scopes)} "
-        f"namespaces={list(info.namespaces)} - store it now, it will not be shown again",
+        f"namespaces={list(info.namespaces)} owner_oid={info.owner_oid!r} "
+        f"roles={list(info.roles)} - store it now, it will not be shown again",
         file=sys.stderr,
     )
     return 0
@@ -590,7 +623,8 @@ def _print_token_info(info: TokenInfo) -> None:
     status = "revoked" if info.revoked_at is not None else "active"
     print(
         f"{info.name}\tstatus={status}\tscopes={','.join(info.scopes)}\t"
-        f"namespaces={','.join(info.namespaces)}\tcreated_at={info.created_at.isoformat()}\t"
+        f"namespaces={','.join(info.namespaces)}\towner_oid={info.owner_oid or '-'}\t"
+        f"roles={','.join(info.roles) or '-'}\tcreated_at={info.created_at.isoformat()}\t"
         f"expires_at={info.expires_at.isoformat() if info.expires_at else '-'}\t"
         f"last_used_at={info.last_used_at.isoformat() if info.last_used_at else '-'}"
     )
@@ -802,6 +836,23 @@ def _serve(*, stdio: bool, http: bool) -> int:
 
 
 async def _serve_stdio() -> int:
+    """Run the stdio transport.
+
+    Refuses `STORAGE_BACKEND=postgres` (ADR-0008 addendum "identity sources
+    and curate", #115/#116): enterprise mode is remote only - a local stdio
+    process always holds the owner credentials (`DATABASE_URL`), so a
+    claimed stdio identity would protect nothing even if the request path
+    switched roles for it.
+    """
+    if storage_backend_from_env(dict(os.environ)) == "postgres":
+        print(
+            "serve --stdio: refusing STORAGE_BACKEND=postgres - enterprise mode is "
+            "remote only (ADR-0008 addendum): a local stdio process holds the owner "
+            "credentials and could bypass row-level security regardless of any "
+            "identity it claimed",
+            file=sys.stderr,
+        )
+        return 2
     async with open_services(os.environ) as services:
         server = build_server(services)
         await server.run_stdio_async()

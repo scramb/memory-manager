@@ -31,11 +31,13 @@ given run is the one a plain `from conftest import human_commit` (used by
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from git_fixtures import (
@@ -46,9 +48,11 @@ from git_fixtures import (
     seed_notes,
     vault_config,
 )
+from mcp.server.auth.provider import AccessToken
 
 from memory_manager.app import Services, open_services
 from memory_manager.config import VaultConfig
+from memory_manager.db import rls
 from memory_manager.queue import WriteQueue
 from memory_manager.storage.git import GitBackend
 from memory_manager.vault.note import Note, serialize
@@ -60,6 +64,7 @@ __all__ = [
     "human_commit",
     "human_delete",
     "human_rename",
+    "postgres_backend_principal",
     "seed_notes",
     "services",
     "services_with_db",
@@ -67,6 +72,58 @@ __all__ = [
     "vault_config",
     "vault_root",
 ]
+
+#: The principal `services_with_postgres_backend`'s own namespace registry row
+#: is seeded for (`"personal"`, matching every test in this package that writes
+#: through `memory_write` without an explicit namespace). Private to this
+#: module, like `SEEDED_NOTES` above - `postgres_backend_principal` below is
+#: how a test actually gets it onto the current request.
+_POSTGRES_BACKEND_OID = "oid-mcp-postgres-tests"
+
+
+@pytest.fixture
+def postgres_backend_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `db.rls.current_principal()` resolve to `services_with_postgres_backend`'s
+    seeded personal namespace, for a test that calls a tool through it.
+
+    A plain pytest fixture, not a bare helper function, for the same "no
+    unambiguous import" reason `vault_root` above is one: pytest injects
+    fixtures by name without an import at all. Monkeypatches
+    `db.rls.get_access_token` directly (the same technique
+    `tests/auth/test_limits_audit.py` uses for `mcp/server.py`'s own bound
+    `current_access_token` import) - the in-memory `mcp.Client` these tests
+    drive `build_server(services)` through never runs the real HTTP
+    transport's `AuthContextMiddleware`, so there is no bearer token to
+    carry claims for `db.rls`'s accessor to read otherwise.
+    """
+    token = AccessToken(
+        token="mm_x",  # noqa: S106 - a fake test token, not a credential
+        client_id="static:test",
+        scopes=[],
+        claims={"oid": _POSTGRES_BACKEND_OID, "roles": ["Memory.User"]},
+    )
+    monkeypatch.setattr(rls, "get_access_token", lambda: token)
+
+
+async def _seed_personal_namespace(database_url: str, *, oid: str, alias: str) -> None:
+    """Seed `namespaces`/`users` rows so `oid`'s own namespace `alias` is
+    readable/writable under RLS (`mm_readable_ns`/`mm_writable_ns`,
+    `migrations/0005_rls.sql`) - connects as the test database's owner
+    (`mm`), which carries no RLS on these two membership tables at all.
+    """
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute(
+            "insert into users (oid, tid, display_name) values ($1, 'tenant-test', $1)", oid
+        )
+        await conn.execute(
+            "insert into namespaces (kind, external_key, alias) values ('user', $1, $2)",
+            oid,
+            alias,
+        )
+    finally:
+        await conn.close()
+
 
 _NOW = datetime(2025, 6, 1, tzinfo=UTC)
 
@@ -207,16 +264,60 @@ async def services_with_db(
 
 
 @pytest_asyncio.fixture
-async def services_with_postgres_backend(test_database_url: str) -> AsyncIterator[Services]:
+async def services_with_postgres_backend(
+    admin_database_url: str, test_database_url: str
+) -> AsyncIterator[Services]:
     """A `Services` against the `postgres` backend (ADR-0007 §2, WP-18) - no vault,
     no clone, nothing seeded. Tests write their own fixture notes through
     `memory_write`, the same way `services_with_db`'s own "with database" tests in
     `tests/mcp/test_search_tool.py` do, since there is no vault here to seed through
     `seed_notes` at all.
+
+    Request path (ADR-0008 addendum, #116): this builds and tears down its own
+    disposable app role (`open_services` requires `DATABASE_APP_ROLE`, and
+    grants it the content-table privileges it needs at startup), and seeds one
+    `namespaces` registry row for `_POSTGRES_BACKEND_OID`'s personal namespace,
+    aliased `"personal"` - every test built on this fixture writes there.
+    Tests still need `as_principal` (above) before calling a tool, since
+    there is no bearer token here to carry a principal otherwise.
     """
-    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
-    async with open_services(environ) as services:
-        yield services
+    role = f"mm_test_app_{secrets.token_hex(8)}"
+    admin_conn = await asyncpg.connect(admin_database_url)
+    try:
+        await admin_conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
+    finally:
+        await admin_conn.close()
+
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": role,
+    }
+    try:
+        async with open_services(environ) as services:
+            await _seed_personal_namespace(
+                test_database_url, oid=_POSTGRES_BACKEND_OID, alias="personal"
+            )
+            yield services
+    finally:
+        # See `tests/test_app.py`'s identical fixture for why `drop owned by`
+        # against `test_database_url` has to run before the cluster-wide
+        # `DROP ROLE` below.
+        owned_conn: asyncpg.Connection | None
+        try:
+            owned_conn = await asyncpg.connect(test_database_url)
+        except asyncpg.PostgresError:
+            owned_conn = None
+        if owned_conn is not None:
+            try:
+                await owned_conn.execute(f'drop owned by "{role}"')
+            finally:
+                await owned_conn.close()
+        admin_conn = await asyncpg.connect(admin_database_url)
+        try:
+            await admin_conn.execute(f'drop role if exists "{role}"')
+        finally:
+            await admin_conn.close()
 
 
 @pytest.fixture

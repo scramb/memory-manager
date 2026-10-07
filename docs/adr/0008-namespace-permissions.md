@@ -79,3 +79,25 @@ Checked against the guardrails:
 ## Reversibility
 
 Expensive once data exists. Aliases and the registry end up in exports, audit entries and users' habits. RLS policies themselves are cheap to change.
+
+## Addendum 2026-10-07 — system identity under FORCE RLS (#100)
+
+ADR-0008 did not say how trusted cross-namespace paths reach the data once every content table has `ENABLE` + `FORCE ROW LEVEL SECURITY`: the Git-mode index, `reindex --full`, and later the worker, erasure and the Git-to-Postgres import. The owner decided on 2026-10-07:
+
+- **The owner role is the system identity.** Migration `0005_rls.sql` adds an explicit owner-only policy (`TO` the migrating role, `USING`/`WITH CHECK` true) on each content table, next to the identity policies. Git mode and system jobs keep connecting as the owner and are unchanged.
+- **Request transactions in Postgres mode switch roles.** Each one switches to a non-owner, non-`BYPASSRLS` `NOLOGIN` role with `set_config('role', …, true)` and sets the identity in the same transaction. Both happen in one helper. The operator creates that role and grants it to the owner; there is still a single `DATABASE_URL`.
+- **The bypass is tied to the owner credential, not to a setting any code can flip.** Request code must never use a connection that has not switched roles. #101 closes this structurally by pinning the request path to the helper, and a test enforces it.
+
+Rejected: requiring a session marker such as `app.system = 'on'` in addition to ownership. A forgotten marker fails closed, but the bypass becomes a settable GUC, every Git-mode pool creation site has to change, and a missing marker silently empties search in Git mode.
+
+## Addendum 2026-10-07 — identity sources and curate (#101, #115, #116)
+
+Owner decisions on 2026-10-07, taken while #101 was split:
+
+- **Static tokens carry a principal now.** `static_tokens` gets `owner_oid` and `roles` (#115). This pulls the owner part of ADR-0006 §7 forward from WP-24, so that Postgres mode can be tested end-to-end over HTTP before the Entra login exists.
+- **`serve --stdio` refuses `STORAGE_BACKEND=postgres`.** Enterprise mode is remote only. A local process holding the owner credentials could bypass RLS anyway, so a claimed stdio identity would protect nothing.
+- **Group memberships are never written in the request path.** `user_groups` is filled by the login (WP-22) or by the operator; tests seed it. The app computes access from token claims, RLS computes it from `user_groups`. When the two disagree, the request fails closed.
+- **The personal namespace is created lazily.** On a principal's first request, a `SECURITY DEFINER` function inserts only the row for `app.oid`. The app role gets no general `INSERT` on `namespaces`.
+- **Curate is author-based.** Archiving your own note in a shared namespace counts as a write; archiving someone else's note counts as curate. To make the author reliable, `vault_revisions` records `author_oid`, and a note's author is the `author_oid` of its revision 1.
+
+**Curate requires write (2026-10-07, #119).** A `Memory.Curator` who may not write a namespace cannot curate it either. For example, a curator who is only a `reader` in a project where `project_write = 'writers'` cannot archive other people's notes there. This keeps the application matrix and `mm_writable_ns()` congruent, so every cell stays enforced twice. The owner chose this over widening the project branch of `mm_writable_ns()` for curators.

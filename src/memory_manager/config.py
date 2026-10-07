@@ -23,6 +23,7 @@ __all__ = [
     "VaultConfig",
     "VaultConfigError",
     "canonical_resource_url",
+    "database_app_role_from_env",
     "storage_backend_from_env",
 ]
 
@@ -156,6 +157,35 @@ def storage_backend_from_env(environ: dict[str, str]) -> str:
             "the postgres backend is the source of truth and has no vault to fall back to"
         )
     return backend
+
+
+def database_app_role_from_env(environ: dict[str, str]) -> str | None:
+    """The non-owner role (`DATABASE_APP_ROLE`) request transactions switch to, or
+    `None` for `STORAGE_BACKEND=git`, which has no row-level security at all.
+
+    Required when `STORAGE_BACKEND=postgres` (ADR-0008 addendum "system identity
+    under FORCE RLS", #116): every request transaction that touches content must
+    switch to this role and the caller's identity before touching a
+    `FORCE ROW LEVEL SECURITY` table (`db.rls.request_connection`) - raises
+    `StorageConfigError` naming the variable if it is missing, before anything is
+    migrated, connected to or granted. Checked, not merely read: callers of
+    `app.open_services` rely on this raising before a connection pool is opened,
+    the same "fails before anything is started" contract `storage_backend_from_env`
+    already gives `STORAGE_BACKEND`/`DATABASE_URL`. Only `open_services` (the
+    request-serving entry point) calls this - `open_storage` (the import CLI) and
+    `cli.py`'s `reindex` command are system jobs that keep connecting as the owner
+    (ADR-0008 addendum) and need no app role at all.
+    """
+    if environ.get("STORAGE_BACKEND", _DEFAULT_STORAGE_BACKEND) != "postgres":
+        return None
+    role = environ.get("DATABASE_APP_ROLE")
+    if not role:
+        raise StorageConfigError(
+            "DATABASE_APP_ROLE is required when STORAGE_BACKEND=postgres (ADR-0008 "
+            "addendum): the non-owner role every request transaction must switch to "
+            "before touching a row-level-security-protected content table"
+        )
+    return role
 
 
 class EmbeddingConfigError(ValueError):

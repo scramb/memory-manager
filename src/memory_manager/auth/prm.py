@@ -60,8 +60,8 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
 from memory_manager.app import Services
+from memory_manager.auth.scopes import READ_SCOPE, WRITE_SCOPE
 from memory_manager.config import ServerConfig, canonical_resource_url
-from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
 __all__ = [
     "RESOURCE_NAME",

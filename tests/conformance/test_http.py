@@ -44,6 +44,7 @@ reuses for the parametrised `"postgres"` case.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -63,12 +64,23 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp_types import METHOD_NOT_FOUND, UNSUPPORTED_PROTOCOL_VERSION
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
-from memory_manager.auth.tokens import ALL_NAMESPACES, create_token
+from memory_manager.auth.tokens import ALL_NAMESPACES, MEMORY_ROLES, create_token
 from memory_manager.db.migrate import migrate
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
+
+#: The static token's owner principal for the `"postgres"`-parametrised cases
+#: of `http_env`/`http_headers` below (ADR-0008 addendum, #115/#116) - this
+#: oid's own personal namespace is seeded, aliased `"me"`, matching
+#: `_SEEDED_PATH` - `me` rewriting (#101) would show it as `me` regardless of
+#: its real alias, but using `"me"` as the stored alias too means this
+#: module's single `_SEEDED_PATH` constant works unchanged for both the
+#: `"git"` backend (no rewriting at all, a plain literal namespace) and the
+#: `"postgres"` one (where it is, coincidentally, already the display form).
+_OWNER_OID = "oid-http-conformance"
+_OWNER_ROLE = MEMORY_ROLES[0]  # "Memory.User"
 
 __all__: list[str] = []
 
@@ -89,7 +101,7 @@ _EXPECTED_TOOL_NAMES = frozenset(
     }
 )
 
-_SEEDED_PATH = "personal/fact/favorite-color.md"
+_SEEDED_PATH = "me/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
 
 # DATABASE_URL set (always, for the `"postgres"` backend; on request, for
@@ -132,6 +144,11 @@ async def _seed_postgres_note(database_url: str, content: bytes) -> None:
     `PostgresBackend` directly - the `"postgres"` backend's counterpart to
     `git_fixtures.seed_notes`'s commit onto the bare remote (see
     `tests/conformance/test_stdio.py`'s identical twin).
+
+    No `app_role` (ADR-0008 addendum, #116): this connects, and writes, as
+    the migrating owner - the one identity every content table's
+    owner-only policy always lets through regardless of namespace, exactly
+    like Git-mode indexing or `reindex --full` would.
     """
     migration_conn = await asyncpg.connect(database_url)
     try:
@@ -148,10 +165,71 @@ async def _seed_postgres_note(database_url: str, content: bytes) -> None:
         await pool.close()
 
 
+async def _seed_personal_namespace(database_url: str, *, oid: str, alias: str) -> None:
+    """Seed `namespaces`/`users` rows so `oid`'s own namespace `alias` is
+    readable/writable under RLS (`mm_readable_ns`/`mm_writable_ns`,
+    `migrations/0005_rls.sql`) - connects as the owner, which carries no RLS
+    on these two membership tables at all.
+    """
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute(
+            "insert into users (oid, tid, display_name) values ($1, 'tenant-conformance', $1)",
+            oid,
+        )
+        await conn.execute(
+            "insert into namespaces (kind, external_key, alias) values ('user', $1, $2)",
+            oid,
+            alias,
+        )
+    finally:
+        await conn.close()
+
+
+async def _create_app_role(admin_database_url: str) -> str:
+    """A disposable, non-owner, non-superuser role for the RLS request path
+    (ADR-0008 addendum, #116). Roles are cluster-wide - created against
+    `admin_database_url`, not the per-test database - and never granted here:
+    the subprocess's own `open_services` does that at startup
+    (`db.rls.grant_app_role`), once `DATABASE_APP_ROLE` names it.
+    """
+    role = f"mm_test_app_{secrets.token_hex(8)}"
+    conn = await asyncpg.connect(admin_database_url)
+    try:
+        await conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
+    finally:
+        await conn.close()
+    return role
+
+
+async def _drop_app_role(admin_database_url: str, database_url: str, role: str) -> None:
+    """Undo `_create_app_role`, in the order that avoids `DependentObjectsStillExistError`
+    (see `tests/test_app.py`'s identical `app_role` fixture for why)."""
+    owned_conn: asyncpg.Connection | None
+    try:
+        owned_conn = await asyncpg.connect(database_url)
+    except asyncpg.PostgresError:
+        owned_conn = None
+    if owned_conn is not None:
+        try:
+            await owned_conn.execute(f'drop owned by "{role}"')
+        finally:
+            await owned_conn.close()
+    admin_conn = await asyncpg.connect(admin_database_url)
+    try:
+        await admin_conn.execute(f'drop role if exists "{role}"')
+    finally:
+        await admin_conn.close()
+
+
 @pytest_asyncio.fixture(params=["git", "postgres"], ids=["git", "postgres"])
 async def http_env(
-    request: pytest.FixtureRequest, tmp_path: Path, bare_remote: Path, test_database_url: str
-) -> dict[str, str]:
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    bare_remote: Path,
+    test_database_url: str,
+    admin_database_url: str,
+) -> AsyncIterator[dict[str, str]]:
     """An HTTP subprocess's env, backend seeded with one note (ADR-0007 §2, WP-18).
 
     `"git"`: `VAULT_REMOTE`/`VAULT_DIR`, no `DATABASE_URL` - same reasoning as
@@ -162,20 +240,36 @@ async def http_env(
     (#35, ADR-0004). `http_headers` below is this fixture's companion: the
     bearer token every test built on `http_server` needs to actually reach
     anything in the `"postgres"` case.
+
+    Request path (ADR-0008 addendum, #116): the `"postgres"` branch also
+    creates a disposable app role (`DATABASE_APP_ROLE` - the subprocess's own
+    `open_services` grants it at startup) and seeds `_OWNER_OID`'s personal
+    namespace, aliased `"me"` (`_SEEDED_PATH`'s own comment explains why this
+    alias is itself `"me"`, not just shown as it) - `http_headers` creates a
+    token carrying that same oid as its owner principal, so every request
+    this module makes against the `"postgres"` case runs under the app role
+    and that identity.
     """
     note = _seeded_note(datetime(2025, 6, 1, tzinfo=UTC), _SEEDED_BODY)
     content = serialize(note)
 
     if request.param == "postgres":
         await _seed_postgres_note(test_database_url, content)
-        return {
-            "STORAGE_BACKEND": "postgres",
-            "DATABASE_URL": test_database_url,
-            "PUBLIC_URL": _PUBLIC_URL,
-        }
+        await _seed_personal_namespace(test_database_url, oid=_OWNER_OID, alias="me")
+        role = await _create_app_role(admin_database_url)
+        try:
+            yield {
+                "STORAGE_BACKEND": "postgres",
+                "DATABASE_URL": test_database_url,
+                "PUBLIC_URL": _PUBLIC_URL,
+                "DATABASE_APP_ROLE": role,
+            }
+        finally:
+            await _drop_app_role(admin_database_url, test_database_url, role)
+        return
 
     seed_notes(bare_remote, {_SEEDED_PATH: content})
-    return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
+    yield {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
 
 
 @pytest_asyncio.fixture
@@ -204,7 +298,10 @@ async def http_headers(http_env: Mapping[str, str]) -> dict[str, str]:
 
     `http_env`'s `"postgres"` branch has already migrated `database_url` by the
     time this runs (through `_seed_postgres_note`), so `static_tokens` already
-    exists here too.
+    exists here too. The token carries `_OWNER_OID`/`_OWNER_ROLE` as its owner
+    principal (ADR-0008 addendum, #115) - `http_env`'s own personal-namespace
+    row for that oid is what makes the request path's RLS checks (#116) let
+    every request in this module's `"postgres"` case through.
     """
     database_url = http_env.get("DATABASE_URL")
     if not database_url:
@@ -212,7 +309,12 @@ async def http_headers(http_env: Mapping[str, str]) -> dict[str, str]:
     pool = await asyncpg.create_pool(database_url)
     try:
         plaintext, _info = await create_token(
-            pool, "conformance", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+            pool,
+            "conformance",
+            scopes=[READ_SCOPE, WRITE_SCOPE],
+            namespaces=[ALL_NAMESPACES],
+            owner_oid=_OWNER_OID,
+            roles=[_OWNER_ROLE],
         )
     finally:
         await pool.close()

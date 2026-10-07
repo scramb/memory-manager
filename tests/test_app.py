@@ -12,14 +12,20 @@ write that happened to pick it up even finishes.
 
 from __future__ import annotations
 
+import secrets
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+import asyncpg
 import pytest
+import pytest_asyncio
 from git_fixtures import human_commit
+from mcp.server.auth.provider import AccessToken
 
 from memory_manager.app import open_services
 from memory_manager.config import StorageConfigError
+from memory_manager.db import rls
 from memory_manager.queue import WriteRequest
 from memory_manager.storage.base import VersionConflict
 from memory_manager.vault.note import Note, serialize
@@ -27,6 +33,87 @@ from memory_manager.vault.ulid import new_ulid
 
 _NOW = datetime(2025, 6, 1, tzinfo=UTC)
 _HUMAN_PATH = "personal/fact/human.md"
+_TEST_OID = "oid-test-app"
+
+
+@pytest_asyncio.fixture
+async def app_role(admin_database_url: str, test_database_url: str) -> AsyncIterator[str]:
+    """A disposable, non-owner, non-superuser role for the RLS request path
+    (ADR-0008 addendum, #116). Roles are cluster-wide (created against
+    `admin_database_url`, not `test_database_url`'s own database) -
+    `open_services` itself grants it the content-table privileges it needs
+    (`db.rls.grant_app_role`, run at startup) once it migrates.
+
+    Teardown first runs `drop owned by` against `test_database_url`: the
+    grant `grant_app_role` leaves behind makes this role a "dependent
+    object" of that database, so a cluster-wide `DROP ROLE` would otherwise
+    fail with `DependentObjectsStillExistError` while the database still
+    exists (pytest tears fixtures down in reverse of their own setup order,
+    and this one does not control whether `test_database_url`'s database
+    happens to already be gone by the time this runs).
+    """
+    role = f"mm_test_app_{secrets.token_hex(8)}"
+    admin_conn = await asyncpg.connect(admin_database_url)
+    try:
+        await admin_conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
+    finally:
+        await admin_conn.close()
+    try:
+        yield role
+    finally:
+        owned_conn: asyncpg.Connection | None
+        try:
+            owned_conn = await asyncpg.connect(test_database_url)
+        except asyncpg.PostgresError:
+            owned_conn = None
+        if owned_conn is not None:
+            try:
+                await owned_conn.execute(f'drop owned by "{role}"')
+            finally:
+                await owned_conn.close()
+        admin_conn = await asyncpg.connect(admin_database_url)
+        try:
+            await admin_conn.execute(f'drop role if exists "{role}"')
+        finally:
+            await admin_conn.close()
+
+
+async def _seed_personal_namespace(database_url: str, *, oid: str, alias: str) -> None:
+    """Seed `namespaces`/`users` rows so `oid`'s own namespace `alias` is
+    readable/writable under RLS (`mm_readable_ns`/`mm_writable_ns`,
+    `migrations/0005_rls.sql`) - connects as the test database's owner
+    (`mm`), which carries no RLS on these two membership tables at all.
+    """
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute(
+            "insert into users (oid, tid, display_name) values ($1, 'tenant-test', $1)", oid
+        )
+        await conn.execute(
+            "insert into namespaces (kind, external_key, alias) values ('user', $1, $2)",
+            oid,
+            alias,
+        )
+    finally:
+        await conn.close()
+
+
+def _as_principal(monkeypatch: pytest.MonkeyPatch, *, oid: str, roles: list[str]) -> None:
+    """Make `db.rls.current_principal()` resolve to `oid`/`roles` for this test.
+
+    Monkeypatches `db.rls.get_access_token` directly - the same technique
+    `tests/auth/test_limits_audit.py` uses for `mcp/server.py`'s own bound
+    `current_access_token` import - since these tests call
+    `services.storage` straight, with no HTTP transport to ever set the real
+    `AuthContextMiddleware` contextvar.
+    """
+    token = AccessToken(
+        token="mm_x",  # noqa: S106 - a fake test token, not a credential
+        client_id="static:test",
+        scopes=[],
+        claims={"oid": oid, "roles": roles},
+    )
+    monkeypatch.setattr(rls, "get_access_token", lambda: token)
 
 
 def _note_bytes(**overrides: object) -> bytes:
@@ -141,13 +228,19 @@ async def test_postgres_backend_without_database_url_fails_before_the_vault_dir_
 # --- The `postgres` backend (ADR-0007 §2, WP-18) -----------------------------
 
 
-async def test_postgres_backend_opens_with_no_vault_env_at_all(test_database_url: str) -> None:
+async def test_postgres_backend_opens_with_no_vault_env_at_all(
+    test_database_url: str, app_role: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No `VAULT_*` variable - proof this mode never clones anything (ADR-0007 §2).
 
     `services.indexer` is set despite there being no vault at all (ADR-0007
     §4, WP-18/#98): it indexes from `vault_notes`, not a working copy.
     """
-    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": app_role,
+    }
 
     async with open_services(environ) as services:
         assert services.repo is None
@@ -157,6 +250,13 @@ async def test_postgres_backend_opens_with_no_vault_env_at_all(test_database_url
         assert services.provider is None  # no EMBEDDING_* set
         assert services.trigger_sync is None
         assert services.pool is not None
+        assert services.app_role == app_role
+
+        # Request path (#116): the write below runs under `app_role` and
+        # `_TEST_OID`'s own identity, so it needs its personal namespace
+        # registered and a principal on the current request.
+        await _seed_personal_namespace(test_database_url, oid=_TEST_OID, alias="personal")
+        _as_principal(monkeypatch, oid=_TEST_OID, roles=["Memory.User"])
 
         result = await services.storage.write(
             "personal/fact/new.md",
@@ -168,13 +268,20 @@ async def test_postgres_backend_opens_with_no_vault_env_at_all(test_database_url
 
 
 async def test_postgres_backend_writes_get_exactly_one_audit_row_each_including_rejected(
-    test_database_url: str,
+    test_database_url: str, app_role: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": app_role,
+    }
     path = "personal/fact/new.md"
 
     async with open_services(environ) as services:
         assert services.pool is not None
+
+        await _seed_personal_namespace(test_database_url, oid=_TEST_OID, alias="personal")
+        _as_principal(monkeypatch, oid=_TEST_OID, roles=["Memory.User"])
 
         result = await services.storage.write(
             path, _note_bytes(title="New"), if_version="new", client="ci"
