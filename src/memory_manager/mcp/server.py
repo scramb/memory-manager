@@ -28,6 +28,21 @@ token at all. `INSTRUCTIONS` (the server's `instructions`, sent on
 every connection) and the `memory_guide` prompt registered below both come
 from `mcp/instructions.py` (#20); the error mapping every tool here uses
 lives in `mcp/errors.py`.
+
+When `Services.app_role` is set (`"postgres"`, ADR-0008 addendum, #101/#116),
+every tool additionally goes through `mcp/namespaces.py`'s own, independent
+enforcement of ADR-0008's permission matrix, on top of - never instead of -
+RLS: `_resolve_namespaces` makes the one `namespaces.resolve` round trip a
+tool call needs, every path/namespace argument is rewritten from `me` to the
+caller's real personal-namespace alias before use and back to `me` in every
+success and error result (`_to_stored_path`/`_to_display_path`,
+`_rewrite_error_result`), and `_require_writable`/`_require_archive_access`
+replace `mcp/authz.py`'s plain, token-namespace-only
+`require_writable_namespace` with the full matrix, further narrowed by
+whatever a static/OAuth token's own `namespaces` claim (ADR-0004) still
+restricts (`_effective_readable`/`_effective_writable`). `"git"` mode
+(`Services.app_role is None`) never runs any of this - every tool call below
+is then exactly what it always was.
 """
 
 from __future__ import annotations
@@ -48,6 +63,7 @@ from mcp_types import CallToolResult, TextContent
 
 from memory_manager.app import Services
 from memory_manager.db import rls
+from memory_manager.mcp import namespaces
 from memory_manager.mcp.authz import (
     READ_SCOPE,
     WRITE_SCOPE,
@@ -56,13 +72,14 @@ from memory_manager.mcp.authz import (
     require_scope,
     require_writable_namespace,
     restrict_namespaces,
+    writable_namespaces,
 )
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.observability import instrument_tool
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
-from memory_manager.storage import NotFound, StorageBackend, WriteError
+from memory_manager.storage import InvalidNote, NotFound, StorageBackend, WriteError
 from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
 from memory_manager.vault.paths import PathRejected, parse_note_path
 from memory_manager.vault.ulid import is_ulid, new_ulid
@@ -350,6 +367,187 @@ an error result (`isError: true`) whose structured content carries enough to
 retry, the same way `memory_write` does."""
 
 
+async def _resolve_namespaces(services: Services) -> namespaces.Resolution | None:
+    """The calling principal's ADR-0008 matrix access, or `None` for `"git"` mode.
+
+    `None` exactly when `Services.app_role` is `None` ("git" mode has no RLS
+    and no namespace registry at all - the module docstring's "exactly what
+    it always was") - every helper below treats `None` as "no rewriting, no
+    matrix check, fall back to `mcp/authz.py`'s plain token-namespace check".
+    The one `namespaces.resolve` round trip a tool call needs; raises
+    `db.rls.NoPrincipal` before acquiring a connection at all if the current
+    request carries none (`namespaces.resolve`'s own docstring).
+    """
+    if services.app_role is None:
+        return None
+    if services.pool is None:  # pragma: no cover - open_services always pairs these
+        raise AssertionError("Services.app_role is set but Services.pool is None")
+    return await namespaces.resolve(services.pool, role=services.app_role)
+
+
+def _effective_readable(
+    resolved: namespaces.Resolution | None, ctx: Context | None
+) -> set[str] | None:
+    """The namespaces the caller may read: the ADR-0008 matrix, further narrowed by
+    whatever a token's own `namespaces` claim (ADR-0004) still restricts - `None` only
+    when neither side restricts anything (`"git"` mode with an unrestricted/no token).
+    """
+    token_readable = readable_namespaces(ctx)
+    if resolved is None:
+        return token_readable
+    matrix = resolved.readable()
+    return matrix if token_readable is None else matrix & token_readable
+
+
+def _effective_writable(resolved: namespaces.Resolution | None) -> set[str] | None:
+    """The namespaces the caller may write to - `_effective_readable`'s write-side twin."""
+    token_writable = writable_namespaces()
+    if resolved is None:
+        return token_writable
+    matrix = resolved.writable()
+    return matrix if token_writable is None else matrix & token_writable
+
+
+def _to_stored_path(path: str, resolved: namespaces.Resolution | None) -> str:
+    """`path` translated from `me`/alias to the real stored alias, or unchanged in `"git"` mode."""
+    if resolved is None:
+        return path
+    return namespaces.rewrite_path_to_stored(path, resolved)
+
+
+def _to_display_path(path: str, resolved: namespaces.Resolution | None) -> str:
+    """`path` translated from the real stored alias to `me`/alias, or unchanged in `"git"` mode."""
+    if resolved is None:
+        return path
+    return namespaces.rewrite_path_to_display(path, resolved)
+
+
+def _to_stored_path_or_result(
+    path: str, resolved: namespaces.Resolution | None
+) -> str | CallToolResult:
+    """`_to_stored_path`, with a rejected `u-*` namespace (`Resolution.to_stored`) turned
+    into the same `InvalidNote`-shaped `_error_result` every other invalid path already
+    gets - never an uncaught `PathRejected` escaping a write tool call the way a bare
+    `parse_note_path` failure deeper in `storage.write`/`edit`/`supersede`/`archive`
+    never does either (`storage.rules.parse_note_path_or_raise` maps that one the same
+    way). Every write tool below checks `isinstance(result, CallToolResult)` immediately
+    and returns it as-is before doing anything else.
+    """
+    try:
+        return _to_stored_path(path, resolved)
+    except PathRejected as exc:
+        return _error_result(InvalidNote(path, str(exc)))
+
+
+def _to_stored_namespace(value: str, resolved: namespaces.Resolution | None) -> str:
+    """A bare namespace filter value (not a full path), translated the same way `_to_stored_path`
+    translates one - `memory_index`'s `namespace`/`memory_search`'s `namespaces` arguments."""
+    if resolved is None:
+        return value
+    return resolved.to_stored(value)
+
+
+def _require_writable(path: str, resolved: namespaces.Resolution | None) -> None:
+    """Raise `ToolError` if `path`'s namespace is not writable for the calling principal.
+
+    Falls back to `mcp/authz.py`'s plain `require_writable_namespace` in `"git"`
+    mode (`resolved is None`); otherwise checks the ADR-0008 matrix
+    (`Resolution.writable`) instead - `path` must already be in stored-alias
+    form (`_to_stored_path`), not `me`. Best-effort on a `path` that does not
+    even parse, the same way `require_writable_namespace` is: left to the
+    write call's own, sharper `PathRejected`.
+    """
+    if resolved is None:
+        require_writable_namespace(path)
+        return
+    try:
+        note_path = parse_note_path(path, allow_archive=True)
+    except PathRejected:
+        return
+    if note_path.namespace not in resolved.writable():
+        raise ToolError(
+            f"caller may not write to namespace {resolved.to_display(note_path.namespace)!r}"
+        )
+
+
+async def _require_archive_access(
+    path: str, resolved: namespaces.Resolution | None, services: Services
+) -> None:
+    """Raise `ToolError` if the calling principal may not archive `path`.
+
+    Falls back to the plain writable check in `"git"` mode. Otherwise: write
+    access first (ADR-0008 addendum 2026-10-07, #119, "curate requires
+    write"), then - only for a note whose revision-1 `author_oid`
+    (`namespaces.author_oid_of`) is not the caller's own `oid` - the matrix's
+    stricter curate check (`Resolution.can_curate`). Archiving your own note
+    in a shared namespace is a plain write (ADR-0008 addendum "curate is
+    author-based"); only `memory_archive` makes this distinction -
+    `memory_write`/`memory_edit`/`memory_supersede` stay write-only,
+    regardless of who authored what they touch.
+    """
+    if resolved is None:
+        require_writable_namespace(path)
+        return
+    try:
+        note_path = parse_note_path(path, allow_archive=True)
+    except PathRejected:
+        return
+    alias = note_path.namespace
+    if alias not in resolved.writable():
+        raise ToolError(f"caller may not write to namespace {resolved.to_display(alias)!r}")
+
+    if (
+        services.pool is None or services.app_role is None
+    ):  # pragma: no cover - paired by open_services
+        raise AssertionError("_require_archive_access called without pool/app_role")
+    author_oid = await namespaces.author_oid_of(services.pool, role=services.app_role, path=path)
+    is_own_note = author_oid is not None and author_oid == resolved.oid
+    if is_own_note:
+        return
+    if not resolved.can_curate(alias):
+        raise ToolError(
+            f"caller may not curate namespace {resolved.to_display(alias)!r}: "
+            "not the note's author, and lacks curator/owner/admin rights there"
+        )
+
+
+def _rewrite_error_result(
+    result: CallToolResult, resolved: namespaces.Resolution | None
+) -> CallToolResult:
+    """`result`'s `path` (`VersionConflict`/`NotFound`/`InvalidNote`/`EditMismatch`'s
+    shared `to_dict()` field) translated back to `me`/alias, in both the structured
+    content and the plain-text content block - a no-op in `"git"` mode or for any
+    error shape that carries no `path` at all.
+    """
+    if resolved is None:
+        return result
+    structured = result.structured_content
+    if not isinstance(structured, Mapping) or "path" not in structured:
+        return result
+    original_path = structured["path"]
+    if not isinstance(original_path, str):
+        return result
+    rewritten_path = namespaces.rewrite_path_to_display(original_path, resolved)
+    if rewritten_path == original_path:
+        return result
+
+    new_structured = dict(structured)
+    new_structured["path"] = rewritten_path
+    message = new_structured.get("message")
+    if isinstance(message, str):
+        new_structured["message"] = message.replace(f"'{original_path}'", f"'{rewritten_path}'")
+
+    new_content = [
+        TextContent(
+            type="text", text=block.text.replace(f"'{original_path}'", f"'{rewritten_path}'")
+        )
+        if isinstance(block, TextContent)
+        else block
+        for block in result.content
+    ]
+    return CallToolResult(content=new_content, is_error=True, structured_content=new_structured)
+
+
 def build_server(
     services: Services,
     *,
@@ -397,19 +595,31 @@ def build_server(
     ) -> list[MemoryIndexEntry]:
         """List every note in the vault: the table of contents to read first."""
         require_scope(READ_SCOPE)
-        readable = readable_namespaces(ctx)
+        resolved = await _resolve_namespaces(services)
+        stored_namespace = None
+        if namespace is not None:
+            try:
+                stored_namespace = _to_stored_namespace(namespace, resolved)
+            except PathRejected as exc:
+                raise ToolError(
+                    f"memory_index got an invalid namespace {namespace!r}: {exc}"
+                ) from exc
+        readable = _effective_readable(resolved, ctx)
         entries = [
             entry
             for entry in await _index_entries(services.storage)
             if _matches(
                 entry,
-                namespace=namespace,
+                namespace=stored_namespace,
                 type=type,
                 include_archived=include_archived,
                 readable=readable,
             )
         ]
-        return _cap_index(entries)
+        entries = _cap_index(entries)
+        if resolved is not None:
+            entries = [_rewrite_index_entry(entry, resolved) for entry in entries]
+        return entries
 
     @mcp.tool(description=_MEMORY_READ_DESCRIPTION)
     @instrument_tool("memory_read")
@@ -420,8 +630,9 @@ def build_server(
             raise ToolError(
                 f"memory_read accepts at most {_MAX_READ_ITEMS} items, got {len(items)}"
             )
-        readable = readable_namespaces(ctx)
-        return await _read_items(services.storage, items, readable=readable)
+        resolved = await _resolve_namespaces(services)
+        readable = _effective_readable(resolved, ctx)
+        return await _read_items(services.storage, items, readable=readable, resolved=resolved)
 
     @mcp.tool(description=_MEMORY_SEARCH_DESCRIPTION)
     @instrument_tool("memory_search")
@@ -445,10 +656,18 @@ def build_server(
                     f"expected one of: {', '.join(NOTE_TYPES)}"
                 )
 
+        resolved = await _resolve_namespaces(services)
+        stored_namespaces: list[str] | None = None
+        if namespaces is not None:
+            try:
+                stored_namespaces = [_to_stored_namespace(ns, resolved) for ns in namespaces]
+            except PathRejected as exc:
+                raise ToolError(f"memory_search got an invalid namespace: {exc}") from exc
+
         parsed_valid_at = _parse_valid_at(valid_at)
         clamped_limit = max(_MIN_SEARCH_LIMIT, min(limit, _MAX_SEARCH_LIMIT))
-        readable = readable_namespaces(ctx)
-        effective_namespaces = restrict_namespaces(namespaces, readable)
+        readable = _effective_readable(resolved, ctx)
+        effective_namespaces = restrict_namespaces(stored_namespaces, readable)
         mode = _search_mode(services)
 
         # `effective_namespaces == []` (as opposed to `None`) means the caller may read
@@ -511,6 +730,8 @@ def build_server(
                 "memory_search: services.indexer and services.vault_root are both None"
             )
 
+        if resolved is not None:
+            results = [_rewrite_search_result(result, resolved) for result in results]
         return {"results": results, "mode": mode}
 
     @mcp.tool(description=_MEMORY_WRITE_DESCRIPTION)
@@ -523,15 +744,22 @@ def build_server(
     ) -> Annotated[CallToolResult, MemoryWriteResult]:
         """Create or replace the note at `path`."""
         require_scope(WRITE_SCOPE)
-        require_writable_namespace(path)
+        resolved = await _resolve_namespaces(services)
+        stored_path_or_error = _to_stored_path_or_result(path, resolved)
+        if isinstance(stored_path_or_error, CallToolResult):
+            return stored_path_or_error
+        stored_path = stored_path_or_error
+        _require_writable(stored_path, resolved)
         try:
-            prepared = await _prepare_write_content(services.storage, path, content, if_version)
+            prepared = await _prepare_write_content(
+                services.storage, stored_path, content, if_version
+            )
         except NoteFormatError as exc:
             return _error_result(exc)
 
         try:
             result = await services.storage.write(
-                path,
+                stored_path,
                 prepared.content,
                 if_version=if_version,
                 client=current_client(),
@@ -539,11 +767,11 @@ def build_server(
                 message=message,
             )
         except WriteError as exc:
-            return _error_result(exc)
+            return _rewrite_error_result(_error_result(exc), resolved)
 
         return _ok_result(
             {
-                "path": result.path,
+                "path": _to_display_path(result.path, resolved),
                 "id": prepared.id,
                 "version": result.version,
                 "commit": result.commit,
@@ -561,10 +789,15 @@ def build_server(
     ) -> Annotated[CallToolResult, MemoryWriteResult]:
         """Replace one exact occurrence of `old_str` with `new_str` in the note at `path`."""
         require_scope(WRITE_SCOPE)
-        require_writable_namespace(path)
+        resolved = await _resolve_namespaces(services)
+        stored_path_or_error = _to_stored_path_or_result(path, resolved)
+        if isinstance(stored_path_or_error, CallToolResult):
+            return stored_path_or_error
+        stored_path = stored_path_or_error
+        _require_writable(stored_path, resolved)
         try:
             result = await services.storage.edit(
-                path,
+                stored_path,
                 old_str,
                 new_str,
                 if_version=if_version,
@@ -573,14 +806,19 @@ def build_server(
                 message=message,
             )
         except WriteError as exc:
-            return _error_result(exc)
+            return _rewrite_error_result(_error_result(exc), resolved)
 
         stored = await services.storage.read(result.path)
         if stored is None:  # pragma: no cover - defensive, a write that just succeeded disappeared
             raise RuntimeError(f"'{result.path}' was just written but is now missing")
         note_id = parse(stored.content).id
         return _ok_result(
-            {"path": result.path, "id": note_id, "version": result.version, "commit": result.commit}
+            {
+                "path": _to_display_path(result.path, resolved),
+                "id": note_id,
+                "version": result.version,
+                "commit": result.commit,
+            }
         )
 
     @mcp.tool(description=_MEMORY_SUPERSEDE_DESCRIPTION)
@@ -594,15 +832,23 @@ def build_server(
     ) -> Annotated[CallToolResult, MemorySupersedeResult]:
         """Replace the note `old` with a new note at `new_path`, keeping both."""
         require_scope(WRITE_SCOPE)
-        resolved_old = await _resolve_path_or_id(services.storage, old)
+        resolved = await _resolve_namespaces(services)
+        stored_old_input_or_error = _to_stored_path_or_result(old, resolved)
+        if isinstance(stored_old_input_or_error, CallToolResult):
+            return stored_old_input_or_error
+        resolved_old = await _resolve_path_or_id(services.storage, stored_old_input_or_error)
         if resolved_old is None:
             return _error_result(NotFound(old))
-        require_writable_namespace(resolved_old)
-        require_writable_namespace(new_path)
+        stored_new_path_or_error = _to_stored_path_or_result(new_path, resolved)
+        if isinstance(stored_new_path_or_error, CallToolResult):
+            return stored_new_path_or_error
+        stored_new_path = stored_new_path_or_error
+        _require_writable(resolved_old, resolved)
+        _require_writable(stored_new_path, resolved)
 
         try:
             prepared = await _prepare_write_content(
-                services.storage, new_path, new_content, _NEW_VERSION
+                services.storage, stored_new_path, new_content, _NEW_VERSION
             )
         except NoteFormatError as exc:
             return _error_result(exc)
@@ -610,7 +856,7 @@ def build_server(
         try:
             result = await services.storage.supersede(
                 resolved_old,
-                new_path,
+                stored_new_path,
                 prepared.content,
                 if_version=if_version,
                 client=current_client(),
@@ -618,7 +864,7 @@ def build_server(
                 message=message,
             )
         except WriteError as exc:
-            return _error_result(exc)
+            return _rewrite_error_result(_error_result(exc), resolved)
 
         old_version = (result.related or {}).get(resolved_old, "")
         old_stored = await services.storage.read(resolved_old)
@@ -628,8 +874,16 @@ def build_server(
         valid_to = old_note.valid_to.isoformat() if old_note.valid_to is not None else ""
         return _ok_result(
             {
-                "new": {"path": result.path, "id": prepared.id, "version": result.version},
-                "old": {"path": resolved_old, "version": old_version, "valid_to": valid_to},
+                "new": {
+                    "path": _to_display_path(result.path, resolved),
+                    "id": prepared.id,
+                    "version": result.version,
+                },
+                "old": {
+                    "path": _to_display_path(resolved_old, resolved),
+                    "version": old_version,
+                    "valid_to": valid_to,
+                },
                 "commit": result.commit,
             }
         )
@@ -643,24 +897,32 @@ def build_server(
     ) -> Annotated[CallToolResult, MemoryArchiveResult]:
         """Archive the note at `path`: move it to `_archive/`, never delete it."""
         require_scope(WRITE_SCOPE)
-        resolved = await _resolve_path_or_id(services.storage, path)
-        if resolved is None:
+        resolved_ns = await _resolve_namespaces(services)
+        stored_path_input_or_error = _to_stored_path_or_result(path, resolved_ns)
+        if isinstance(stored_path_input_or_error, CallToolResult):
+            return stored_path_input_or_error
+        resolved_path = await _resolve_path_or_id(services.storage, stored_path_input_or_error)
+        if resolved_path is None:
             return _error_result(NotFound(path))
-        require_writable_namespace(resolved)
+        await _require_archive_access(resolved_path, resolved_ns, services)
 
         try:
             result = await services.storage.archive(
-                resolved,
+                resolved_path,
                 if_version=if_version,
                 client=current_client(),
                 actor=current_actor(),
                 message=message,
             )
         except WriteError as exc:
-            return _error_result(exc)
+            return _rewrite_error_result(_error_result(exc), resolved_ns)
 
         return _ok_result(
-            {"archived_path": result.path, "version": result.version, "commit": result.commit}
+            {
+                "archived_path": _to_display_path(result.path, resolved_ns),
+                "version": result.version,
+                "commit": result.commit,
+            }
         )
 
     return mcp
@@ -765,6 +1027,19 @@ def _cap_index(entries: list[MemoryIndexEntry]) -> list[MemoryIndexEntry]:
     return slimmed
 
 
+def _rewrite_index_entry(
+    entry: MemoryIndexEntry, resolved: namespaces.Resolution
+) -> MemoryIndexEntry:
+    """`entry`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own docstring)."""
+    path = entry.get("path")
+    if path is None:
+        return entry
+    rewritten = namespaces.rewrite_path_to_display(path, resolved)
+    if rewritten == path:
+        return entry
+    return {**entry, "path": rewritten}
+
+
 def _search_mode(services: Services) -> str:
     """Which ranking `memory_search` would use for `services`, without running a query.
 
@@ -823,9 +1098,29 @@ def _scan_hit_result(hit: ScanHit) -> MemorySearchResult:
     }
 
 
+def _rewrite_search_result(
+    result: MemorySearchResult, resolved: namespaces.Resolution
+) -> MemorySearchResult:
+    """`result`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own docstring)."""
+    rewritten = namespaces.rewrite_path_to_display(result["path"], resolved)
+    if rewritten == result["path"]:
+        return result
+    return {**result, "path": rewritten}
+
+
 async def _read_items(
-    storage: StorageBackend, items: list[str], *, readable: set[str] | None = None
+    storage: StorageBackend,
+    items: list[str],
+    *,
+    readable: set[str] | None = None,
+    resolved: namespaces.Resolution | None = None,
 ) -> list[MemoryReadItem]:
+    """`memory_read`'s own loop. `item` (echoed back on every error) is always the
+    caller's own, unrewritten input; `path` - the *stored* path - is what the
+    lookup/readability check and `storage.read` itself use, translated back to
+    `me`/alias (`resolved`, `None` in `"git"` mode) only in the one success case's
+    `path` field.
+    """
     id_map: dict[str, str] | None = None
     results: list[MemoryReadItem] = []
 
@@ -844,12 +1139,18 @@ async def _read_items(
                 )
                 continue
             path = found
+        else:
+            try:
+                path = _to_stored_path(path, resolved)
+            except PathRejected as exc:
+                results.append({"item": item, "error": error_to_dict(exc)})
+                continue
 
         if readable is not None and not _namespace_readable(path, readable):
             results.append(
                 {
                     "item": item,
-                    "error": {"error": "NotFound", "message": f"'{path}' does not exist"},
+                    "error": {"error": "NotFound", "message": f"'{item}' does not exist"},
                 }
             )
             continue
@@ -864,7 +1165,7 @@ async def _read_items(
             results.append(
                 {
                     "item": item,
-                    "error": {"error": "NotFound", "message": f"'{path}' does not exist"},
+                    "error": {"error": "NotFound", "message": f"'{item}' does not exist"},
                 }
             )
             continue
@@ -877,7 +1178,7 @@ async def _read_items(
 
         results.append(
             {
-                "path": path,
+                "path": _to_display_path(path, resolved),
                 "id": note.id,
                 "version": stored.version,
                 "content": stored.content.decode("utf-8"),

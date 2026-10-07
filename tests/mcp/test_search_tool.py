@@ -234,6 +234,10 @@ async def test_memory_search_with_postgres_backend_mode_is_fulltext_and_finds_th
     # below run under the app role and this principal's identity -
     # `services_with_postgres_backend` already seeded its personal namespace,
     # aliased "personal" (`tests/mcp/conftest.py`'s `postgres_backend_principal`).
+    # ADR-0008's own `me` rewriting (#101) shows that own personal namespace
+    # as `me` in every tool input and output, regardless of its real alias -
+    # the write below addresses it either way (`personal` happens to equal
+    # the stored alias), but the search result always comes back as `me`.
     async with Client(build_server(services_with_postgres_backend)) as client:
         await _write(
             client,
@@ -245,7 +249,7 @@ async def test_memory_search_with_postgres_backend_mode_is_fulltext_and_finds_th
         payload = await _search(client, "aardvark")
 
     assert payload["mode"] == "fulltext"
-    assert {item["path"] for item in payload["results"]} == {"personal/fact/aardvark-routine.md"}
+    assert {item["path"] for item in payload["results"]} == {"me/fact/aardvark-routine.md"}
 
 
 # -- validation, shared by both modes -------------------------------------------

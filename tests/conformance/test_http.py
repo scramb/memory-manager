@@ -73,8 +73,12 @@ from memory_manager.vault.ulid import new_ulid
 
 #: The static token's owner principal for the `"postgres"`-parametrised cases
 #: of `http_env`/`http_headers` below (ADR-0008 addendum, #115/#116) - this
-#: oid's own personal namespace is seeded, aliased `"personal"`, matching
-#: `_SEEDED_PATH`.
+#: oid's own personal namespace is seeded, aliased `"me"`, matching
+#: `_SEEDED_PATH` - `me` rewriting (#101) would show it as `me` regardless of
+#: its real alias, but using `"me"` as the stored alias too means this
+#: module's single `_SEEDED_PATH` constant works unchanged for both the
+#: `"git"` backend (no rewriting at all, a plain literal namespace) and the
+#: `"postgres"` one (where it is, coincidentally, already the display form).
 _OWNER_OID = "oid-http-conformance"
 _OWNER_ROLE = MEMORY_ROLES[0]  # "Memory.User"
 
@@ -97,7 +101,7 @@ _EXPECTED_TOOL_NAMES = frozenset(
     }
 )
 
-_SEEDED_PATH = "personal/fact/favorite-color.md"
+_SEEDED_PATH = "me/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
 
 # DATABASE_URL set (always, for the `"postgres"` backend; on request, for
@@ -240,16 +244,18 @@ async def http_env(
     Request path (ADR-0008 addendum, #116): the `"postgres"` branch also
     creates a disposable app role (`DATABASE_APP_ROLE` - the subprocess's own
     `open_services` grants it at startup) and seeds `_OWNER_OID`'s personal
-    namespace, aliased `"personal"` - `http_headers` creates a token carrying
-    that same oid as its owner principal, so every request this module makes
-    against the `"postgres"` case runs under the app role and that identity.
+    namespace, aliased `"me"` (`_SEEDED_PATH`'s own comment explains why this
+    alias is itself `"me"`, not just shown as it) - `http_headers` creates a
+    token carrying that same oid as its owner principal, so every request
+    this module makes against the `"postgres"` case runs under the app role
+    and that identity.
     """
     note = _seeded_note(datetime(2025, 6, 1, tzinfo=UTC), _SEEDED_BODY)
     content = serialize(note)
 
     if request.param == "postgres":
         await _seed_postgres_note(test_database_url, content)
-        await _seed_personal_namespace(test_database_url, oid=_OWNER_OID, alias="personal")
+        await _seed_personal_namespace(test_database_url, oid=_OWNER_OID, alias="me")
         role = await _create_app_role(admin_database_url)
         try:
             yield {
