@@ -60,7 +60,13 @@ from pathlib import Path
 import asyncpg
 
 from memory_manager.audit import AuditWriter
-from memory_manager.config import EmbeddingConfig, VaultConfig, storage_backend_from_env
+from memory_manager.config import (
+    EmbeddingConfig,
+    VaultConfig,
+    database_app_role_from_env,
+    storage_backend_from_env,
+)
+from memory_manager.db import rls
 from memory_manager.db.migrate import migrate
 from memory_manager.index.embeddings import EmbeddingProvider, provider_from_config
 from memory_manager.index.indexer import Indexer, VaultNotesSource
@@ -100,6 +106,15 @@ class Services:
     working copy to point at. Every caller that reaches for one of them
     (`mcp/server.py`'s scan fallback, `http.py`'s `/readyz`) is a `"git"`
     backend-specific path and narrows accordingly.
+
+    `app_role` (ADR-0008 addendum, #116) is the non-owner role every request
+    transaction must switch to before touching a row-level-security-protected
+    content table - set only for `"postgres"` (`database_app_role_from_env`
+    requires it there); `None` for `"git"`, which has no RLS at all.
+    `mcp/server.py`'s `memory_search` reads it to decide whether to run on a
+    `db.rls.request_connection` (set) or the plain owner pool (`None`) - the
+    same switch `storage.postgres.PostgresBackend` itself already made via its
+    own `app_role` constructor argument, built with the identical value.
     """
 
     repo: Repo | None
@@ -110,6 +125,7 @@ class Services:
     provider: EmbeddingProvider | None
     storage: StorageBackend
     trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
+    app_role: str | None = None
 
 
 @dataclass
@@ -143,6 +159,7 @@ async def _open_backend(
     vault_config: VaultConfig | None,
     database_url: str | None,
     embedding_config: EmbeddingConfig | None = None,
+    app_role: str | None = None,
 ) -> AsyncIterator[_BackendHandle]:
     """Build the `STORAGE_BACKEND` named by `backend_name`, torn down on exit.
 
@@ -163,6 +180,20 @@ async def _open_backend(
     never passes one, so a `"postgres"` call from there stays index-free, same
     as it always was. Any `self._background_tasks` the indexer still has
     pending are drained (`Indexer.aclose`) before the pool closes.
+
+    `app_role` (ADR-0008 addendum, #116) is `"postgres"`-only too: given only
+    by `open_services` (`database_app_role_from_env` requires it there before
+    this is ever called) and never by `open_storage`, which is a system job
+    that keeps connecting as the owner (same ADR addendum: "Git mode and
+    system jobs keep connecting as the owner"). When given, this runs
+    `db.rls.check_app_role` then `db.rls.grant_app_role` against it on
+    `migration_conn` - the owner connection that just ran `migrate` - before
+    building `PostgresBackend` with it, so a misconfigured role is refused at
+    startup, never on a request's first write. A migration owner that turns
+    out to itself be a superuser only gets a warning (FORCE RLS has no effect
+    on it, but every content access below still goes through the switched
+    role regardless) - this process keeps starting, the risk is operational,
+    not something to refuse on.
     """
     if backend_name == "postgres":
         if (
@@ -172,6 +203,20 @@ async def _open_backend(
         migration_conn = await asyncpg.connect(database_url)
         try:
             await migrate(migration_conn)
+            if app_role is not None:
+                owner_is_superuser = await migration_conn.fetchval(
+                    "select rolsuper from pg_roles where rolname = current_user"
+                )
+                if owner_is_superuser:
+                    _logger.warning(
+                        "STORAGE_BACKEND=postgres: the migrating/owner role is a "
+                        "superuser - FORCE ROW LEVEL SECURITY has no effect on it, "
+                        "relying entirely on every request transaction switching to "
+                        "DATABASE_APP_ROLE=%r before touching content (ADR-0008 addendum)",
+                        app_role,
+                    )
+                await rls.check_app_role(migration_conn, app_role)
+                await rls.grant_app_role(migration_conn, app_role)
         finally:
             await migration_conn.close()
 
@@ -186,6 +231,7 @@ async def _open_backend(
             pool,
             index_hook=indexer.index_on_connection if indexer is not None else None,
             index_commit_hook=indexer.schedule_embeddings if indexer is not None else None,
+            app_role=app_role,
         )
         try:
             yield _BackendHandle(
@@ -259,18 +305,24 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     indexes itself, so there is nothing to catch up on at startup) - only the
     audit hook is wired onto the backend in addition to what `_open_backend`
     already wired in as `index_hook`/`index_commit_hook`, and `Services.pool`
-    is the backend's own pool.
+    is the backend's own pool. `app_role` (ADR-0008 addendum, #116) is read
+    here too (`database_app_role_from_env`, `None` for `"git"`, required and
+    validated before anything else starts for `"postgres"`) and threaded
+    through `_open_backend` into `PostgresBackend` and `Services.app_role`
+    alike.
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
     vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
     embedding_config = EmbeddingConfig.from_env(dict(environ))
+    app_role = database_app_role_from_env(dict(environ))
 
     async with _open_backend(
         storage_backend_name,
         vault_config=vault_config,
         database_url=database_url,
         embedding_config=embedding_config,
+        app_role=app_role,
     ) as handle:
         pool: asyncpg.Pool | None = handle.pool
         index_pool: asyncpg.Pool | None = None
@@ -320,6 +372,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                     provider=provider,
                     storage=handle.storage,
                     trigger_sync=trigger_sync,
+                    app_role=app_role,
                 )
             finally:
                 if poll_task is not None:

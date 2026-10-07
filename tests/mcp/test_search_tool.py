@@ -228,8 +228,12 @@ async def test_memory_search_without_database_valid_at_today_excludes_expired(
 
 
 async def test_memory_search_with_postgres_backend_mode_is_fulltext_and_finds_the_note(
-    services_with_postgres_backend: Services,
+    services_with_postgres_backend: Services, postgres_backend_principal: None
 ) -> None:
+    # Request path (ADR-0008 addendum, #116): both the write and the search
+    # below run under the app role and this principal's identity -
+    # `services_with_postgres_backend` already seeded its personal namespace,
+    # aliased "personal" (`tests/mcp/conftest.py`'s `postgres_backend_principal`).
     async with Client(build_server(services_with_postgres_backend)) as client:
         await _write(
             client,

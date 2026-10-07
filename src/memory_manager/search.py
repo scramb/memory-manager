@@ -375,7 +375,7 @@ async def vector_search(
 
 
 async def hybrid_search(
-    pool: asyncpg.Pool,
+    pool: _Queryable,
     query: str,
     *,
     provider: EmbeddingProvider | None = None,
@@ -391,6 +391,12 @@ async def hybrid_search(
     `mode` is `"hybrid"` when `provider` is given, `"fulltext"` otherwise -
     the same distinction `mcp/server.py`'s `_search_mode` reports to a
     caller.
+
+    `pool` accepts a single connection too (`_Queryable`, #116): `mcp/
+    server.py`'s `memory_search` passes a `db.rls.request_connection` in
+    `postgres` mode, so the whole search runs under the caller's own
+    identity rather than the owner pool - `"git"` with `DATABASE_URL`
+    configured still passes the plain owner pool, unaffected.
     """
     mode = "hybrid" if provider is not None else "fulltext"
     async with track_search(mode):
@@ -406,7 +412,7 @@ async def hybrid_search(
 
 
 async def _hybrid_search_impl(
-    pool: asyncpg.Pool,
+    pool: _Queryable,
     query: str,
     *,
     provider: EmbeddingProvider | None = None,
@@ -555,14 +561,14 @@ def rrf_fuse[RankItem](
     return scores
 
 
-async def _fetch_notes(pool: asyncpg.Pool, note_ids: Sequence[str]) -> dict[str, asyncpg.Record]:
+async def _fetch_notes(pool: _Queryable, note_ids: Sequence[str]) -> dict[str, asyncpg.Record]:
     if not note_ids:
         return {}
     rows = await pool.fetch(_NOTES_BY_ID_SQL, list(note_ids))
     return {row["id"]: row for row in rows}
 
 
-async def _headline(pool: asyncpg.Pool, text: str, query: str) -> str:
+async def _headline(pool: _Queryable, text: str, query: str) -> str:
     result = await pool.fetchval(_HEADLINE_SQL, text, query, _HEADLINE_OPTIONS)
     return str(result)
 

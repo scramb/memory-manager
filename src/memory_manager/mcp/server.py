@@ -47,6 +47,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent
 
 from memory_manager.app import Services
+from memory_manager.db import rls
 from memory_manager.mcp.authz import (
     READ_SCOPE,
     WRITE_SCOPE,
@@ -471,13 +472,30 @@ def build_server(
                 raise AssertionError(  # pragma: no cover - open_services always pairs these
                     "Services.indexer is set but Services.pool is None"
                 )
-            note_hits = await hybrid_search(
-                services.pool,
-                query,
-                provider=services.provider,
-                filters=filters,
-                limit=clamped_limit,
-            )
+            if services.app_role is not None:
+                # `"postgres"` (ADR-0008 addendum, #116): run the whole search on
+                # one connection switched to the app role and the caller's own
+                # identity, not the owner pool - `rls.request_connection` raises
+                # `NoPrincipal` before acquiring one at all if the request
+                # carries none.
+                async with rls.request_connection(services.pool, role=services.app_role) as conn:
+                    note_hits = await hybrid_search(
+                        conn,
+                        query,
+                        provider=services.provider,
+                        filters=filters,
+                        limit=clamped_limit,
+                    )
+            else:
+                # `"git"` with `DATABASE_URL` configured: no RLS at all, the
+                # plain owner pool is exactly what `services.pool` already is.
+                note_hits = await hybrid_search(
+                    services.pool,
+                    query,
+                    provider=services.provider,
+                    filters=filters,
+                    limit=clamped_limit,
+                )
             results = [_note_hit_result(hit) for hit in note_hits]
         elif services.vault_root is not None:
             scan_hits = scan_search(

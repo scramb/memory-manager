@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncpg
 import httpx
+import pytest_asyncio
 from git_fixtures import human_commit
 from starlette.applications import Starlette
 
@@ -50,6 +53,44 @@ Added out of band.
 
 def _environ(bare_remote: Path, tmp_path: Path) -> dict[str, str]:
     return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
+
+
+@pytest_asyncio.fixture
+async def app_role(admin_database_url: str, test_database_url: str) -> AsyncIterator[str]:
+    """A disposable, non-owner, non-superuser role for the RLS request path
+    (ADR-0008 addendum, #116) - `open_services` requires `DATABASE_APP_ROLE`
+    for `STORAGE_BACKEND=postgres` and grants it the content-table
+    privileges it needs at startup (`db.rls.grant_app_role`). Neither test
+    using this fixture touches a content table, so no `namespaces`/`users`
+    registry row or principal is seeded here - only the role needs to exist.
+    """
+    role = f"mm_test_app_{secrets.token_hex(8)}"
+    admin_conn = await asyncpg.connect(admin_database_url)
+    try:
+        await admin_conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
+    finally:
+        await admin_conn.close()
+    try:
+        yield role
+    finally:
+        # See `tests/test_app.py`'s identical fixture for why `drop owned by`
+        # against `test_database_url` has to run before the cluster-wide
+        # `DROP ROLE` below.
+        owned_conn: asyncpg.Connection | None
+        try:
+            owned_conn = await asyncpg.connect(test_database_url)
+        except asyncpg.PostgresError:
+            owned_conn = None
+        if owned_conn is not None:
+            try:
+                await owned_conn.execute(f'drop owned by "{role}"')
+            finally:
+                await owned_conn.close()
+        admin_conn = await asyncpg.connect(admin_database_url)
+        try:
+            await admin_conn.execute(f'drop role if exists "{role}"')
+        finally:
+            await admin_conn.close()
 
 
 @asynccontextmanager
@@ -125,12 +166,16 @@ async def test_readyz_is_503_when_the_database_is_unreachable(
 
 
 async def test_readyz_is_ready_with_the_postgres_backend_and_no_vault(
-    test_database_url: str,
+    test_database_url: str, app_role: str
 ) -> None:
     """The `postgres` backend (ADR-0007 §2, WP-18) has no `vault_root` to check at
     all - `vault` collapses to the same database reachability `database` reports.
     """
-    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": app_role,
+    }
     config = ServerConfig(public_url="https://mm.example.test")
     async with _running_app(environ, config) as (_app, client):
         response = await client.get(READY_PATH)
@@ -190,14 +235,18 @@ async def test_webhook_is_404_without_a_configured_secret(
 
 
 async def test_webhook_is_404_with_the_postgres_backend_even_with_a_secret_configured(
-    test_database_url: str,
+    test_database_url: str, app_role: str
 ) -> None:
     """The `postgres` backend (ADR-0007 §2, WP-18) has no vault and nothing a webhook
     could ever resync (`Services.trigger_sync` is `None`) - 404 regardless of
     whether `VAULT_WEBHOOK_SECRET` happens to be set, same as the endpoint not
     existing at all.
     """
-    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": app_role,
+    }
     config = ServerConfig(public_url="https://mm.example.test", webhook_secret=_WEBHOOK_SECRET)
     async with _running_app(environ, config) as (_app, client):
         response = await client.post(WEBHOOK_PATH, content=b"{}")

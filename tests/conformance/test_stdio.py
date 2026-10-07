@@ -26,14 +26,14 @@ Two complementary harnesses are used:
   is parsed as JSON before anything else happens, which is this module's running check
   that the server's stdout carries nothing but JSON-RPC messages.
 
-`stdio_env` is parametrised over `STORAGE_BACKEND` (ADR-0007 §2, WP-18), so every
-test built on it runs against both: `"git"` talks to a vault cloned from a
-throwaway local bare remote (`tests/git_fixtures.bare_remote`, no network), with
-no `DATABASE_URL` - `memory_index`/`memory_read` do not need Postgres
-(`app.open_services`); `"postgres"` carries no `VAULT_*` variable at all, proof
-that this mode never clones anything, and seeds its one note straight through
-`storage.postgres.PostgresBackend.write` after migrating, instead of
-`seed_notes`'s git commit.
+`stdio_env` seeds a `"git"`-backend vault cloned from a throwaway local bare
+remote (`tests/git_fixtures.bare_remote`, no network), with no `DATABASE_URL` -
+`memory_index`/`memory_read` do not need Postgres (`app.open_services`).
+`STORAGE_BACKEND=postgres` has no stdio variant at all (ADR-0008 addendum
+"identity sources and curate", #115/#116): `cli.py`'s `serve --stdio` refuses
+it outright, so there is nothing left for this module to exercise over stdio -
+`tests/conformance/test_http.py`'s `http_env` is where the `"postgres"`
+backend is exercised instead.
 """
 
 from __future__ import annotations
@@ -48,7 +48,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import pytest
 import pytest_asyncio
 from git_fixtures import seed_notes
@@ -56,8 +55,6 @@ from mcp import Client, MCPDeprecationWarning
 from mcp.client.stdio import StdioServerParameters
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
-from memory_manager.db.migrate import migrate
-from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -95,18 +92,15 @@ _PARAMETRIZE_VERSIONS = pytest.mark.parametrize(
 )
 
 
-@pytest_asyncio.fixture(params=["git", "postgres"], ids=["git", "postgres"])
-async def stdio_env(
-    request: pytest.FixtureRequest, tmp_path: Path, bare_remote: Path, test_database_url: str
-) -> dict[str, str]:
-    """A stdio subprocess's env, backend seeded with one note (ADR-0007 §2, WP-18).
+@pytest_asyncio.fixture
+async def stdio_env(tmp_path: Path, bare_remote: Path) -> dict[str, str]:
+    """A stdio subprocess's env, a `"git"`-backend vault seeded with one note.
 
-    `"git"`: `VAULT_REMOTE`/`VAULT_DIR`, no `DATABASE_URL` -
-    `memory_index`/`memory_read` work without Postgres
-    (`memory_manager.app.open_services`), and conformance here is about the
-    wire protocol, not the search index. `"postgres"`: `STORAGE_BACKEND`/
-    `DATABASE_URL` only - no `VAULT_*` variable at all, proving this mode
-    never clones anything (`app._open_backend`'s `"postgres"` branch).
+    `VAULT_REMOTE`/`VAULT_DIR`, no `DATABASE_URL` - `memory_index`/
+    `memory_read` work without Postgres (`memory_manager.app.open_services`),
+    and conformance here is about the wire protocol, not the search index.
+    No `"postgres"` variant (module docstring): `cli.py`'s `serve --stdio`
+    refuses that backend outright.
     """
     now = datetime(2025, 6, 1, tzinfo=UTC)
     note = Note(
@@ -121,32 +115,8 @@ async def stdio_env(
     )
     content = serialize(note)
 
-    if request.param == "postgres":
-        await _seed_postgres_note(test_database_url, content)
-        return {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
-
     seed_notes(bare_remote, {_SEEDED_PATH: content})
     return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
-
-
-async def _seed_postgres_note(database_url: str, content: bytes) -> None:
-    """Migrate `database_url`, then write `content` at `_SEEDED_PATH` through
-    `PostgresBackend` directly - the `"postgres"` backend's counterpart to
-    `git_fixtures.seed_notes`'s commit onto the bare remote.
-    """
-    migration_conn = await asyncpg.connect(database_url)
-    try:
-        await migrate(migration_conn)
-    finally:
-        await migration_conn.close()
-
-    pool = await asyncpg.create_pool(database_url)
-    try:
-        await PostgresBackend(pool).write(
-            _SEEDED_PATH, content, if_version="new", client="conformance-seed"
-        )
-    finally:
-        await pool.close()
 
 
 def _stdio_params(env: Mapping[str, str]) -> StdioServerParameters:
@@ -360,6 +330,31 @@ async def test_ping_at_handshake_era_returns_empty_result(stdio_env: dict[str, s
             warnings.simplefilter("ignore", MCPDeprecationWarning)
             result = await client.send_ping()
     assert result.model_dump(exclude_none=True) == {}
+
+
+async def test_serve_stdio_refuses_the_postgres_backend() -> None:
+    """`cli.py`'s `serve --stdio` refuses `STORAGE_BACKEND=postgres` outright
+    (ADR-0008 addendum "identity sources and curate", #115/#116): exit code 2,
+    before `open_services` ever runs - `DATABASE_URL` here is never actually
+    connected to (`storage_backend_from_env` only checks it is non-empty).
+    """
+    env = {
+        **os.environ,
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": "postgresql://unused/unused",
+    }
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        *_CLI_ARGS,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=_SHUTDOWN_TIMEOUT)
+
+    assert process.returncode == 2
+    assert b"STORAGE_BACKEND=postgres" in stderr
 
 
 # --- Raw JSON-RPC checks: protocol-layer errors, malformed input, discover ----------

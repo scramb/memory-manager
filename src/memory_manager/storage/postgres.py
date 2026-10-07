@@ -22,6 +22,24 @@ only ever starts a background task). Without either hook (every other
 caller, most tests), indexing is simply skipped - the two parameters default
 to `None` and `PostgresBackend(pool)` keeps working unchanged.
 
+Row-level security (ADR-0008 + both addenda, #116): `__init__`'s optional
+`app_role` turns on the request path's role switch. Every content-table
+access below - `read`/`list` and the inner flow of `write`/`edit`/`archive`/
+`supersede` - runs exclusively through `_content_connection`, this class's
+one seam onto a connection: without `app_role` (every existing
+`PostgresBackend(pool)` call, including every test in this package) it is a
+plain pool connection in its own transaction, exactly as before `app_role`
+existed; with it, it is `db.rls.request_connection`, which switches the
+connection to `app_role` and the calling request's principal before yielding
+it - and raises `db.rls.NoPrincipal` *before* acquiring one at all if the
+request carries none, so a missing principal can never silently fall
+through to running as the owner. The index hook above runs on that very
+same connection, so `notes`/`chunks`/`links` are written under the app role
+too, automatically. `changes_since` is the one method that stays on the
+owner pool unconditionally, `app_role` or not - it is a system path
+(`app.py`'s `_reindex`/CLI scope, never a per-request caller), not part of
+the request path this module's docstring is otherwise about.
+
 Concurrency: a `write`/`edit` runs in one `READ COMMITTED` transaction (the
 pool's default - no `REPEATABLE READ`/`SERIALIZABLE`). An `UPDATE ... WHERE
 id = $id AND current_revision = $n` is safe under `READ COMMITTED` without
@@ -84,11 +102,13 @@ reoccupied within this very window), absent means `deleted`.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import asyncpg
 
+from memory_manager.db import rls
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
     AuditHook,
@@ -109,6 +129,13 @@ from memory_manager.vault.paths import PathRejected, parse_note_path
 __all__ = ["PostgresBackend"]
 
 _logger = logging.getLogger(__name__)
+
+# A connection acquired from `self._pool` directly (no `app_role` configured) or
+# one `db.rls.request_connection` has already switched role/identity on - both
+# expose the same `fetch`/`fetchrow`/`execute`/`transaction` surface this module
+# uses, so every inner flow below is written against either shape
+# interchangeably (same idea as `db/rls.py`'s own `_Connectable`).
+_Connectable = asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 _SELECT_CURRENT = """
 select id, content, version, current_revision
@@ -191,6 +218,7 @@ class PostgresBackend:
         clock: Callable[[], datetime] = _utc_now,
         index_hook: IndexHook | None = None,
         index_commit_hook: IndexCommitHook | None = None,
+        app_role: str | None = None,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -201,6 +229,33 @@ class PostgresBackend:
         # either, built from an `index.indexer.Indexer` over `vault_notes`.
         self._index_hook = index_hook
         self._index_commit_hook = index_commit_hook
+        # `app_role` (ADR-0008 addendum, #116): optional so every existing
+        # `PostgresBackend(pool)` call keeps running exactly as before - only
+        # `app.py`'s `open_services` passes one, for the request-serving process.
+        self._app_role = app_role
+
+    @asynccontextmanager
+    async def _content_connection(self) -> AsyncIterator[_Connectable]:
+        """One connection, inside one transaction, for a single content-table access.
+
+        Every `read`/`list`/write/archive/supersede flow below runs
+        exclusively through this - the structural guarantee #116 asks for:
+        once `app_role` is configured, this backend never touches
+        `vault_notes`/`vault_revisions`/`notes`/`chunks`/`links` on a
+        connection that has not switched to `app_role` under the current
+        request's principal (`db.rls.request_connection`, which itself
+        raises `db.rls.NoPrincipal` before ever acquiring one if the request
+        carries none). Without `app_role` (every existing
+        `PostgresBackend(pool)` call, no request path, #96/#97's own tests),
+        this is a plain pool connection in its own transaction, exactly as
+        every flow below acquired one before this method existed.
+        """
+        if self._app_role is None:
+            async with self._pool.acquire() as plain_conn, plain_conn.transaction():
+                yield plain_conn
+            return
+        async with rls.request_connection(self._pool, role=self._app_role) as switched_conn:
+            yield switched_conn
 
     def add_audit_hook(self, hook: AuditHook) -> None:
         """Register `hook`, awaited after every `write`/`edit`/`supersede`/`archive`.
@@ -231,7 +286,8 @@ class PostgresBackend:
         being converted to an `InvalidNote` here.
         """
         parse_note_path(path, allow_archive=True)
-        row = await self._pool.fetchrow(_SELECT_CURRENT, path)
+        async with self._content_connection() as conn:
+            row = await conn.fetchrow(_SELECT_CURRENT, path)
         if row is None:
             return None
         return StoredNote(path=path, content=bytes(row["content"]), version=row["version"])
@@ -246,7 +302,8 @@ class PostgresBackend:
         rules just to read it back. Archived notes are included only when
         `include_archived` is set.
         """
-        rows = await self._pool.fetch(_SELECT_LIST)
+        async with self._content_connection() as conn:
+            rows = await conn.fetch(_SELECT_LIST)
         entries: list[StoredNote] = []
         for row in rows:
             path = row["path"]
@@ -334,7 +391,7 @@ class PostgresBackend:
         note_path = rules.parse_note_path_or_raise(request.path, allow_archive=True)
 
         try:
-            async with self._pool.acquire() as conn, conn.transaction():
+            async with self._content_connection() as conn:
                 current_row = await conn.fetchrow(_SELECT_CURRENT, request.path)
                 current = bytes(current_row["content"]) if current_row is not None else None
                 current_version = current_row["version"] if current_row is not None else None
@@ -396,7 +453,7 @@ class PostgresBackend:
 
     async def _insert_new(
         self,
-        conn: asyncpg.pool.PoolConnectionProxy,
+        conn: _Connectable,
         namespace: str,
         path: str,
         final_bytes: bytes,
@@ -420,7 +477,7 @@ class PostgresBackend:
 
     async def _update_existing(
         self,
-        conn: asyncpg.pool.PoolConnectionProxy,
+        conn: _Connectable,
         path: str,
         final_bytes: bytes,
         new_version: str,
@@ -445,7 +502,7 @@ class PostgresBackend:
         return str(updated["id"]), int(updated["current_revision"])
 
     async def _reread_for_conflict(
-        self, conn: asyncpg.pool.PoolConnectionProxy, path: str
+        self, conn: _Connectable, path: str
     ) -> tuple[str | None, str | None]:
         """`(version, content)` of the row a losing writer's conflict is reported against.
 
@@ -506,7 +563,7 @@ class PostgresBackend:
     async def _archive_inner(self, request: WriteRequest) -> WriteResult:
         path = request.path
         try:
-            async with self._pool.acquire() as conn, conn.transaction():
+            async with self._content_connection() as conn:
                 current_row = await conn.fetchrow(_SELECT_CURRENT, path)
                 current = bytes(current_row["content"]) if current_row is not None else None
                 current_version = current_row["version"] if current_row is not None else None
@@ -620,7 +677,7 @@ class PostgresBackend:
         actor = request.actor
         message = request.message
         try:
-            async with self._pool.acquire() as conn, conn.transaction():
+            async with self._content_connection() as conn:
                 old_row = await conn.fetchrow(_SELECT_CURRENT, path)
                 old_current = bytes(old_row["content"]) if old_row is not None else None
                 old_version = old_row["version"] if old_row is not None else None

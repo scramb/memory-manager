@@ -836,6 +836,23 @@ def _serve(*, stdio: bool, http: bool) -> int:
 
 
 async def _serve_stdio() -> int:
+    """Run the stdio transport.
+
+    Refuses `STORAGE_BACKEND=postgres` (ADR-0008 addendum "identity sources
+    and curate", #115/#116): enterprise mode is remote only - a local stdio
+    process always holds the owner credentials (`DATABASE_URL`), so a
+    claimed stdio identity would protect nothing even if the request path
+    switched roles for it.
+    """
+    if storage_backend_from_env(dict(os.environ)) == "postgres":
+        print(
+            "serve --stdio: refusing STORAGE_BACKEND=postgres - enterprise mode is "
+            "remote only (ADR-0008 addendum): a local stdio process holds the owner "
+            "credentials and could bypass row-level security regardless of any "
+            "identity it claimed",
+            file=sys.stderr,
+        )
+        return 2
     async with open_services(os.environ) as services:
         server = build_server(services)
         await server.run_stdio_async()
