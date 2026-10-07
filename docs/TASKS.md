@@ -1,6 +1,6 @@
 # TASKS — memory-manager
 
-Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M11` until GitHub milestones exist.
+Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M17` until GitHub milestones exist.
 Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-07
 
 Legend: `#13` = GitHub issue · `⛔` blocked · `O1` = open decision in the PLAN · ticked means **verified**, not "written".
@@ -252,3 +252,115 @@ Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
 
 ### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
+
+---
+
+## M12 — Shared client foundation
+
+Goal: compatibility profiles, schema linter, usage rules from one source, personal tokens, per-profile conformance suite, `connect`/`doctor --client` for Claude Code — see [F-02](./features/F-02-client-integrations.md). · Due: open
+
+### WP-35 — Client integration decisions · F-02 · Branch: `wp/35-client-decisions` · PR: open
+
+- [ ] #126 Client integration decisions are recorded as accepted ADRs with research and the F-02 plan ⛔ blocked by O13–O16 (owner)
+
+### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: open
+
+- [ ] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
+- [ ] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones ⛔ blocked by #127
+
+### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: open
+
+- [ ] #129 `docs/clients` has a page template, a support-matrix skeleton and pages for claude.ai and Claude Code
+
+### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: open
+
+- [ ] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/` ⛔ blocked by #126
+- [ ] #131 Each MCP request runs under the profile chosen by override, clientInfo or default ⛔ blocked by #130
+- [ ] #132 Every tool carries MCP annotations and the core usage rules in its description ⛔ blocked by #126, #127
+- [ ] #133 A schema linter fails CI when a tool violates a supported profile's limits ⛔ blocked by #130
+
+### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
+
+- [ ] #134 Personal tokens carry a kind and are bounded by their owner's rights ⛔ blocked by #126
+- [ ] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, WP-25
+
+### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open
+
+- [ ] #136 The conformance suite runs the full tool set and its error cases once per profile ⛔ blocked by #131, #132
+
+### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
+
+- [ ] #137 `connect claude-code` merges the server into Claude Code's config, and `connect claude-ai` prints the setup steps
+- [ ] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace ⛔ blocked by #131, #137
+
+---
+
+## M13 — Open WebUI, released on its own
+
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O13 (ADR-0011) · Due: open
+
+### WP-42 — Open WebUI spike and per-user auth · F-02 · Branch: `wp/42-openwebui-auth` · PR: open
+
+### WP-43 — Open WebUI profile · F-02 · Branch: `wp/43-openwebui-profile` · PR: open
+
+### WP-44 — Open WebUI filter · F-02 · Branch: `wp/44-openwebui-filter` · PR: open
+
+### WP-45 — Open WebUI memory import · F-02 · Branch: `wp/45-openwebui-import` · PR: open
+
+### WP-46 — Open WebUI deployment, docs and release · F-02 · Branch: `wp/46-openwebui-release` · PR: open
+
+---
+
+## M14 — IDE and CLI clients
+
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O19 (support matrix) · Due: open
+
+### WP-47 — Headless CLI harness and Codex · F-02 · Branch: `wp/47-headless-cli` · PR: open
+
+### WP-48 — Gemini CLI and Code Assist · F-02 · Branch: `wp/48-gemini-cli` · PR: open
+
+### WP-49 — Cursor · F-02 · Branch: `wp/49-cursor` · PR: open
+
+### WP-50 — GitHub Copilot · F-02 · Branch: `wp/50-copilot` · PR: open
+
+### WP-51 — Google Antigravity · F-02 · Branch: `wp/51-antigravity` · PR: open
+
+---
+
+## M15 — Autonomous agent runtimes
+
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O16 (ADR-0013), O19 · Due: open
+
+### WP-52 — Agent identity and write guard · F-02 · Branch: `wp/52-agent-identity` · PR: open
+
+### WP-53 — Hermes Agent · F-02 · Branch: `wp/53-hermes` · PR: open
+
+### WP-54 — OpenClaw · F-02 · Branch: `wp/54-openclaw` · PR: open
+
+### WP-55 — Native agent memory integration · F-02 · Branch: `wp/55-agent-native` · PR: open
+
+---
+
+## M16 — Web clients
+
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O19 · Due: open
+
+### WP-56 — ChatGPT · F-02 · Branch: `wp/56-chatgpt` · PR: open
+
+### WP-57 — Gemini Enterprise · F-02 · Branch: `wp/57-gemini-enterprise` · PR: open
+
+### WP-58 — Manual client checklist · F-02 · Branch: `wp/58-client-checklist` · PR: open
+
+---
+
+## M17 — v1.0.0-rc
+
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. · Due: open
+
+### WP-59 — Stable API and compatibility policy · F-02 · Branch: `wp/59-stable-api` · PR: open
+
+### WP-60 — Security review for the release candidate · F-02 · Branch: `wp/60-security-rc` · PR: open
+
+### WP-61 — Documentation website · F-02 · Branch: `wp/61-docs-site` · PR: open
+
+### WP-62 — Release v1.0.0-rc.1 · F-02 · Branch: `wp/62-release-rc` · PR: open

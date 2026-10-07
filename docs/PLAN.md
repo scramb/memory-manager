@@ -5,7 +5,7 @@
 > lives exclusively in `docs/TASKS.md`.
 > Source of truth for tasks: GitHub issues in `scramb/memory-manager`; `docs/TASKS.md` is the readable mirror.
 
-Last updated: 2026-10-07 · Development rules: [`CLAUDE.md`](../CLAUDE.md)
+Last updated: 2026-10-07 (F-02 planned) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
 
 ## Goal
 
@@ -64,6 +64,10 @@ One process, one replica for writes (single-writer). The process owns the local 
 | Shared state | rate limits, brute-force window, pending login state | Valkey (optional) or Postgres (ADR-0009) | module |
 | Worker | embedding job queue (`SKIP LOCKED`), Graph delta sync, retention, cleanup | Python | separate deployment (enterprise) |
 | Account pages | self-service export/delete, admin area (namespaces, ACLs, erasure, break-glass) | server-rendered HTML | module in the server |
+| Compatibility profiles | per-client limits and instruction delivery, schema linter | Python (ADR-0010) | module |
+| Usage rules | `docs/memory-guide.md` → instructions, prompt, short form, client instruction files | Python generator | CLI + CI check |
+| Client adapters | `connect <client>` config merge, `doctor --client` | Python | CLI |
+| Client integrations | Open WebUI filter/tool, instruction files and config examples per client | Python (Open WebUI) + config | `integrations/<client>/` |
 | CLI | operations | Python entry point | same image |
 
 ### Data flow (write)
@@ -97,6 +101,7 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | Enterprise auth | embedded AS as facade, login delegated to Entra ID, own short-lived tokens bound to `oid`; Graph delta sync for deprovisioning | clients against Entra directly, APIM gateway | Entra has no DCR/CIMD and lacks `code_challenge_methods_supported`, so claude.ai cannot use it directly | [ADR-0006](./adr/0006-enterprise-auth-entra.md) |
 | Storage backend | `StorageBackend` interface: Git (default) or Postgres with append-only revisions (enterprise) | scaled Git, Postgres only | horizontal writes and GDPR erasure without breaking single-user/team mode | [ADR-0007](./adr/0007-storage-backend.md) |
 | Namespaces + permissions | registry with aliases (`me`, groups, projects, `org`) in the existing path format; RLS derives access from membership tables, app checks independently | type-prefixed IDs in paths, app-computed namespace list | no tool contract break; two independent access computations | [ADR-0008](./adr/0008-namespace-permissions.md) |
+| Client compatibility | one strict tool surface for all clients, profiles change only how usage rules are delivered, selected by `?profile=`/header/`clientInfo` | per-client tool surfaces | one contract and test matrix that works on any stateless replica (Proposed) | [ADR-0010](./adr/0010-client-compatibility-profiles.md) |
 | Scaling | stateless Streamable HTTP, no sticky sessions; shared state in Valkey if configured, else Postgres | stateful sessions, Valkey mandatory | any replica serves any request; no extra service for small setups | [ADR-0009](./adr/0009-stateless-replicas.md) |
 | Load test | k6 in a container, p95 thresholds as CI gate | Locust | single binary with built-in thresholds; JS scripts count as test tooling | — (owner 2026-10-07) |
 | Deployment | repo ships its own generic deployment like bring--mcp: Kustomize base in `deploy/` + `deploy/README.md`, Helm chart, Flux example; no operator-specific values (hosts, secrets, cluster names) in this public repo — those live in the operator's own overlay | Helm only; owner-specific manifests in the repo | same pattern as bring--mcp, safe for a public repo ([reference](./research/bring-mcp-reference.md)) | — (owner 2026-10-06) |
@@ -121,12 +126,19 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | M9 | data lifecycle and governance (F-01) | WP-25 … WP-28 |
 | M10 | enterprise operations (F-01) | WP-29 … WP-31 |
 | M11 | proven at target size, release v0.2.0 (F-01) | WP-32 … WP-34 |
+| M12 | shared client foundation: profiles, linter, usage rules from one source, personal tokens, `connect`/`doctor` (F-02) | WP-35 … WP-41 |
+| M13 | Open WebUI, released on its own (F-02) | WP-42 … WP-46 |
+| M14 | IDE and CLI clients (F-02) | WP-47 … WP-51 |
+| M15 | autonomous agent runtimes (F-02) | WP-52 … WP-55 |
+| M16 | web clients (F-02) | WP-56 … WP-58 |
+| M17 | v1.0.0-rc (F-02) | WP-59 … WP-62 |
 
 ## Features
 
 | Feature | Benefit | Milestones | Status |
 |---|---|---|---|
-| [F-01 Enterprise Scale](./features/F-01-enterprise-scale.md) | about 2,000 Entra users with personal, group, project and org memory on a horizontally scaled server | M7–M11 | planned |
+| [F-01 Enterprise Scale](./features/F-01-enterprise-scale.md) | about 2,000 Entra users with personal, group, project and org memory on a horizontally scaled server | M7–M11 | in progress |
+| [F-02 Client Integrations](./features/F-02-client-integrations.md) | one memory from every common AI client (Open WebUI, IDEs, CLIs, agent runtimes, ChatGPT, Gemini), set up with `connect` and checked with `doctor`; ends in v1.0.0-rc | M12–M17 | planned |
 
 ## Open decisions
 
@@ -144,6 +156,15 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O10 | Storage backend for enterprise mode | — decided: `StorageBackend` with Postgres SoT; CLAUDE.md rules adapted (ADR-0007) | — | owner ✔ 2026-10-07 |
 | O11 | Namespace and permission model | — decided: aliases + RLS from membership tables; `memory_promote`, `namespace_kind`, `/account` incl. admin area; break-glass default 2 admins (ADR-0008) | — | owner ✔ 2026-10-07 |
 | O12 | Sessions and shared state across replicas | — decided: stateless; Valkey optional with Postgres fallback (ADR-0009) | — | owner ✔ 2026-10-07 |
+| O13 | Open WebUI identity | A per-user OAuth for tools + personal token for the filter (recommended) · B forward SSO token · C trusted headers ([ADR-0011](./adr/0011-openwebui-identity.md), Proposed) | M13 | owner |
+| O14 | Client compatibility and profile selection | one strict tool surface, profiles for delivery, explicit selection (recommended) · per-client surfaces · lint only ([ADR-0010](./adr/0010-client-compatibility-profiles.md), Proposed) | #130–#133 | owner |
+| O15 | Personal tokens and `/account` outside enterprise mode | extend static tokens + `/account` token section (recommended) · refresh tokens · CLI only ([ADR-0012](./adr/0012-personal-tokens.md), Proposed) | #134, #135 | owner |
+| O16 | Agent identity and write guard | agent namespace kind + approval queue (recommended) · scopes only · runtime guards only ([ADR-0013](./adr/0013-agent-identity.md), Proposed) | M15 | owner |
+| O17 | Native agent memory integration (tier 2) | tier 1 (MCP) only in v1 (recommended) · Hermes provider (Python) · OpenClaw plugin (TypeScript, outside the pool) | WP-55 | owner |
+| O18 | Pre-registered confidential OAuth clients (Gemini Enterprise has no DCR) | static client registration · route via Entra · *Not possible* | WP-57 | owner, after O19 |
+| O19 | Client support matrix (*Full / Partial / Not possible*) | see [`docs/clients/README.md`](./features/F-02-client-integrations.md) once #129 lands | M14–M16 | owner |
+| O20 | Docs website tooling | MkDocs Material · plain Markdown on GitHub | WP-61 | owner |
+| O21 | Model API keys and cost for headless CLI E2E in CI | secrets with spend cap, nightly · local model where possible · manual only | WP-47, WP-48 | owner |
 
 ## Risks
 
