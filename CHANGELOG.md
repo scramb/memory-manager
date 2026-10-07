@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/scramb/memory-manager/compare/v0.1.2...v0.1.3) (2026-10-07)
+
+
+### Documentation
+
+* guide connecting claude.ai and Claude Code to a deployed server ([#86](https://github.com/scramb/memory-manager/issues/86)) ([a1dc957](https://github.com/scramb/memory-manager/commit/a1dc957584fa5ed36fe913761c791409609d5828)), closes [#40](https://github.com/scramb/memory-manager/issues/40) [#22](https://github.com/scramb/memory-manager/issues/22) [#47](https://github.com/scramb/memory-manager/issues/47)
+
 ## [0.1.2](https://github.com/scramb/memory-manager/compare/v0.1.1...v0.1.2) (2026-10-07)
 
 
