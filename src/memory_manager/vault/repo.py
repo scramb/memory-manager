@@ -351,6 +351,41 @@ class Repo:
             f"local HEAD {old_head} and origin/{branch} ({remote_head}) have diverged",
         )
 
+    def diff_since(self, rev: str | None) -> ChangeSet:
+        """Diff `rev` (or the empty tree if `None`) against `refs/remotes/origin/<branch>`.
+
+        Fetches the remote branch first, so this always reports against the
+        remote's current tip, not whatever was fetched last. Returns an
+        empty `ChangeSet` - not a `GitError` - if the remote branch does not
+        exist yet (nothing has ever been pushed there).
+
+        Unlike `sync()`, this never touches the working tree or local
+        `HEAD`: it only reads the fetched remote-tracking ref and diffs it,
+        so it is safe to call while the write queue is mid-write on this
+        same clone (`storage.git.GitBackend.changes_since`, ADR-0007 §1) -
+        at the cost of possibly racing it: the result can briefly lag or
+        lead a concurrent `read()`/`write()` of the same path.
+        """
+        git = self._git()
+        branch = self._config.branch
+
+        remote_check = git.run(
+            *self._auth_args(), "ls-remote", "--exit-code", "--heads", "origin", branch, check=False
+        )
+        if remote_check.returncode == 2:
+            return ChangeSet(old_head=rev, new_head=rev)
+        if remote_check.returncode != 0:
+            raise GitError(
+                ("ls-remote", "--exit-code", "--heads", "origin", branch),
+                remote_check.returncode,
+                _decode(remote_check.stderr),
+            )
+
+        git.run(*self._auth_args(), "fetch", "origin", branch)
+        remote_head = _decode(git.run("rev-parse", f"refs/remotes/origin/{branch}").stdout).strip()
+        diff_old_rev = rev if rev is not None else _EMPTY_TREE
+        return self._diff_changeset(git, rev, remote_head, diff_old_rev, remote_head)
+
     def _current_head(self, git: Git) -> str | None:
         """The current `HEAD` commit SHA, or `None` if `HEAD` is unborn."""
         result = git.run("rev-parse", "--verify", "-q", "HEAD", check=False)

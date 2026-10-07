@@ -169,7 +169,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ### WP-17 — Storage backend interface · F-01 · Branch: `wp/17-storage-interface` · PR: open
 
-- [ ] #94 A `StorageBackend` protocol with a Git implementation passes a backend contract suite
+- [x] #94 A `StorageBackend` protocol with a Git implementation passes a backend contract suite
 - [ ] #95 MCP tools, app wiring and CLI use only `StorageBackend` ⛔ blocked by #94
 
 ### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: open
