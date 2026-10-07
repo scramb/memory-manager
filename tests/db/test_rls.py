@@ -294,6 +294,48 @@ class TestRowLevelSecurityFlags:
             assert any(entry.startswith("search_path=") for entry in row["proconfig"])
         assert foreign_has_execute is False
 
+    async def test_namespace_resolution_functions_are_security_definer_with_pinned_search_path(
+        self, rls_db: RlsDb
+    ) -> None:
+        """`0009_namespace_resolution.sql`'s `mm_ensure_personal_ns`/
+        `mm_principal_namespaces` get the same treatment `mm_readable_ns`/
+        `mm_writable_ns` already get above - `SECURITY DEFINER`, a pinned
+        `search_path`, and `EXECUTE` revoked from a role with no grant."""
+        conn = await _connect_as(rls_db.owner_url)
+        try:
+            rows = await conn.fetch(
+                "select proname, prosecdef, proconfig from pg_proc "
+                "where proname in ('mm_ensure_personal_ns', 'mm_principal_namespaces')"
+            )
+            foreign_has_execute_ensure = await conn.fetchval(
+                "select has_function_privilege($1, 'mm_ensure_personal_ns()', 'EXECUTE')",
+                rls_db.foreign_role,
+            )
+            foreign_has_execute_resolve = await conn.fetchval(
+                "select has_function_privilege($1, 'mm_principal_namespaces(text[])', 'EXECUTE')",
+                rls_db.foreign_role,
+            )
+            app_role_has_execute_ensure = await conn.fetchval(
+                "select has_function_privilege($1, 'mm_ensure_personal_ns()', 'EXECUTE')",
+                rls_db.app_role,
+            )
+            app_role_has_execute_resolve = await conn.fetchval(
+                "select has_function_privilege($1, 'mm_principal_namespaces(text[])', 'EXECUTE')",
+                rls_db.app_role,
+            )
+        finally:
+            await conn.close()
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row["prosecdef"] is True
+            assert row["proconfig"] is not None
+            assert any(entry.startswith("search_path=") for entry in row["proconfig"])
+        assert foreign_has_execute_ensure is False
+        assert foreign_has_execute_resolve is False
+        assert app_role_has_execute_ensure is True
+        assert app_role_has_execute_resolve is True
+
     async def test_grant_app_role_refuses_superuser_bypassrls_and_owner(
         self, rls_db: RlsDb
     ) -> None:

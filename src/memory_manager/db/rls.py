@@ -3,14 +3,15 @@
 
 `migrations/0005_rls.sql` adds `mm_readable_ns()`/`mm_writable_ns()` and
 turns on `ENABLE`/`FORCE ROW LEVEL SECURITY` on `vault_notes`,
-`vault_revisions`, `notes`, `chunks` and `links`. This module is the two
-pieces of Python the SQL alone cannot provide:
+`vault_revisions`, `notes`, `chunks` and `links`; `0009_namespace_resolution.
+sql` adds `mm_ensure_personal_ns()`/`mm_principal_namespaces(text[])`. This
+module is the two pieces of Python the SQL alone cannot provide:
 
 - `grant_app_role`: an idempotent, owner-run grant of exactly the
   privileges a request-serving role needs (table DML, the `chunks_id_seq`
-  sequence, `EXECUTE` on both functions) - and nothing on `namespaces` or
-  the membership tables, which the `SECURITY DEFINER` functions read with
-  the owner's own privileges regardless of the caller.
+  sequence, `EXECUTE` on all four functions) - and nothing on `namespaces`
+  or the membership tables, which the `SECURITY DEFINER` functions read
+  with the owner's own privileges regardless of the caller.
 - `request_identity`: the per-transaction role switch and identity
   settings a request connection must perform before touching any of the
   five tables above. Everything here is set with `set_config(..., true)`
@@ -72,7 +73,17 @@ _Connectable = asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 # is append-only: no `update`/`delete` grant.
 _FULL_DML_TABLES = ("vault_notes", "notes", "chunks", "links")
 _APPEND_ONLY_TABLES = ("vault_revisions",)
-_FUNCTIONS = ("mm_readable_ns", "mm_writable_ns")
+# `(name, argument signature)`: `grant_app_role`'s loop below formats the
+# signature straight into the `GRANT EXECUTE` statement, so
+# `mm_principal_namespaces` (0009_namespace_resolution.sql) - the one
+# function here that is not zero-arg - carries its own `(text[])` alongside
+# the other three's `()`.
+_FUNCTIONS = (
+    ("mm_readable_ns", "()"),
+    ("mm_writable_ns", "()"),
+    ("mm_ensure_personal_ns", "()"),
+    ("mm_principal_namespaces", "(text[])"),
+)
 
 
 class RoleRefused(Exception):
@@ -120,8 +131,8 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
         # `break_glass_grants.id`), which does not require a separate
         # sequence grant on top of table `INSERT`.
         await conn.execute(f'grant usage on sequence "chunks_id_seq" to "{role}"')
-        for function in _FUNCTIONS:
-            await conn.execute(f'grant execute on function "{function}"() to "{role}"')
+        for function, signature in _FUNCTIONS:
+            await conn.execute(f'grant execute on function "{function}"{signature} to "{role}"')
 
 
 @asynccontextmanager

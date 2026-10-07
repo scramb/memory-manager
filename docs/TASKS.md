@@ -186,7 +186,8 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #115 Static tokens carry an owner principal for Postgres mode
 - [x] #116 Postgres-mode requests run only under the RLS identity
 - [x] #118 `pytest tests/mcp` runs on its own without an import cycle
-- [ ] #101 Principal and alias resolution enforce the namespace permission matrix in application code ⛔ blocked by #115, #116
+- [x] #119 The database resolves the caller's namespaces and records revision authors
+- [ ] #101 Principal and alias resolution enforce the namespace permission matrix in application code ⛔ blocked by #119
 - [ ] #102 Search and index results carry `namespace_kind` ⛔ blocked by #101
 
 ### WP-20 — Shared state and replicas · F-01 · Branch: `wp/20-shared-state` · PR: open
