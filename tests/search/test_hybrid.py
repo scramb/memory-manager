@@ -193,6 +193,35 @@ async def pool(test_database_url: str) -> AsyncIterator[asyncpg.Pool]:
         await created_pool.close()
 
 
+@pytest_asyncio.fixture
+async def generic_plan_pool(test_database_url: str) -> AsyncIterator[asyncpg.Pool]:
+    """A single-connection pool pinned to `plan_cache_mode=force_generic_plan`.
+
+    Negative control for `TestCustomPlans` below (#120): `min_size=
+    max_size=1` guarantees every call in a test reuses the exact same
+    physical connection, so `pg_prepared_statements` on it reflects every
+    one of those calls, not a handful spread across an incidental second
+    connection. `server_settings` is a startup parameter, and asyncpg's
+    default `reset` behaviour (`RESET ALL` on release) restores a released
+    connection to its *startup* settings rather than Postgres's own
+    defaults - so this value holds across every acquire/release in the
+    pool's lifetime unless something scopes a change more narrowly, which
+    is exactly what `_hybrid_search_impl`'s `SET LOCAL` (#120) has to do to
+    pass this test against a connection deliberately pinned to the
+    opposite setting.
+    """
+    created_pool = await asyncpg.create_pool(
+        test_database_url,
+        min_size=1,
+        max_size=1,
+        server_settings={"plan_cache_mode": "force_generic_plan"},
+    )
+    try:
+        yield created_pool
+    finally:
+        await created_pool.close()
+
+
 @pytest.fixture
 def provider() -> FakeProvider:
     return FakeProvider()
@@ -326,6 +355,63 @@ class TestSnippet:
         strong = next(hit for hit in hits if hit.path == "work/fact/library-strong.md")
         assert "**" in strong.snippet
         assert "library" in strong.snippet.lower()
+
+
+class TestCustomPlans:
+    """#120: `_hybrid_search_impl` must force its own custom plan.
+
+    `generic_plan_pool` starts pinned to `force_generic_plan` - the
+    opposite of what `_hybrid_search_impl` needs - so `generic_plans ==
+    0` only holds if it overrides that itself (`SET LOCAL
+    plan_cache_mode = force_custom_plan`) on every call, rather than
+    relying on Postgres's own `auto` heuristic (which would still show up
+    here as a `pg_prepared_statements` row, just with `generic_plans > 0`
+    once the connection's pinned setting takes over past its own
+    plan-count threshold).
+    """
+
+    async def test_fulltext_statement_always_plans_custom(
+        self, seeded: asyncpg.Pool, generic_plan_pool: asyncpg.Pool
+    ) -> None:
+        for _ in range(6):
+            await hybrid_search(generic_plan_pool, "database")
+
+        # Binding the substring as a parameter, rather than writing it
+        # into this query's own text, keeps this statement's own entry in
+        # `pg_prepared_statements` (once asyncpg caches it too) from
+        # ever matching its own `like` pattern.
+        row = await generic_plan_pool.fetchrow(
+            "select generic_plans, custom_plans from pg_prepared_statements"
+            " where statement like '%' || $1 || '%'",
+            "mm_frequent_lexemes",
+        )
+        assert row is not None, "the full-text statement was never prepared"
+        assert row["generic_plans"] == 0
+        assert row["custom_plans"] >= 6
+
+    async def test_fulltext_statement_also_plans_custom_on_an_already_open_connection(
+        self, seeded: asyncpg.Pool, generic_plan_pool: asyncpg.Pool
+    ) -> None:
+        """The RLS request path (#116) calls `hybrid_search` with a connection
+        it already holds inside its own transaction (`rls.request_connection`/
+        `rls.request_identity`), not a pool. `_hybrid_search_impl` must force
+        the same custom plan on that connection too, each call reusing the
+        caller's transaction rather than opening (and relying on) one of its
+        own - otherwise the RLS request path would silently lose #120's fix.
+        """
+        async with generic_plan_pool.acquire() as conn:
+            for _ in range(6):
+                async with conn.transaction():
+                    await hybrid_search(conn, "database")
+
+        row = await generic_plan_pool.fetchrow(
+            "select generic_plans, custom_plans from pg_prepared_statements"
+            " where statement like '%' || $1 || '%'",
+            "mm_frequent_lexemes",
+        )
+        assert row is not None, "the full-text statement was never prepared"
+        assert row["generic_plans"] == 0
+        assert row["custom_plans"] >= 6
 
 
 class TestRrfFuse:
