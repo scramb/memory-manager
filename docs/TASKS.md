@@ -1,7 +1,7 @@
 # TASKS — memory-manager
 
 Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M6` until GitHub milestones exist.
-Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-06
+Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-07
 
 Legend: `#13` = GitHub issue · `⛔` blocked · `O1` = open decision in the PLAN · ticked means **verified**, not "written".
 
@@ -150,4 +150,5 @@ Goal: complete docs, security review done, importers, first signed release.
 
 - [x] #51 Security review against OWASP Top 10 for LLM apps, findings fixed or documented
 - [x] #52 Release pipeline: GHCR push, cosign signing, SBOM, chart-releaser, release-please
-- [ ] #53 README comparison with mem0, Basic Memory, Zep; tag v0.1.0
+- [x] #53 README comparison with mem0, Basic Memory, Zep; tag v0.1.0
+- [ ] #77 A deploy key without a trailing newline still loads
