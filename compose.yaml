@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Local/self-hosted quickstart (#42, WP-12): memory-manager + Postgres/pgvector,
+# with a one-shot init container that seeds a local vault "remote" when no
+# external VAULT_REMOTE is configured. Ollama is opt-in via the `ollama`
+# profile - most of the 5-minute startup budget would otherwise go to
+# pulling a model. The modern `compose.yaml` name is used deliberately over
+# `docker-compose.yml`; both are read by `docker compose`/`podman compose`.
+#
+# No `${VAR:-default}` interpolation anywhere below, deliberately: podman-compose
+# 1.3 only resolves that syntax when the variable has some definition *somewhere*
+# (shell env or a top-level `.env` next to this file) - on a fresh checkout, with
+# neither, it passes the literal, unresolved `${VAR:-default}` string straight
+# into the container instead of falling back to `default` (confirmed by reading
+# its interpolation code, not assumed). Every value these services need to boot
+# at all is therefore a plain literal here. `env_file: .../required: false` is
+# a different, unrelated mechanism - a service-level file of extra variables,
+# read as-is with no interpolation step to get wrong - and is what the handful
+# of genuinely optional settings (embeddings, CORS origins) are overridable
+# through, via `.env` (see `.env.example`); `up`/`run` works the same with or
+# without that file.
+#
+# Quickstart: see README.md.
+
+services:
+  # One-shot, root, fixes up ownership of the two named volumes `vault-init`/
+  # `memory-manager` write to as uid 10001 before either of them starts.
+  # Needed for Docker: a *fresh* named volume's mount point is created
+  # root:root 0755 (Docker only copies the image's own ownership into it
+  # when the mount target pre-exists as a directory *in the image* - true
+  # for neither volume here), which a non-root process cannot write into at
+  # all. Podman's rootless mode happens to auto-chown a fresh volume to
+  # match a container's non-root user on mount, which is exactly why this
+  # was invisible when this compose file was only ever run through podman
+  # locally - confirmed by reproducing both the root:root default and the
+  # podman-only auto-chown directly against a throwaway volume, not assumed.
+  volume-perms:
+    image: docker.io/library/busybox:1.37
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/perms/vault-clone", "/perms/vault-remote"]
+    volumes:
+      - vault-clone:/perms/vault-clone
+      - vault-remote:/perms/vault-remote
+    restart: "no"
+
+  postgres:
+    image: docker.io/pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mm
+      POSTGRES_PASSWORD: mm
+      POSTGRES_DB: mm
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    # No published host port on purpose: nothing outside this compose
+    # project needs to reach it, and a fixed host port here would risk
+    # colliding with a Postgres container a developer already has running
+    # for local test/eval runs (`make db-up`, see Makefile). Not meant to
+    # be operator-customized (no `env_file`) - these credentials never
+    # leave the compose-internal network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mm -d mm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: makes sure the local bare "remote" memory-manager clones from
+  # (file:///data/remote.git, VAULT_REMOTE below) exists and carries a first
+  # note, so a brand-new stack has something to read instead of an empty
+  # vault. A no-op if VAULT_REMOTE is changed (edit this file) to point
+  # somewhere else - that remote is the operator's own vault, there is
+  # nothing local to seed.
+  vault-init:
+    build: .
+    image: ghcr.io/scramb/memory-manager:latest
+    command: ["/bin/sh", "/compose-init.sh"]
+    environment:
+      VAULT_REMOTE: file:///data/remote.git
+    volumes:
+      - vault-remote:/data/remote.git
+      - ./scripts/compose-init.sh:/compose-init.sh:ro
+    depends_on:
+      volume-perms:
+        condition: service_completed_successfully
+    restart: "no"
+
+  memory-manager:
+    build: .
+    image: ghcr.io/scramb/memory-manager:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "10001:10001"
+    environment:
+      # Fixed by this compose topology, not operator-facing: change these
+      # by editing this file (a real deployment is expected to adapt its
+      # own copy, CLAUDE.md "deployment artefacts are generic").
+      DATABASE_URL: postgresql://mm:mm@postgres:5432/mm
+      VAULT_REMOTE: file:///data/remote.git
+      PUBLIC_URL: http://localhost:8080
+    # Genuinely optional settings only (embeddings, CORS origins) - omitted
+    # here so `.env` is the *only* source for them and can actually override
+    # them (a key set under `environment:` always wins over the same key
+    # from `env_file`, so anything that must stay operator-overridable
+    # cannot also be listed above). `required: false`: `up`/`run` works
+    # identically whether or not `.env` exists - see `.env.example`.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # The working clone (VAULT_DIR, defaulted to /data/vault by the
+      # image) and the bare remote both live under /data - the image's
+      # root filesystem is read-only, so both need an explicit volume,
+      # not just the one `VOLUME /data` already declares.
+      - vault-clone:/data
+      - vault-remote:/data/remote.git
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      volume-perms:
+        condition: service_completed_successfully
+      vault-init:
+        condition: service_completed_successfully
+    # No container-level healthcheck: /healthz and /readyz are liveness/
+    # readiness probes meant for an orchestrator in front of this (the
+    # Dockerfile makes the same call for Kubernetes); scripts/smoke-compose.sh
+    # polls /readyz itself for this compose project.
+
+  # Opt-in local embedding provider: `docker compose --profile ollama up`,
+  # with EMBEDDING_PROVIDER=ollama (and EMBEDDING_URL=http://ollama:11434)
+  # set for the memory-manager service - see .env.example and the README
+  # quickstart. Left out of the default `up` and out of the CI smoke job:
+  # pulling a model would blow well past the 5-minute startup budget.
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  pg-data:
+  vault-clone:
+  vault-remote:
+  ollama-data:

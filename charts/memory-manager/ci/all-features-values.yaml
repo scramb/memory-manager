@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Turns on every optional template this chart has, so `helm template -f
+# this | kubeconform` (validate.yml's deploy job) exercises each one at
+# least once. Not a realistic install on its own (ingress and httpRoute
+# both enabled at the same time, for instance) - just coverage.
+serviceAccount:
+  create: true
+
+secrets:
+  create: true
+  values:
+    sshPrivateKey: "placeholder"
+    sshKnownHosts: "placeholder"
+    vaultWebhookSecret: "placeholder"
+    oidcClientSecret: "placeholder"
+    oauthClientSecretKey: "placeholder"
+    adminPasswordHash: "placeholder"
+
+login:
+  mode: password
+
+embedding:
+  provider: openai
+  url: https://api.example.com/v1
+  model: text-embedding-3-small
+  dimensions: 1536
+  apiKeySecretKey: EMBEDDING_API_KEY
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  hosts:
+    - host: memory.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+networkPolicy:
+  enabled: true
+  ingress:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: gateway-namespace
+    podSelector: {}
+  egress:
+    allowAll: false
+    rules:
+      # Postgres, if it lives in another namespace of the same cluster.
+      - to:
+          - namespaceSelector: {}
+        ports:
+          - protocol: TCP
+            port: 5432
+      # Vault git remote (443/22) and OIDC issuer (443) - destination
+      # unrestricted since their actual IPs are operator-specific.
+      - ports:
+          - protocol: TCP
+            port: 443
+          - protocol: TCP
+            port: 22
+
+serviceMonitor:
+  enabled: true

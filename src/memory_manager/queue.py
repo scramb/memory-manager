@@ -55,6 +55,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, NoReturn
 
+from memory_manager.observability.metrics import QUEUE_DEPTH, record_queue_write
 from memory_manager.vault.git import GitError, PushRejected
 from memory_manager.vault.note import NoteFormatError, parse, serialize, version
 from memory_manager.vault.paths import PathRejected, conflict_path, parse_note_path
@@ -387,6 +388,7 @@ class WriteQueue:
         """
         future: asyncio.Future[WriteResult] = asyncio.get_running_loop().create_future()
         await self._queue.put((request, future))
+        QUEUE_DEPTH.set(self._queue.qsize())
         return await future
 
     async def sync(self) -> ChangeSet:
@@ -410,11 +412,13 @@ class WriteQueue:
         future: asyncio.Future[ChangeSet] = asyncio.get_running_loop().create_future()
         self._pending_sync = future
         await self._queue.put(_SyncJob(future=future))
+        QUEUE_DEPTH.set(self._queue.qsize())
         return await future
 
     async def _consume(self) -> None:
         while True:
             item = await self._queue.get()
+            QUEUE_DEPTH.set(self._queue.qsize())
             if isinstance(item, _SyncJob):
                 await self._run_sync_job(item)
             else:
@@ -435,10 +439,12 @@ class WriteQueue:
             await self._run_audit_hooks(request, None, exc)
             if not future.done():
                 future.set_exception(exc)
+            record_queue_write(request.op, "error")
         else:
             await self._run_audit_hooks(request, result, None)
             if not future.done():
                 future.set_result(result)
+            record_queue_write(request.op, "ok")
 
     async def _run_sync_job(self, job: _SyncJob) -> None:
         # A later concurrent `sync()` call must enqueue its own fresh job

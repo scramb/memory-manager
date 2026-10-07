@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The whole host goes to the app: the MCP endpoint (/mcp), the embedded
+# authorization server's own routes and metadata (/.well-known/*,
+# /authorize, /token, /register, /revoke), the vault webhook
+# (/hooks/vault) and /healthz, /readyz. The app itself decides who gets
+# in - every MCP request needs a bearer token it issued or verified.
+#
+# `gateway-name`/`gateway-namespace` and the hostname are placeholders -
+# an operator overlay patches `parentRefs`/`hostnames` to their own
+# Gateway API gateway and public DNS name. Lower-case: a Kubernetes object
+# name must be a valid RFC 1123 DNS label, so an upper-case placeholder
+# would fail schema validation before an operator even gets to patch it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+spec:
+  parentRefs:
+    - name: gateway-name
+      namespace: gateway-namespace
+  hostnames:
+    - memory.example.com
+  rules:
+    - backendRefs:
+        - name: memory-manager
+          port: 8080

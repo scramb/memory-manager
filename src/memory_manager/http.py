@@ -114,6 +114,8 @@ from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
+from memory_manager.observability.logging import RequestIdMiddleware
+from memory_manager.observability.metrics import metrics_endpoint
 
 __all__ = ["ServicesFactory", "build_authenticator", "create_app"]
 
@@ -122,6 +124,7 @@ _logger = logging.getLogger(__name__)
 HEALTH_PATH = "/healthz"
 READY_PATH = "/readyz"
 WEBHOOK_PATH = "/hooks/vault"
+METRICS_PATH = "/metrics"
 
 _SOURCE_URL = "https://github.com/scramb/memory-manager"
 _MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
@@ -279,6 +282,7 @@ def create_app(
         # same way the two routes above shadow its PRM route - see `auth.metadata`'s
         # module docstring for why.
         Route(OAUTH_METADATA_PATH, endpoint=_authorization_server_metadata, methods=["GET"]),
+        Route(METRICS_PATH, endpoint=metrics_endpoint, methods=["GET"]),
     ]
     if authenticator is not None:
         # `/login` only exists when an `Authenticator` is actually configured.
@@ -312,6 +316,8 @@ def create_app(
         Mount("/", app=_McpMount())
     )
     middleware = [
+        # Outermost: every response, including a 429/413, carries a request id.
+        Middleware(RequestIdMiddleware),
         # Outermost: reject an over-limit or oversized request before
         # Origin validation, routing or auth ever run (#39).
         Middleware(

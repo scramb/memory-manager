@@ -66,6 +66,7 @@ from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
+from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
@@ -789,7 +790,10 @@ def _serve(*, stdio: bool, http: bool) -> int:
     # go to stderr, never stdout (a stray `print()` would corrupt the wire).
     # Harmless but kept the same for --http: nothing here relies on stdout
     # staying clean, logs just belong together regardless of transport.
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    # `configure_logging_from_env` (#43) always logs to stderr too; it also
+    # reads `LOG_LEVEL`/`LOG_FORMAT` (default `INFO`/`json`, the container
+    # default) instead of hardcoding both the way `logging.basicConfig` did.
+    configure_logging_from_env(os.environ)
 
     try:
         if stdio:

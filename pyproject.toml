@@ -11,11 +11,18 @@ dependencies = [
     "cryptography>=42",
     "httpx>=0.28.1",
     "mcp>=2.3,<3",
+    "prometheus-client>=0.26.0",
     "pyyaml>=6.0",
 ]
 
 [project.scripts]
 memory-manager = "memory_manager.cli:main"
+
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-exporter-otlp>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+]
 
 [dependency-groups]
 dev = [
@@ -53,6 +60,17 @@ files = ["src", "tests"]
 # module name instead of resolving each by its path.
 explicit_package_bases = true
 mypy_path = ["src", "tests"]
+
+# `opentelemetry-sdk`/`opentelemetry-exporter-otlp` are the optional `otel`
+# extra (observability/tracing.py, #43) - not installed by `uv sync` without
+# `--extra otel`, which is how `make check`/CI run it (CLAUDE.md: few
+# dependencies, every external service optional). Without this, mypy fails
+# the whole run with "Cannot find implementation or library stub" instead of
+# just treating those imports (inside a guarded `try/except ImportError`,
+# never required) as untyped.
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Postgres 16 + pgvector (PLAN: a derived, fully rebuildable search index -
+# `memory-manager reindex --full` repopulates it from the vault, so losing
+# this `Cluster` loses only the index, never a note). One instance: the
+# vault is the source of truth, not this database, so the usual "replicas
+# for availability" argument does not apply here the way it would for a
+# primary store; an operator who wants more resilience adds replicas in
+# their own overlay.
+#
+# `docker.io/pgvector/pgvector:pg16` (the same image `compose.yaml` runs
+# locally) rather than CloudNativePG's own `ghcr.io/cloudnative-pg/
+# postgresql` images: it is a stock PostgreSQL 16 image plus the compiled
+# `vector` extension, which is all CNPG's instance manager needs (standard
+# `initdb`/`pg_ctl`/binary layout) - `memory-manager`'s own migrations run
+# `CREATE EXTENSION IF NOT EXISTS vector` and the rest of the schema.
+#
+# `prune: disabled`: a Flux prune would delete this `Cluster` and, with
+# it, the PVC - there is nothing to prune back to, only a full reindex.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: memory-manager-db
+  labels:
+    app.kubernetes.io/name: memory-manager
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  instances: 1
+  imageName: docker.io/pgvector/pgvector:pg16
+  bootstrap:
+    initdb:
+      database: memory_manager
+      owner: memory_manager
+  storage:
+    # No `storageClass` here on purpose - the cluster's default storage
+    # class is used unless an operator overlay sets one explicitly.
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi

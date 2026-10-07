@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default (deploy/README.md: "the namespace itself, and any
+# network policy restricting who may reach the pod" is an operator's own
+# cluster topology, not this project's to decide) - documented here for
+# anyone who wants it anyway. Ingress is scoped to configurable
+# namespace/pod selectors on the MCP port; egress defaults to
+# allow-all-with-DNS, because the vault's git remote, the OIDC issuer and
+# an embedding provider are all operator-specific hostnames whose IPs this
+# chart cannot know - set the egress block's "allowAll" to false and list
+# its own "rules" (raw NetworkPolicyEgressRule entries) to lock it down to
+# your own resolved ranges.
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "memory-manager.fullname" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "memory-manager.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingress.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.ingress.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+  egress:
+    # DNS is always allowed, even when "allowAll" above is false - without
+    # it nothing else below can resolve either.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicy.egress.allowAll }}
+    - {}
+    {{- else }}
+    {{- range .Values.networkPolicy.egress.rules }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+{{- end }}
