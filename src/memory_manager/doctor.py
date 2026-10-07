@@ -21,7 +21,7 @@ from pathlib import Path
 
 from memory_manager.vault.links import VaultEntry, extract_links, resolve_links
 from memory_manager.vault.note import Note, NoteFormatError, serialize
-from memory_manager.vault.paths import PathRejected, parse_note_path
+from memory_manager.vault.paths import PathRejected, iter_md_files, parse_note_path
 from memory_manager.vault.secrets import scan as scan_secrets
 from memory_manager.vault.validate import NoteInvalid, validate_bytes
 
@@ -53,18 +53,18 @@ class _LiveNote:
 def run_doctor(vault_root: Path) -> DoctorReport:
     """Walk `vault_root` and check every `.md` file against ADR-0005.
 
-    Skips `.git`. A `*.conflict.md` file is reported as a warning (a
-    conflict is waiting for a human to resolve) and otherwise left alone -
-    it is never valid note content on its own and is not expected to parse.
+    Skips `.git` and never follows a symlink (`vault.paths.iter_md_files`) - a
+    `*.md` symlink has no business in the vault and must never have its
+    target's content read, scanned or reported back as if it were a note.
+    A `*.conflict.md` file is reported as a warning (a conflict is waiting
+    for a human to resolve) and otherwise left alone - it is never valid
+    note content on its own and is not expected to parse.
     """
     report = DoctorReport()
     live_notes: list[_LiveNote] = []
 
-    for file in sorted(vault_root.rglob("*.md")):
-        rel_parts = file.relative_to(vault_root).parts
-        if ".git" in rel_parts:
-            continue
-        rel = "/".join(rel_parts)
+    for file in iter_md_files(vault_root):
+        rel = "/".join(file.relative_to(vault_root).parts)
         data = file.read_bytes()
 
         text = _decode(data)

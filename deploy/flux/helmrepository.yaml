@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# OCI source for the chart on GHCR (#52 publishes it there as
+# OCI source for the chart on GHCR (`.github/workflows/release.yml`
+# publishes every tagged release there as
 # `oci://ghcr.io/scramb/charts/memory-manager`; this `HelmRepository`
 # points at the repository root, `helmrelease.yaml`'s own `chart` → `spec`
 # → `chart` field names the chart within it, Flux's own convention for an

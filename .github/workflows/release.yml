@@ -1,0 +1,200 @@
+name: release
+
+# Publishes on a version tag (pushed directly for a pre-release, or by
+# merging the release-please PR for a stable one - see
+# .github/workflows/release-please.yml and docs/releasing.md):
+#   - container image:  ghcr.io/<owner>/memory-manager:<version>(+latest, <major.minor> for stable)
+#   - SBOM (SPDX):       attached to the GitHub release
+#   - signatures:        keyless cosign, image AND chart, verifiable with the GitHub OIDC issuer
+#   - Helm chart (OCI):  ghcr.io/<owner>/charts/memory-manager:<version>
+# A leading "v" is stripped so the value is valid SemVer for the chart,
+# e.g. tag "v1.2.3" -> version "1.2.3". Tags with a pre-release suffix
+# (e.g. "v0.0.1-rc.1") only ever get the full-version image tag, never
+# "latest" or the "<major.minor>" floating tag, and the GitHub release is
+# marked pre-release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # release-please.yml dispatches this explicitly after it tags a stable
+  # release: a push made with GITHUB_TOKEN does not re-trigger other
+  # workflows, `workflow_dispatch` is the exception - see docs/releasing.md.
+  # No inputs needed: `--ref <tag>` already puts GITHUB_REF_NAME/ref_name
+  # on the tag, same as a real tag push.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard - must run against a version tag
+        run: |
+          if [[ "${{ github.ref_type }}" != "tag" || "${{ github.ref_name }}" != v* ]]; then
+            echo "::error::release.yml must run against a tag ref starting with 'v' (got ref_type=${{ github.ref_type }}, ref_name=${{ github.ref_name }})"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compute names, version and tags
+        id: vars
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' is not a 'vX.Y.Z' or 'vX.Y.Z-pre' release tag"
+            exit 1
+          fi
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          CHART_REF="${REGISTRY}/${OWNER}/charts/memory-manager"
+
+          tags=("${IMAGE}:${VERSION}")
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+            MAJOR_MINOR="${VERSION%.*}"
+            tags+=("${IMAGE}:${MAJOR_MINOR}" "${IMAGE}:latest")
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+            echo "owner=$OWNER"
+            echo "image=$IMAGE"
+            echo "chart_repo=oci://${REGISTRY}/${OWNER}/charts"
+            echo "chart_ref=$CHART_REF"
+            echo "tags<<TAGS_EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing version '$VERSION' from tag '${GITHUB_REF_NAME}' (prerelease=$PRERELEASE)"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.vars.outputs.tags }}
+          build-args: |
+            MM_GIT_SHA=${{ github.sha }}
+            MM_VERSION=${{ steps.vars.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless, GitHub OIDC)
+        run: cosign sign --yes "${{ steps.vars.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+      - name: Verify the image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/v.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ steps.vars.outputs.image }}@${{ steps.build.outputs.digest }}"
+
+      - name: Generate an SPDX SBOM for the release asset
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.vars.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package the chart (version == app-version == released tag)
+        run: |
+          helm package charts/memory-manager \
+            --version "${{ steps.vars.outputs.version }}" \
+            --app-version "${{ steps.vars.outputs.version }}" \
+            --destination /tmp/chart
+
+      - name: Push the chart to GHCR (OCI)
+        id: chart
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login "${{ env.REGISTRY }}" -u "${{ github.actor }}" --password-stdin
+          out="$(helm push "/tmp/chart/memory-manager-${{ steps.vars.outputs.version }}.tgz" \
+            "${{ steps.vars.outputs.chart_repo }}" 2>&1 | tee /dev/stderr)"
+          digest="$(printf '%s\n' "$out" | grep -oE 'sha256:[0-9a-f]{64}' | head -n1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the chart artifact
+        run: cosign sign --yes "${{ steps.vars.outputs.chart_ref }}@${{ steps.chart.outputs.digest }}"
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # Stable tags normally already have a release here (created by
+            # release-please when its PR was merged); a pre-release tag
+            # like "v0.0.1-rc.1" is pushed by hand and has none yet.
+            extra_opts=()
+            [[ "${{ steps.vars.outputs.prerelease }}" == "true" ]] && extra_opts+=(--prerelease)
+            gh release create "$tag" --repo "${{ github.repository }}" --generate-notes "${extra_opts[@]}"
+          fi
+          gh release upload "$tag" --repo "${{ github.repository }}" --clobber \
+            sbom.spdx.json \
+            "/tmp/chart/memory-manager-${{ steps.vars.outputs.version }}.tgz"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Released \`${{ steps.vars.outputs.version }}\`"
+            echo
+            echo "**Image**"
+            echo '```'
+            printf '%s\n' "${{ steps.vars.outputs.tags }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "**Verify**"
+            echo '```bash'
+            echo "cosign verify --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/v.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${{ steps.vars.outputs.image }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo "**Chart (OCI)**"
+            echo '```bash'
+            echo "helm install memory-manager ${{ steps.vars.outputs.chart_repo }}/memory-manager --version ${{ steps.vars.outputs.version }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

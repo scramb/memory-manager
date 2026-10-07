@@ -5,11 +5,19 @@
 # this Cluster loses only the index, never a note). Requires the
 # CloudNativePG operator already installed in the cluster - this chart
 # only renders the Cluster custom resource, not the operator itself.
-# `docker.io/pgvector/pgvector:pg16` (the same image compose.yaml runs
-# locally) rather than CloudNativePG's own postgresql images: a stock
-# PostgreSQL 16 image plus the compiled vector extension is all CNPG's
-# instance manager needs - memory-manager's own migrations run
-# `CREATE EXTENSION IF NOT EXISTS vector` and the rest of the schema.
+#
+# The cnpg block's `imageName` value must be a CNPG operand image (the
+# stock `pgvector/pgvector` image compose.yaml runs locally is NOT one -
+# CNPG's instance manager requires its own image layout); the default,
+# `ghcr.io/cloudnative-pg/postgresql:16-standard-trixie`, already ships the
+# vector extension compiled in. `postInitApplicationSQL` creates it once,
+# as the bootstrap (superuser) role, right after `initdb` - the app's own
+# database role is never a superuser, and `CREATE EXTENSION` needs one
+# unless the extension is already there, at which point memory-manager's
+# own migration 0001 (`CREATE EXTENSION IF NOT EXISTS vector`) runs as a
+# no-op requiring no such privilege (verified directly in
+# `tests/db/test_migrations.py`,
+# `TestMigrate::test_succeeds_for_a_non_superuser_role_once_vector_already_exists`).
 {{- if .Values.database.cnpg.enabled }}
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -24,6 +32,8 @@ spec:
     initdb:
       database: memory_manager
       owner: memory_manager
+      postInitApplicationSQL:
+        - "CREATE EXTENSION IF NOT EXISTS vector;"
   storage:
     {{- with .Values.database.cnpg.storage.storageClassName }}
     storageClass: {{ . }}

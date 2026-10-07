@@ -2,8 +2,10 @@
 
 How to add the `memory-manager` stdio server as an MCP server in Claude Code, so the
 `memory_*` tools (see `src/memory_manager/mcp/instructions.py`) become available in a
-session. There is no HTTP/OAuth transport yet (that is M4, issue #40); this guide covers the
-local stdio transport only.
+session. This guide covers the local stdio transport. For a deployed server, add it over HTTP
+instead (`claude mcp add --transport http memory https://memory.example.com/mcp`). Claude Code
+then runs the OAuth login in the browser, or uses a static token passed with
+`--header "Authorization: Bearer <token>"` (see `memory-manager token create`).
 
 Checked against `claude --version` **2.1.280** on **2026-10-06**. Command syntax also recorded
 in [`docs/research/mcp-auth-and-connectors.md`](../research/mcp-auth-and-connectors.md#5-claude-code-k1).

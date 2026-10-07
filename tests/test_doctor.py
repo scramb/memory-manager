@@ -142,6 +142,31 @@ class TestWarnings:
         assert any("supersedes unknown id" in warning for warning in report.warnings)
 
 
+class TestSymlinkSafety:
+    def test_symlinked_note_file_is_never_read(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside-the-vault.md"
+        outside.write_text("AWS key: AKIAABCDEFGHIJKLMNOP\n", encoding="utf-8")
+        link = tmp_path / "personal" / "fact"
+        link.mkdir(parents=True)
+        (link / "evil.md").symlink_to(outside)
+
+        report = run_doctor(tmp_path)
+
+        assert report.errors == []
+        assert report.warnings == []
+
+    def test_note_reached_through_a_symlinked_directory_is_never_read(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside-dir"
+        outside.mkdir()
+        _write(outside, "fact/leaky.md", serialize(_note(body="AWS key: AKIAABCDEFGHIJKLMNOP\n")))
+        (tmp_path / "personal").symlink_to(outside)
+
+        report = run_doctor(tmp_path)
+
+        assert report.errors == []
+        assert report.warnings == []
+
+
 class TestExampleVault:
     def test_example_vault_has_no_errors(self) -> None:
         report = run_doctor(_EXAMPLES_VAULT)

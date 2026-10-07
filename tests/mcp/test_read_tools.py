@@ -108,6 +108,41 @@ async def test_memory_index_include_archived(services: Services) -> None:
     assert _RETIRED_FACT_PATH in paths
 
 
+async def test_memory_index_never_follows_a_symlinked_note_file(services: Services) -> None:
+    # A client can never write a symlink through the MCP write path (`vault.paths.resolve`
+    # rejects one); this is the human-pushed-straight-to-the-remote case `vault.paths.
+    # iter_md_files` guards `_iter_vault_notes` against - a `*.md` symlink must never have
+    # its target's content read, parsed and reported back through `memory_index` as if it
+    # were a real note in the vault, even when the target happens to parse as a valid one.
+    outside = services.vault_root.parent / "outside-the-vault.md"
+    outside.write_text(
+        "---\n"
+        "id: 01J8Z3K9N2M4P6Q8R0S2T4V6W9\n"
+        "title: Secret\n"
+        "description: leaked\n"
+        "type: fact\n"
+        "created: 2025-06-01T00:00:00Z\n"
+        "updated: 2025-06-01T00:00:00Z\n"
+        "---\n"
+        "leaked body\n",
+        encoding="utf-8",
+    )
+    symlinked_path = "personal/fact/symlinked.md"
+    (services.vault_root / symlinked_path).symlink_to(outside)
+
+    async with Client(build_server(services)) as client:
+        result = await client.call_tool("memory_index", {})
+        read_result = await client.call_tool(
+            "memory_read", {"items": ["01J8Z3K9N2M4P6Q8R0S2T4V6W9"]}
+        )
+
+    entries = result.structured_content["result"]
+    assert symlinked_path not in {entry["path"] for entry in entries}
+
+    read_items = read_result.structured_content["result"]
+    assert read_items[0]["error"]["error"] == "NotFound"
+
+
 async def test_memory_read_by_path_returns_content_and_version(services: Services) -> None:
     expected_bytes = (services.vault_root / _FAVORITE_COLOR_PATH).read_bytes()
     expected_note = parse(expected_bytes)

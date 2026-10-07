@@ -20,7 +20,7 @@ from pathlib import Path
 
 from memory_manager.search import SearchFilters
 from memory_manager.vault.note import Note, NoteFormatError, parse
-from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path
+from memory_manager.vault.paths import NotePath, PathRejected, iter_md_files, parse_note_path
 
 __all__ = ["ScanHit", "scan_search"]
 
@@ -51,18 +51,17 @@ def scan_search(
     in a search result the way `memory_index` has one. `filters` is applied
     identically to `search.hybrid_search`'s. Ranked best score first, ties
     broken by path; only notes scoring above zero are returned, at most
-    `limit` of them.
+    `limit` of them. Never follows a symlink (`vault.paths.iter_md_files`):
+    a symlink's target must never have its body read and surfaced in a
+    snippet as if it were a note in the vault.
     """
     terms = _terms(query)
     if not terms:
         return []
 
     hits: list[ScanHit] = []
-    for file in sorted(vault_root.rglob("*.md")):
-        rel_parts = file.relative_to(vault_root).parts
-        if ".git" in rel_parts:
-            continue
-        rel = "/".join(rel_parts)
+    for file in iter_md_files(vault_root):
+        rel = "/".join(file.relative_to(vault_root).parts)
         try:
             note_path = parse_note_path(rel, allow_archive=True)
         except PathRejected:

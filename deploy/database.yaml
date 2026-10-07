@@ -8,12 +8,19 @@
 # primary store; an operator who wants more resilience adds replicas in
 # their own overlay.
 #
-# `docker.io/pgvector/pgvector:pg16` (the same image `compose.yaml` runs
-# locally) rather than CloudNativePG's own `ghcr.io/cloudnative-pg/
-# postgresql` images: it is a stock PostgreSQL 16 image plus the compiled
-# `vector` extension, which is all CNPG's instance manager needs (standard
-# `initdb`/`pg_ctl`/binary layout) - `memory-manager`'s own migrations run
-# `CREATE EXTENSION IF NOT EXISTS vector` and the rest of the schema.
+# `ghcr.io/cloudnative-pg/postgresql:16-standard-trixie`: a CNPG operand
+# image (CNPG's instance manager requires its own image layout - the stock
+# `pgvector/pgvector` image `compose.yaml` runs locally is NOT one) that
+# already ships the `vector` extension compiled in.
+#
+# `postInitApplicationSQL` creates the extension once, as the bootstrap
+# (superuser) role, right after `initdb`: the app's own database role
+# (`memory_manager`, what `DATABASE_URL` ultimately authenticates as) is
+# never a superuser, and `CREATE EXTENSION` needs one unless the extension
+# is already there - at which point `memory-manager`'s own migration 0001
+# (`CREATE EXTENSION IF NOT EXISTS vector`) runs as a no-op requiring no
+# such privilege (verified directly in `tests/db/test_migrations.py`,
+# `TestMigrate::test_succeeds_for_a_non_superuser_role_once_vector_already_exists`).
 #
 # `prune: disabled`: a Flux prune would delete this `Cluster` and, with
 # it, the PVC - there is nothing to prune back to, only a full reindex.
@@ -27,11 +34,13 @@ metadata:
     kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   instances: 1
-  imageName: docker.io/pgvector/pgvector:pg16
+  imageName: ghcr.io/cloudnative-pg/postgresql:16-standard-trixie
   bootstrap:
     initdb:
       database: memory_manager
       owner: memory_manager
+      postInitApplicationSQL:
+        - "CREATE EXTENSION IF NOT EXISTS vector;"
   storage:
     # No `storageClass` here on purpose - the cluster's default storage
     # class is used unless an operator overlay sets one explicitly.

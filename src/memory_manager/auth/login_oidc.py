@@ -31,7 +31,15 @@ Discovery (`{issuer}/.well-known/openid-configuration`) is cached for
 `_DISCOVERY_CACHE_TTL` and its own `issuer` field is checked against the
 configured one *exactly* - a mismatch is a startup-adjacent configuration
 problem (wrong `OIDC_ISSUER`, or a compromised/misrouted discovery document),
-never silently accepted.
+never silently accepted. "Exactly" means exactly: OIDC Discovery §4.3
+requires the document's `issuer` to equal the configured one byte for byte,
+trailing slash included - `self._issuer` is kept verbatim as configured for
+that comparison; only the well-known URL itself is built by stripping
+*one* trailing slash before joining `/.well-known/openid-configuration`
+(an IdP like Hydra that advertises its issuer with a trailing slash, e.g.
+`https://auth.example.test/`, must still compare equal - stripping the
+slash before comparing would make this check pass for an issuer the
+operator never configured).
 """
 
 from __future__ import annotations
@@ -128,7 +136,9 @@ class OidcAuthenticator:
         namespace_map: Mapping[str, Sequence[str]],
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self._issuer = issuer.rstrip("/")
+        # Kept verbatim, trailing slash and all - see the module docstring on why
+        # this must never be normalized before the discovery-document comparison.
+        self._issuer = issuer
         self._client_id = client_id
         self._client_secret = client_secret
         self._redirect_uri = redirect_uri
@@ -356,7 +366,7 @@ class OidcAuthenticator:
         if self._discovery is not None and now - self._discovery_at < _DISCOVERY_CACHE_TTL:
             return self._discovery
 
-        url = f"{self._issuer}/.well-known/openid-configuration"
+        url = f"{self._issuer.rstrip('/')}/.well-known/openid-configuration"
         try:
             response = await self._http.get(url)
             response.raise_for_status()
