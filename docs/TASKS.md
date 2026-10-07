@@ -185,6 +185,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #100 RLS limits every content table to the caller's namespaces even without a WHERE clause
 - [x] #115 Static tokens carry an owner principal for Postgres mode
 - [x] #116 Postgres-mode requests run only under the RLS identity
+- [x] #118 `pytest tests/mcp` runs on its own without an import cycle
 - [ ] #101 Principal and alias resolution enforce the namespace permission matrix in application code ⛔ blocked by #115, #116
 - [ ] #102 Search and index results carry `namespace_kind` ⛔ blocked by #101
 
