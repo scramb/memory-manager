@@ -15,6 +15,11 @@
         {
           "type": "generic",
           "path": "deploy/kustomization.yaml"
+        },
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='memory-manager')].version"
         }
       ]
     }
