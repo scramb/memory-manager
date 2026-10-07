@@ -18,6 +18,7 @@ import base64
 import hashlib
 import html
 import secrets
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,7 +42,12 @@ from memory_manager.auth.login import (
     resolve_namespaces,
 )
 from memory_manager.auth.login_oidc import CALLBACK_PATH, OidcAuthenticator
-from memory_manager.auth.login_password import PasswordAuthenticator, hash_password
+from memory_manager.auth.login_password import (
+    PasswordAuthenticator,
+    _FailureWindow,
+    _window_for,
+    hash_password,
+)
 from memory_manager.cli import main as cli_main
 from memory_manager.config import ServerConfig, ServerConfigError
 from memory_manager.http import create_app
@@ -237,6 +243,45 @@ class TestPasswordAuthenticatorFromEnv:
             {"ADMIN_PASSWORD_HASH": hash_password(_ADMIN_PASSWORD)}
         )
         assert isinstance(authenticator, PasswordAuthenticator)
+
+
+# === _window_for: bounded per-IP brute-force tracking ===============================
+
+
+class TestWindowForEviction:
+    def test_a_third_ip_evicts_the_least_recently_used_one_beyond_max_tracked(self) -> None:
+        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
+
+        _window_for(by_ip, "1.1.1.1", max_tracked=2)
+        _window_for(by_ip, "2.2.2.2", max_tracked=2)
+        assert list(by_ip) == ["1.1.1.1", "2.2.2.2"]
+
+        _window_for(by_ip, "3.3.3.3", max_tracked=2)
+
+        assert len(by_ip) == 2
+        assert "1.1.1.1" not in by_ip
+        assert set(by_ip) == {"2.2.2.2", "3.3.3.3"}
+
+    def test_revisiting_an_ip_keeps_it_from_being_evicted_next(self) -> None:
+        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
+
+        _window_for(by_ip, "1.1.1.1", max_tracked=2)
+        _window_for(by_ip, "2.2.2.2", max_tracked=2)
+        _window_for(by_ip, "1.1.1.1", max_tracked=2)  # refreshes "1.1.1.1"'s position
+        _window_for(by_ip, "3.3.3.3", max_tracked=2)
+
+        assert set(by_ip) == {"1.1.1.1", "3.3.3.3"}
+
+    def test_an_evicted_ips_failure_history_is_gone(self) -> None:
+        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
+        window = _window_for(by_ip, "1.1.1.1", max_tracked=1)
+        window.record(0.0)
+
+        _window_for(by_ip, "2.2.2.2", max_tracked=1)  # evicts "1.1.1.1"
+
+        fresh = _window_for(by_ip, "1.1.1.1", max_tracked=1)
+        assert fresh is not window
+        assert fresh.blocked(0.0) is False
 
 
 # === OidcAuthenticator.from_env =====================================================
@@ -612,6 +657,53 @@ async def test_oidc_discovery_issuer_mismatch_is_rejected(
     bare_remote: Path, tmp_path: Path, test_database_url: str, fake_oidc_provider: Any
 ) -> None:
     fake_oidc_provider.discovery_issuer_override = "https://a-different-issuer.example.test"
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    authenticator = _oidc_authenticator(
+        fake_oidc_provider, allowed_subjects=frozenset({"alice-sub"})
+    )
+    async with _running_app(environ, config, authenticator=authenticator) as (_app, client):
+        client_id = await _register_client(client)
+        _verifier, code_challenge = _pkce_pair()
+
+        interstitial_response = await _start_authorize(
+            client, client_id=client_id, code_challenge=code_challenge
+        )
+        confirm_response = await _confirm_interstitial(client, interstitial_response)
+        assert confirm_response.status_code == 503
+
+
+async def test_oidc_discovery_accepts_a_trailing_slash_issuer_matched_exactly(
+    bare_remote: Path, tmp_path: Path, test_database_url: str, fake_oidc_provider: Any
+) -> None:
+    # Hydra (and some other IdPs) advertise their issuer with a trailing slash; OIDC
+    # Discovery §4.3 requires an exact, byte-for-byte match against the configured
+    # OIDC_ISSUER, trailing slash included - this must still succeed, not be rejected
+    # the way `test_oidc_discovery_issuer_mismatch_is_rejected` above expects a real
+    # mismatch to be.
+    fake_oidc_provider.issuer = "https://idp.example.test/"
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    authenticator = _oidc_authenticator(
+        fake_oidc_provider, allowed_subjects=frozenset({"alice-sub"})
+    )
+    async with _running_app(environ, config, authenticator=authenticator) as (_app, client):
+        client_id = await _register_client(client)
+        _verifier, code_challenge = _pkce_pair()
+
+        interstitial_response = await _start_authorize(
+            client, client_id=client_id, code_challenge=code_challenge
+        )
+        confirm_response = await _confirm_interstitial(client, interstitial_response)
+        assert confirm_response.status_code == 302, confirm_response.text
+
+
+async def test_oidc_discovery_rejects_a_trailing_slash_mismatch(
+    bare_remote: Path, tmp_path: Path, test_database_url: str, fake_oidc_provider: Any
+) -> None:
+    # The configured issuer has no trailing slash; the discovery document's issuer
+    # does - still a mismatch per OIDC Discovery §4.3, not normalized away.
+    fake_oidc_provider.discovery_issuer_override = f"{fake_oidc_provider.issuer}/"
     config = _config()
     environ = _environ(bare_remote, tmp_path, test_database_url)
     authenticator = _oidc_authenticator(

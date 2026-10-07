@@ -23,12 +23,20 @@ capped by the global window too, not just their own. Either window at
 "the 6th attempt is blocked even if it is right" is the point, not an
 accident: a correct guess during an active brute-force run must not reset
 the clock for the attacker still trying.
+
+Per-IP windows live in `_window_for`'s `by_ip`, bounded to `_MAX_TRACKED_IPS`
+entries with the same LRU eviction `auth.ratelimit.RateLimiter` uses for the
+same reason: `POST /login` carries no rate limit of its own ahead of this
+(`http.py`'s `_LimitsMiddleware` only meters `mcp_path`/`webhook_path`/the
+OAuth AS endpoints, not `LOGIN_PATH`), so an unbounded `dict` keyed by
+client IP would let an attacker cycling through source addresses grow this
+process's memory without ever triggering a single block.
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -55,6 +63,10 @@ _PASSWORD_FIELD = "password"  # noqa: S105 - a form field name, not a credential
 #: outright (ADR-0004's brute-force protection: "5 failures / 10 min").
 _MAX_FAILURES = 5
 _WINDOW_SECONDS = 10 * 60.0
+
+#: Bound on `_by_ip`'s size - same default and eviction policy as
+#: `auth.ratelimit.RateLimiter`'s `max_keys` (see the module docstring).
+_MAX_TRACKED_IPS = 10_000
 
 _hasher = PasswordHasher()
 
@@ -92,6 +104,23 @@ class _FailureWindow:
         return len(self._failures) >= _MAX_FAILURES
 
 
+def _window_for(
+    by_ip: OrderedDict[str, _FailureWindow], client_ip: str, *, max_tracked: int = _MAX_TRACKED_IPS
+) -> _FailureWindow:
+    """`by_ip[client_ip]`, creating it on first use - bounded to `max_tracked` entries,
+    least-recently-used evicted first, the same policy `auth.ratelimit.RateLimiter`
+    uses and for the same reason (see this module's docstring)."""
+    window = by_ip.get(client_ip)
+    if window is None:
+        window = _FailureWindow()
+        by_ip[client_ip] = window
+        if len(by_ip) > max_tracked:
+            by_ip.popitem(last=False)
+    else:
+        by_ip.move_to_end(client_ip)
+    return window
+
+
 class PasswordAuthenticator:
     """`LOGIN_MODE=password`: one admin password, subject always `ADMIN_SUBJECT`."""
 
@@ -100,7 +129,7 @@ class PasswordAuthenticator:
     def __init__(self, *, password_hash: str, namespaces: list[str]) -> None:
         self._password_hash = password_hash
         self._namespaces = namespaces
-        self._by_ip: dict[str, _FailureWindow] = defaultdict(_FailureWindow)
+        self._by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
         self._global = _FailureWindow()
 
     @classmethod
@@ -140,8 +169,9 @@ class PasswordAuthenticator:
         password = str(form.get(_PASSWORD_FIELD, ""))
         client_ip = request.client.host if request.client is not None else "unknown"
         now = time.monotonic()
+        window = _window_for(self._by_ip, client_ip)
 
-        if self._by_ip[client_ip].blocked(now) or self._global.blocked(now):
+        if window.blocked(now) or self._global.blocked(now):
             return html_response(
                 login_password_page(
                     pending_id=pending.id,
@@ -153,7 +183,7 @@ class PasswordAuthenticator:
             )
 
         if not _verify_password(self._password_hash, password):
-            self._by_ip[client_ip].record(now)
+            window.record(now)
             self._global.record(now)
             return html_response(
                 login_password_page(

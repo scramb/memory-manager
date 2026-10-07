@@ -18,12 +18,26 @@ input any other way.
 `*.conflict.md` files (ADR-0005 "Conflict files", #15): a client can never
 write one through `parse_note_path`/`resolve`, only the write queue through
 `resolve_internal` after a rebase conflict.
+
+`iter_md_files` is the same symlink safety for the other direction: a caller
+that needs every note-shaped file on disk (`doctor.run_doctor`,
+`mcp.server._iter_vault_notes`, `search_fallback.scan_search`) rather than
+one path a client asked for by name. A plain `Path.rglob("*.md")` follows a
+symlink transparently - a `*.md` symlink committed to the vault (nothing in
+the write path can ever create one, but a human pushing straight to the git
+remote can) would otherwise have its target's bytes read, parsed and
+reported back through `memory_index`/`doctor`/`memory_search` (in
+no-database mode, `scan_search` reads a note's full body - the most severe
+of the three, #51) exactly like a real note, defeating `resolve`'s own
+symlink check for every caller that never goes through it.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -33,6 +47,7 @@ __all__ = [
     "NotePath",
     "PathRejected",
     "conflict_path",
+    "iter_md_files",
     "parse_note_path",
     "resolve",
     "resolve_internal",
@@ -198,6 +213,25 @@ def conflict_path(note_path: NotePath) -> str:
     """
     live = note_path.live_path()
     return f"{live.namespace}/{live.type}/{live.slug}{_CONFLICT_SUFFIX}"
+
+
+def iter_md_files(vault_root: Path) -> Iterator[Path]:
+    """Every `*.md` file under `vault_root`, in the same order `sorted(rglob(...))`
+    would give, but never through a symlink - neither a symlinked file itself nor
+    one reached by descending into a symlinked directory. `.git` is never descended
+    into either, the same exclusion every caller of this applied by hand before.
+    """
+    for dirpath, dirnames, filenames in os.walk(vault_root, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = sorted(
+            name for name in dirnames if name != ".git" and not (current / name).is_symlink()
+        )
+        for filename in sorted(filenames):
+            if not filename.endswith(_FILE_SUFFIX):
+                continue
+            file_path = current / filename
+            if not file_path.is_symlink():
+                yield file_path
 
 
 def resolve_internal(vault_root: Path, rel: str) -> Path:

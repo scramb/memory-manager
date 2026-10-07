@@ -58,7 +58,13 @@ from memory_manager.queue import NotFound, WriteError, WriteRequest
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
 from memory_manager.vault.note import Note, NoteFormatError, parse, serialize, version
-from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path, resolve
+from memory_manager.vault.paths import (
+    NotePath,
+    PathRejected,
+    iter_md_files,
+    parse_note_path,
+    resolve,
+)
 from memory_manager.vault.ulid import is_ulid, new_ulid
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -650,13 +656,13 @@ def _iter_vault_notes(vault_root: Path) -> Iterator[_VaultNote]:
     A path that is not note-shaped at all (e.g. a stray `README.md`) is
     skipped silently, exactly like `Indexer._discover_paths`; a note-shaped
     path that fails to parse is still yielded, with `note=None` and `error`
-    set, so callers can report it instead of dropping it.
+    set, so callers can report it instead of dropping it. Never follows a
+    symlink (`vault.paths.iter_md_files`): `memory_index`/`memory_read`'s id
+    lookup must never read, parse or report a symlink target's content as if
+    it were a note in the vault.
     """
-    for file in sorted(vault_root.rglob("*.md")):
-        rel_parts = file.relative_to(vault_root).parts
-        if ".git" in rel_parts:
-            continue
-        rel = "/".join(rel_parts)
+    for file in iter_md_files(vault_root):
+        rel = "/".join(file.relative_to(vault_root).parts)
         try:
             note_path = parse_note_path(rel, allow_archive=True)
         except PathRejected:
