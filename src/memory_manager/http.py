@@ -110,7 +110,13 @@ from memory_manager.auth.prm import (
 )
 from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.auth.ratelimit import RateLimiter
-from memory_manager.auth.shared_state import InMemorySharedState, PostgresSharedState, SharedState
+from memory_manager.auth.shared_state import (
+    InMemorySharedState,
+    PostgresSharedState,
+    SharedState,
+    ValkeySharedState,
+    build_valkey_shared_state,
+)
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -164,12 +170,15 @@ class _SharedStateHandle:
     """Forwards every `SharedState` call to whatever `backend` is currently set.
 
     Built once by `create_app` (default `InMemorySharedState` - today's
-    single-replica behaviour, in effect until and unless `lifespan` swaps it) and
+    single-replica behaviour, in effect until and unless it is swapped) and
     handed, as this one object, to every `RateLimiter` and to `bind_shared_state` on
     a `PasswordAuthenticator`/`OidcAuthenticator` - the same "build now, fill in
-    later" shape `_OAuthProviderCell` uses for the OAuth provider: `lifespan` sets
-    `backend` to a `PostgresSharedState` once `services.pool` exists, and every
-    holder of this handle picks that up on its next call, with nothing re-wired.
+    later" shape `_OAuthProviderCell` uses for the OAuth provider: `create_app`
+    itself sets `backend` to a `ValkeySharedState` once `config.valkey_url` is set
+    (ADR-0009 §2, #104 - does not depend on `services`, so there is no need to wait
+    for `lifespan`), and `lifespan` sets it to a `PostgresSharedState` once
+    `services.pool` exists and no Valkey backend won already; every holder of this
+    handle picks either up on its next call, with nothing re-wired.
     """
 
     def __init__(self) -> None:
@@ -230,11 +239,37 @@ def create_app(
     `config.cimd_enabled` is false.
     """
 
+    # Only needed for pending OIDC login state (`put_pending`); `None` when no
+    # `OAUTH_CLIENT_SECRET_KEY` is configured still lets rate limiting work, both
+    # `PostgresSharedState.put_pending` and `ValkeySharedState.put_pending` refuse to
+    # run without one. Built once, here, rather than separately inside each backend's
+    # own branch below.
+    cipher = (
+        store.ClientSecretCipher(config.oauth_client_secret_key)
+        if config.oauth_client_secret_key is not None
+        else None
+    )
+
     oauth_cell = _OAuthProviderCell()
     shared_state = _SharedStateHandle()
+    if config.valkey_url is not None:
+        # Valkey takes precedence over Postgres (ADR-0009 §2, #104) and does not
+        # depend on `services.pool`, so it is built right here rather than inside
+        # `lifespan` - a missing `redis` package is a startup error before this
+        # server ever binds a port, not something discovered only once `lifespan`
+        # runs.
+        try:
+            shared_state.backend = build_valkey_shared_state(config.valkey_url, cipher=cipher)
+        except ImportError as exc:
+            raise ServerConfigError(
+                "VALKEY_URL is set, but the 'redis' package is not installed: install "
+                "the 'valkey' extra to use Valkey-backed shared state, e.g. "
+                "`uv sync --extra valkey` or `pip install 'memory-manager[valkey]'`"
+            ) from exc
     if isinstance(authenticator, (PasswordAuthenticator, OidcAuthenticator)):
         # Bound now, against the handle - not the backend it starts with: `lifespan`
-        # below swaps `shared_state.backend` once `services.pool` exists, and this
+        # below may still swap `shared_state.backend` to a `PostgresSharedState` once
+        # `services.pool` exists (unless Valkey already won, just above), and this
         # authenticator (built outside `create_app`, by `build_authenticator`) picks
         # that up on its next call without being touched again.
         authenticator.bind_shared_state(shared_state)
@@ -242,19 +277,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
-            if services.pool is not None:
+            if config.valkey_url is None and services.pool is not None:
                 # Rate limits, the login brute-force window and pending OIDC login
                 # state move to Postgres once a database is configured (ADR-0009 §2,
                 # #103) - the same condition `_build_oauth_provider`/`token_verifier`
-                # already gate on below. The cipher is only needed for pending OIDC
-                # login state (`PostgresSharedState.put_pending`); `None` when no
-                # `OAUTH_CLIENT_SECRET_KEY` is configured still lets rate limiting work,
-                # `put_pending` itself refuses to run without one.
-                cipher = (
-                    store.ClientSecretCipher(config.oauth_client_secret_key)
-                    if config.oauth_client_secret_key is not None
-                    else None
-                )
+                # already gate on below. Skipped when a `ValkeySharedState` already
+                # won above (#104): the two are never combined.
                 shared_state.backend = PostgresSharedState(services.pool, cipher=cipher)
 
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
@@ -314,6 +342,10 @@ def create_app(
                     # pass their own mocked one, which stays theirs to close) - otherwise
                     # that client, and its connection pool, outlives this app's lifespan.
                     await authenticator.aclose()
+                if isinstance(shared_state.backend, ValkeySharedState):
+                    # Closes the `redis.asyncio.Redis` connection pool `create_app`
+                    # built above - otherwise it outlives this app's lifespan.
+                    await shared_state.backend.aclose()
 
     routes: list[Route | Mount] = [
         Route(HEALTH_PATH, endpoint=_healthz, methods=["GET"]),
@@ -601,10 +633,10 @@ class _LimitsMiddleware:
 
     Every limiter call goes through `_allow`, which fails *open* (allows the
     request, logs a warning) if the shared `SharedState` backend raises -
-    once a database is configured (`create_app`'s `lifespan`), a limiter
-    check is a Postgres round trip, and a transient database outage must
-    never itself turn into "every request gets rejected" on top of whatever
-    else that outage already breaks.
+    once a database or `VALKEY_URL` is configured (`create_app`), a limiter
+    check is a Postgres or Valkey round trip, and a transient outage of
+    either must never itself turn into "every request gets rejected" on top
+    of whatever else that outage already breaks.
     """
 
     def __init__(

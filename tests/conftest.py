@@ -39,6 +39,7 @@ __all__ = [
     "human_delete",
     "human_rename",
     "test_database_url",
+    "valkey_url",
     "vault_config",
 ]
 
@@ -54,6 +55,25 @@ def admin_database_url() -> str:
     if url:
         return url
     reason = "MM_TEST_DATABASE_URL is not set"
+    if os.environ.get("CI"):
+        pytest.fail(f"{reason} (required in CI)")
+    pytest.skip(reason)
+
+
+@pytest.fixture(scope="session")
+def valkey_url() -> str:
+    """The connection URL from `MM_TEST_VALKEY_URL` (#104), same shape as
+    `admin_database_url` above.
+
+    Skips the test locally if the variable is unset; fails it instead when
+    `CI` is set. Unlike Postgres, every test shares the one Valkey instance
+    this names - `tests/auth/test_shared_state.py`'s own `shared_state`
+    fixture gives each test its own key prefix instead of its own database.
+    """
+    url = os.environ.get("MM_TEST_VALKEY_URL")
+    if url:
+        return url
+    reason = "MM_TEST_VALKEY_URL is not set"
     if os.environ.get("CI"):
         pytest.fail(f"{reason} (required in CI)")
     pytest.skip(reason)

@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down image smoke up down
+.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -40,6 +40,20 @@ db-up:
 
 db-down:
 	podman stop mm-pg 2>/dev/null || true
+
+# Valkey for local/manual testing of auth.shared_state.ValkeySharedState (#104; CI
+# uses a service container instead, see .github/workflows/validate.yml). No
+# persistence (--save "" --appendonly no, ADR-0009 §2: Valkey holds only state that
+# may be lost). Does not set MM_TEST_VALKEY_URL - unlike MM_TEST_DATABASE_URL above,
+# opting a test run into talking to Valkey is left to the caller.
+valkey-up:
+	podman start mm-valkey 2>/dev/null || podman run -d --name mm-valkey \
+		-p 6379:6379 \
+		docker.io/valkey/valkey:8 \
+		valkey-server --save "" --appendonly no
+
+valkey-down:
+	podman stop mm-valkey 2>/dev/null || true
 
 # Builds the runtime image locally (#41). CI instead buildx-builds
 # linux/amd64,linux/arm64 - see .github/workflows/validate.yml.

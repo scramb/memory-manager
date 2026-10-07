@@ -6,8 +6,8 @@
 `auth.login_password.PasswordAuthenticator` and `auth.login_oidc.
 OidcAuthenticator` depend on instead of their own process-local structures: a
 fixed window per key (`window_hit`/`window_peek`) plus single-use,
-TTL-bounded pending state (`put_pending`/`take_pending`). Two implementations
-today, both passing the same contract suite (`tests/auth/
+TTL-bounded pending state (`put_pending`/`take_pending`). Three
+implementations today, all passing the same contract suite (`tests/auth/
 test_shared_state.py`):
 
 - `InMemorySharedState`: today's single-replica behaviour, unchanged -
@@ -32,9 +32,28 @@ test_shared_state.py`):
   refuses to run without one, rather than ever storing a `code_verifier`/
   `nonce` pair in the clear.
 
-A third implementation (Valkey, #104) is deliberately not anticipated by any
-Postgres-specific type in `SharedState` itself - `asyncpg`/`pool` appear only
-inside `PostgresSharedState`.
+- `ValkeySharedState`: the preferred shared backend once `VALKEY_URL` is
+  configured (`http.py`'s `create_app`, ADR-0009 §2, #104) - takes precedence
+  over `PostgresSharedState` when both are configured. Rate-limit windows are
+  one key per `key`, `INCR`ed and given a TTL of `window_seconds` with
+  `PEXPIRE ... NX` (only the first hit of a window sets it, inside the same
+  `MULTI`/`EXEC` pipeline as the `INCR`, so a window key is never left
+  without a TTL even under concurrent first hits) - loss-tolerant by design,
+  same as `rate_limits`: Valkey runs without persistence (ADR-0009 §2), so a
+  restart merely resets open windows and drops pending logins in progress,
+  never silently wrong data. Pending login state is `SET ... PX` (the TTL)
+  under a key hashed with SHA-256 (`_hash_key`, same as `PostgresSharedState`
+  - CLAUDE.md: "token hashes only"; rate-limit window keys, unlike pending
+  ones, carry no secret and stay plain, same as `rate_limits.key`), payload
+  encrypted at rest with the same `ClientSecretCipher` `PostgresSharedState`
+  uses - `put_pending` refuses the same way without one; `take_pending` is
+  `GETDEL`, single-use by construction. `redis.asyncio.Redis` is imported
+  lazily, inside `build_valkey_shared_state`, never at module import time -
+  the `redis` package is the optional `valkey` extra (CLAUDE.md: few
+  dependencies), not installed unless a deployment actually sets
+  `VALKEY_URL`; `http.py`'s `create_app` turns the resulting `ImportError`
+  into a `ServerConfigError` naming `VALKEY_URL` and the extra, rather than
+  falling back to Postgres or in-process state silently.
 """
 
 from __future__ import annotations
@@ -46,19 +65,34 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import asyncpg
 
 from memory_manager.auth.store import ClientSecretCipher
 
-__all__ = ["InMemorySharedState", "PostgresSharedState", "SharedState"]
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
+
+__all__ = [
+    "InMemorySharedState",
+    "PostgresSharedState",
+    "SharedState",
+    "ValkeySharedState",
+    "build_valkey_shared_state",
+]
 
 _DEFAULT_MAX_KEYS = 10_000
 
 #: `oauth_pending.kind` for a `PostgresSharedState` pending login - anything other
 #: than `'authorize'`, which `auth.store.save_pending`/`get_pending` own exclusively.
 _PENDING_KIND = "login_pending"
+
+#: Default key prefixes `ValkeySharedState` namespaces its two kinds of key under -
+#: configurable so a test (or a deployment sharing one Valkey instance across more
+#: than this server) can give each run its own, isolated prefix.
+_DEFAULT_VALKEY_WINDOW_PREFIX = "mm:window:"
+_DEFAULT_VALKEY_PENDING_PREFIX = "mm:pending:"
 
 
 def _evict_lru_if_needed[V](keys: OrderedDict[str, V], max_keys: int) -> None:
@@ -258,3 +292,107 @@ class PostgresSharedState:
 
 def _hash_key(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+class ValkeySharedState:
+    """The preferred shared backend once `VALKEY_URL` is configured (`http.py`'s
+    `create_app`, ADR-0009 §2, #104) - see the module docstring for the key shapes.
+
+    `client` is a connected `redis.asyncio.Redis` (built by `build_valkey_shared_state`,
+    the only place that imports `redis` at all); `window_prefix`/`pending_prefix` let a
+    deployment (or a test) namespace this instance's keys separately from anything
+    else sharing the same Valkey, the same role `rate_limits`/`oauth_pending` being
+    dedicated tables plays for `PostgresSharedState`. `cipher` is required only for
+    `put_pending`/`take_pending`, exactly like `PostgresSharedState`.
+    """
+
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        cipher: ClientSecretCipher | None = None,
+        window_prefix: str = _DEFAULT_VALKEY_WINDOW_PREFIX,
+        pending_prefix: str = _DEFAULT_VALKEY_PENDING_PREFIX,
+    ) -> None:
+        self._client = client
+        self._cipher = cipher
+        self._window_prefix = window_prefix
+        self._pending_prefix = pending_prefix
+
+    async def window_hit(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        window_key = f"{self._window_prefix}{key}"
+        ttl_ms = max(1, round(window_seconds * 1000))
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.incr(window_key)
+            # `NX`: only the first hit of a window sets the TTL - inside the same
+            # `MULTI`/`EXEC` as the `INCR` above, so a window key is never left
+            # without a TTL even under concurrent first hits on the same key.
+            pipe.pexpire(window_key, ttl_ms, nx=True)
+            pipe.pttl(window_key)
+            count, _, remaining_ms = await pipe.execute()
+        if int(remaining_ms) < 0:  # pragma: no cover - defensive: the NX PEXPIRE above
+            return int(count), window_seconds  # always sets a TTL before this PTTL runs
+        return int(count), int(remaining_ms) / 1000.0
+
+    async def window_peek(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        window_key = f"{self._window_prefix}{key}"
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.get(window_key)
+            pipe.pttl(window_key)
+            value, remaining_ms = await pipe.execute()
+        if value is None:
+            return 0, window_seconds
+        remaining = int(remaining_ms) / 1000.0 if int(remaining_ms) >= 0 else window_seconds
+        return int(value), remaining
+
+    async def put_pending(self, key: str, payload: str, *, ttl_seconds: float) -> None:
+        if self._cipher is None:
+            raise RuntimeError(
+                "ValkeySharedState.put_pending requires a cipher (OAUTH_CLIENT_SECRET_KEY) "
+                "- refuses to store pending login state unencrypted"
+            )
+        encrypted = self._cipher.encrypt(payload)
+        pending_key = f"{self._pending_prefix}{_hash_key(key)}"
+        ttl_ms = max(1, round(ttl_seconds * 1000))
+        await self._client.set(pending_key, encrypted, px=ttl_ms)
+
+    async def take_pending(self, key: str) -> str | None:
+        pending_key = f"{self._pending_prefix}{_hash_key(key)}"
+        encrypted = await self._client.getdel(pending_key)
+        if encrypted is None:
+            return None
+        if isinstance(encrypted, bytes):  # pragma: no cover - decode_responses=True means str
+            encrypted = encrypted.decode("utf-8")
+        if self._cipher is None:  # pragma: no cover - defensive: put_pending already refused
+            return None
+        return self._cipher.decrypt(encrypted)
+
+    async def aclose(self) -> None:
+        """Closes the underlying connection pool - called from `http.py`'s `lifespan`,
+        the same place that closes an `OidcAuthenticator`'s `httpx.AsyncClient`."""
+        await self._client.aclose()
+
+
+def build_valkey_shared_state(
+    url: str,
+    *,
+    cipher: ClientSecretCipher | None = None,
+    window_prefix: str = _DEFAULT_VALKEY_WINDOW_PREFIX,
+    pending_prefix: str = _DEFAULT_VALKEY_PENDING_PREFIX,
+) -> ValkeySharedState:
+    """A `ValkeySharedState` connected to `url` (`VALKEY_URL`) - does not connect yet,
+    `redis.asyncio.Redis.from_url` only builds a lazy connection pool.
+
+    Raises `ImportError` if the `redis` package is not installed - the `valkey` extra
+    (`memory-manager[valkey]`) is optional (CLAUDE.md: few dependencies); `http.py`'s
+    `create_app` turns that into a `ServerConfigError` naming `VALKEY_URL` and the
+    extra, rather than falling back to Postgres or in-process state silently. This is
+    the one place in this module that imports `redis` at all - the rest of
+    `ValkeySharedState` only ever sees the `Redis` instance handed to it.
+    """
+    from redis.asyncio import Redis as _Redis
+
+    client = _Redis.from_url(url, decode_responses=True)
+    return ValkeySharedState(
+        client, cipher=cipher, window_prefix=window_prefix, pending_prefix=pending_prefix
+    )

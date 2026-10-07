@@ -243,6 +243,21 @@ class ServerConfig:
     `public_url` above) - `http.py` raises `ServerConfigError` naming it if
     it is missing then, never falls back to running without it.
 
+    `valkey_url` (`VALKEY_URL`) names a Valkey/Redis instance for
+    `auth.shared_state.SharedState` to use instead of Postgres (ADR-0009 §2,
+    #104) - optional; unset means "Postgres once a database is configured,
+    in-process otherwise", the pre-#104 behaviour. When set, `http.py`'s
+    `create_app` builds a `ValkeySharedState` on top of it, which then takes
+    precedence over Postgres regardless of whether a database is configured
+    too - rate limiting and pending login state are loss-tolerant either
+    way (ADR-0009 §2), so there is nothing to migrate when switching between
+    them. `from_env` only checks the scheme (`redis://`, `rediss://` or
+    `unix://`, the three `redis.asyncio.Redis.from_url` accepts) is one of
+    those three - never the URL itself, which may carry a password - and
+    raises `ServerConfigError` naming the variable, not the value, if it is
+    not. `http.py` raises a separate `ServerConfigError` at startup if the
+    `redis` package (the optional `valkey` extra) is not installed.
+
     `cimd_enabled` (`CIMD_ENABLED`, default on) turns Client ID Metadata
     Document registration (SEP-991, #38) on or off alongside DCR: `http.py`
     only builds a `cimd.ClientMetadataFetcher` for `auth.provider.
@@ -261,8 +276,9 @@ class ServerConfig:
     `oauth_per_minute`/`oauth_burst` and `webhook_per_minute`/`webhook_burst`
     (`RATE_LIMIT_MCP_PER_MINUTE`/`RATE_LIMIT_MCP_BURST`/... ) feed one
     `auth.ratelimit.RateLimiter` each (#39), all built once in `http.py`'s
-    `create_app`, on a shared `auth.shared_state.SharedState` (Postgres once a
-    database is configured, in-process otherwise - ADR-0009 §2, #103): `burst`
+    `create_app`, on a shared `auth.shared_state.SharedState` (Valkey once
+    `valkey_url` is set, Postgres once a database is configured otherwise,
+    in-process if neither is - ADR-0009 §2, #103/#104): `burst`
     calls (`max(1, floor(burst))`) within a fixed window of `burst * 60 /
     per_minute` seconds, the average throughput a token bucket of that
     capacity and refill rate would allow. Every request to `mcp_path` counts
@@ -297,6 +313,7 @@ class ServerConfig:
     json_response: bool = True
     login_mode: str | None = None
     oauth_client_secret_key: str | None = field(default=None, repr=False)
+    valkey_url: str | None = field(default=None, repr=False)
     cimd_enabled: bool = True
     max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES
     mcp_per_minute: float = _DEFAULT_MCP_PER_MINUTE
@@ -354,6 +371,7 @@ class ServerConfig:
         json_response = _parse_bool(environ.get("MCP_JSON_RESPONSE"), default=True)
         login_mode = environ.get("LOGIN_MODE") or None
         oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
+        valkey_url = _parse_valkey_url(environ.get("VALKEY_URL"))
         cimd_enabled = _parse_bool(environ.get("CIMD_ENABLED"), default=True)
         max_request_bytes = _parse_positive_int(
             environ, "MAX_REQUEST_BYTES", _DEFAULT_MAX_REQUEST_BYTES
@@ -388,6 +406,7 @@ class ServerConfig:
             json_response=json_response,
             login_mode=login_mode,
             oauth_client_secret_key=oauth_client_secret_key,
+            valkey_url=valkey_url,
             cimd_enabled=cimd_enabled,
             max_request_bytes=max_request_bytes,
             mcp_per_minute=mcp_per_minute,
@@ -438,6 +457,23 @@ def _parse_positive_float(environ: dict[str, str], name: str, default: float) ->
     if value <= 0:
         raise ServerConfigError(f"{name} must be positive, got {value}")
     return value
+
+
+#: Schemes `redis.asyncio.Redis.from_url` accepts (confirmed by reading `redis-py`'s
+#: `from_url`, #104) - `VALKEY_URL` is checked against these without ever including
+#: the value itself in an error message, since it may carry a password.
+_VALKEY_URL_SCHEMES = frozenset({"redis", "rediss", "unix"})
+
+
+def _parse_valkey_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    scheme = urlsplit(raw).scheme
+    if scheme not in _VALKEY_URL_SCHEMES:
+        raise ServerConfigError(
+            f"VALKEY_URL must start with redis://, rediss:// or unix://, got a scheme of {scheme!r}"
+        )
+    return raw
 
 
 def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[str, ...]:
