@@ -174,7 +174,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: open
 
-- [ ] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests ⛔ blocked by #94
+- [x] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests
 - [ ] #97 `serve` runs on the Postgres backend with supersede, archive and listing ⛔ blocked by #95, #96
 - [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #97
 - [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #97
