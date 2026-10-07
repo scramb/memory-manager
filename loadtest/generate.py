@@ -61,6 +61,19 @@ _QUERY_MARKER_INTERVAL = 25
 
 _ORG_ALIAS = "org"
 
+# Title/description word counts (#108 round 1): drawn from `_VOCAB` by
+# `rng.sample` (no repeats within one title/description), never a fixed
+# English word repeated on every note. The earlier generator put the
+# literal word "note" in every title ("Synthetic note {index}") and every
+# description ("Synthetic description for note {index} in ..."); full-text
+# search then ranked every chunk for a query containing "note" - the search
+# had to intersect a near-total-table posting list with the one note
+# actually matching the marker. #117 now bounds that case via planner
+# statistics, but the generator should not manufacture it in the first
+# place.
+_TITLE_WORD_COUNT = 3
+_DESCRIPTION_WORD_COUNT = 4
+
 # Invented words only (CLAUDE.md: no real personal data) - plain lower-case
 # ASCII, nothing that resembles a hex/base32/ULID token, so the body filler
 # can never trip the secret scan or be mistaken for a real identifier.
@@ -169,6 +182,24 @@ def _bisect_left(values: Sequence[float], target: float) -> int:
     return low
 
 
+def _build_title(rng: random.Random) -> str:
+    """A title made of `_TITLE_WORD_COUNT` distinct `_VOCAB` words.
+
+    Every title draws from the same 41-word pool, so no single word - unlike
+    the old fixed "note" - dominates titles the way a fixed English word
+    would (see `test_no_single_word_dominates_the_generated_titles`).
+    """
+    words = rng.sample(_VOCAB, _TITLE_WORD_COUNT)
+    return " ".join(word.capitalize() for word in words)
+
+
+def _build_description(rng: random.Random, namespace_alias: str) -> str:
+    """A description made of `_DESCRIPTION_WORD_COUNT` distinct `_VOCAB` words
+    plus the owning namespace's alias - never a fixed English phrase."""
+    words = rng.sample(_VOCAB, _DESCRIPTION_WORD_COUNT)
+    return f"{' '.join(words)} - {namespace_alias}"
+
+
 def _build_body(rng: random.Random, target_bytes: int, marker: str | None) -> str:
     """`target_bytes` bytes (including the trailing `\\n`) of invented words.
 
@@ -177,7 +208,7 @@ def _build_body(rng: random.Random, target_bytes: int, marker: str | None) -> st
     """
     parts: list[str] = []
     if marker is not None:
-        parts.append(f"This note's unique load-test marker is {marker}.")
+        parts.append(f"Unique load-test marker: {marker}.")
     length = sum(len(part) + 1 for part in parts)
     while length < target_bytes:
         word = rng.choice(_VOCAB)
@@ -213,8 +244,8 @@ def _build_note(
     note_type = NOTE_TYPES[index % len(NOTE_TYPES)]
     slug = f"note-{index:0{slug_width}d}"
 
-    title = f"Synthetic note {index}"
-    description = f"Synthetic description for note {index} in {namespace.alias}."
+    title = _build_title(rng)
+    description = _build_description(rng, namespace.alias)
 
     marker = None
     if index % _QUERY_MARKER_INTERVAL == 0:
@@ -244,7 +275,7 @@ def _build_note(
     if marker is not None:
         query = _Query(
             id=f"q{index:0{slug_width}d}",
-            query=f"Which note carries the marker {marker}?",
+            query=f"What is tagged with the unique marker {marker}?",
             expected=(note_id,),
             namespaces=(namespace.alias,),
         )

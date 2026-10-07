@@ -13,6 +13,12 @@ and the latency scenarios:
   `expected` note ids are guaranteed to contain a unique marker term,
   giving the load test known-answer queries.
 
-Nothing here loads a database or runs k6 (#108) - this module only
-produces the on-disk vault and its sidecars.
+`loadtest.load` bulk-loads that vault into Postgres (ADR-0007 §2), creates
+one static token per sampled synthetic principal, and writes a JSON side
+file for k6 - the server's base URL, a sample of known note paths, and the
+token list. `loadtest/k6/` (`lib.js`, `search.js`, `read.js`, `write.js`,
+`smoke.js`) drives the actual `memory_search`/`memory_read`/`memory_write`/
+`memory_edit` calls against a running server, with a p95 latency threshold
+per scenario. `make loadtest-smoke` (`scripts/loadtest-smoke.sh`) wires all
+three together: generate, load, reindex, serve, run k6.
 """

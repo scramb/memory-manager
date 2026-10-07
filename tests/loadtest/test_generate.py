@@ -171,6 +171,27 @@ def test_namespaces_file_matches_the_generated_vault_and_is_well_formed(tmp_path
     assert namespace_dirs <= namespaces.keys()
 
 
+def test_no_single_word_dominates_the_generated_titles(tmp_path: Path) -> None:
+    """#108 round 1: the old generator put the literal word "note" in every
+    title, which let full-text search rank every chunk for a query
+    containing "note" - this is the regression test for that specific
+    failure, not a general style check."""
+    out = tmp_path / "vault-out"
+    _generate(out)
+
+    vault_root = out / "vault"
+    titles = [validate_bytes(path.read_bytes()).title.lower() for path in vault_root.rglob("*.md")]
+    assert titles, "generator produced no notes"
+
+    word_counts = Counter(word for title in titles for word in title.split())
+    most_common_word, occurrences = word_counts.most_common(1)[0]
+    share = occurrences / len(titles)
+    assert share <= 0.5, (
+        f"{most_common_word!r} appears in {occurrences}/{len(titles)} titles ({share:.0%}) - "
+        "a word this common would let full-text search rank every note for it"
+    )
+
+
 def test_namespace_sizes_are_clearly_unequal(tmp_path: Path) -> None:
     out = tmp_path / "vault-out"
     _generate(out)
