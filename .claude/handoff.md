@@ -1,29 +1,32 @@
-Date: 2026-10-07 · Branch: main · Last commit: 24c93c1 chore(main): release 0.1.0 (#76)
+Date: 2026-10-07 · Branch: main · Last commit: release 0.1.3
 
 ## Done
 
-- M0 to M6 implemented and merged (WP-01 to WP-15). v0.1.0 is released: https://github.com/scramb/memory-manager/releases/tag/v0.1.0. The signed image `ghcr.io/scramb/memory-manager:0.1.0` passes `cosign verify`, and the chart (`oci://ghcr.io/scramb/charts/memory-manager`) and SPDX SBOM are attached.
-- Deployed on the owner's cluster via an operator overlay kept outside this repository (OIDC provider plus app delivery). `/healthz` reports 0.1.0, `/readyz` returns 200, PRM, AS metadata and the 401 challenge are correct.
-- End-to-end check with a static token over HTTPS: `memory_write` lands as a commit by `claude-code` in the private vault repo, and `memory_search` finds the note (fulltext mode). The test tokens are revoked. The note `ops/reference/deployment-smoke-test.md` is still in the vault and can be archived.
-- OAuth flow verified automatically up to the upstream IdP login page: DCR, `/authorize` with PKCE + `resource`, the login interstitial showing the redirect host, and the handoff to the OIDC provider as client `memory-manager`.
+- All milestones M0 to M6 are done. Every planned issue is closed and verified.
+- v0.1.0 to v0.1.3 are released, each image signed and checked with `cosign verify`. 0.1.3 runs on the owner's deployment, which is delivered through an operator overlay kept outside this repository.
+- The owner verified the remote path on 2026-10-07: claude.ai connects through CIMD and OIDC and writes notes (vault commits by `claude-ai`), and Claude Code finds them via OAuth. The Claude Code skill shows up in `/skills`. Steps are in `docs/guides/remote-connect.md`.
+- Live fixes after 0.1.0:
+  - #80 (0.1.1): claude.ai's CIMD document has no `scope`, which caused invalid_scope.
+  - #82 (0.1.2): CIMD fetches pinned an IPv6 address at random in an IPv4-only cluster.
+  - #77: deploy keys without a trailing newline now load.
+  - #85 (0.1.3): access logs redact OAuth codes, state and pending ids.
+- The smoke-test note has been archived.
 
 ## In progress
 
-- Nothing is in a half-done state.
+- Nothing.
 
 ## Failed / dead ends
 
-- The deploy key stored through `$(cat key)` lost its trailing newline, and OpenSSH failed with `error in libcrypto`. The key was rotated and re-stored with a newline. App robustness is tracked in #77.
-- Cloudflare in front of the host blocks the default `Python-urllib` user agent (403). Real clients are unaffected; scripts need a user agent.
-- release-please: Actions could not create PRs (repo setting changed), and plain YAML extra-files only bumped `$.version` (fixed with the generic updater, #74). Tags and PRs created with GITHUB_TOKEN trigger nothing, so release-please now dispatches `release.yml` and `validate.yml`.
+- Storing private keys through `$(cat key)` strips the trailing newline, and OpenSSH then fails with `error in libcrypto`. The app tolerates this since #77.
+- release-please needs the repo setting that lets Actions create PRs. Tags and PRs it creates with GITHUB_TOKEN trigger no other workflows, so it dispatches `release.yml` and `validate.yml` itself. A closed release PR keeps its `autorelease: pending` label, so remove the label before regenerating.
+- A CDN in front of the server blocks the `Python-urllib` user agent.
 
 ## Next step
 
-- #40: owner adds the claude.ai custom connector (`https://<host>/mcp`) and logs in via OIDC. Then `claude mcp add --transport http` in Claude Code with the OAuth login. A note written in one client must be found with `memory_search` in the other; record the client versions and the date in docs.
-- #22: owner copies `integrations/claude-code/skills/memory/` to `~/.claude/skills/` and checks that `/skills` lists `memory`.
-- #47: one live run of the Cloudflare Tunnel guide (optional; needs a Cloudflare tunnel).
-- #77: newline-tolerant deploy key, then a patch release.
+- #89: let release-please bump uv.lock (cosmetic).
+- Rollouts: bump the tag in the operator overlay (see `docs/releasing.md` and the overlay's runbook).
 
 ## Open questions
 
-- Does the upstream IdP put `email` + `email_verified` into the userinfo for the owner's account? If the OIDC login is denied, add the IdP subject to the allowlist (`OIDC_ALLOWED_SUBJECTS`).
+- None.
