@@ -4,35 +4,27 @@
 `scan_search` is what `mcp/server.py`'s `memory_search` falls back to when
 `services.indexer` is `None` - no `DATABASE_URL` configured for the `git`
 backend, see `app.py`'s module docstring ("full-text/vector search and
-`memory_search` degrade, note read/write do not"). It walks the working
-copy directly instead of querying Postgres: no stemming, no chunking, no
-fusion - just a case-insensitive term-overlap score over each note's own
-fields, title and aliases weighted higher than tags, description and body.
-Good enough to keep stdio usable without Postgres; not a substitute for
-`search.hybrid_search`.
-
-`scan_notes` is the same scoring applied to notes already read into memory
-instead of a vault working copy - `mcp/server.py`'s interim `memory_search`
-path for the `postgres` backend (ADR-0007 §2) until #98 adds real indexing
-there. Both share `_score_note`, the per-note filter/scoring core that
-takes a bare `(path, bytes)` pair rather than a filesystem path, so neither
-walking a vault nor reading `StorageBackend.list()`'s results has to know
-how scoring itself works.
+`memory_search` degrade, note read/write do not"). The `postgres` backend
+always has an indexer (ADR-0007 §4, WP-18/#98), so it never falls back here.
+`scan_search` walks the working copy directly instead of querying Postgres:
+no stemming, no chunking, no fusion - just a case-insensitive term-overlap
+score over each note's own fields, title and aliases weighted higher than
+tags, description and body. Good enough to keep stdio usable without
+Postgres; not a substitute for `search.hybrid_search`.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from memory_manager.search import SearchFilters
-from memory_manager.storage.base import StoredNote
 from memory_manager.vault.note import Note, NoteFormatError, parse
 from memory_manager.vault.paths import NotePath, PathRejected, iter_md_files, parse_note_path
 
-__all__ = ["ScanHit", "scan_notes", "scan_search"]
+__all__ = ["ScanHit", "scan_search"]
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _TITLE_ALIAS_WEIGHT = 3.0
@@ -75,36 +67,10 @@ def scan_search(
     return _ranked(hits, limit)
 
 
-def scan_notes(
-    notes: Iterable[StoredNote], query: str, *, filters: SearchFilters, limit: int
-) -> list[ScanHit]:
-    """`scan_search`'s scoring, applied to notes already read into memory.
-
-    The interim `memory_search` fallback for the `postgres` backend
-    (ADR-0007 §2, WP-18) until #98 adds real indexing there:
-    `mcp/server.py` passes `await services.storage.list(include_archived=True)`
-    (filtering to `filters.include_archived` happens below, same as
-    `scan_search`'s own walk never skips an archived file upfront either) -
-    O(n) in the number of notes the backend holds, since every one of them
-    is parsed and scored on every call, same as `scan_search` does for
-    every file under the vault.
-    """
-    terms = _terms(query)
-    if not terms:
-        return []
-
-    hits: list[ScanHit] = []
-    for note in notes:
-        hit = _score_note(note.path, note.content, terms, filters)
-        if hit is not None:
-            hits.append(hit)
-    return _ranked(hits, limit)
-
-
 def _score_note(
     path: str, data: bytes, terms: Sequence[str], filters: SearchFilters
 ) -> ScanHit | None:
-    """`scan_search`/`scan_notes`'s shared per-note core: filter, then score.
+    """`scan_search`'s per-note core: filter, then score.
 
     A note-shaped file that fails to parse, or a path that is not
     note-shaped at all, is skipped silently (returns `None`) - there is no

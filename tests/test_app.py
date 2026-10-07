@@ -142,14 +142,19 @@ async def test_postgres_backend_without_database_url_fails_before_the_vault_dir_
 
 
 async def test_postgres_backend_opens_with_no_vault_env_at_all(test_database_url: str) -> None:
-    """No `VAULT_*` variable - proof this mode never clones anything (ADR-0007 §2)."""
+    """No `VAULT_*` variable - proof this mode never clones anything (ADR-0007 §2).
+
+    `services.indexer` is set despite there being no vault at all (ADR-0007
+    §4, WP-18/#98): it indexes from `vault_notes`, not a working copy.
+    """
     environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
 
     async with open_services(environ) as services:
         assert services.repo is None
         assert services.queue is None
         assert services.vault_root is None
-        assert services.indexer is None
+        assert services.indexer is not None
+        assert services.provider is None  # no EMBEDDING_* set
         assert services.trigger_sync is None
         assert services.pool is not None
 

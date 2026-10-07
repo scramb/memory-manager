@@ -224,10 +224,10 @@ async def test_memory_search_without_database_valid_at_today_excludes_expired(
         assert with_today["results"] == []
 
 
-# -- the `postgres` backend, no indexer yet (search_fallback.scan_notes, #98) ---
+# -- the `postgres` backend, indexed in the write transaction (#98) -------------
 
 
-async def test_memory_search_with_postgres_backend_mode_is_scan_and_finds_the_note(
+async def test_memory_search_with_postgres_backend_mode_is_fulltext_and_finds_the_note(
     services_with_postgres_backend: Services,
 ) -> None:
     async with Client(build_server(services_with_postgres_backend)) as client:
@@ -240,7 +240,7 @@ async def test_memory_search_with_postgres_backend_mode_is_scan_and_finds_the_no
 
         payload = await _search(client, "aardvark")
 
-    assert payload["mode"] == "scan"
+    assert payload["mode"] == "fulltext"
     assert {item["path"] for item in payload["results"]} == {"personal/fact/aardvark-routine.md"}
 
 

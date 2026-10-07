@@ -14,16 +14,20 @@ full-text/vector search and `memory_search` degrade, note read/write do not
 (`CLAUDE.md`: Postgres is a derived index, never the only place a client's
 data lives, for this backend).
 
-For `"postgres"` (enterprise mode, ADR-0007 §2/§7, WP-18), `DATABASE_URL` is
-required (`storage_backend_from_env` enforces this before anything else
+For `"postgres"` (enterprise mode, ADR-0007 §2/§4/§7, WP-18), `DATABASE_URL`
+is required (`storage_backend_from_env` enforces this before anything else
 runs) and there is no vault at all: no clone, no `Repo`/`WriteQueue`, no
 poll loop, no vault webhook (ADR-0009) - `Services.repo`/`queue`/
 `vault_root` are all `None`, and `Services.pool` is the
 `storage.postgres.PostgresBackend`'s own connection pool rather than one
-`_open_index` builds separately. Indexing notes into `notes`/`chunks` for
-search (`Services.indexer`) is `None` in this mode too - that is #98's job,
-not this one's; `memory_search` falls back to `search_fallback.scan_notes`
-over `storage.list()` until then (`mcp/server.py`).
+`_open_index` builds separately. Indexing (`Services.indexer`) is wired in
+too (#98), but differently from `"git"`: no startup reindex (there is no
+"first request" lag to cover - every write indexes itself, in the same
+transaction, before `PostgresBackend` ever returns from it) and no
+sync/write-queue hooks (there is no queue) - instead, an `index.indexer.Indexer`
+built over `vault_notes` is handed to `PostgresBackend` itself as its
+`index_hook`/`index_commit_hook` (ADR-0007 §4), so `memory_search` can use
+`search.hybrid_search` exactly like `"git"` with `DATABASE_URL` does.
 
 `Services` is what the MCP tool layer (`mcp/server.py`) and the write tools
 (#18/#19) are built against; nothing outside this module touches
@@ -59,7 +63,7 @@ from memory_manager.audit import AuditWriter
 from memory_manager.config import EmbeddingConfig, VaultConfig, storage_backend_from_env
 from memory_manager.db.migrate import migrate
 from memory_manager.index.embeddings import EmbeddingProvider, provider_from_config
-from memory_manager.index.indexer import Indexer
+from memory_manager.index.indexer import Indexer, VaultNotesSource
 from memory_manager.queue import (
     AuditHook,
     EditMismatch,
@@ -110,24 +114,35 @@ class Services:
 
 @dataclass
 class _BackendHandle:
-    """What `_open_backend` hands back: the backend, plus its `"git"`-only innards.
+    """What `_open_backend` hands back: the backend, plus its backend-specific innards.
 
     `repo`/`queue` are `None` for `"postgres"`. `pool` is `None` for
     `"git"` (that backend's own index pool, if any, is `_open_index`'s
     separate concern) and the backend's own connection pool for
     `"postgres"` - `open_services` reuses it for the audit writer and
-    `Services.pool` instead of opening a second one.
+    `Services.pool` instead of opening a second one. `indexer`/`provider`
+    are `"postgres"`-only too (ADR-0007 §4, WP-18): built here, over
+    `vault_notes`, only when `_open_backend` was given an `embedding_config`
+    (`open_services` always passes one; `open_storage`, which needs no
+    index at all, does not) - `None`/`None` otherwise, same as `"git"`'s are
+    until `open_services`'s own `_open_index` call sets them.
     """
 
     storage: StorageBackend
     repo: Repo | None
     queue: WriteQueue | None
     pool: asyncpg.Pool | None
+    indexer: Indexer | None = None
+    provider: EmbeddingProvider | None = None
 
 
 @asynccontextmanager
 async def _open_backend(
-    backend_name: str, *, vault_config: VaultConfig | None, database_url: str | None
+    backend_name: str,
+    *,
+    vault_config: VaultConfig | None,
+    database_url: str | None,
+    embedding_config: EmbeddingConfig | None = None,
 ) -> AsyncIterator[_BackendHandle]:
     """Build the `STORAGE_BACKEND` named by `backend_name`, torn down on exit.
 
@@ -139,6 +154,15 @@ async def _open_backend(
     `storage.postgres.PostgresBackend` with no clone, no working copy and no
     `Repo`/`WriteQueue` at all (ADR-0007 §2/§7, ADR-0009: no clone, no poll,
     no vault webhook in this mode) - `repo`/`queue` come back `None`.
+
+    `embedding_config`, given only by `open_services` (ADR-0007 §4, WP-18/#98),
+    additionally builds an `index.indexer.Indexer` over `vault_notes` and wires
+    it into the `PostgresBackend` as its `index_hook`/`index_commit_hook` -
+    every write indexes itself in the same transaction, and embeddings for it
+    are scheduled right after. `open_storage` (the import CLI's entry point)
+    never passes one, so a `"postgres"` call from there stays index-free, same
+    as it always was. Any `self._background_tasks` the indexer still has
+    pending are drained (`Indexer.aclose`) before the pool closes.
     """
     if backend_name == "postgres":
         if (
@@ -152,9 +176,29 @@ async def _open_backend(
             await migration_conn.close()
 
         pool = await asyncpg.create_pool(database_url)
+        indexer: Indexer | None = None
+        provider: EmbeddingProvider | None = None
+        if embedding_config is not None:
+            provider = provider_from_config(embedding_config)
+            indexer = Indexer(pool, VaultNotesSource(), provider)
+
+        storage = PostgresBackend(
+            pool,
+            index_hook=indexer.index_on_connection if indexer is not None else None,
+            index_commit_hook=indexer.schedule_embeddings if indexer is not None else None,
+        )
         try:
-            yield _BackendHandle(storage=PostgresBackend(pool), repo=None, queue=None, pool=pool)
+            yield _BackendHandle(
+                storage=storage,
+                repo=None,
+                queue=None,
+                pool=pool,
+                indexer=indexer,
+                provider=provider,
+            )
         finally:
+            if indexer is not None:
+                await indexer.aclose()
             await pool.close()
         return
 
@@ -211,8 +255,11 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     all). For `"git"` with `environ["DATABASE_URL"]` set, also migrates and
     reindexes the Postgres index before yielding, so the index is never
     stale behind the vault for the first request. For `"postgres"`, there is
-    no index to build yet (#98): only the audit hook is wired onto the
-    backend, and `Services.pool` is the backend's own pool.
+    no comparable startup reindex (ADR-0007 §4, WP-18/#98: every write already
+    indexes itself, so there is nothing to catch up on at startup) - only the
+    audit hook is wired onto the backend in addition to what `_open_backend`
+    already wired in as `index_hook`/`index_commit_hook`, and `Services.pool`
+    is the backend's own pool.
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
@@ -220,7 +267,10 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     embedding_config = EmbeddingConfig.from_env(dict(environ))
 
     async with _open_backend(
-        storage_backend_name, vault_config=vault_config, database_url=database_url
+        storage_backend_name,
+        vault_config=vault_config,
+        database_url=database_url,
+        embedding_config=embedding_config,
     ) as handle:
         pool: asyncpg.Pool | None = handle.pool
         index_pool: asyncpg.Pool | None = None
@@ -256,6 +306,8 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                     "_open_backend('postgres', ...) returned no pool/PostgresBackend"
                 )
             else:
+                indexer = handle.indexer
+                provider = handle.provider
                 handle.storage.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
 
             try:

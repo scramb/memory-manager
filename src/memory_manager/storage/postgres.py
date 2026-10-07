@@ -9,6 +9,19 @@ current_revision = $n` idiom `queue.py`'s Git path uses at the file level.
 `write`/`edit` build a `WriteRequest` exactly like `GitBackend` does and
 hand it to one private flow, `_write_or_edit`, that both call.
 
+Indexing (ADR-0007 §4, WP-18/#98): `__init__`'s optional `index_hook` is
+awaited on the write's own connection, inside its own transaction, right
+after the revision row is inserted - `index.indexer.Indexer.index_on_connection`
+is the one implementation, wired in by `app.py`. An exception from it rolls
+back the whole write exactly like any other failure in that transaction
+(the existing `asyncpg.PostgresError` -> `WriteFailed` mapping applies
+unchanged); `index_commit_hook` runs only once that transaction has already
+committed, with the ids of every note the write just touched, and is never
+awaited by anything that could make a write wait on it (`Indexer.schedule_embeddings`
+only ever starts a background task). Without either hook (every other
+caller, most tests), indexing is simply skipped - the two parameters default
+to `None` and `PostgresBackend(pool)` keeps working unchanged.
+
 Concurrency: a `write`/`edit` runs in one `READ COMMITTED` transaction (the
 pool's default - no `REPEATABLE READ`/`SERIALIZABLE`). An `UPDATE ... WHERE
 id = $id AND current_revision = $n` is safe under `READ COMMITTED` without
@@ -77,6 +90,8 @@ import asyncpg
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
     AuditHook,
+    IndexCommitHook,
+    IndexHook,
     InvalidNote,
     NotFound,
     StorageChanges,
@@ -167,10 +182,23 @@ class PostgresBackend:
     `valid_to` stamps, truncated to whole seconds like the Git backend's.
     """
 
-    def __init__(self, pool: asyncpg.Pool, *, clock: Callable[[], datetime] = _utc_now) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        clock: Callable[[], datetime] = _utc_now,
+        index_hook: IndexHook | None = None,
+        index_commit_hook: IndexCommitHook | None = None,
+    ) -> None:
         self._pool = pool
         self._clock = clock
         self._audit_hooks: list[AuditHook] = []
+        # `index_hook`/`index_commit_hook` (ADR-0007 §4, WP-18/#98): optional so
+        # every existing `PostgresBackend(pool)` call (most tests) keeps running
+        # with no index wired in at all - `app.py` is the only caller that passes
+        # either, built from an `index.indexer.Indexer` over `vault_notes`.
+        self._index_hook = index_hook
+        self._index_commit_hook = index_commit_hook
 
     def add_audit_hook(self, hook: AuditHook) -> None:
         """Register `hook`, awaited after every `write`/`edit`/`supersede`/`archive`.
@@ -351,10 +379,16 @@ class PostgresBackend:
                     request.client,
                     message,
                 )
+
+                if self._index_hook is not None:
+                    await self._index_hook(conn, request.path, final_bytes)
         except asyncpg.UniqueViolationError as exc:
             raise InvalidNote(request.path, str(exc)) from exc
         except asyncpg.PostgresError as exc:
             raise WriteFailed(str(exc)) from exc
+
+        if self._index_commit_hook is not None:
+            await self._index_commit_hook((note_id,))
 
         return WriteResult(path=request.path, version=new_version, commit=f"{note_id}@{revision}")
 
@@ -514,10 +548,16 @@ class PostgresBackend:
                     request.client,
                     final_message,
                 )
+
+                if self._index_hook is not None:
+                    await self._index_hook(conn, archive_rel, archived_bytes)
         except asyncpg.UniqueViolationError as exc:
             raise InvalidNote(path, str(exc)) from exc
         except asyncpg.PostgresError as exc:
             raise WriteFailed(str(exc)) from exc
+
+        if self._index_commit_hook is not None:
+            await self._index_commit_hook((note_id,))
 
         return WriteResult(path=archive_rel, version=new_version, commit=f"{note_id}@{revision}")
 
@@ -628,6 +668,8 @@ class PostgresBackend:
                     client,
                     final_message,
                 )
+                if self._index_hook is not None:
+                    await self._index_hook(conn, path, old_final_bytes)
 
                 new_note_id = parse(new_final_bytes).id
                 inserted = await conn.fetchrow(
@@ -654,10 +696,15 @@ class PostgresBackend:
                     client,
                     final_message,
                 )
+                if self._index_hook is not None:
+                    await self._index_hook(conn, checked_new_path, new_final_bytes)
         except asyncpg.UniqueViolationError as exc:
             raise InvalidNote(new_path, str(exc)) from exc
         except asyncpg.PostgresError as exc:
             raise WriteFailed(str(exc)) from exc
+
+        if self._index_commit_hook is not None:
+            await self._index_commit_hook((old_note_id, str(inserted["id"])))
 
         return WriteResult(
             path=checked_new_path,
