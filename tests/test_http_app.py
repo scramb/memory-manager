@@ -89,7 +89,7 @@ async def test_readyz_is_ready_once_the_vault_is_cloned(bare_remote: Path, tmp_p
         response = await client.get(READY_PATH)
 
     assert response.status_code == 200
-    assert response.json() == {"ready": True, "vault": True, "database": True}
+    assert response.json() == {"ready": True, "vault": True, "database": True, "draining": False}
 
 
 async def test_readyz_is_503_when_the_vault_clone_is_gone(

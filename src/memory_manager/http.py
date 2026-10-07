@@ -73,9 +73,11 @@ import logging
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from types import FrameType
 from typing import cast
 
 import asyncpg
+import uvicorn
 from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
@@ -124,7 +126,7 @@ from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
 from memory_manager.observability.metrics import metrics_endpoint
 
-__all__ = ["ServicesFactory", "build_authenticator", "create_app"]
+__all__ = ["GracefulShutdownServer", "ServicesFactory", "build_authenticator", "create_app"]
 
 _logger = logging.getLogger(__name__)
 
@@ -195,6 +197,36 @@ class _SharedStateHandle:
 
     async def take_pending(self, key: str) -> str | None:
         return await self.backend.take_pending(key)
+
+
+class GracefulShutdownServer(uvicorn.Server):
+    """A `uvicorn.Server` that flips this ASGI app's `draining` flag the instant
+    `SIGTERM`/`SIGINT` arrives (ADR-0009 §1/§5), so `/readyz` fails fast and a load
+    balancer stops routing new requests here *before* uvicorn's own grace period
+    (`Config.timeout_graceful_shutdown`, `ServerConfig.shutdown_grace_seconds`,
+    `cli.py`'s `_serve_http`) even starts draining in-flight ones.
+
+    `handle_exit` is overridden as a real method, not a per-instance closure or
+    attribute: `sse_starlette` patches `uvicorn.Server.handle_exit` at import time
+    (`AppStatus.handle_exit`) and, on signal, finds *the* running server by reading
+    `signal.getsignal(signal.SIGTERM).__self__` - `uvicorn.Server.
+    install_signal_handlers` registers exactly `self.handle_exit` as the handler, so
+    that only resolves to this instance if `handle_exit` stays a bound method on
+    this class. `super().handle_exit(sig, frame)` is what still runs uvicorn's own
+    `should_exit`/`force_exit` bookkeeping and sse_starlette's patched behaviour
+    (draining any open legacy GET stream) - this override only adds the one extra
+    side effect, never replaces it.
+
+    Reads the app straight off `self.config.app` instead of a constructor
+    parameter: `cli.py` always builds this with the already-constructed `Starlette`
+    app (never a string/factory), and `uvicorn.Config.__init__` assigns that value
+    to `.app` verbatim, before `.load()` ever runs - so it is already the right
+    object the moment this server exists.
+    """
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        cast(Starlette, self.config.app).state.draining = True
+        super().handle_exit(sig, frame)
 
 
 def create_app(
@@ -435,6 +467,9 @@ def create_app(
     # Known synchronously (no vault/DB work needed), unlike `services`/`mcp_app`
     # above - set right away rather than deferred into `lifespan`.
     app.state.config = config
+    # Flipped to `True` by `GracefulShutdownServer.handle_exit` on `SIGTERM`/
+    # `SIGINT` (ADR-0009 §5) - `_readyz` checks this before anything else.
+    app.state.draining = False
     return app
 
 
@@ -933,7 +968,17 @@ async def _healthz(_request: Request) -> Response:
 
 
 async def _readyz(request: Request) -> Response:
-    """503 when the vault clone is missing, or a configured database is unreachable."""
+    """503 when draining (ADR-0009 §5), the vault clone is missing, or a configured
+    database is unreachable.
+
+    The draining check runs first and skips the database round trip entirely -
+    once `GracefulShutdownServer.handle_exit` has set `app.state.draining`, this
+    process is shutting down regardless of what the database says, so there is
+    nothing to gain from asking it.
+    """
+    if request.app.state.draining:
+        return JSONResponse({"ready": False, "draining": True}, status_code=503)
+
     services: Services = request.app.state.services
     vault_ready = (services.vault_root / ".git").is_dir()
 
@@ -946,7 +991,12 @@ async def _readyz(request: Request) -> Response:
             database_ready = False
 
     ready = vault_ready and database_ready
-    body = {"ready": ready, "vault": vault_ready, "database": database_ready}
+    body = {
+        "ready": ready,
+        "vault": vault_ready,
+        "database": database_ready,
+        "draining": False,
+    }
     return JSONResponse(body, status_code=200 if ready else 503)
 
 

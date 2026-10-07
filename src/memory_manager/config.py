@@ -54,6 +54,12 @@ _DEFAULT_WEBHOOK_PER_MINUTE = 30.0
 _DEFAULT_WEBHOOK_BURST = 10.0
 _DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
 
+# Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
+# `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
+# value instead, so `SIGKILL` from an orchestrator is never what actually ends
+# a draining process.
+_DEFAULT_SHUTDOWN_GRACE_SECONDS = 20
+
 
 class VaultConfigError(ValueError):
     """A required `VAULT_*` environment variable is missing or invalid."""
@@ -302,6 +308,17 @@ class ServerConfig:
     (`"*"`, this field's pre-#39 default) would let any caller spoof
     `X-Forwarded-For` to pick its own rate-limit bucket, or collapse every
     real client behind a reverse proxy onto that proxy's one bucket.
+
+    `shutdown_grace_seconds` (`SHUTDOWN_GRACE_SECONDS`, default 20) is how
+    long `cli.py`'s `_serve_http` tells uvicorn
+    (`Config(timeout_graceful_shutdown=...)`) to keep draining in-flight
+    requests after `SIGTERM`/`SIGINT` before cancelling whatever is still
+    running (ADR-0009 §1/§5). `http.py`'s `GracefulShutdownServer` flips
+    `/readyz` to 503 on that same signal, before this grace period even
+    starts, so a load balancer stops routing new requests here while the
+    ones already in flight still get the full grace period to finish.
+    Kubernetes `preStop`/`terminationGracePeriodSeconds` (WP-29) sit outside
+    this value entirely, on top of it.
     """
 
     host: str = _DEFAULT_HOST
@@ -325,6 +342,7 @@ class ServerConfig:
     webhook_per_minute: float = _DEFAULT_WEBHOOK_PER_MINUTE
     webhook_burst: float = _DEFAULT_WEBHOOK_BURST
     forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
+    shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -356,7 +374,8 @@ class ServerConfig:
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
-        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS` entries of `environ`.
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS` entries of
+        `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
         variable if `PORT` is not a valid port number, or any size/rate
@@ -395,6 +414,9 @@ class ServerConfig:
             environ, "RATE_LIMIT_WEBHOOK_BURST", _DEFAULT_WEBHOOK_BURST
         )
         forwarded_allow_ips = environ.get("FORWARDED_ALLOW_IPS") or _DEFAULT_FORWARDED_ALLOW_IPS
+        shutdown_grace_seconds = _parse_positive_int(
+            environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
+        )
 
         return cls(
             host=host,
@@ -418,6 +440,7 @@ class ServerConfig:
             webhook_per_minute=webhook_per_minute,
             webhook_burst=webhook_burst,
             forwarded_allow_ips=forwarded_allow_ips,
+            shutdown_grace_seconds=shutdown_grace_seconds,
         )
 
 

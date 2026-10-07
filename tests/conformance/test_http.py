@@ -32,10 +32,6 @@ itself has no `headers=` parameter).
 
 from __future__ import annotations
 
-import asyncio
-import os
-import socket
-import sys
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +44,8 @@ import httpx2
 import pytest
 import pytest_asyncio
 from git_fixtures import seed_notes
+from http_fixtures import Server as _Server
+from http_fixtures import run_http_server
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp_types import METHOD_NOT_FOUND, UNSUPPORTED_PROTOCOL_VERSION
@@ -59,8 +57,6 @@ from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
 __all__: list[str] = []
-
-_CLI_ARGS = ("-m", "memory_manager.cli", "serve", "--http")
 
 # Spelled out as literals, checked against the installed SDK's own registry
 # below - see `tests/conformance/test_stdio.py`'s identical comment.
@@ -82,10 +78,6 @@ _EXPECTED_TOOL_NAMES = frozenset(
 _SEEDED_PATH = "personal/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
 
-_STARTUP_TIMEOUT = 10.0
-_SHUTDOWN_TIMEOUT = 5.0
-_POLL_INTERVAL = 0.1
-
 _PARAMETRIZE_VERSIONS = pytest.mark.parametrize(
     "version", [_HANDSHAKE_VERSION, _MODERN_VERSION], ids=["2025-11-25", "2026-07-28"]
 )
@@ -100,27 +92,6 @@ def test_negotiated_versions_match_the_sdks_registry() -> None:
     """
     assert _HANDSHAKE_VERSION == LATEST_HANDSHAKE_VERSION
     assert _MODERN_VERSION == LATEST_MODERN_VERSION
-
-
-@dataclass
-class _Server:
-    process: asyncio.subprocess.Process
-    base_url: str
-    mcp_url: str
-
-
-def _free_port() -> int:
-    """An ephemeral TCP port, free at the instant of the call.
-
-    Closed again immediately: `serve --http` binds it itself a moment
-    later. Vulnerable in theory to another process grabbing the same port
-    first - the same race every "find a free port for a test server"
-    helper accepts.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        port: int = sock.getsockname()[1]
-        return port
 
 
 @pytest.fixture
@@ -154,48 +125,8 @@ async def http_server(http_env: Mapping[str, str]) -> AsyncIterator[_Server]:
     no bearer-token auth turned on (#34) - see `authenticated_http_server`
     below for that case.
     """
-    port = _free_port()
-    full_env = {**os.environ, **http_env, "HOST": "127.0.0.1", "PORT": str(port)}
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        *_CLI_ARGS,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=full_env,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-    try:
-        await _wait_until_ready(process, base_url)
-        yield _Server(process=process, base_url=base_url, mcp_url=f"{base_url}/mcp")
-    finally:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-
-
-async def _wait_until_ready(process: asyncio.subprocess.Process, base_url: str) -> None:
-    deadline = asyncio.get_running_loop().time() + _STARTUP_TIMEOUT
-    async with httpx.AsyncClient() as client:
-        while True:
-            if process.returncode is not None:
-                stderr = await process.stderr.read() if process.stderr else b""
-                raise AssertionError(
-                    f"memory-manager serve --http exited early (code {process.returncode}): "
-                    f"{stderr.decode('utf-8', errors='replace')}"
-                )
-            try:
-                response = await client.get(f"{base_url}/healthz", timeout=1.0)
-                if response.status_code == 200:
-                    return
-            except httpx.TransportError:
-                pass
-            if asyncio.get_running_loop().time() > deadline:
-                raise TimeoutError("memory-manager serve --http did not become ready in time")
-            await asyncio.sleep(_POLL_INTERVAL)
+    async with run_http_server(http_env) as server:
+        yield server
 
 
 # --- Bearer-token auth (#34): a real subprocess with `DATABASE_URL` set -----
@@ -214,16 +145,12 @@ async def authenticated_http_server(
     """Same subprocess as `http_server`, with `DATABASE_URL` set and one token created.
 
     The subprocess's own startup (`open_services`) migrates `test_database_url`
-    before this fixture ever touches it, so by the time `_wait_until_ready`
-    returns, `static_tokens` already exists - the token below is created
-    against that same database, not a separate one.
+    before this fixture ever touches it, so by the time `run_http_server`'s
+    `wait_until_ready` returns, `static_tokens` already exists - the token below is
+    created against that same database, not a separate one.
     """
-    port = _free_port()
     full_env = {
-        **os.environ,
         **http_env,
-        "HOST": "127.0.0.1",
-        "PORT": str(port),
         "DATABASE_URL": test_database_url,
         # DATABASE_URL set above turns bearer-token auth on (#34), which
         # requires PUBLIC_URL (#35, ADR-0004) - the subprocess refuses to
@@ -234,18 +161,7 @@ async def authenticated_http_server(
         # talks to.
         "PUBLIC_URL": "https://mm.example.test",
     }
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        *_CLI_ARGS,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=full_env,
-    )
-    base_url = f"http://127.0.0.1:{port}"
-    try:
-        await _wait_until_ready(process, base_url)
-
+    async with run_http_server(full_env) as server:
         pool = await asyncpg.create_pool(test_database_url)
         try:
             plaintext, _info = await create_token(
@@ -257,15 +173,7 @@ async def authenticated_http_server(
         finally:
             await pool.close()
 
-        server = _Server(process=process, base_url=base_url, mcp_url=f"{base_url}/mcp")
         yield _AuthenticatedServer(server=server, token=plaintext)
-    finally:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
 
 
 async def test_mcp_without_a_token_is_401_when_database_url_is_set(

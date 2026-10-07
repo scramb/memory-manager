@@ -187,12 +187,16 @@ class _CapturedUvicornConfig:
 
 
 class _FakeUvicornServer:
-    """Stands in for `uvicorn.Server`: `.serve()` returns immediately, never binds a
-    socket - `cli._serve_http` never gets far enough to call `create_app`'s `lifespan`
-    (that only happens inside the real `Server.serve()`), so no vault/database is
-    needed for this test either."""
+    """Stands in for `uvicorn.Server`/`http.GracefulShutdownServer`: `.serve()` returns
+    immediately, never binds a socket - `cli._serve_http` never gets far enough to call
+    `create_app`'s `lifespan` (that only happens inside the real `Server.serve()`), so
+    no vault/database is needed for this test either.
 
-    def __init__(self, config: _CapturedUvicornConfig) -> None:
+    Accepts (and ignores) any extra positional/keyword constructor argument -
+    `GracefulShutdownServer` takes only `config` today, same as `uvicorn.Server`, but
+    this stays a drop-in replacement for either even if that changes."""
+
+    def __init__(self, config: _CapturedUvicornConfig, *args: object, **kwargs: object) -> None:
         self.config = config
 
     async def serve(self) -> None:
@@ -200,10 +204,11 @@ class _FakeUvicornServer:
 
 
 def _patch_uvicorn(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Replaces `uvicorn.Config`/`.Server` - the same module object `cli.py`'s own
-    `import uvicorn` bound, so this reaches `_serve_http`'s calls without reading
-    `cli`'s (unexported) `uvicorn` attribute back out. Returns the dict
-    `_serve_http`'s `uvicorn.Config(...)` call's keyword arguments land in."""
+    """Replaces `uvicorn.Config` and both `uvicorn.Server` and `cli`'s own
+    `GracefulShutdownServer` - the names `cli.py`'s `_serve_http` actually calls, so
+    this reaches it without reading `cli`'s (unexported) `uvicorn` attribute back out.
+    Returns the dict `_serve_http`'s `uvicorn.Config(...)` call's keyword arguments
+    land in."""
     captured: dict[str, object] = {}
 
     def fake_config(app: object, **kwargs: object) -> _CapturedUvicornConfig:
@@ -212,6 +217,7 @@ def _patch_uvicorn(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
     monkeypatch.setattr(uvicorn, "Config", fake_config)
     monkeypatch.setattr(uvicorn, "Server", _FakeUvicornServer)
+    monkeypatch.setattr(cli, "GracefulShutdownServer", _FakeUvicornServer)
     return captured
 
 

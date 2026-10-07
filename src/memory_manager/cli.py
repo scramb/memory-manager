@@ -55,7 +55,7 @@ from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_vault
-from memory_manager.http import build_authenticator, create_app
+from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
 from memory_manager.importers.chatgpt import collect as collect_chatgpt
@@ -847,8 +847,13 @@ async def _serve_http() -> int:
         # `X-Forwarded-For` to pick its own rate-limit bucket, or collapse
         # every client behind a real proxy onto that proxy's one bucket.
         forwarded_allow_ips=config.forwarded_allow_ips,
+        # `ServerConfig.shutdown_grace_seconds` (`SHUTDOWN_GRACE_SECONDS`,
+        # default 20, ADR-0009 §1/§5) - uvicorn's own default is `None`
+        # (wait forever), which would leave only an orchestrator's SIGKILL
+        # to bound a draining shutdown.
+        timeout_graceful_shutdown=config.shutdown_grace_seconds,
     )
-    server = uvicorn.Server(uvicorn_config)
+    server = GracefulShutdownServer(uvicorn_config)
     await server.serve()
     return 0
 
