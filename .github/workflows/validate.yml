@@ -36,6 +36,12 @@ jobs:
             | kubeconform -strict -summary \
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Render and validate the Flux example (incl. CRD schemas)
+        run: |
+          kubectl kustomize deploy/flux \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
       - name: Lint the Helm chart
         run: helm lint charts/memory-manager
       - name: Render and validate the Helm chart (default values)

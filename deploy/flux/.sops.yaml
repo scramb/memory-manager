@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Example SOPS rule set for sops-secret.example.yaml - the SOPS
+# alternative README.md's own "Secrets" section describes, kept out of
+# kustomization.yaml's resources (see that file's own comment and
+# README.md). The age recipient below is a placeholder, never a real key
+# (CLAUDE.md: a public repository carries no real keys) - an operator
+# generates their own with `age-keygen`, keeps the private key out of Git,
+# and points this file's own `age:` entry at the resulting public key
+# instead.
+creation_rules:
+  - path_regex: sops-secret\.example\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    age: age1exampleexampleexampleexampleexampleexampleexampleexamplex

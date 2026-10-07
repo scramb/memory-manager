@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Installs the Helm chart `charts/memory-manager` (#45) ships, from the OCI
+# source in `helmrepository.yaml`, with the same values an operator would
+# pass via `-f my-values.yaml` to `helm install` directly
+# (`charts/memory-manager/README.md`'s own "Values" table) - every
+# hostname/email/secret-store name below is a placeholder, same table.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+spec:
+  interval: 10m
+  releaseName: memory-manager
+  chart:
+    spec:
+      chart: memory-manager
+      version: ">=0.1.0 <0.2.0"
+      sourceRef:
+        kind: HelmRepository
+        name: memory-manager
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    publicUrl: https://memory.example.com
+    vault:
+      remote: "git@git.example.com:memory-manager/vault.git"
+      branch: main
+    login:
+      mode: oidc
+      oidc:
+        issuer: https://idp.example.com
+        clientId: memory-manager
+        allowedEmails: you@example.com
+      namespaces: personal
+    # Points at externalsecret.yaml's own target, not the chart's "<release>
+    # -secrets" default (that coincides only when the release is also named
+    # "memory-manager", see externalsecret.yaml's own comment) - explicit
+    # either way.
+    secrets:
+      existingSecret: memory-manager-secrets
+    database:
+      cnpg:
+        enabled: true
+    httpRoute:
+      enabled: true
+      parentRefs:
+        - name: gateway-name
+          namespace: gateway-namespace
+      hostnames:
+        - memory.example.com
