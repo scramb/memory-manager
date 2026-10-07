@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/scramb/memory-manager/compare/v0.1.1...v0.1.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* **auth:** fall back across resolved addresses when fetching CIMD documents ([#83](https://github.com/scramb/memory-manager/issues/83)) ([bd3729d](https://github.com/scramb/memory-manager/commit/bd3729db61408b29042a11c1a1bbc443ac5e396d)), closes [#82](https://github.com/scramb/memory-manager/issues/82)
+
 ## [0.1.1](https://github.com/scramb/memory-manager/compare/v0.1.0...v0.1.1) (2026-10-07)
 
 
