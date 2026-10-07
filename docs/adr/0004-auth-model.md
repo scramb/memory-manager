@@ -63,3 +63,9 @@ Checked against the guardrails:
 ## Reversibility
 
 Medium. Token format and DB tables are internal; switching to an external AS later means adding verification, not removing data. The login method is configuration.
+
+## Addendum 2026-10-07 — implementation notes (#36, #37)
+
+- **Client secrets of confidential DCR clients are encrypted at rest, not hashed.** The SDK's `ClientAuthenticator` compares `client_secret` in plaintext and has no injection point, so a hash cannot be checked. These secrets are stored with Fernet (authenticated encryption, key `OAUTH_CLIENT_SECRET_KEY`, required when the AS is on). Access tokens, refresh tokens and authorization codes remain SHA-256 hashes. claude.ai and Claude Code register as public clients (no secret), so the encrypted path only serves rare confidential clients.
+- **`resource` is mandatory** at `/authorize` and `/token`; a missing or foreign value is `invalid_target`.
+- **Upstream OIDC client (L2):** no new dependency. The client is ~200 lines on `httpx`: discovery, authorization code + PKCE, confidential `client_secret_basic`. The identity is taken from the `userinfo` endpoint, called with the access token that the token endpoint returned directly over TLS. Because of that, no ID-token signature validation (JOSE) is needed. An allowlist (`OIDC_ALLOWED_EMAILS` / `OIDC_ALLOWED_SUBJECTS`) is mandatory and denies by default, because an upstream IdP may issue tokens to any of its accounts.

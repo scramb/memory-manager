@@ -225,6 +225,14 @@ async def authenticated_http_server(
         "HOST": "127.0.0.1",
         "PORT": str(port),
         "DATABASE_URL": test_database_url,
+        # DATABASE_URL set above turns bearer-token auth on (#34), which
+        # requires PUBLIC_URL (#35, ADR-0004) - the subprocess refuses to
+        # start otherwise. Its value is unrelated to `base_url` below: the
+        # bearer tokens this fixture creates carry no RFC 8707 resource of
+        # their own (`validate_token_resource=False`, `http.py`), so this
+        # never has to match the loopback address the test client actually
+        # talks to.
+        "PUBLIC_URL": "https://mm.example.test",
     }
     process = await asyncio.create_subprocess_exec(
         sys.executable,

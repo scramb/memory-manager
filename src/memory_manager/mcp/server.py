@@ -33,9 +33,9 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
-from mcp.server.auth.provider import TokenVerifier
+from mcp.server.auth.provider import OAuthAuthorizationServerProvider, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -62,7 +62,7 @@ from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path, 
 from memory_manager.vault.ulid import is_ulid, new_ulid
 from memory_manager.vault.validate import NOTE_TYPES
 
-__all__ = ["INSTRUCTIONS", "build_server", "current_client"]
+__all__ = ["INSTRUCTIONS", "build_server", "current_actor", "current_client"]
 
 _logger = logging.getLogger(__name__)
 
@@ -172,16 +172,51 @@ class MemoryArchiveResult(TypedDict):
 def current_client() -> str:
     """The client identity a write through this process commits as.
 
-    An HTTP request carrying a static token always commits as
-    `"claude-code"`, regardless of the token's own name or `MEMORY_CLIENT` -
-    static tokens authenticate human-driven clients (Claude Code, CI), not a
-    separate committer identity (#34). Stdio mode has no token at all, so it
-    commits as `MEMORY_CLIENT` (default `"claude-code"`) - one of
-    `vault.repo.author_for`'s known clients.
+    An OAuth access token (#36) carries its own committer identity in
+    `claims["client_label"]` - `"claude-ai"` when the token's client
+    registered a claude.ai/claude.com redirect URI, `"claude-code"`
+    otherwise (`auth.provider`'s `_client_label_for`, set once at issuance,
+    not re-derived here). A static token (#34) carries no such claim and
+    always commits as `"claude-code"`, regardless of the token's own name or
+    `MEMORY_CLIENT` - static tokens authenticate human-driven clients
+    (Claude Code, CI), not a separate committer identity. Stdio mode has no
+    token at all, so it commits as `MEMORY_CLIENT` (default `"claude-code"`)
+    - one of `vault.repo.author_for`'s known clients.
     """
-    if current_access_token() is not None:
-        return _DEFAULT_CLIENT
-    return os.environ.get(_CLIENT_ENV_VAR, _DEFAULT_CLIENT)
+    token = current_access_token()
+    if token is None:
+        return os.environ.get(_CLIENT_ENV_VAR, _DEFAULT_CLIENT)
+    if token.claims is not None and "client_label" in token.claims:
+        return str(token.claims["client_label"])
+    return _DEFAULT_CLIENT
+
+
+_STDIO_ACTOR = "stdio"
+# Mirrors `auth.verifier`'s own private `_CLIENT_ID_PREFIX` - a static
+# token's `AccessToken.client_id` (not re-exported, so duplicated as a
+# literal here rather than importing a private name).
+_STATIC_CLIENT_ID_PREFIX = "static:"
+
+
+def current_actor() -> str:
+    """Who asked for the write this process is about to make, for the audit log (#39).
+
+    An OAuth access token (#36) carries its own subject in
+    `AccessToken.subject` - the human who logged in and authorized the
+    client, independent of `current_client()`'s committer label. A static
+    token (#34) carries no subject of its own; its `client_id` is
+    `"static:<name>"` (`auth.verifier._verify_static_token`), so the token's
+    name is what identifies it here instead. Stdio mode has no token at all,
+    so it is always `"stdio"` - never guessed from `MEMORY_CLIENT`, which
+    names the *committer* `current_client()` returns, not who is actually
+    running the local session.
+    """
+    token = current_access_token()
+    if token is None:
+        return _STDIO_ACTOR
+    if token.subject is not None:
+        return token.subject
+    return token.client_id.removeprefix(_STATIC_CLIENT_ID_PREFIX)
 
 
 # Each tool's description is built from `TOOL_DATA_SENTENCE` rather than repeating the
@@ -313,21 +348,31 @@ def build_server(
     *,
     auth: AuthSettings | None = None,
     token_verifier: TokenVerifier | None = None,
+    auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
 ) -> MCPServer:
     """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
 
-    `auth`/`token_verifier` are `None` for stdio (no bearer auth at all) and
-    for an HTTP server with no `DATABASE_URL` configured (#33's
-    loopback-only mode); `http.py` builds both from
-    `memory_manager.auth.verifier.StaticTokenVerifier` whenever a database is
-    configured (#34). Passed straight to `MCPServer`, which is what actually
-    wires the SDK's bearer-auth middleware into `streamable_http_app()` -
-    nothing in this module reads either one directly; every tool below gets
-    the per-request token through `mcp/authz.py`'s `get_access_token()`
-    instead.
+    `auth` plus exactly one of `token_verifier`/`auth_server_provider` - or
+    neither - are `None` for stdio (no bearer auth at all) and for an HTTP
+    server with no `DATABASE_URL` configured (#33's loopback-only mode);
+    `http.py` passes a `memory_manager.auth.verifier.StaticTokenVerifier`
+    whenever a database is configured but no OAuth authorization server is
+    (#34), or a `memory_manager.auth.provider.MemoryManagerOAuthProvider`
+    once one is (#36 - `MCPServer` itself then derives the bearer-token
+    verifier from the provider, merging OAuth and static tokens; see that
+    provider's module docstring). Passed straight to `MCPServer`, which is
+    what actually wires the SDK's bearer-auth middleware (and, for a
+    provider, the `/authorize`/`/token`/... routes) into
+    `streamable_http_app()` - nothing in this module reads any of the three
+    directly; every tool below gets the per-request token through
+    `mcp/authz.py`'s `get_access_token()` instead.
     """
     mcp = MCPServer(
-        name="memory-manager", instructions=INSTRUCTIONS, auth=auth, token_verifier=token_verifier
+        name="memory-manager",
+        instructions=INSTRUCTIONS,
+        auth=auth,
+        token_verifier=token_verifier,
+        auth_server_provider=auth_server_provider,
     )
 
     @mcp.prompt(name="memory_guide")
@@ -452,6 +497,7 @@ def build_server(
             op="write",
             path=path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             content=prepared.content,
             message=message,
@@ -486,6 +532,7 @@ def build_server(
             op="edit",
             path=path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             old_str=old_str,
             new_str=new_str,
@@ -530,6 +577,7 @@ def build_server(
             path=resolved_old,
             new_path=new_path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             content=prepared.content,
             message=message,
@@ -570,6 +618,7 @@ def build_server(
             op="archive",
             path=resolved,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             message=message,
         )

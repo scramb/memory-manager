@@ -5,7 +5,10 @@
 index; `serve --stdio` runs the MCP server for a local Claude Code
 connection, `serve --http` runs it over Streamable HTTP (`http.py`);
 `token create|list|revoke` manage the static bearer tokens `/mcp` accepts
-once `DATABASE_URL` is set (ADR-0004, #34).
+once `DATABASE_URL` is set (ADR-0004, #34); `hash-password` is the operator
+helper for `LOGIN_MODE=password` (ADR-0004 L1, #37) - it never takes the
+password as an argument (it would then show up in shell history and
+`ps`), only ever reading it from stdin.
 
 `serve --http` with `DATABASE_URL` set turns bearer-token auth on for
 `/mcp` (`http.py`); without it (no token to ever verify a request against)
@@ -33,6 +36,7 @@ import asyncpg
 import uvicorn
 
 from memory_manager.app import open_services
+from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
     TokenInfo,
@@ -51,7 +55,7 @@ from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_vault
-from memory_manager.http import create_app
+from memory_manager.http import build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
 from memory_manager.importers.chatgpt import collect as collect_chatgpt
@@ -137,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "serve":
         return _serve(stdio=args.stdio, http=args.http)
+
+    if args.command == "hash-password":
+        return _run_hash_password()
 
     if args.command == "token":
         if args.subcommand == "create":
@@ -363,7 +370,21 @@ def _build_parser() -> argparse.ArgumentParser:
     token_revoke_parser = token_subparsers.add_parser("revoke", help="revoke a token by name")
     token_revoke_parser.add_argument("name", help="the token's name, as passed to 'token create'")
 
+    subparsers.add_parser(
+        "hash-password",
+        help="hash a password from stdin into an ADMIN_PASSWORD_HASH value (ADR-0004 L1)",
+    )
+
     return parser
+
+
+def _run_hash_password() -> int:
+    password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        print("hash-password: no password read from stdin", file=sys.stderr)
+        return 2
+    print(hash_password(password))
+    return 0
 
 
 def _run_doctor_command(vault: str | None) -> int:
@@ -821,14 +842,24 @@ async def _serve_http() -> int:
             _ALLOW_UNAUTHENTICATED_ENV,
         )
 
-    app = create_app(lambda: open_services(os.environ), config)
+    authenticator = build_authenticator(config, os.environ)
+    app = create_app(lambda: open_services(os.environ), config, authenticator=authenticator)
     uvicorn_config = uvicorn.Config(
         app,
         host=config.host,
         port=config.port,
         log_config=None,
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        # `ServerConfig.forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default
+        # `127.0.0.1`, #39) - which proxy hop uvicorn's own
+        # `ProxyHeadersMiddleware` trusts `X-Forwarded-For` from before
+        # rewriting `scope["client"]`. That value is what `http.py`'s
+        # `_LimitsMiddleware` keys its IP-based rate limits on (and what
+        # `_vault_webhook`'s signature check logs as the caller); trusting
+        # every hop (the old hardcoded `"*"`) would let a request spoof
+        # `X-Forwarded-For` to pick its own rate-limit bucket, or collapse
+        # every client behind a real proxy onto that proxy's one bucket.
+        forwarded_allow_ips=config.forwarded_allow_ips,
     )
     server = uvicorn.Server(uvicorn_config)
     await server.serve()

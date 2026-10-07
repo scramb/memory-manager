@@ -110,7 +110,10 @@ async def test_readyz_is_503_when_the_database_is_unreachable(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:
     environ = {**_environ(bare_remote, tmp_path), "DATABASE_URL": test_database_url}
-    config = ServerConfig()
+    # DATABASE_URL set turns bearer-token auth on (#34), which requires
+    # PUBLIC_URL (#35, ADR-0004) - unrelated to what this test checks, but
+    # needed for the app to start at all.
+    config = ServerConfig(public_url="https://mm.example.test")
     async with _running_app(environ, config) as (app, client):
         await app.state.services.pool.close()
         response = await client.get(READY_PATH)

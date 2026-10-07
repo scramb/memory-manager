@@ -108,11 +108,11 @@ Goal: Streamable HTTP with OAuth, verified as a claude.ai custom connector.
 
 ### WP-11 — OAuth · Branch: `wp/11-oauth`
 
-- [ ] #35 Protected Resource Metadata + `WWW-Authenticate` challenge
-- [ ] #36 Embedded authorization server per ADR-0004: AS metadata, DCR, PKCE S256 only, audience check, rotating refresh, revocation
-- [ ] #37 Login at `/authorize`: upstream OIDC and admin-password modes
-- [ ] #38 CIMD support (advertise + fetch client metadata documents with SSRF guards)
-- [ ] #39 Rate limits per token/client, request/file size caps, audit log for every write
+- [x] #35 Protected Resource Metadata + `WWW-Authenticate` challenge
+- [x] #36 Embedded authorization server per ADR-0004: AS metadata, DCR, PKCE S256 only, audience check, rotating refresh, revocation
+- [x] #37 Login at `/authorize`: upstream OIDC and admin-password modes
+- [x] #38 CIMD support (advertise + fetch client metadata documents with SSRF guards)
+- [x] #39 Rate limits per token/client, request/file size caps, audit log for every write
 - [ ] #40 Manual verification: claude.ai custom connector + `claude mcp add --transport http`, documented
 
 ---

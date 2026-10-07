@@ -21,6 +21,7 @@ __all__ = [
     "ServerConfigError",
     "VaultConfig",
     "VaultConfigError",
+    "canonical_resource_url",
 ]
 
 _DEFAULT_BRANCH = "main"
@@ -33,6 +34,21 @@ _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8080
 _DEFAULT_MCP_PATH = "/mcp"
 _FALSY_BOOL_ENV = frozenset({"0", "false", "no", "off", ""})
+
+# Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
+# "burst" is the token bucket's capacity - how many calls a key can make
+# back-to-back before the per-minute rate takes over. See `ServerConfig`'s
+# docstring for which route class each pair gates.
+_DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
+_DEFAULT_MCP_PER_MINUTE = 120.0
+_DEFAULT_MCP_BURST = 30.0
+_DEFAULT_WRITE_PER_MINUTE = 30.0
+_DEFAULT_WRITE_BURST = 10.0
+_DEFAULT_OAUTH_PER_MINUTE = 30.0
+_DEFAULT_OAUTH_BURST = 10.0
+_DEFAULT_WEBHOOK_PER_MINUTE = 30.0
+_DEFAULT_WEBHOOK_BURST = 10.0
+_DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
 
 
 class VaultConfigError(ValueError):
@@ -176,6 +192,66 @@ class ServerConfig:
     header is checked against - `ALLOWED_ORIGINS` plus `public_url`'s own
     origin, never just the raw `ALLOWED_ORIGINS` env value - so `http.py`
     never has to re-derive it.
+
+    `login_mode` (`LOGIN_MODE`) names which `auth.login.Authenticator` the
+    embedded OAuth authorization server should log a human in with
+    (ADR-0004's L1/L2 - a single admin password or upstream OIDC). Neither
+    is implemented yet (#37): `http.py` only ever enables the authorization
+    server when it is handed an `Authenticator` directly (currently true
+    only in tests, via `create_app`'s `authenticator` parameter), and raises
+    `ServerConfigError` on startup if `login_mode` is set without one - a
+    clear refusal rather than silently running with no OAuth login at all.
+    `login_mode` unset is not an error: it means "no OAuth authorization
+    server", the same static-tokens-only behaviour this server already had
+    before #36.
+
+    `oauth_client_secret_key` (`OAUTH_CLIENT_SECRET_KEY`) is the Fernet key
+    `auth.store.ClientSecretCipher` encrypts a DCR client's `client_secret`
+    with at rest (see that module's docstring for why it is encrypted, not
+    hashed, unlike every other OAuth secret). Required only once the OAuth
+    authorization server actually turns on (`http.py`, same condition as
+    `public_url` above) - `http.py` raises `ServerConfigError` naming it if
+    it is missing then, never falls back to running without it.
+
+    `cimd_enabled` (`CIMD_ENABLED`, default on) turns Client ID Metadata
+    Document registration (SEP-991, #38) on or off alongside DCR: `http.py`
+    only builds a `cimd.ClientMetadataFetcher` for `auth.provider.
+    MemoryManagerOAuthProvider` when this is true, and the AS metadata
+    document (`auth.metadata`) only advertises `client_id_metadata_document_
+    supported`/`"none"` then too. Off has no effect on DCR, which is
+    unconditional once the OAuth authorization server is enabled at all.
+
+    `max_request_bytes` (`MAX_REQUEST_BYTES`) is `http.py`'s body-size cap on
+    `mcp_path` (#39) - the note-file cap (16 KiB) is a separate, later check
+    in `vault.validate`; this one exists so a request body is never buffered
+    past this many bytes in the first place, counted as bytes actually
+    received rather than trusted from `Content-Length`.
+
+    `mcp_per_minute`/`mcp_burst`, `write_per_minute`/`write_burst`,
+    `oauth_per_minute`/`oauth_burst` and `webhook_per_minute`/`webhook_burst`
+    (`RATE_LIMIT_MCP_PER_MINUTE`/`RATE_LIMIT_MCP_BURST`/... ) feed one
+    `auth.ratelimit.RateLimiter` each (#39), all built once in `http.py`'s
+    `create_app`: every request to `mcp_path` against the `mcp_*` pair,
+    keyed by the hashed bearer token (or the client IP, unauthenticated);
+    every `memory_write`/`memory_edit`/`memory_supersede`/`memory_archive`
+    tool call *additionally* against the tighter `write_*` pair, same key;
+    every request to `/register`/`/token`/`/authorize` against `oauth_*`,
+    keyed by client IP; every request to the vault webhook against
+    `webhook_*`, keyed by client IP. A key over its limit gets a 429 with
+    `Retry-After`.
+
+    `forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) names
+    the proxy IPs/CIDRs this server should trust `X-Forwarded-For` from when
+    picking the "client IP" the limits above key on - the same semantics as
+    uvicorn's own `forwarded_allow_ips`, which is where this is actually
+    enforced: `cli.py`'s `_serve_http` passes this value straight into
+    `uvicorn.Config(forwarded_allow_ips=...)`, so by the time an ASGI app
+    (this one included) sees `scope["client"]`, uvicorn's own
+    `ProxyHeadersMiddleware` has already rewritten it from `X-Forwarded-For`
+    if (and only if) the request came from one of these. Trusting every hop
+    (`"*"`, this field's pre-#39 default) would let any caller spoof
+    `X-Forwarded-For` to pick its own rate-limit bucket, or collapse every
+    real client behind a reverse proxy onto that proxy's one bucket.
     """
 
     host: str = _DEFAULT_HOST
@@ -185,26 +261,55 @@ class ServerConfig:
     allowed_origins: tuple[str, ...] = ()
     webhook_secret: str | None = field(default=None, repr=False)
     json_response: bool = True
+    login_mode: str | None = None
+    oauth_client_secret_key: str | None = field(default=None, repr=False)
+    cimd_enabled: bool = True
+    max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES
+    mcp_per_minute: float = _DEFAULT_MCP_PER_MINUTE
+    mcp_burst: float = _DEFAULT_MCP_BURST
+    write_per_minute: float = _DEFAULT_WRITE_PER_MINUTE
+    write_burst: float = _DEFAULT_WRITE_BURST
+    oauth_per_minute: float = _DEFAULT_OAUTH_PER_MINUTE
+    oauth_burst: float = _DEFAULT_OAUTH_BURST
+    webhook_per_minute: float = _DEFAULT_WEBHOOK_PER_MINUTE
+    webhook_burst: float = _DEFAULT_WEBHOOK_BURST
+    forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
 
     def resource_url(self) -> str:
-        """The MCP server's own URL, for `AuthSettings.resource_server_url`/`issuer_url`.
+        """The MCP server's own canonical URL (RFC 8707 "resource"), for
+        `AuthSettings.resource_server_url` and Protected Resource Metadata's
+        `resource` field (ADR-0004, #35).
 
-        `public_url` when set (the operator's own canonical URL - ADR-0004
-        requires it match exactly what a client is told); `http://{host}:{port}`
-        otherwise, so bearer-token auth (#34) can still turn on with nothing
-        beyond `DATABASE_URL` configured (there is no real authorization
-        server behind `issuer_url` yet, #35/#36 - this value is metadata, not
-        a reachable endpoint, until then).
+        Always `canonical_resource_url(public_url, mcp_path)` - a client is
+        told this exact value and must send it back unchanged as the RFC 8707
+        `resource` indicator, so it can never be derived from a request's
+        `Host` header (attacker- or proxy-controlled) or guessed from
+        `host`/`port` (not necessarily the externally reachable address).
+
+        Raises `ServerConfigError` if `public_url` is unset. This is only
+        ever called once bearer-token auth is turning on (`http.py`'s
+        lifespan, exactly when `services.pool is not None` - #34/ADR-0004),
+        so that is also where this enforces "`PUBLIC_URL` is required when
+        auth is enabled" - there is no safe default to invent instead.
         """
-        return self.public_url or f"http://{self.host}:{self.port}"
+        if self.public_url is None:
+            raise ServerConfigError(
+                "PUBLIC_URL is required once bearer-token auth is enabled "
+                "(DATABASE_URL is set): the canonical resource URL (ADR-0004) must "
+                "never be derived from a request's Host header; set PUBLIC_URL to "
+                "this server's externally reachable origin, e.g. https://memory.example.com"
+            )
+        return canonical_resource_url(self.public_url, self.mcp_path)
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
-        `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE` entries of `environ`.
+        `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
-        variable if `PORT` is not a valid port number.
+        variable if `PORT` is not a valid port number, or any size/rate
+        limit is not a positive number.
         """
         host = environ.get("HOST", _DEFAULT_HOST)
         port = _parse_port(environ.get("PORT"))
@@ -213,6 +318,31 @@ class ServerConfig:
         allowed_origins = _resolve_allowed_origins(environ.get("ALLOWED_ORIGINS"), public_url)
         webhook_secret = environ.get("VAULT_WEBHOOK_SECRET") or None
         json_response = _parse_bool(environ.get("MCP_JSON_RESPONSE"), default=True)
+        login_mode = environ.get("LOGIN_MODE") or None
+        oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
+        cimd_enabled = _parse_bool(environ.get("CIMD_ENABLED"), default=True)
+        max_request_bytes = _parse_positive_int(
+            environ, "MAX_REQUEST_BYTES", _DEFAULT_MAX_REQUEST_BYTES
+        )
+        mcp_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_MCP_PER_MINUTE", _DEFAULT_MCP_PER_MINUTE
+        )
+        mcp_burst = _parse_positive_float(environ, "RATE_LIMIT_MCP_BURST", _DEFAULT_MCP_BURST)
+        write_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_WRITE_PER_MINUTE", _DEFAULT_WRITE_PER_MINUTE
+        )
+        write_burst = _parse_positive_float(environ, "RATE_LIMIT_WRITE_BURST", _DEFAULT_WRITE_BURST)
+        oauth_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_OAUTH_PER_MINUTE", _DEFAULT_OAUTH_PER_MINUTE
+        )
+        oauth_burst = _parse_positive_float(environ, "RATE_LIMIT_OAUTH_BURST", _DEFAULT_OAUTH_BURST)
+        webhook_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_WEBHOOK_PER_MINUTE", _DEFAULT_WEBHOOK_PER_MINUTE
+        )
+        webhook_burst = _parse_positive_float(
+            environ, "RATE_LIMIT_WEBHOOK_BURST", _DEFAULT_WEBHOOK_BURST
+        )
+        forwarded_allow_ips = environ.get("FORWARDED_ALLOW_IPS") or _DEFAULT_FORWARDED_ALLOW_IPS
 
         return cls(
             host=host,
@@ -222,6 +352,19 @@ class ServerConfig:
             allowed_origins=allowed_origins,
             webhook_secret=webhook_secret,
             json_response=json_response,
+            login_mode=login_mode,
+            oauth_client_secret_key=oauth_client_secret_key,
+            cimd_enabled=cimd_enabled,
+            max_request_bytes=max_request_bytes,
+            mcp_per_minute=mcp_per_minute,
+            mcp_burst=mcp_burst,
+            write_per_minute=write_per_minute,
+            write_burst=write_burst,
+            oauth_per_minute=oauth_per_minute,
+            oauth_burst=oauth_burst,
+            webhook_per_minute=webhook_per_minute,
+            webhook_burst=webhook_burst,
+            forwarded_allow_ips=forwarded_allow_ips,
         )
 
 
@@ -235,6 +378,32 @@ def _parse_port(raw: str | None) -> int:
     if not 1 <= port <= 65535:
         raise ServerConfigError(f"PORT must be between 1 and 65535, got {port}")
     return port
+
+
+def _parse_positive_int(environ: dict[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _parse_positive_float(environ: dict[str, str], name: str, default: float) -> float:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
 
 
 def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[str, ...]:
@@ -253,6 +422,37 @@ def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[s
 def _origin_of(url: str) -> str:
     parsed = urlsplit(url)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def canonical_resource_url(public_url: str, path: str) -> str:
+    """`public_url` plus `path`, normalized to the canonical form clients compare
+    against byte-for-byte (RFC 8707 `resource`; docs/research/mcp-auth-and-connectors.md
+    §3: "lowercase scheme/host, no trailing slash").
+
+    - scheme and host lowercased (`urlsplit().hostname` already lowercases; the
+      scheme is lowercased here too)
+    - the default port for the scheme (`:443` for `https`, `:80` for `http`) is
+      dropped; any other port is kept
+    - `path` is normalized to exactly one leading slash and no trailing slash,
+      regardless of how many slashes it arrived with - except the empty string,
+      which stays empty: `canonical_resource_url(public_url, "")` is the bare
+      origin (no path at all), used for the AS issuer (ADR-0004: "the issuer =
+      canonical origin"), as opposed to `canonical_resource_url(public_url,
+      mcp_path)` for the resource URL itself, which always has a path
+    - any path, query or fragment already present on `public_url` itself is
+      dropped - `PUBLIC_URL` is documented as the origin only (ADR-0004: "`PUBLIC_URL`
+      + `MCP_PATH` is canonicalised once at startup"), so `path` is the single
+      source of truth for what comes after the origin
+    """
+    parsed = urlsplit(public_url)
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname or ""
+    port = parsed.port
+    default_port = {"https": 443, "http": 80}.get(scheme)
+    netloc = hostname if port is None or port == default_port else f"{hostname}:{port}"
+    stripped_path = path.strip("/")
+    normalized_path = f"/{stripped_path}" if stripped_path else ""
+    return f"{scheme}://{netloc}{normalized_path}"
 
 
 def _parse_bool(raw: str | None, *, default: bool) -> bool:

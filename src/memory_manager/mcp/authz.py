@@ -9,9 +9,15 @@ narrow to. Both are derived from the calling request's access token -
 contextvar the HTTP transport's `AuthContextMiddleware` sets per request
 (`http.py`); stdio mode never runs that middleware, so there `ctx` is
 unused and every call reads/writes as unrestricted, exactly as before #34.
-A token's namespaces live in `AccessToken.claims["namespaces"]`
-(`memory_manager.auth.verifier.StaticTokenVerifier`); `("*",)` there means
-"every namespace", the same literal `memory_manager.auth.tokens` uses.
+A token's namespaces live in `AccessToken.claims["namespaces"]`, for a
+static token (`memory_manager.auth.verifier.StaticTokenVerifier`) and an
+OAuth access token (`memory_manager.auth.provider.
+MemoryManagerOAuthProvider.load_access_token`, #36) alike - this module
+never needs to tell the two apart. `("*",)` there means "every namespace",
+the same literal `memory_manager.auth.tokens` uses; an OAuth token's
+namespaces are whatever `auth.login`'s `Authenticator` passed to
+`complete_authorization`, so `("*",)` never occurs for one in practice, but
+is read the same way if it ever does.
 
 `restrict_namespaces` folds a tool's own `namespaces` argument together
 with what `readable_namespaces` allows, so `mcp/server.py` only has to call

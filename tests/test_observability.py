@@ -45,6 +45,7 @@ from memory_manager.observability.metrics import (
 
 _NOTE_PATH = "personal/fact/a.md"
 _WEBHOOK_SECRET = "s3cr3t"  # noqa: S105 - test fixture value, not a real secret
+_PUBLIC_URL = "https://mm.example.test"
 
 
 def _note_content(body: str = "Body.\n") -> str:
@@ -186,7 +187,7 @@ async def test_search_duration_is_recorded_with_a_database(
 ) -> None:
     import asyncpg
 
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     environ = _environ(bare_remote, tmp_path, DATABASE_URL=test_database_url)
     async with _running_app(environ, config) as app:
         pool = await asyncpg.create_pool(test_database_url)
@@ -347,7 +348,7 @@ async def test_no_token_or_note_content_in_logs_during_an_authenticated_write(
 ) -> None:
     import asyncpg
 
-    config = ServerConfig()
+    config = ServerConfig(public_url=_PUBLIC_URL)
     environ = _environ(bare_remote, tmp_path, DATABASE_URL=test_database_url)
     marker = "wp12-note-body-marker-9f8e7d6c5b4a"
 
