@@ -232,4 +232,4 @@ curl -s -o /dev/null -w '%{http_code}\n' https://memory.example.com/mcp   # 401 
 - [`deploy/README.md`](../../deploy/README.md) - "Checks" and "Webhook setup" sections this guide's
   own verification and webhook notes mirror.
 
-**Verified: not yet - tracked in #47**
+**Verified: not live.** The commands were checked against cloudflared 2026.10.0 and the Cloudflare docs (2026-10-07). The reference deployment uses a Cloudflare-proxied gateway instead of a tunnel, so the owner closed #47 without a live tunnel run.

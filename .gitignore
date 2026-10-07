@@ -9,3 +9,4 @@ htmlcov/
 dist/
 *.egg-info/
 .venv/
+.claude/worktrees/

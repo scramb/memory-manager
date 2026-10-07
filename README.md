@@ -89,6 +89,8 @@ podman compose down -v
 
 ## Connect
 
+Remote setup for both clients (OAuth, verified 2026-10-07): [`docs/guides/remote-connect.md`](./docs/guides/remote-connect.md).
+
 - **Claude Code**: see [`docs/guides/claude-code.md`](./docs/guides/claude-code.md) for the
   stdio transport (`claude mcp add`) and the environment variables the server reads.
 - **claude.ai**: add memory-manager as a custom connector under *Settings → Connectors → Add
