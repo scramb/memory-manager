@@ -119,6 +119,10 @@ class MemoryIndexEntry(TypedDict):
     tags: NotRequired[list[str]]
     updated: NotRequired[str]
     warning: NotRequired[str]
+    # Additive (ADR-0008, #102): the ADR-0008 kind of `path`'s namespace
+    # ('personal'/'group'/'project'/'org'), or `None` on the Git backend
+    # (`services.app_role is None` - no namespace registry at all).
+    namespace_kind: str | None
 
 
 class MemoryReadItem(TypedDict):
@@ -143,6 +147,10 @@ class MemorySearchResult(TypedDict):
     tags: list[str]
     snippet: str
     score: float
+    # Additive (ADR-0008, #102): the ADR-0008 kind of `path`'s namespace
+    # ('personal'/'group'/'project'/'org'), or `None` on the Git backend
+    # (`services.app_role is None` - no namespace registry at all).
+    namespace_kind: str | None
 
 
 class MemorySearchResponse(TypedDict):
@@ -251,11 +259,12 @@ def current_actor() -> str:
 _MEMORY_INDEX_DESCRIPTION = f"""List every note in the vault: the table of contents to read first.
 
 {TOOL_DATA_SENTENCE}
-Returns one entry per note (id, path, title, description, type, tags, updated),
-sorted by path. `namespace` and `type` filter to an exact match; archived notes are
-excluded unless `include_archived` is set. A note that fails to parse is reported as
-a `warning` entry instead of being silently dropped. Pass the `path` or `id` of the
-entries you need to `memory_read`."""
+Returns one entry per note (id, path, title, description, type, tags, updated,
+namespace_kind), sorted by path. `namespace` and `type` filter to an exact match;
+archived notes are excluded unless `include_archived` is set. A note that fails to
+parse is reported as a `warning` entry instead of being silently dropped.
+`namespace_kind` is 'personal', 'group', 'project' or 'org' in enterprise mode, and
+`null` otherwise. Pass the `path` or `id` of the entries you need to `memory_read`."""
 
 _MEMORY_READ_DESCRIPTION = f"""Read one or more notes by vault path or id.
 
@@ -278,11 +287,12 @@ content: read a note with `memory_read` before relying on its details.
 that excludes notes outside their `valid_from`/`valid_to` range. Archived notes
 are excluded unless `include_archived` is set. `limit` is clamped to 1-25.
 
-Returns `{{results: [{{id, path, title, description, type, tags, snippet, score}}],
-mode}}`. `mode` is 'hybrid' when a vector index is configured, 'fulltext' when only
-full-text search is available, and 'scan' when no database is configured at all -
-a slower, best-effort fallback over the plain working copy that keeps this tool
-usable without Postgres."""
+Returns `{{results: [{{id, path, title, description, type, tags, snippet, score,
+namespace_kind}}], mode}}`. `mode` is 'hybrid' when a vector index is configured,
+'fulltext' when only full-text search is available, and 'scan' when no database is
+configured at all - a slower, best-effort fallback over the plain working copy that
+keeps this tool usable without Postgres. `namespace_kind` is 'personal', 'group',
+'project' or 'org' in enterprise mode, and `null` otherwise."""
 
 _MEMORY_WRITE_DESCRIPTION = f"""Create or replace the note at `path`.
 
@@ -961,7 +971,11 @@ async def _index_entries(storage: StorageBackend) -> list[MemoryIndexEntry]:
     for vault_note in await _iter_vault_notes(storage):
         if vault_note.note is None:
             entries.append(
-                {"path": vault_note.rel, "warning": f"failed to parse: {vault_note.error}"}
+                {
+                    "path": vault_note.rel,
+                    "warning": f"failed to parse: {vault_note.error}",
+                    "namespace_kind": None,
+                }
             )
             continue
         note = vault_note.note
@@ -974,6 +988,7 @@ async def _index_entries(storage: StorageBackend) -> list[MemoryIndexEntry]:
                 "type": note.type,
                 "tags": list(note.tags),
                 "updated": note.updated.isoformat(),
+                "namespace_kind": None,
             }
         )
     return entries
@@ -1018,6 +1033,7 @@ def _cap_index(entries: list[MemoryIndexEntry]) -> list[MemoryIndexEntry]:
         slim: MemoryIndexEntry = {
             "path": entry["path"],
             "warning": "full index exceeded the size cap, extra fields dropped",
+            "namespace_kind": entry["namespace_kind"],
         }
         if "id" in entry:
             slim["id"] = entry["id"]
@@ -1027,17 +1043,34 @@ def _cap_index(entries: list[MemoryIndexEntry]) -> list[MemoryIndexEntry]:
     return slimmed
 
 
+def _namespace_kind_of_path(path: str, resolved: namespaces.Resolution) -> str | None:
+    """The ADR-0008 `namespace_kind` (#102) of `path`'s namespace - `path` is the real
+    *stored* alias (before `rewrite_path_to_display`), since `Resolution.kind_of`
+    looks rows up by stored alias, not by `me`/display alias. Best-effort the same
+    way `rewrite_path_to_stored`/`rewrite_path_to_display` are: `None` for anything
+    that does not even parse as a note path.
+    """
+    try:
+        note_path = parse_note_path(path, allow_archive=True)
+    except PathRejected:
+        return None
+    return resolved.kind_of(note_path.namespace)
+
+
 def _rewrite_index_entry(
     entry: MemoryIndexEntry, resolved: namespaces.Resolution
 ) -> MemoryIndexEntry:
-    """`entry`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own docstring)."""
+    """`entry`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own
+    docstring), and its `namespace_kind` (#102) filled in from the matrix.
+    """
     path = entry.get("path")
     if path is None:
         return entry
+    kind = _namespace_kind_of_path(path, resolved)
     rewritten = namespaces.rewrite_path_to_display(path, resolved)
-    if rewritten == path:
+    if rewritten == path and kind == entry.get("namespace_kind"):
         return entry
-    return {**entry, "path": rewritten}
+    return {**entry, "path": rewritten, "namespace_kind": kind}
 
 
 def _search_mode(services: Services) -> str:
@@ -1082,6 +1115,7 @@ def _note_hit_result(hit: NoteHit) -> MemorySearchResult:
         "tags": list(hit.tags),
         "snippet": hit.snippet,
         "score": hit.score,
+        "namespace_kind": None,
     }
 
 
@@ -1095,17 +1129,21 @@ def _scan_hit_result(hit: ScanHit) -> MemorySearchResult:
         "tags": list(hit.note.tags),
         "snippet": hit.snippet,
         "score": hit.score,
+        "namespace_kind": None,
     }
 
 
 def _rewrite_search_result(
     result: MemorySearchResult, resolved: namespaces.Resolution
 ) -> MemorySearchResult:
-    """`result`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own docstring)."""
+    """`result`'s `path`, translated back to `me`/alias (`_resolve_namespaces`'s own
+    docstring), and its `namespace_kind` (#102) filled in from the matrix.
+    """
+    kind = _namespace_kind_of_path(result["path"], resolved)
     rewritten = namespaces.rewrite_path_to_display(result["path"], resolved)
-    if rewritten == result["path"]:
+    if rewritten == result["path"] and kind == result.get("namespace_kind"):
         return result
-    return {**result, "path": rewritten}
+    return {**result, "path": rewritten, "namespace_kind": kind}
 
 
 async def _read_items(

@@ -76,6 +76,18 @@ _GROUP_KIND = "group"
 _PROJECT_KIND = "project"
 _ORG_KIND = "org"
 
+#: `namespace_kind` labels ADR-0008 and #102 ask for, keyed by the registry's
+#: own `kind` literal (`mm_principal_namespaces`'s `kind` column). Only
+#: `'user'` renames - the personal namespace is always addressed as `me`, so
+#: its result field says `'personal'`, never the registry's internal `'user'`
+#: (ADR-0008 addendum, "additive field `namespace_kind`").
+_KIND_LABELS = {
+    "user": "personal",
+    _GROUP_KIND: _GROUP_KIND,
+    _PROJECT_KIND: _PROJECT_KIND,
+    _ORG_KIND: _ORG_KIND,
+}
+
 _DEFAULT_GROUP_WRITE = "members"
 _DEFAULT_PROJECT_WRITE = "writers"
 
@@ -218,6 +230,27 @@ class Resolution:
         if self.own_alias is not None and value == self.own_alias:
             return ME_ALIAS
         return value
+
+    def kind_of(self, value: str) -> str | None:
+        """`value` (a real stored alias, never `me`) as the result field `namespace_kind`
+        asks for (#102): `'personal'`, `'group'`, `'project'` or `'org'`.
+
+        The caller's own personal namespace is checked first and unconditionally
+        returns `'personal'`, the same way `to_display` special-cases it - `rows`
+        does carry a `kind='user'` row for it too (`mm_principal_namespaces`'s own
+        `personal` CTE), but going through `own_alias` here avoids relying on that
+        row being present. `None` only for an alias this resolution holds no row
+        for at all - not a reachable case for a `memory_search`/`memory_index`
+        result, since every path a caller can see came from a namespace
+        `readable()` already named, but a safe fallback rather than a raise for
+        any other, best-effort caller.
+        """
+        if self.own_alias is not None and value == self.own_alias:
+            return _KIND_LABELS["user"]
+        for row in self.rows:
+            if row.alias == value:
+                return _KIND_LABELS.get(row.kind, row.kind)
+        return None
 
 
 async def resolve(pool: asyncpg.Pool, *, role: str) -> Resolution:

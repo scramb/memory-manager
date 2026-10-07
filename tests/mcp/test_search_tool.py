@@ -108,7 +108,17 @@ async def test_memory_search_with_database_ranks_by_relevance(services_with_db: 
 
     top = payload["results"][0]
     assert top["title"] == "Giraffe Habits"
-    assert set(top) == {"id", "path", "title", "description", "type", "tags", "snippet", "score"}
+    assert set(top) == {
+        "id",
+        "path",
+        "title",
+        "description",
+        "type",
+        "tags",
+        "snippet",
+        "score",
+        "namespace_kind",
+    }
 
 
 async def test_memory_search_with_database_filters_by_type_tags_and_namespace(
