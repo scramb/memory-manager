@@ -53,16 +53,28 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Literal, NoReturn
+from typing import NoReturn
 
 from memory_manager.observability.metrics import QUEUE_DEPTH, record_queue_write
+from memory_manager.storage import rules
+from memory_manager.storage.base import (
+    EditMismatch,
+    InvalidNote,
+    NotFound,
+    Op,
+    SecretRejected,
+    VersionConflict,
+    WriteConflict,
+    WriteError,
+    WriteFailed,
+    WriteRequest,
+    WriteResult,
+)
 from memory_manager.vault.git import GitError, PushRejected
-from memory_manager.vault.note import NoteFormatError, parse, serialize, version
+from memory_manager.vault.note import version
 from memory_manager.vault.paths import PathRejected, conflict_path, parse_note_path
 from memory_manager.vault.repo import Repo, author_for
-from memory_manager.vault.secrets import SecretFound, check
 from memory_manager.vault.sync import ChangeSet
-from memory_manager.vault.validate import NoteInvalid, validate, validate_bytes
 
 __all__ = [
     "AuditHook",
@@ -84,201 +96,7 @@ __all__ = [
 
 _logger = logging.getLogger(__name__)
 
-_NEW = "new"
 _MAX_PUSH_ATTEMPTS = 3
-
-Op = Literal["write", "edit", "archive", "supersede"]
-
-
-@dataclass(frozen=True)
-class WriteRequest:
-    """One write submitted to the queue.
-
-    `if_version` is either the sha256 `vault.note.version` of the content
-    the caller last saw, or the literal `"new"` meaning `path` must not
-    exist yet. `content` is used by `write`; `old_str`/`new_str` by `edit`;
-    `archive` needs neither. `supersede` keeps `path` pointing at the old
-    note (`if_version` is its current version) and uses `new_path`/`content`
-    for the new note that replaces it - the two end up in one commit (#19).
-    `message` overrides the default commit message (`"<op> <path>"`).
-    """
-
-    op: Op
-    path: str
-    client: str
-    if_version: str
-    content: bytes | None = None
-    old_str: str | None = None
-    new_str: str | None = None
-    new_path: str | None = None
-    message: str | None = None
-    #: The caller's identity for the audit log (#39): an OAuth access token's
-    #: subject, a static token's name, or `"stdio"` for a local session with
-    #: no token at all (`memory_manager.mcp.server.current_actor`'s default,
-    #: and this field's). Distinct from `client`, which is the *committer*
-    #: label `vault.repo.author_for` commits as - `actor` is who asked,
-    #: `client` is who the commit says did it.
-    actor: str = "stdio"
-
-
-@dataclass(frozen=True)
-class WriteResult:
-    """What a successful write produced: where, at what version, in which commit.
-
-    `related` is set only by `supersede`: the old note's new path mapped to
-    its new version, for a caller that needs to report both notes' state
-    from one result.
-    """
-
-    path: str
-    version: str
-    commit: str
-    related: dict[str, str] | None = None
-
-
-class WriteError(Exception):
-    """Base class for every error `WriteQueue.submit` can raise.
-
-    `to_dict()` is the shape an MCP tool result reports back to a client
-    (#18/#19 wire this up); every subclass extends it with whatever extra
-    fields its error carries.
-    """
-
-    def to_dict(self) -> dict[str, object]:
-        return {"error": type(self).__name__, "message": str(self)}
-
-
-class VersionConflict(WriteError):
-    """`if_version` did not match the current content at `path`.
-
-    `current_version`/`current_content` are `None` exactly when the file
-    does not exist at all - the caller asked for a version check against a
-    path that was never (or no longer) there.
-    """
-
-    def __init__(self, path: str, current_version: str | None, current_content: str | None) -> None:
-        self.path = path
-        self.current_version = current_version
-        self.current_content = current_content
-        if current_version is None:
-            message = f"'{path}' does not exist, use if_version 'new' to create it"
-        else:
-            message = f"'{path}' has moved to version {current_version}, if_version is stale"
-        super().__init__(message)
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        result["current_version"] = self.current_version
-        result["current_content"] = self.current_content
-        return result
-
-
-class WriteConflict(WriteError):
-    """A push was rejected and rebasing it onto the remote conflicted.
-
-    Nothing was overwritten: the local commit was discarded and the remote
-    note is unchanged. Both the rejected write and the remote's current
-    version are preserved at `conflict_path` for a human to resolve.
-    `current_version`/`current_content` describe the remote's current state
-    the same way `VersionConflict` does - `None` exactly when the remote
-    side no longer has the note (it was deleted there).
-    """
-
-    def __init__(
-        self,
-        path: str,
-        conflict_path: str,
-        current_version: str | None,
-        current_content: str | None,
-    ) -> None:
-        self.path = path
-        self.conflict_path = conflict_path
-        self.current_version = current_version
-        self.current_content = current_content
-        super().__init__(
-            f"'{path}' could not be written: it changed on the remote at the same "
-            f"time, see '{conflict_path}'"
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        result["conflict_path"] = self.conflict_path
-        result["current_version"] = self.current_version
-        result["current_content"] = self.current_content
-        return result
-
-
-class NotFound(WriteError):
-    """`path` does not exist, for an operation that requires it to (archive)."""
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        super().__init__(f"'{path}' does not exist")
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        return result
-
-
-class EditMismatch(WriteError):
-    """An `edit`'s `old_str` occurred zero or more than one time."""
-
-    def __init__(self, path: str, count: int) -> None:
-        self.path = path
-        self.count = count
-        super().__init__(f"old_str occurs {count} times in '{path}', must occur exactly once")
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        result["count"] = self.count
-        return result
-
-
-class InvalidNote(WriteError):
-    """The note bytes a write would produce violate ADR-0005 or the path rules.
-
-    Wraps the message of a `NoteFormatError`, `NoteInvalid` or `PathRejected`
-    raised while validating a write, or a queue-level rule such as "id must
-    not change" or "archive target exists".
-    """
-
-    def __init__(self, path: str, message: str) -> None:
-        self.path = path
-        super().__init__(f"'{path}' is invalid: {message}")
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        return result
-
-
-class SecretRejected(WriteError):
-    """The note text a write would produce looks like it contains a secret."""
-
-    def __init__(self, path: str, message: str) -> None:
-        self.path = path
-        super().__init__(f"'{path}' rejected: {message}")
-
-    def to_dict(self) -> dict[str, object]:
-        result = super().to_dict()
-        result["path"] = self.path
-        return result
-
-
-class WriteFailed(WriteError):
-    """A git operation failed, or a push the remote kept rejecting.
-
-    A single rejected push is retried through a rebase (see `WriteConflict`
-    for the case where that rebase conflicts); this is raised when the
-    rebase itself fails for a reason other than a conflict, when the remote
-    keeps moving faster than `_MAX_PUSH_ATTEMPTS` retries can catch up, or
-    for any other git error. Either way the local clone is reset to the
-    remote before this is raised, so it never carries an unpushed commit.
-    """
 
 
 WriteHook = Callable[["WriteResult", "WriteRequest", tuple[str, ...]], Awaitable[None]]
@@ -500,7 +318,7 @@ class WriteQueue:
             raise InvalidNote(request.path, str(exc)) from exc
 
         current_version = version(current) if current is not None else None
-        _check_version(request, current_version, current)
+        rules.check_version(request, current_version, current)
 
         if request.op == "archive":
             result, changed_paths = await self._do_archive(request, current)
@@ -521,33 +339,9 @@ class WriteQueue:
     async def _do_write_or_edit(
         self, request: WriteRequest, current: bytes | None
     ) -> tuple[WriteResult, tuple[str, ...]]:
-        new_bytes = _new_content(request, current)
-
-        try:
-            note_path = parse_note_path(request.path)
-        except PathRejected as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-
-        try:
-            parsed = validate_bytes(new_bytes, expected_type=note_path.type)
-        except (NoteFormatError, NoteInvalid) as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-
-        if current is not None:
-            try:
-                current_note = parse(current)
-            except NoteFormatError as exc:
-                raise InvalidNote(request.path, str(exc)) from exc
-            if current_note.id != parsed.id:
-                raise InvalidNote(request.path, "id must not change")
-
-        try:
-            check(new_bytes.decode("utf-8"))
-        except SecretFound as exc:
-            raise SecretRejected(request.path, str(exc)) from exc
-
-        canonical = serialize(parsed)
-        final_bytes = new_bytes if new_bytes == canonical else canonical
+        final_bytes = rules.prepare_write_or_edit(
+            request.op, request.path, request.content, request.old_str, request.new_str, current
+        )
 
         message = request.message or f"{request.op} {request.path}"
         author = author_for(request.client)
@@ -567,28 +361,18 @@ class WriteQueue:
         if current is None:
             raise NotFound(request.path)
 
-        try:
-            note_path = parse_note_path(request.path)
-        except PathRejected as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-
+        note_path = rules.parse_note_path_or_raise(request.path)
         archive_rel = note_path.archive_path().relative
 
         try:
             already_archived = await asyncio.to_thread(self._repo.read_file, archive_rel)
         except PathRejected as exc:
             raise InvalidNote(request.path, str(exc)) from exc
-        if already_archived is not None:
-            raise InvalidNote(request.path, "archive target exists")
-
-        try:
-            parsed = parse(current)
-        except NoteFormatError as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
 
         now = self._clock().astimezone(UTC).replace(microsecond=0)
-        archived_note = replace(parsed, updated=now)
-        archived_bytes = serialize(archived_note)
+        archived_bytes = rules.prepare_archive(
+            request.path, current, archive_exists=already_archived is not None, now=now
+        )
 
         message = request.message or f"archive {request.path}"
         author = author_for(request.client)
@@ -605,74 +389,33 @@ class WriteQueue:
     async def _do_supersede(
         self, request: WriteRequest, current: bytes | None
     ) -> tuple[WriteResult, tuple[str, ...]]:
-        if current is None:
-            raise NotFound(request.path)
-        if not request.new_path:
-            raise InvalidNote(request.path, "supersede requires new_path")
-        if request.content is None:
-            raise InvalidNote(request.new_path, "supersede requires content for the new note")
+        old_note_path, new_note_path, new_path, content, current_bytes = (
+            rules.prepare_supersede_paths(request.path, request.new_path, request.content, current)
+        )
 
         try:
-            old_note_path = parse_note_path(request.path)
+            new_target = await asyncio.to_thread(self._repo.read_file, new_path)
         except PathRejected as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-        try:
-            new_note_path = parse_note_path(request.new_path)
-        except PathRejected as exc:
-            raise InvalidNote(request.new_path, str(exc)) from exc
-
-        try:
-            new_target = await asyncio.to_thread(self._repo.read_file, request.new_path)
-        except PathRejected as exc:
-            raise InvalidNote(request.new_path, str(exc)) from exc
-        if new_target is not None:
-            raise InvalidNote(request.new_path, "already exists, supersede needs an unused path")
-
-        try:
-            old_note = parse(current)
-        except NoteFormatError as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-        try:
-            new_note = parse(request.content)
-        except NoteFormatError as exc:
-            raise InvalidNote(request.new_path, str(exc)) from exc
-
-        supersedes = new_note.supersedes
-        if old_note.id not in supersedes:
-            supersedes = (*supersedes, old_note.id)
-        new_note = replace(new_note, supersedes=supersedes)
+            raise InvalidNote(new_path, str(exc)) from exc
 
         now = self._clock().astimezone(UTC).replace(microsecond=0)
-        today = now.date()
-        if old_note.valid_to is not None and old_note.valid_to < today:
-            new_valid_to = old_note.valid_to
-        else:
-            new_valid_to = today
-        old_note = replace(old_note, valid_to=new_valid_to, updated=now)
+        new_final_bytes, old_final_bytes = rules.prepare_supersede_content(
+            request.path,
+            new_path,
+            content,
+            current_bytes,
+            old_note_path=old_note_path,
+            new_note_path=new_note_path,
+            new_target_exists=new_target is not None,
+            now=now,
+        )
 
-        try:
-            validate(new_note, expected_type=new_note_path.type)
-        except NoteInvalid as exc:
-            raise InvalidNote(request.new_path, str(exc)) from exc
-        try:
-            validate(old_note, expected_type=old_note_path.type)
-        except NoteInvalid as exc:
-            raise InvalidNote(request.path, str(exc)) from exc
-
-        new_final_bytes = serialize(new_note)
-        old_final_bytes = serialize(old_note)
-
-        try:
-            check(new_final_bytes.decode("utf-8"))
-        except SecretFound as exc:
-            raise SecretRejected(request.new_path, str(exc)) from exc
-
-        message = request.message or f"supersede {request.path} with {request.new_path}"
+        message = request.message or f"supersede {request.path} with {new_path}"
         author = author_for(request.client)
         try:
             commit_sha = await asyncio.to_thread(
                 self._repo.commit_files,
-                {request.path: old_final_bytes, request.new_path: new_final_bytes},
+                {request.path: old_final_bytes, new_path: new_final_bytes},
                 author,
                 message,
             )
@@ -680,12 +423,12 @@ class WriteQueue:
             raise WriteFailed(str(exc)) from exc
 
         result = WriteResult(
-            path=request.new_path,
+            path=new_path,
             version=version(new_final_bytes),
             commit=commit_sha,
             related={request.path: version(old_final_bytes)},
         )
-        return result, (request.path, request.new_path)
+        return result, (request.path, new_path)
 
     async def _push(
         self, request: WriteRequest, changed_paths: tuple[str, ...], base: str | None
@@ -798,7 +541,7 @@ class WriteQueue:
             path=path,
             conflict_path=conflict_rel,
             current_version=version(theirs) if theirs is not None else None,
-            current_content=_decode_for_conflict(theirs),
+            current_content=rules.decode_for_conflict(theirs),
         )
 
     async def _run_hooks(
@@ -820,38 +563,6 @@ class WriteQueue:
                 _logger.exception("write queue audit hook failed for %s", request.path)
 
 
-def _check_version(
-    request: WriteRequest, current_version: str | None, current: bytes | None
-) -> None:
-    if request.if_version == _NEW:
-        if current is not None:
-            raise VersionConflict(request.path, current_version, _decode_for_conflict(current))
-    elif current_version != request.if_version:
-        raise VersionConflict(request.path, current_version, _decode_for_conflict(current))
-
-
-def _decode_for_conflict(current: bytes | None) -> str | None:
-    if current is None:
-        return None
-    return current.decode("utf-8", errors="replace")
-
-
-def _new_content(request: WriteRequest, current: bytes | None) -> bytes:
-    if request.op == "write":
-        if request.content is None:
-            raise InvalidNote(request.path, "write requires content")
-        return request.content
-
-    if request.old_str is None or request.new_str is None:
-        raise InvalidNote(request.path, "edit requires old_str and new_str")
-    current_text = current.decode("utf-8") if current is not None else ""
-    count = current_text.count(request.old_str)
-    if count != 1:
-        raise EditMismatch(request.path, count)
-    new_text = current_text.replace(request.old_str, request.new_str, 1)
-    return new_text.encode("utf-8")
-
-
 def _render_conflict_file(
     path: str,
     client: str,
@@ -867,8 +578,8 @@ def _render_conflict_file(
     already inside either version, so it can never be closed early by the
     content it wraps.
     """
-    ours_decoded = _decode_for_conflict(ours)
-    theirs_decoded = _decode_for_conflict(theirs)
+    ours_decoded = rules.decode_for_conflict(ours)
+    theirs_decoded = rules.decode_for_conflict(theirs)
     ours_text = ours_decoded if ours_decoded is not None else "(deleted locally)"
     theirs_text = theirs_decoded if theirs_decoded is not None else "(deleted on the remote)"
     fence = _conflict_fence(ours_text, theirs_text)

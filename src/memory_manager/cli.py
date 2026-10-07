@@ -35,7 +35,7 @@ from pathlib import Path
 import asyncpg
 import uvicorn
 
-from memory_manager.app import open_services
+from memory_manager.app import open_services, open_storage
 from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
@@ -56,7 +56,7 @@ from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_vault
 from memory_manager.http import build_authenticator, create_app
-from memory_manager.importers import ImportReport, dedupe_against_vault, open_queue, run_import
+from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
 from memory_manager.importers.chatgpt import collect as collect_chatgpt
 from memory_manager.importers.claude import ClaudeFormatError
@@ -436,21 +436,18 @@ async def _run_import_markdown(
         print(f"'{directory}' is not a directory", file=sys.stderr)
         return 2
 
+    items, pre_rejected = collect_markdown(
+        directory, namespace=namespace, default_type=default_type
+    )
+
     try:
-        repo, queue, _vault_dir = await open_queue(os.environ)
+        async with open_storage(os.environ) as storage:
+            report = await run_import(items, storage, apply=apply)
     except VaultConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    try:
-        items, pre_rejected = collect_markdown(
-            directory, namespace=namespace, default_type=default_type
-        )
-        report = await run_import(items, queue, repo, apply=apply)
-        report.rejected = pre_rejected + report.rejected
-    finally:
-        await queue.stop()
-
+    report.rejected = pre_rejected + report.rejected
     _print_import_report(report, apply=apply)
     return 1 if (apply and report.rejected) else 0
 
@@ -467,20 +464,15 @@ async def _run_import_claude(file: Path, *, namespace: str, type_: str, apply: b
         return 2
 
     try:
-        repo, queue, vault_dir = await open_queue(os.environ)
+        async with open_storage(os.environ) as storage:
+            kept_items, duplicates = await dedupe_against_vault(items, storage)
+            report = await run_import(kept_items, storage, apply=apply)
     except VaultConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    try:
-        await asyncio.to_thread(repo.sync)
-        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
-        report = await run_import(kept_items, queue, repo, apply=apply)
-        report.rejected = pre_rejected + report.rejected
-        report.duplicates = duplicates + report.duplicates
-    finally:
-        await queue.stop()
-
+    report.rejected = pre_rejected + report.rejected
+    report.duplicates = duplicates + report.duplicates
     _print_import_report(report, apply=apply)
     return 1 if (apply and report.rejected) else 0
 
@@ -501,20 +493,15 @@ async def _run_import_chatgpt(
         return 2
 
     try:
-        repo, queue, vault_dir = await open_queue(os.environ)
+        async with open_storage(os.environ) as storage:
+            kept_items, duplicates = await dedupe_against_vault(items, storage)
+            report = await run_import(kept_items, storage, apply=apply)
     except VaultConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    try:
-        await asyncio.to_thread(repo.sync)
-        kept_items, duplicates = dedupe_against_vault(items, vault_dir)
-        report = await run_import(kept_items, queue, repo, apply=apply)
-        report.rejected = pre_rejected + report.rejected
-        report.duplicates = duplicates + report.duplicates
-    finally:
-        await queue.stop()
-
+    report.rejected = pre_rejected + report.rejected
+    report.duplicates = duplicates + report.duplicates
     _print_import_report(report, apply=apply)
     return 1 if (apply and report.rejected) else 0
 

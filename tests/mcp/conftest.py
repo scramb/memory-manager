@@ -41,6 +41,7 @@ from git_fixtures import (
 from memory_manager.app import Services, open_services
 from memory_manager.config import VaultConfig
 from memory_manager.queue import WriteQueue
+from memory_manager.storage.git import GitBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.ulid import new_ulid
@@ -161,6 +162,7 @@ async def services(vault_config: VaultConfig, bare_remote: Path) -> AsyncIterato
             pool=None,
             indexer=None,
             provider=None,
+            storage=GitBackend(queue, repo, vault_config.dir),
         )
     finally:
         await queue.stop()

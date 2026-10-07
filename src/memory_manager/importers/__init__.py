@@ -14,7 +14,6 @@ from memory_manager.importers.core import (
     ImportItemRejected,
     ImportReport,
     dedupe_against_vault,
-    open_queue,
     run_import,
 )
 
@@ -23,6 +22,5 @@ __all__ = [
     "ImportItemRejected",
     "ImportReport",
     "dedupe_against_vault",
-    "open_queue",
     "run_import",
 ]

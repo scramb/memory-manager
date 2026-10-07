@@ -8,35 +8,31 @@ deduplication, the existing-path/unchanged rule (CLAUDE.md "never overwrite
 silently") and the actual write - lives here, once.
 
 `to_note_bytes` turns a single item into note bytes; `run_import` drives a
-whole batch through the write queue (client `import`, CLAUDE.md: writes only
-through `WriteQueue`), reporting what happened without ever raising on a
-single bad item - a rejected file is reported, not fatal.
+whole batch through a `StorageBackend` (client `import`, ADR-0007 §1: every
+write goes through the interface, never a backend's own internals directly),
+reporting what happened without ever raising on a single bad item - a
+rejected file is reported, not fatal.
 
 `dedupe_against_vault` is the cross-run/cross-vault half of deduplication
 (`#49`): since ADR-0005 stays frozen and the Claude/ChatGPT importers add no
 `import_key`/`import_origin` frontmatter field, "has this memory already
-been imported" is answered by scanning the vault's working copy once for
-notes whose `source` already starts with `import:`, not by a dedicated key.
+been imported" is answered by scanning the backend's notes once for ones
+whose `source` already starts with `import:`, not by a dedicated key.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import os
 import re
 import unicodedata
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 
-from memory_manager.config import VaultConfig
-from memory_manager.queue import WriteError, WriteQueue, WriteRequest
+from memory_manager.storage import StorageBackend, WriteError
 from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
 from memory_manager.vault.paths import PathRejected, parse_note_path
-from memory_manager.vault.repo import Repo
 from memory_manager.vault.secrets import SecretFound, check
 from memory_manager.vault.ulid import new_ulid
 from memory_manager.vault.validate import MAX_FILE_BYTES, NoteInvalid, validate_bytes
@@ -49,7 +45,6 @@ __all__ = [
     "dedup_hash",
     "dedupe_against_vault",
     "normalize_for_dedup",
-    "open_queue",
     "run_import",
     "scan_vault_import_hashes",
     "slugify",
@@ -286,42 +281,18 @@ def dedup_hash(text: str) -> str:
     return hashlib.sha256(normalize_for_dedup(_first_paragraph(text)).encode("utf-8")).hexdigest()
 
 
-def _walk_vault_markdown_files(vault_dir: Path) -> list[Path]:
-    """Every `*.md` file under `vault_dir`, never through a symlink.
+async def scan_vault_import_hashes(storage: StorageBackend) -> set[str]:
+    """The `dedup_hash` of every note `storage` holds whose `source` is an import's.
 
-    Same safety rules as `importers.markdown`'s walk (CLAUDE.md path
-    safety): dotfiles/dirs and symlinked files or directories are skipped.
-    """
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(vault_dir, followlinks=False):
-        current = Path(dirpath)
-        dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if not name.startswith(".") and not (current / name).is_symlink()
-        )
-        for filename in sorted(filenames):
-            if filename.startswith(".") or not filename.endswith(".md"):
-                continue
-            file_path = current / filename
-            if file_path.is_symlink():
-                continue
-            files.append(file_path)
-    return files
-
-
-def scan_vault_import_hashes(vault_dir: Path) -> set[str]:
-    """The `dedup_hash` of every note under `vault_dir` whose `source` is an import's.
-
-    Walks the vault's working copy once - never the Postgres index, "git is
-    the source of truth" - so `dedupe_against_vault` can recognize a memory
-    an earlier run (of this importer or a different one) already turned
-    into a note, without a dedicated frontmatter key.
+    Lists the backend's notes once - never the Postgres index, ADR-0007 §1's
+    "the storage backend is the source of truth" - so `dedupe_against_vault`
+    can recognize a memory an earlier run (of this importer or a different
+    one) already turned into a note, without a dedicated frontmatter key.
     """
     hashes: set[str] = set()
-    for file_path in _walk_vault_markdown_files(vault_dir):
+    for stored in await storage.list(include_archived=True):
         try:
-            note = parse(file_path.read_bytes())
+            note = parse(stored.content)
         except NoteFormatError:
             continue
         if note.source is not None and note.source.startswith(_IMPORT_SOURCE_PREFIX):
@@ -329,8 +300,8 @@ def scan_vault_import_hashes(vault_dir: Path) -> set[str]:
     return hashes
 
 
-def dedupe_against_vault(
-    items: Iterable[ImportItem], vault_dir: Path
+async def dedupe_against_vault(
+    items: Iterable[ImportItem], storage: StorageBackend
 ) -> tuple[list[ImportItem], list[str]]:
     """Drop items whose normalized text already exists, in this run or in the vault.
 
@@ -340,7 +311,7 @@ def dedupe_against_vault(
     very same import again drops every item, because the vault scan already
     carries last run's hashes.
     """
-    seen = scan_vault_import_hashes(vault_dir)
+    seen = await scan_vault_import_hashes(storage)
     kept: list[ImportItem] = []
     duplicates: list[str] = []
     for item in items:
@@ -367,40 +338,23 @@ def _dedupe_slug(base: str, used: set[str]) -> str:
         suffix += 1
 
 
-async def open_queue(environ: Mapping[str, str]) -> tuple[Repo, WriteQueue, Path]:
-    """Build a `Repo`/`WriteQueue` pair from `VAULT_*` environment variables.
-
-    `memory_manager.app` (the shared service wiring) does not exist on this
-    branch yet, so the importer CLI builds its own queue directly - the
-    only thing it needs from that future module is exactly this. The third
-    return value is the vault's local working-copy directory, so a caller
-    can scan it directly (`scan_vault_import_hashes`) without reaching into
-    `Repo` internals.
-    """
-    config = VaultConfig.from_env(dict(environ))
-    repo = Repo(config)
-    write_queue = WriteQueue(repo)
-    await write_queue.start()
-    return repo, write_queue, config.dir
-
-
 async def run_import(
-    items: Iterable[ImportItem], queue: WriteQueue, repo: Repo, *, apply: bool
+    items: Iterable[ImportItem], storage: StorageBackend, *, apply: bool
 ) -> ImportReport:
-    """Drive every `item` through validation, dedup and the write queue.
+    """Drive every `item` through validation, dedup and `storage`.
 
     Dry-run (`apply=False`, the default everywhere above this function) does
     every check - slug/path validation, the secret scan, the existing-path
-    comparison - but never calls `queue.submit`, so nothing is written;
+    comparison - but never calls `storage.write`, so nothing is written;
     `--apply` is the only thing that turns a "would create" into a commit.
     A single item failing any check is reported in `ImportReport.rejected`
-    and does not stop the rest of the batch.
+    and does not stop the rest of the batch. `storage` is assumed already
+    synced to the remote (the factory that built it did so on entry) -
+    this function never syncs on its own.
     """
     report = ImportReport()
     seen_bodies: set[str] = set()
     seen_slugs: dict[tuple[str, str], set[str]] = defaultdict(set)
-
-    await asyncio.to_thread(repo.sync)
 
     for item in items:
         body_hash = _body_hash(item.body)
@@ -436,9 +390,9 @@ async def run_import(
             report.rejected.append((item.source, str(exc)))
             continue
 
-        current = await asyncio.to_thread(repo.read_file, path)
+        current = await storage.read(path)
         if current is not None:
-            if current == note_bytes:
+            if current.content == note_bytes:
                 report.unchanged.append(path)
             else:
                 report.skipped_existing.append(path)
@@ -448,15 +402,7 @@ async def run_import(
 
         if apply:
             try:
-                await queue.submit(
-                    WriteRequest(
-                        op="write",
-                        path=path,
-                        client=_IMPORT_CLIENT,
-                        if_version="new",
-                        content=note_bytes,
-                    )
-                )
+                await storage.write(path, note_bytes, if_version="new", client=_IMPORT_CLIENT)
             except WriteError as exc:
                 report.rejected.append((item.source, str(exc)))
                 continue

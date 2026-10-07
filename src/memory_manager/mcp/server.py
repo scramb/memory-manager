@@ -4,9 +4,11 @@
 `build_server` assembles an `mcp.server.mcpserver.MCPServer` around a
 `memory_manager.app.Services`: `memory_index` is the "table of contents" a
 client reads first, `memory_read` fetches the notes it picked by path or id,
-`memory_write`/`memory_edit` write through `Services.queue`
-(`memory_manager.queue.WriteQueue`), and `memory_supersede`/`memory_archive`
-retire a note without ever deleting it (CLAUDE.md "Never hard-delete notes")
+`memory_write`/`memory_edit` write through `Services.storage`
+(`memory_manager.storage.StorageBackend`, ADR-0007 §1 - every tool below
+calls only the interface, never a backend's own internals), and
+`memory_supersede`/`memory_archive` retire a note without ever deleting it
+(CLAUDE.md "Never hard-delete notes")
 - all five surface a conflict as an error result carrying the current
 content and version instead of ever overwriting silently (CLAUDE.md "Never
 overwrite silently"). `memory_search` (#30) ranks notes with
@@ -29,10 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
-from pathlib import Path
 from typing import Annotated, Any, NotRequired, TypedDict
 
 from mcp.server.auth.provider import OAuthAuthorizationServerProvider, TokenVerifier
@@ -54,17 +55,11 @@ from memory_manager.mcp.authz import (
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.observability import instrument_tool
-from memory_manager.queue import NotFound, WriteError, WriteRequest
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
-from memory_manager.vault.note import Note, NoteFormatError, parse, serialize, version
-from memory_manager.vault.paths import (
-    NotePath,
-    PathRejected,
-    iter_md_files,
-    parse_note_path,
-    resolve,
-)
+from memory_manager.storage import NotFound, StorageBackend, WriteError
+from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
+from memory_manager.vault.paths import PathRejected, parse_note_path
 from memory_manager.vault.ulid import is_ulid, new_ulid
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -84,8 +79,9 @@ _NEW_VERSION = "new"
 _PLACEHOLDER_ID = "new"
 _PLACEHOLDER_TIMESTAMP = "1970-01-01T00:00:00Z"
 
-# Known to `vault.repo.author_for`; what a stdio session commits as, and what
-# any static-token-authenticated HTTP request commits as too (`current_client`).
+# Known to the Git backend's `Repo.author_for` as a committer name; what a
+# stdio session commits as, and what any static-token-authenticated HTTP
+# request commits as too (`current_client`).
 _DEFAULT_CLIENT = "claude-code"
 _CLIENT_ENV_VAR = "MEMORY_CLIENT"
 
@@ -187,7 +183,7 @@ def current_client() -> str:
     `MEMORY_CLIENT` - static tokens authenticate human-driven clients
     (Claude Code, CI), not a separate committer identity. Stdio mode has no
     token at all, so it commits as `MEMORY_CLIENT` (default `"claude-code"`)
-    - one of `vault.repo.author_for`'s known clients.
+    - one of the Git backend's `Repo.author_for`'s known clients.
     """
     token = current_access_token()
     if token is None:
@@ -399,7 +395,7 @@ def build_server(
         readable = readable_namespaces(ctx)
         entries = [
             entry
-            for entry in _index_entries(services.vault_root)
+            for entry in await _index_entries(services.storage)
             if _matches(
                 entry,
                 namespace=namespace,
@@ -420,7 +416,7 @@ def build_server(
                 f"memory_read accepts at most {_MAX_READ_ITEMS} items, got {len(items)}"
             )
         readable = readable_namespaces(ctx)
-        return _read_items(services.vault_root, items, readable=readable)
+        return await _read_items(services.storage, items, readable=readable)
 
     @mcp.tool(description=_MEMORY_SEARCH_DESCRIPTION)
     @instrument_tool("memory_search")
@@ -495,21 +491,19 @@ def build_server(
         require_scope(WRITE_SCOPE)
         require_writable_namespace(path)
         try:
-            prepared = _prepare_write_content(services.vault_root, path, content, if_version)
+            prepared = await _prepare_write_content(services.storage, path, content, if_version)
         except NoteFormatError as exc:
             return _error_result(exc)
 
-        request = WriteRequest(
-            op="write",
-            path=path,
-            client=current_client(),
-            actor=current_actor(),
-            if_version=if_version,
-            content=prepared.content,
-            message=message,
-        )
         try:
-            result = await services.queue.submit(request)
+            result = await services.storage.write(
+                path,
+                prepared.content,
+                if_version=if_version,
+                client=current_client(),
+                actor=current_actor(),
+                message=message,
+            )
         except WriteError as exc:
             return _error_result(exc)
 
@@ -534,22 +528,23 @@ def build_server(
         """Replace one exact occurrence of `old_str` with `new_str` in the note at `path`."""
         require_scope(WRITE_SCOPE)
         require_writable_namespace(path)
-        request = WriteRequest(
-            op="edit",
-            path=path,
-            client=current_client(),
-            actor=current_actor(),
-            if_version=if_version,
-            old_str=old_str,
-            new_str=new_str,
-            message=message,
-        )
         try:
-            result = await services.queue.submit(request)
+            result = await services.storage.edit(
+                path,
+                old_str,
+                new_str,
+                if_version=if_version,
+                client=current_client(),
+                actor=current_actor(),
+                message=message,
+            )
         except WriteError as exc:
             return _error_result(exc)
 
-        note_id = parse(resolve(services.vault_root, result.path).read_bytes()).id
+        stored = await services.storage.read(result.path)
+        if stored is None:  # pragma: no cover - defensive, a write that just succeeded disappeared
+            raise RuntimeError(f"'{result.path}' was just written but is now missing")
+        note_id = parse(stored.content).id
         return _ok_result(
             {"path": result.path, "id": note_id, "version": result.version, "commit": result.commit}
         )
@@ -565,38 +560,37 @@ def build_server(
     ) -> Annotated[CallToolResult, MemorySupersedeResult]:
         """Replace the note `old` with a new note at `new_path`, keeping both."""
         require_scope(WRITE_SCOPE)
-        resolved_old = _resolve_path_or_id(services.vault_root, old)
+        resolved_old = await _resolve_path_or_id(services.storage, old)
         if resolved_old is None:
             return _error_result(NotFound(old))
         require_writable_namespace(resolved_old)
         require_writable_namespace(new_path)
 
         try:
-            prepared = _prepare_write_content(
-                services.vault_root, new_path, new_content, _NEW_VERSION
+            prepared = await _prepare_write_content(
+                services.storage, new_path, new_content, _NEW_VERSION
             )
         except NoteFormatError as exc:
             return _error_result(exc)
 
-        request = WriteRequest(
-            op="supersede",
-            path=resolved_old,
-            new_path=new_path,
-            client=current_client(),
-            actor=current_actor(),
-            if_version=if_version,
-            content=prepared.content,
-            message=message,
-        )
         try:
-            result = await services.queue.submit(request)
+            result = await services.storage.supersede(
+                resolved_old,
+                new_path,
+                prepared.content,
+                if_version=if_version,
+                client=current_client(),
+                actor=current_actor(),
+                message=message,
+            )
         except WriteError as exc:
             return _error_result(exc)
 
         old_version = (result.related or {}).get(resolved_old, "")
-        old_note = parse(
-            resolve(services.vault_root, resolved_old, allow_archive=True).read_bytes()
-        )
+        old_stored = await services.storage.read(resolved_old)
+        if old_stored is None:  # pragma: no cover - defensive, see memory_edit above
+            raise RuntimeError(f"'{resolved_old}' was just superseded but is now missing")
+        old_note = parse(old_stored.content)
         valid_to = old_note.valid_to.isoformat() if old_note.valid_to is not None else ""
         return _ok_result(
             {
@@ -615,21 +609,19 @@ def build_server(
     ) -> Annotated[CallToolResult, MemoryArchiveResult]:
         """Archive the note at `path`: move it to `_archive/`, never delete it."""
         require_scope(WRITE_SCOPE)
-        resolved = _resolve_path_or_id(services.vault_root, path)
+        resolved = await _resolve_path_or_id(services.storage, path)
         if resolved is None:
             return _error_result(NotFound(path))
         require_writable_namespace(resolved)
 
-        request = WriteRequest(
-            op="archive",
-            path=resolved,
-            client=current_client(),
-            actor=current_actor(),
-            if_version=if_version,
-            message=message,
-        )
         try:
-            result = await services.queue.submit(request)
+            result = await services.storage.archive(
+                resolved,
+                if_version=if_version,
+                client=current_client(),
+                actor=current_actor(),
+                message=message,
+            )
         except WriteError as exc:
             return _error_result(exc)
 
@@ -642,42 +634,35 @@ def build_server(
 
 @dataclass(frozen=True)
 class _VaultNote:
-    """One `*.md` file under the vault root that is shaped like a note path."""
+    """One note `StorageBackend.list` reported, parsed best-effort."""
 
     rel: str
-    note_path: NotePath
     note: Note | None
     error: NoteFormatError | None
 
 
-def _iter_vault_notes(vault_root: Path) -> Iterator[_VaultNote]:
-    """Every note-shaped file in the vault, in path order, parsed best-effort.
+async def _iter_vault_notes(storage: StorageBackend) -> list[_VaultNote]:
+    """Every note in the vault, in path order, parsed best-effort.
 
-    A path that is not note-shaped at all (e.g. a stray `README.md`) is
-    skipped silently, exactly like `Indexer._discover_paths`; a note-shaped
-    path that fails to parse is still yielded, with `note=None` and `error`
-    set, so callers can report it instead of dropping it. Never follows a
-    symlink (`vault.paths.iter_md_files`): `memory_index`/`memory_read`'s id
-    lookup must never read, parse or report a symlink target's content as if
-    it were a note in the vault.
+    A note that fails to parse is still included, with `note=None` and
+    `error` set, so callers can report it instead of dropping it -
+    `storage.list` already did the note-shaped-path filtering (a stray
+    `README.md` never reaches here at all).
     """
-    for file in iter_md_files(vault_root):
-        rel = "/".join(file.relative_to(vault_root).parts)
+    notes: list[_VaultNote] = []
+    for stored in await storage.list(include_archived=True):
         try:
-            note_path = parse_note_path(rel, allow_archive=True)
-        except PathRejected:
-            continue
-        try:
-            note = parse(file.read_bytes())
+            note = parse(stored.content)
         except NoteFormatError as exc:
-            yield _VaultNote(rel=rel, note_path=note_path, note=None, error=exc)
+            notes.append(_VaultNote(rel=stored.path, note=None, error=exc))
             continue
-        yield _VaultNote(rel=rel, note_path=note_path, note=note, error=None)
+        notes.append(_VaultNote(rel=stored.path, note=note, error=None))
+    return notes
 
 
-def _index_entries(vault_root: Path) -> list[MemoryIndexEntry]:
+async def _index_entries(storage: StorageBackend) -> list[MemoryIndexEntry]:
     entries: list[MemoryIndexEntry] = []
-    for vault_note in _iter_vault_notes(vault_root):
+    for vault_note in await _iter_vault_notes(storage):
         if vault_note.note is None:
             entries.append(
                 {"path": vault_note.rel, "warning": f"failed to parse: {vault_note.error}"}
@@ -804,8 +789,8 @@ def _scan_hit_result(hit: ScanHit) -> MemorySearchResult:
     }
 
 
-def _read_items(
-    vault_root: Path, items: list[str], *, readable: set[str] | None = None
+async def _read_items(
+    storage: StorageBackend, items: list[str], *, readable: set[str] | None = None
 ) -> list[MemoryReadItem]:
     id_map: dict[str, str] | None = None
     results: list[MemoryReadItem] = []
@@ -814,7 +799,7 @@ def _read_items(
         path = item
         if "/" not in item and is_ulid(item):
             if id_map is None:
-                id_map = _build_id_map(vault_root)
+                id_map = await _build_id_map(storage)
             found = id_map.get(item)
             if found is None:
                 results.append(
@@ -836,12 +821,12 @@ def _read_items(
             continue
 
         try:
-            disk_path = resolve(vault_root, path, allow_archive=True)
+            stored = await storage.read(path)
         except PathRejected as exc:
             results.append({"item": item, "error": error_to_dict(exc)})
             continue
 
-        if not disk_path.exists():
+        if stored is None:
             results.append(
                 {
                     "item": item,
@@ -850,9 +835,8 @@ def _read_items(
             )
             continue
 
-        data = disk_path.read_bytes()
         try:
-            note = parse(data)
+            note = parse(stored.content)
         except NoteFormatError as exc:
             results.append({"item": item, "error": error_to_dict(exc)})
             continue
@@ -861,8 +845,8 @@ def _read_items(
             {
                 "path": path,
                 "id": note.id,
-                "version": version(data),
-                "content": data.decode("utf-8"),
+                "version": stored.version,
+                "content": stored.content.decode("utf-8"),
             }
         )
 
@@ -872,7 +856,7 @@ def _read_items(
 def _namespace_readable(path: str, readable: set[str]) -> bool:
     """Whether `path`'s namespace is in `readable`, best-effort.
 
-    A `path` that does not even parse is left to `resolve`'s own, more
+    A `path` that does not even parse is left to `storage.read`'s own, more
     specific `PathRejected` - this only ever turns a readable check into a
     `NotFound` (never exposing whether the namespace exists), not into a
     `PathRejected` of its own.
@@ -884,25 +868,25 @@ def _namespace_readable(path: str, readable: set[str]) -> bool:
     return note_path.namespace in readable
 
 
-def _build_id_map(vault_root: Path) -> dict[str, str]:
+async def _build_id_map(storage: StorageBackend) -> dict[str, str]:
     """Every note's `id -> path`, scanned once for a `memory_read` call that needs it."""
     return {
         vault_note.note.id: vault_note.rel
-        for vault_note in _iter_vault_notes(vault_root)
+        for vault_note in await _iter_vault_notes(storage)
         if vault_note.note is not None
     }
 
 
-def _resolve_path_or_id(vault_root: Path, item: str) -> str | None:
+async def _resolve_path_or_id(storage: StorageBackend, item: str) -> str | None:
     """`item` as a vault path: itself if it already looks like one, else looked up by id.
 
     Used by `memory_supersede`/`memory_archive`, which accept either like
     `memory_read` does. Returns `None` if `item` is a ULID with no matching
     note, so the caller can report its own `NotFound` instead of handing the
-    write queue a path that was never a real lookup.
+    storage backend a path that was never a real lookup.
     """
     if "/" not in item and is_ulid(item):
-        return _build_id_map(vault_root).get(item)
+        return (await _build_id_map(storage)).get(item)
     return item
 
 
@@ -934,17 +918,17 @@ class _PreparedWrite:
     id: str
 
 
-def _prepare_write_content(
-    vault_root: Path, path: str, content: str, if_version: str
+async def _prepare_write_content(
+    storage: StorageBackend, path: str, content: str, if_version: str
 ) -> _PreparedWrite:
-    """Normalize `content`'s `id`/`created`/`updated` before it is submitted to the queue.
+    """Normalize `content`'s `id`/`created`/`updated` before it is submitted to `storage`.
 
     On create (`if_version == "new"`): a missing `id`, or the literal `id: new`, is replaced
     with a freshly generated ULID; `created`/`updated` are always set to now, never taken
     from the client. On update: `updated` is always set to now; `created` is carried forward
     from the note currently at `path` when that can be read, left alone otherwise (an unsafe
-    path or a missing/unparsable note is `WriteQueue.submit`'s error to raise, not this
-    function's). `id` is never touched on update - a changed `id` is `WriteQueue.submit`'s
+    path or a missing/unparsable note is `storage.write`'s error to raise, not this
+    function's). `id` is never touched on update - a changed `id` is `storage.write`'s
     "id must not change" `InvalidNote`, not a silent overwrite.
 
     Raises `NoteFormatError` if `content` does not parse structurally even after the create
@@ -960,7 +944,7 @@ def _prepare_write_content(
         note_id = new_ulid(now) if note.id == _PLACEHOLDER_ID else note.id
         note = replace(note, id=note_id, created=now, updated=now)
     else:
-        current = _current_note(vault_root, path)
+        current = await _current_note(storage, path)
         if current is not None:
             note = replace(note, created=current.created)
         note = replace(note, updated=now)
@@ -999,21 +983,29 @@ def _patch_missing_create_fields(text: str) -> str:
     return "\n".join([lines[0], *missing, *lines[1:]])
 
 
-def _current_note(vault_root: Path, path: str) -> Note | None:
+async def _current_note(storage: StorageBackend, path: str) -> Note | None:
     """Best-effort read of the note currently at `path`, or `None` if it cannot be read.
 
     Used only so `_prepare_write_content` can carry `created` forward on an update; an
-    unsafe path, a missing file or content that fails to parse all return `None` here and
-    are left to `WriteQueue.submit`, which re-reads `path` itself as the one authoritative
-    current state and raises the real error (`VersionConflict`, `InvalidNote`, ...).
+    unsafe path, an archived path (an update never targets `_archive/...` - the same
+    restriction `resolve`'s pre-storage callers relied on `allow_archive=False` for), a
+    missing note or content that fails to parse all return `None` here and are left to
+    `storage.write`, which re-reads `path` itself as the one authoritative current state
+    and raises the real error (`VersionConflict`, `InvalidNote`, ...).
     """
     try:
-        disk_path = resolve(vault_root, path)
+        note_path = parse_note_path(path, allow_archive=True)
     except PathRejected:
         return None
-    if not disk_path.exists():
+    if note_path.archived:
         return None
     try:
-        return parse(disk_path.read_bytes())
+        stored = await storage.read(path)
+    except PathRejected:
+        return None
+    if stored is None:
+        return None
+    try:
+        return parse(stored.content)
     except NoteFormatError:
         return None
