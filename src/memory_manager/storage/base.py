@@ -409,6 +409,10 @@ class StorageBackend(Protocol):
         Returns a fresh cursor to pass on the next call alongside the
         changes. Read-only and independent of any write in progress: a
         concurrent `read()` of a path this reports may briefly lag or lead
-        what `changes_since` itself just saw, by design (ADR-0007 §1).
+        what `changes_since` itself just saw, by design (ADR-0007 §1). May
+        report an already-committed change with a delay (a concurrent
+        transaction elsewhere can hold a backend's visibility window
+        back) but never drops one - a caller polls if it needs a change
+        to have shown up, rather than assuming the very next call will see it.
         """
         ...

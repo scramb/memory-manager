@@ -17,10 +17,20 @@ that subset (#96, the Postgres backend, only exercises
 Deliberately out of scope: `WriteConflict`/`WriteFailed` (a Git-specific
 remote push race, not part of what every backend must satisfy) and exact
 timestamps (no assertion here depends on wall-clock precision).
+
+`changes_since` may report an already-committed change with a delay (a
+concurrent transaction elsewhere in the cluster can hold a backend's
+visibility window back, ADR-0007 §2) - never drops one. The
+`ChangesSinceContract` tests below account for that with `poll_changes_since`:
+they wait, bounded, for an expected change to show up rather than asserting
+it is visible on the very next call.
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -31,6 +41,7 @@ from memory_manager.storage.base import (
     NotFound,
     SecretRejected,
     StorageBackend,
+    StorageChanges,
     VersionConflict,
 )
 from memory_manager.vault.note import Note, parse, serialize, version
@@ -56,6 +67,38 @@ def note_bytes(**overrides: object) -> bytes:
     }
     defaults.update(overrides)
     return serialize(Note(**defaults))  # type: ignore[arg-type]
+
+
+_POLL_DEADLINE_SECONDS = 5.0
+_POLL_INTERVAL_SECONDS = 0.1
+
+
+async def poll_changes_since(
+    backend: StorageBackend,
+    cursor: str | None,
+    predicate: Callable[[StorageChanges], bool],
+) -> StorageChanges:
+    """Call `backend.changes_since(cursor)` from a FIXED `cursor` until
+    `predicate(changes)` holds, bounded (~5 s, pattern: `tests/test_shutdown.py`'s
+    `_wait_for`, `tests/http_fixtures.py`'s `wait_until_ready`).
+
+    `cursor` never advances between calls: a backend is free to report a
+    committed change with a delay (a concurrent transaction elsewhere in
+    the cluster can hold its visibility window back) but must never drop
+    one, so polling from the same starting point is what actually proves
+    that - advancing the cursor on every call would just make each call
+    its own fresh "everything since now", silently papering over a skip.
+    Raises `AssertionError` with the last seen `StorageChanges` if
+    `predicate` never holds before the deadline.
+    """
+    deadline = time.monotonic() + _POLL_DEADLINE_SECONDS
+    changes = await backend.changes_since(cursor)
+    while not predicate(changes):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"condition was never met, last seen: {changes!r}")
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        changes = await backend.changes_since(cursor)
+    return changes
 
 
 class ReadWriteEditContract:
@@ -287,14 +330,23 @@ class ListContract:
 
 
 class ChangesSinceContract:
-    """`changes_since`."""
+    """`changes_since`.
+
+    A backend may delay reporting an already-committed change (a
+    concurrent transaction elsewhere in the cluster can hold its
+    visibility window back) but must never drop one, so these tests poll
+    bounded for an expected change rather than requiring it on the very
+    first call after it was written (`poll_changes_since`).
+    """
 
     async def test_changes_since_none_reports_a_write(self, backend: StorageBackend) -> None:
         await backend.write(
             "personal/fact/a.md", note_bytes(), if_version="new", client="claude-code"
         )
 
-        changes = await backend.changes_since(None)
+        changes = await poll_changes_since(
+            backend, None, lambda changes: "personal/fact/a.md" in changes.changed
+        )
 
         assert "personal/fact/a.md" in changes.changed
         assert changes.cursor
@@ -311,6 +363,13 @@ class ChangesSinceContract:
             "personal/fact/a.md", if_version=written.version, client="claude-code"
         )
 
-        changes = await backend.changes_since(baseline.cursor)
+        changes = await poll_changes_since(
+            backend,
+            baseline.cursor,
+            lambda changes: (
+                "_archive/personal/fact/a.md" in changes.changed
+                and "personal/fact/a.md" in changes.deleted
+            ),
+        )
         assert "personal/fact/a.md" in changes.deleted
         assert "_archive/personal/fact/a.md" in changes.changed

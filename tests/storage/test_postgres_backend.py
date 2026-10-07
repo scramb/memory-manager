@@ -30,6 +30,7 @@ from storage.contract import (
     ReadWriteEditContract,
     SupersedeArchiveContract,
     note_bytes,
+    poll_changes_since,
 )
 
 from memory_manager.db.migrate import migrate
@@ -365,8 +366,17 @@ class TestChangesSinceConcurrency:
         finally:
             await conn_a.close()
 
-        after = await backend.changes_since(baseline.cursor)
+        # A backend that skipped xid(A) would never see both paths show up
+        # here and hit the poll's deadline instead.
+        after = await poll_changes_since(
+            backend,
+            baseline.cursor,
+            lambda changes: (
+                "personal/fact/a.md" in changes.changed and "personal/fact/b.md" in changes.changed
+            ),
+        )
         assert "personal/fact/a.md" in after.changed
+        assert "personal/fact/b.md" in after.changed
 
     async def test_archived_then_reoccupied_path_is_changed_not_deleted(
         self, backend: PostgresBackend, test_database_url: str
@@ -381,6 +391,13 @@ class TestChangesSinceConcurrency:
             "personal/fact/a.md", note_bytes(title="Reoccupied"), if_version="new", client="c"
         )
 
-        changes = await backend.changes_since(baseline.cursor)
+        # Poll until the archive itself is in the window - "a.md in changed"
+        # alone could already be true before the archive ever showed up, from
+        # the reoccupying write landing in an earlier call's snapshot.
+        changes = await poll_changes_since(
+            backend,
+            baseline.cursor,
+            lambda changes: "_archive/personal/fact/a.md" in changes.changed,
+        )
         assert "personal/fact/a.md" in changes.changed
         assert "personal/fact/a.md" not in changes.deleted

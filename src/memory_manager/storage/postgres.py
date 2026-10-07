@@ -68,8 +68,10 @@ transaction that is still in flight when one call takes its snapshot
 keeps the snapshot's `xmin` from moving past it even if that transaction
 commits *after* this call already returned - the next call's window
 starts exactly there, so a lower `xid` committing late is picked up
-instead of skipped, and a long-running transaction anywhere in the
-cluster only delays how soon its own change is reported, never drops it.
+instead of skipped. A long-running transaction anywhere in the cluster -
+not only one that itself writes to this vault - holds `xmin` back the
+same way, so it delays how soon EVERY later-committed change is
+reported, never only its own, and never drops any of them.
 Within one call's window `[cursor, new_xmin)`, a revision whose `path`
 differs from its own note's immediately preceding revision (an `archive`)
 contributes *both* paths to the touched set - the vacated path otherwise
@@ -721,8 +723,9 @@ class PostgresBackend:
         `pg_snapshot_xmin(pg_current_snapshot())` - see the module
         docstring for why `xid8` order, not `created_at`/`revision`, is
         what makes a late-committing lower `xid` never get skipped, and
-        why a long-running transaction anywhere in the cluster only delays
-        how soon its own change is reported, never drops it.
+        why a long-running transaction anywhere in the cluster - not only
+        one touching this vault - delays how soon every later-committed
+        change is reported, never drops any of them.
         """
         lower = int(cursor) if cursor is not None else 0
 
