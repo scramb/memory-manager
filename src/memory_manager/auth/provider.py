@@ -42,11 +42,17 @@ building an `OAuthClientInformationFull` from it on the fly - no
 upserted into `oauth_clients` (marked `"cimd": true`) because `oauth_pending`/
 `oauth_auth_codes`/`oauth_tokens` all carry a foreign key to it
 (`db/migrations/0003_oauth.sql`). `_CimdClientInformation.validate_redirect_uri`
-is the one behavioural difference from a DCR client: RFC 8252 loopback
+is one behavioural difference from a DCR client: RFC 8252 loopback
 redirect URIs match on scheme/host/path only, ignoring the port, exactly as
 Claude Code's own CIMD declares `http://localhost/callback` and
 `http://127.0.0.1/callback` with no fixed port at all
-(docs/research/mcp-auth-and-connectors.md §4).
+(docs/research/mcp-auth-and-connectors.md §4). The other is `scope`
+(`_cimd_scope_for`, #80): claude.ai's own CIMD document has no `scope` field at
+all, which the SDK's `validate_scope` would otherwise read as "registered with
+no scope" rather than "no opinion" - a document without one is built with every
+scope this server supports instead, the same default a DCR client that never
+requested a scope gets at registration; one that does carry a `scope` is
+intersected with the supported set rather than trusted outright.
 """
 
 from __future__ import annotations
@@ -140,6 +146,23 @@ def _loopback_redirect_matches(registered: AnyUrl, requested: AnyUrl) -> bool:
     return (registered.path or "") == (requested.path or "")
 
 
+def _cimd_scope_for(document_scope: str | None) -> str:
+    """The `scope` a CIMD client is built with (#80): every scope this server supports
+    when the document carries none at all (claude.ai's document has no `scope` field;
+    the SDK's `OAuthClientInformationFull.validate_scope` reads a client with `scope is
+    None` as allowed *no* scope at all, not "every scope", which is what turned a
+    missing field into `invalid_scope` on a real `/authorize` request) - a DCR client
+    that never requested a scope gets exactly this same default at registration, so a
+    CIMD client having no registration step of its own is no reason to leave it with
+    none. A document that does carry a `scope` is intersected with the supported set
+    instead, so it can narrow what it is granted but never claim a scope this server
+    does not support."""
+    if document_scope is None:
+        return " ".join(_DEFAULT_SCOPES)
+    requested = set(document_scope.split())
+    return " ".join(scope for scope in _DEFAULT_SCOPES if scope in requested)
+
+
 def _is_cimd_client_id(client_id: str) -> bool:
     """A CIMD `client_id` is an https URL (SEP-991) - the one shape a DCR-issued
     `client_id` (`mcp/server/auth/handlers/register.py`: `str(uuid4())`) never takes,
@@ -229,6 +252,7 @@ class MemoryManagerOAuthProvider(
             "client_name": document.client_name,
             "redirect_uris": list(document.redirect_uris),
             "token_endpoint_auth_method": "none",
+            "scope": _cimd_scope_for(document.scope),
             _CIMD_CLIENT_INFO_MARKER: True,
         }
         await store.save_client(

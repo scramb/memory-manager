@@ -105,6 +105,12 @@ class ClientMetadataDocument:
     client_id: str
     client_name: str | None
     redirect_uris: tuple[str, ...]
+    #: `None` when the document carries no `scope` at all (claude.ai's document, #80) -
+    #: distinct from an empty string, which `auth.provider._cimd_scope_for` would read as
+    #: "the document explicitly asks for nothing". A document that has the field intersects
+    #: it with this server's supported scopes there; one that omits it gets every supported
+    #: scope, the same default a DCR client that never requested one gets at registration.
+    scope: str | None
 
 
 #: `host -> every resolved address` (plain, synchronous - run through `asyncio.to_thread`
@@ -377,8 +383,16 @@ def _parse_document(url: str, body: bytes) -> ClientMetadataDocument:
     if not isinstance(client_name, str):
         client_name = None
 
+    # Not RFC 7591-required on a client information response, and claude.ai's document
+    # (#80) omits it entirely - a non-string value is read the same as an absent one
+    # rather than failing the whole document over an optional field.
+    scope = data.get("scope")
+    if not isinstance(scope, str):
+        scope = None
+
     return ClientMetadataDocument(
         client_id=document_client_id,
         client_name=client_name,
         redirect_uris=tuple(redirect_uris),
+        scope=scope,
     )
