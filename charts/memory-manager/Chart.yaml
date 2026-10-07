@@ -14,8 +14,8 @@ description: Self-hosted long-term memory for Claude - Markdown notes in Git as 
 type: application
 # Kept in lockstep with the git release tag by release-please
 # (release-please-config.json's extra-files) - never hand-edited.
-version: 0.1.2 # x-release-please-version
-appVersion: "0.1.2" # x-release-please-version
+version: 0.1.3 # x-release-please-version
+appVersion: "0.1.3" # x-release-please-version
 home: https://github.com/scramb/memory-manager
 sources:
   - https://github.com/scramb/memory-manager
