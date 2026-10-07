@@ -41,11 +41,27 @@ from pathlib import Path
 
 import asyncpg
 
+from memory_manager.audit import AuditWriter
 from memory_manager.config import EmbeddingConfig, VaultConfig
 from memory_manager.db.migrate import migrate
 from memory_manager.index.embeddings import EmbeddingProvider, provider_from_config
 from memory_manager.index.indexer import Indexer
-from memory_manager.queue import SyncHook, WriteHook, WriteQueue
+from memory_manager.queue import (
+    AuditHook,
+    EditMismatch,
+    InvalidNote,
+    NotFound,
+    SecretRejected,
+    SyncHook,
+    VersionConflict,
+    WriteConflict,
+    WriteError,
+    WriteFailed,
+    WriteHook,
+    WriteQueue,
+    WriteRequest,
+    WriteResult,
+)
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
@@ -99,6 +115,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
             )
             queue.add_hook(_index_write_hook(indexer))
             queue.add_sync_hook(_index_sync_hook(indexer))
+            queue.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
 
         poll_stop = asyncio.Event()
         poll_task = asyncio.create_task(
@@ -170,3 +187,62 @@ def _index_write_hook(indexer: Indexer) -> WriteHook:
         await indexer.index_paths(changed_paths)
 
     return hook
+
+
+def _audit_write_hook(audit: AuditWriter) -> AuditHook:
+    """`WriteQueue.add_audit_hook`'s hook: one `audit_log` row per processed write (#39).
+
+    `detail` is built here, from op-level metadata only - never from
+    `request.content`/`old_str`/`new_str` or an error's `current_content`
+    (`AuditWriter`'s docstring: that is the one place a note's text could
+    leak into the audit log).
+    """
+
+    async def hook(
+        request: WriteRequest, result: WriteResult | None, error: Exception | None
+    ) -> None:
+        outcome, detail = _audit_outcome(result, error)
+        await audit.record(
+            actor=request.actor,
+            client=request.client,
+            op=request.op,
+            path=result.path if result is not None else request.path,
+            commit_sha=result.commit if result is not None else None,
+            outcome=outcome,
+            detail=detail,
+        )
+
+    return hook
+
+
+def _audit_outcome(
+    result: WriteResult | None, error: Exception | None
+) -> tuple[str, dict[str, object]]:
+    """The `(outcome, detail)` pair `_audit_write_hook` records for one write.
+
+    `outcome` is one of `"ok"`/`"conflict"`/`"rejected"`/`"failed"`.
+    `detail` never carries `current_content`/`current_version`-adjacent note
+    text, only a version, an error class name, or a conflict file path.
+    """
+    if error is None:
+        if result is None:  # pragma: no cover - defensive, a write-queue invariant
+            return "failed", {"error": "unknown"}
+        return "ok", {"version": result.version}
+    if isinstance(error, VersionConflict):
+        return "conflict", {"error": "VersionConflict", "current_version": error.current_version}
+    if isinstance(error, WriteConflict):
+        return "conflict", {
+            "error": "WriteConflict",
+            "conflict_path": error.conflict_path,
+            "current_version": error.current_version,
+        }
+    if isinstance(error, (InvalidNote, EditMismatch, NotFound, SecretRejected)):
+        return "rejected", {"error": type(error).__name__}
+    if isinstance(error, WriteFailed):
+        return "failed", {"error": "WriteFailed"}
+    if isinstance(error, WriteError):  # pragma: no cover - defensive, no other WriteError today
+        return "failed", {"error": type(error).__name__}
+    # Not a `WriteError` at all - a bug elsewhere in the write path, not a
+    # client-facing rejection; still audited, as "failed" with no further
+    # detail guessed about an exception type this was never written for.
+    return "failed", {"error": type(error).__name__}  # pragma: no cover - defensive

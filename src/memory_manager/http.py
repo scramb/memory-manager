@@ -68,7 +68,9 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import json
 import logging
+import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
@@ -107,6 +109,7 @@ from memory_manager.auth.prm import (
     serve_protected_resource_metadata,
 )
 from memory_manager.auth.provider import MemoryManagerOAuthProvider
+from memory_manager.auth.ratelimit import RateLimiter
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -125,6 +128,16 @@ _MAX_WEBHOOK_BODY_BYTES = 1024 * 1024
 
 _GITHUB_SIGNATURE_HEADER = "x-hub-signature-256"
 _GITEA_SIGNATURE_HEADER = "x-gitea-signature"
+
+#: The OAuth authorization server's own endpoints (#36), rate-limited by
+#: client IP (#39) - there is no bearer token yet at any of these to key on.
+_OAUTH_RATE_LIMITED_PATHS = frozenset({"/register", "/token", "/authorize"})
+
+#: The MCP tool names whose calls count against `ServerConfig.write_per_minute`/
+#: `write_burst` in addition to the general `mcp_per_minute`/`mcp_burst` limit
+#: every `mcp_path` request counts against (#39) - `mcp/server.py`'s five
+#: write tools, minus `memory_search`/`memory_read`/`memory_index` (read-only).
+_WRITE_TOOL_NAMES = frozenset({"memory_write", "memory_edit", "memory_supersede", "memory_archive"})
 
 ServicesFactory = Callable[[], AbstractAsyncContextManager[Services]]
 
@@ -299,6 +312,20 @@ def create_app(
         Mount("/", app=_McpMount())
     )
     middleware = [
+        # Outermost: reject an over-limit or oversized request before
+        # Origin validation, routing or auth ever run (#39).
+        Middleware(
+            _LimitsMiddleware,
+            mcp_path=config.mcp_path,
+            webhook_path=WEBHOOK_PATH,
+            max_request_bytes=config.max_request_bytes,
+            mcp_limiter=RateLimiter(per_minute=config.mcp_per_minute, burst=config.mcp_burst),
+            write_limiter=RateLimiter(per_minute=config.write_per_minute, burst=config.write_burst),
+            oauth_limiter=RateLimiter(per_minute=config.oauth_per_minute, burst=config.oauth_burst),
+            webhook_limiter=RateLimiter(
+                per_minute=config.webhook_per_minute, burst=config.webhook_burst
+            ),
+        ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
         # Wraps the whole app, including the `Mount` below, so it sees the
         # `WWW-Authenticate` header `mcp_app`'s own `RequireAuthMiddleware`/
@@ -477,6 +504,224 @@ class _McpMount:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         mcp_app: ASGIApp = scope["app"].state.mcp_app
         await mcp_app(scope, receive, send)
+
+
+class _LimitsMiddleware:
+    """Body-size cap plus per-key token-bucket rate limiting (#39).
+
+    Three route classes, matched on `scope["path"]` directly (the same
+    style `_OriginValidationMiddleware` below uses, not a Starlette
+    `Route` lookup - this runs ahead of routing):
+
+    - `mcp_path`: capped at `max_request_bytes`, counted against actual
+      bytes received as they stream in (`_buffer_capped_body`) - never
+      trusted from a `Content-Length` header alone, so a chunked request
+      with no such header is capped just the same. Counts against
+      `mcp_limiter`, keyed by the hashed bearer token (`_request_key`) if
+      one is present, the client IP otherwise. A `tools/call` body naming
+      one of `_WRITE_TOOL_NAMES` additionally counts against
+      `write_limiter`, same key - the tighter per-write limit CLAUDE.md's
+      guardrails call for on top of the general per-token one.
+    - `webhook_path`: no body cap of its own here (`_vault_webhook` already
+      enforces its own 1 MiB cap); counts against `webhook_limiter`, keyed
+      by client IP.
+    - `/register`/`/token`/`/authorize` (`_OAUTH_RATE_LIMITED_PATHS`):
+      counts against `oauth_limiter`, keyed by client IP - none of these
+      carry a bearer token of their own to key on instead.
+
+    Every other path (health/ready, PRM, login, the AS metadata document)
+    passes through unlimited; none of them is a meaningful target for
+    either abuse this middleware defends against.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        mcp_path: str,
+        webhook_path: str,
+        max_request_bytes: int,
+        mcp_limiter: RateLimiter,
+        write_limiter: RateLimiter,
+        oauth_limiter: RateLimiter,
+        webhook_limiter: RateLimiter,
+    ) -> None:
+        self._app = app
+        self._mcp_path = mcp_path
+        self._webhook_path = webhook_path
+        self._max_request_bytes = max_request_bytes
+        self._mcp_limiter = mcp_limiter
+        self._write_limiter = write_limiter
+        self._oauth_limiter = oauth_limiter
+        self._webhook_limiter = webhook_limiter
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        path = scope["path"]
+        if path == self._mcp_path:
+            await self._handle_mcp(scope, receive, send)
+            return
+        if path == self._webhook_path:
+            await self._handle_keyed(scope, receive, send, self._webhook_limiter, _client_ip_key)
+            return
+        if path in _OAUTH_RATE_LIMITED_PATHS:
+            await self._handle_keyed(scope, receive, send, self._oauth_limiter, _client_ip_key)
+            return
+        await self._app(scope, receive, send)
+
+    async def _handle_keyed(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        limiter: RateLimiter,
+        key_of: Callable[[Scope], str],
+    ) -> None:
+        allowed, retry_after = limiter.allow(key_of(scope))
+        if not allowed:
+            await _send_rate_limited(scope, receive, send, retry_after)
+            return
+        await self._app(scope, receive, send)
+
+    async def _handle_mcp(self, scope: Scope, receive: Receive, send: Send) -> None:
+        key = _request_key(scope)
+
+        if scope.get("method") == "POST":
+            body, oversized = await _buffer_capped_body(receive, self._max_request_bytes)
+            if oversized:
+                await _send_payload_too_large(scope, receive, send)
+                return
+            effective_receive = _replaying_receive(body, receive)
+        else:
+            # A GET (SSE stream resumption) or DELETE (session end) carries
+            # no body worth capping or inspecting for a write-tool call.
+            body = b""
+            effective_receive = receive
+
+        allowed, retry_after = self._mcp_limiter.allow(key)
+        if not allowed:
+            await _send_rate_limited(scope, receive, send, retry_after)
+            return
+
+        if _is_write_tool_call(body):
+            allowed, retry_after = self._write_limiter.allow(key)
+            if not allowed:
+                await _send_rate_limited(scope, receive, send, retry_after)
+                return
+
+        await self._app(scope, effective_receive, send)
+
+
+def _client_ip(scope: Scope) -> str:
+    """`scope["client"]`'s host, or `"unknown"` for a transport that carries none.
+
+    This is what uvicorn's own `ProxyHeadersMiddleware` has already
+    rewritten by the time a request reaches this ASGI app, when the
+    operator both passed `proxy_headers=True` and listed the actual proxy
+    in `forwarded_allow_ips` (`ServerConfig.forwarded_allow_ips`'s
+    docstring) - nothing here re-reads `X-Forwarded-For` itself.
+    """
+    client = scope.get("client")
+    if not client:
+        return "unknown"
+    return str(client[0])
+
+
+def _client_ip_key(scope: Scope) -> str:
+    return f"ip:{_client_ip(scope)}"
+
+
+def _request_key(scope: Scope) -> str:
+    """The rate-limit key for an `mcp_path` request: a hashed bearer token, or the
+    client IP if the request carries none (unauthenticated loopback mode, #33).
+
+    Hashed, never the raw token - CLAUDE.md: "token hashes only" is a rule for
+    anything this server keeps around, including in-memory rate-limit state.
+    """
+    authorization = Headers(scope=scope).get("authorization")
+    if authorization is not None and authorization.lower().startswith("bearer "):
+        token = authorization[len("Bearer ") :]
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return f"token:{digest}"
+    return _client_ip_key(scope)
+
+
+async def _buffer_capped_body(receive: Receive, limit: int) -> tuple[bytes, bool]:
+    """Every `http.request` chunk `receive` yields, or `(b"", True)` the moment their
+    total exceeds `limit`.
+
+    Counts actual bytes received, not `Content-Length` - a chunked request
+    with no such header is capped exactly the same way.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    more_body = True
+    while more_body:
+        message = await receive()
+        if message["type"] != "http.request":
+            break
+        chunk = cast(bytes, message.get("body", b""))
+        total += len(chunk)
+        if total > limit:
+            return b"", True
+        chunks.append(chunk)
+        more_body = bool(message.get("more_body", False))
+    return b"".join(chunks), False
+
+
+def _replaying_receive(body: bytes, original_receive: Receive) -> Receive:
+    """A `Receive` that yields `body` once, as a single message, then falls back to
+    `original_receive` - so the request `_buffer_capped_body` already drained in full
+    still reads normally for whatever handles it next (`mcp_app`/`_vault_webhook`)."""
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await original_receive()
+
+    return receive
+
+
+def _is_write_tool_call(body: bytes) -> bool:
+    """Whether `body` is (or, batched, contains) a JSON-RPC `tools/call` naming one of
+    `_WRITE_TOOL_NAMES` - best-effort: anything that fails to parse as JSON, or does
+    not look like a tool call at all, is "no", never an error of its own (the MCP
+    endpoint itself is what validates the request body)."""
+    if not body:
+        return False
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    messages = payload if isinstance(payload, list) else [payload]
+    for message in messages:
+        if not isinstance(message, dict) or message.get("method") != "tools/call":
+            continue
+        params = message.get("params")
+        if isinstance(params, dict) and params.get("name") in _WRITE_TOOL_NAMES:
+            return True
+    return False
+
+
+async def _send_rate_limited(
+    scope: Scope, receive: Receive, send: Send, retry_after: float
+) -> None:
+    seconds = max(1, math.ceil(retry_after)) if math.isfinite(retry_after) else 1
+    response = PlainTextResponse(
+        "rate limit exceeded", status_code=429, headers={"Retry-After": str(seconds)}
+    )
+    await response(scope, receive, send)
+
+
+async def _send_payload_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+    response = PlainTextResponse("payload too large", status_code=413)
+    await response(scope, receive, send)
 
 
 class _OriginValidationMiddleware:

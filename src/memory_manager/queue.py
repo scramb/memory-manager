@@ -26,9 +26,10 @@ aborted, the local commit discarded (`reset_to_remote()`), and both
 versions are written to `<path>.conflict.md` for a human to resolve - the
 write comes back as `WriteConflict`, never silently lost. A push that keeps
 getting rejected even after a clean, unrelated rebase (the remote keeps
-moving) gives up after 3 attempts as `WriteFailed`. Audit log persistence
-lives in Postgres from M3; `add_hook()` is the seam an indexer/audit log
-subscribes through until then.
+moving) gives up after 3 attempts as `WriteFailed`. `add_hook()` is the
+seam the indexer subscribes through, on success only; `add_audit_hook()`
+(#39) is the separate seam for the audit log in Postgres, which needs
+every outcome, not just success - see `AuditHook`'s docstring.
 
 `sync()` (#33) is the other way a caller reaches the working copy: a
 sync-only job, queued through the same consumer as every write, so the
@@ -63,6 +64,7 @@ from memory_manager.vault.sync import ChangeSet
 from memory_manager.vault.validate import NoteInvalid, validate, validate_bytes
 
 __all__ = [
+    "AuditHook",
     "EditMismatch",
     "InvalidNote",
     "NotFound",
@@ -109,6 +111,13 @@ class WriteRequest:
     new_str: str | None = None
     new_path: str | None = None
     message: str | None = None
+    #: The caller's identity for the audit log (#39): an OAuth access token's
+    #: subject, a static token's name, or `"stdio"` for a local session with
+    #: no token at all (`memory_manager.mcp.server.current_actor`'s default,
+    #: and this field's). Distinct from `client`, which is the *committer*
+    #: label `vault.repo.author_for` commits as - `actor` is who asked,
+    #: `client` is who the commit says did it.
+    actor: str = "stdio"
 
 
 @dataclass(frozen=True)
@@ -273,6 +282,16 @@ class WriteFailed(WriteError):
 
 WriteHook = Callable[["WriteResult", "WriteRequest", tuple[str, ...]], Awaitable[None]]
 SyncHook = Callable[[ChangeSet], Awaitable[None]]
+#: Called exactly once for every processed `WriteRequest`, success and
+#: rejection alike (`WriteHook` above only ever fires on success) - the seam
+#: `memory_manager.app` wires an `memory_manager.audit.AuditWriter` through
+#: (#39). `result` and `error` are mutually exclusive: exactly one is
+#: `None`. `error` is typed `Exception`, not `WriteError`, only because
+#: `_run_write_job` catches broadly in case of a bug elsewhere in `_process`
+#: - every error this queue itself ever raises is a `WriteError` subclass.
+#: Same failure contract as `WriteHook`/`SyncHook`: a raising hook is
+#: logged, never allowed to affect the write it was notified about.
+AuditHook = Callable[["WriteRequest", "WriteResult | None", Exception | None], Awaitable[None]]
 
 
 def _utc_now() -> datetime:
@@ -311,6 +330,7 @@ class WriteQueue:
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
         self._consumer_task: asyncio.Task[None] | None = None
         self._hooks: list[WriteHook] = []
+        self._audit_hooks: list[AuditHook] = []
         self._sync_hooks: list[SyncHook] = []
         self._pending_sync: asyncio.Future[ChangeSet] | None = None
 
@@ -321,6 +341,15 @@ class WriteQueue:
         the write it was notified about.
         """
         self._hooks.append(hook)
+
+    def add_audit_hook(self, hook: AuditHook) -> None:
+        """Register `hook` to be awaited after every processed write, ok or not (#39).
+
+        Unlike `add_hook`, this fires for a rejected/conflicting/failed
+        write too - see `AuditHook`'s docstring. Same failure contract: a
+        raising hook is logged, never propagated to the write's own caller.
+        """
+        self._audit_hooks.append(hook)
 
     def add_sync_hook(self, hook: SyncHook) -> None:
         """Register `hook` to be awaited after every sync that found a change (#33).
@@ -396,9 +425,18 @@ class WriteQueue:
         try:
             result = await self._process(request)
         except Exception as exc:  # routed to the submitter, not raised here
+            # Audit hooks run *before* the future resolves - same ordering
+            # `_process`'s own `_run_hooks` (the indexer) already uses for a
+            # success. Otherwise `submit()`'s caller could resume and query
+            # the audit log before this write's own row exists in it (seen
+            # as a real, flaky race once this ran with a real Postgres: a
+            # `fetchrow` landing on the *previous* write's row, or none at
+            # all, because this one's `INSERT` was still in flight).
+            await self._run_audit_hooks(request, None, exc)
             if not future.done():
                 future.set_exception(exc)
         else:
+            await self._run_audit_hooks(request, result, None)
             if not future.done():
                 future.set_result(result)
 
@@ -765,6 +803,15 @@ class WriteQueue:
                 await hook(result, request, changed_paths)
             except Exception:
                 _logger.exception("write queue hook failed for %s", request.path)
+
+    async def _run_audit_hooks(
+        self, request: WriteRequest, result: WriteResult | None, error: Exception | None
+    ) -> None:
+        for hook in self._audit_hooks:
+            try:
+                await hook(request, result, error)
+            except Exception:
+                _logger.exception("write queue audit hook failed for %s", request.path)
 
 
 def _check_version(

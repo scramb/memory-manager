@@ -846,7 +846,16 @@ async def _serve_http() -> int:
         port=config.port,
         log_config=None,
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        # `ServerConfig.forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default
+        # `127.0.0.1`, #39) - which proxy hop uvicorn's own
+        # `ProxyHeadersMiddleware` trusts `X-Forwarded-For` from before
+        # rewriting `scope["client"]`. That value is what `http.py`'s
+        # `_LimitsMiddleware` keys its IP-based rate limits on (and what
+        # `_vault_webhook`'s signature check logs as the caller); trusting
+        # every hop (the old hardcoded `"*"`) would let a request spoof
+        # `X-Forwarded-For` to pick its own rate-limit bucket, or collapse
+        # every client behind a real proxy onto that proxy's one bucket.
+        forwarded_allow_ips=config.forwarded_allow_ips,
     )
     server = uvicorn.Server(uvicorn_config)
     await server.serve()

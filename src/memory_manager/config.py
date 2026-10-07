@@ -35,6 +35,21 @@ _DEFAULT_PORT = 8080
 _DEFAULT_MCP_PATH = "/mcp"
 _FALSY_BOOL_ENV = frozenset({"0", "false", "no", "off", ""})
 
+# Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
+# "burst" is the token bucket's capacity - how many calls a key can make
+# back-to-back before the per-minute rate takes over. See `ServerConfig`'s
+# docstring for which route class each pair gates.
+_DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024
+_DEFAULT_MCP_PER_MINUTE = 120.0
+_DEFAULT_MCP_BURST = 30.0
+_DEFAULT_WRITE_PER_MINUTE = 30.0
+_DEFAULT_WRITE_BURST = 10.0
+_DEFAULT_OAUTH_PER_MINUTE = 30.0
+_DEFAULT_OAUTH_BURST = 10.0
+_DEFAULT_WEBHOOK_PER_MINUTE = 30.0
+_DEFAULT_WEBHOOK_BURST = 10.0
+_DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
+
 
 class VaultConfigError(ValueError):
     """A required `VAULT_*` environment variable is missing or invalid."""
@@ -200,6 +215,38 @@ class ServerConfig:
     document (`auth.metadata`) only advertises `client_id_metadata_document_
     supported`/`"none"` then too. Off has no effect on DCR, which is
     unconditional once the OAuth authorization server is enabled at all.
+
+    `max_request_bytes` (`MAX_REQUEST_BYTES`) is `http.py`'s body-size cap on
+    `mcp_path` (#39) - the note-file cap (16 KiB) is a separate, later check
+    in `vault.validate`; this one exists so a request body is never buffered
+    past this many bytes in the first place, counted as bytes actually
+    received rather than trusted from `Content-Length`.
+
+    `mcp_per_minute`/`mcp_burst`, `write_per_minute`/`write_burst`,
+    `oauth_per_minute`/`oauth_burst` and `webhook_per_minute`/`webhook_burst`
+    (`RATE_LIMIT_MCP_PER_MINUTE`/`RATE_LIMIT_MCP_BURST`/... ) feed one
+    `auth.ratelimit.RateLimiter` each (#39), all built once in `http.py`'s
+    `create_app`: every request to `mcp_path` against the `mcp_*` pair,
+    keyed by the hashed bearer token (or the client IP, unauthenticated);
+    every `memory_write`/`memory_edit`/`memory_supersede`/`memory_archive`
+    tool call *additionally* against the tighter `write_*` pair, same key;
+    every request to `/register`/`/token`/`/authorize` against `oauth_*`,
+    keyed by client IP; every request to the vault webhook against
+    `webhook_*`, keyed by client IP. A key over its limit gets a 429 with
+    `Retry-After`.
+
+    `forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) names
+    the proxy IPs/CIDRs this server should trust `X-Forwarded-For` from when
+    picking the "client IP" the limits above key on - the same semantics as
+    uvicorn's own `forwarded_allow_ips`, which is where this is actually
+    enforced: `cli.py`'s `_serve_http` passes this value straight into
+    `uvicorn.Config(forwarded_allow_ips=...)`, so by the time an ASGI app
+    (this one included) sees `scope["client"]`, uvicorn's own
+    `ProxyHeadersMiddleware` has already rewritten it from `X-Forwarded-For`
+    if (and only if) the request came from one of these. Trusting every hop
+    (`"*"`, this field's pre-#39 default) would let any caller spoof
+    `X-Forwarded-For` to pick its own rate-limit bucket, or collapse every
+    real client behind a reverse proxy onto that proxy's one bucket.
     """
 
     host: str = _DEFAULT_HOST
@@ -212,6 +259,16 @@ class ServerConfig:
     login_mode: str | None = None
     oauth_client_secret_key: str | None = field(default=None, repr=False)
     cimd_enabled: bool = True
+    max_request_bytes: int = _DEFAULT_MAX_REQUEST_BYTES
+    mcp_per_minute: float = _DEFAULT_MCP_PER_MINUTE
+    mcp_burst: float = _DEFAULT_MCP_BURST
+    write_per_minute: float = _DEFAULT_WRITE_PER_MINUTE
+    write_burst: float = _DEFAULT_WRITE_BURST
+    oauth_per_minute: float = _DEFAULT_OAUTH_PER_MINUTE
+    oauth_burst: float = _DEFAULT_OAUTH_BURST
+    webhook_per_minute: float = _DEFAULT_WEBHOOK_PER_MINUTE
+    webhook_burst: float = _DEFAULT_WEBHOOK_BURST
+    forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -242,10 +299,12 @@ class ServerConfig:
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
-        `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE` entries of `environ`.
+        `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
-        variable if `PORT` is not a valid port number.
+        variable if `PORT` is not a valid port number, or any size/rate
+        limit is not a positive number.
         """
         host = environ.get("HOST", _DEFAULT_HOST)
         port = _parse_port(environ.get("PORT"))
@@ -257,6 +316,28 @@ class ServerConfig:
         login_mode = environ.get("LOGIN_MODE") or None
         oauth_client_secret_key = environ.get("OAUTH_CLIENT_SECRET_KEY") or None
         cimd_enabled = _parse_bool(environ.get("CIMD_ENABLED"), default=True)
+        max_request_bytes = _parse_positive_int(
+            environ, "MAX_REQUEST_BYTES", _DEFAULT_MAX_REQUEST_BYTES
+        )
+        mcp_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_MCP_PER_MINUTE", _DEFAULT_MCP_PER_MINUTE
+        )
+        mcp_burst = _parse_positive_float(environ, "RATE_LIMIT_MCP_BURST", _DEFAULT_MCP_BURST)
+        write_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_WRITE_PER_MINUTE", _DEFAULT_WRITE_PER_MINUTE
+        )
+        write_burst = _parse_positive_float(environ, "RATE_LIMIT_WRITE_BURST", _DEFAULT_WRITE_BURST)
+        oauth_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_OAUTH_PER_MINUTE", _DEFAULT_OAUTH_PER_MINUTE
+        )
+        oauth_burst = _parse_positive_float(environ, "RATE_LIMIT_OAUTH_BURST", _DEFAULT_OAUTH_BURST)
+        webhook_per_minute = _parse_positive_float(
+            environ, "RATE_LIMIT_WEBHOOK_PER_MINUTE", _DEFAULT_WEBHOOK_PER_MINUTE
+        )
+        webhook_burst = _parse_positive_float(
+            environ, "RATE_LIMIT_WEBHOOK_BURST", _DEFAULT_WEBHOOK_BURST
+        )
+        forwarded_allow_ips = environ.get("FORWARDED_ALLOW_IPS") or _DEFAULT_FORWARDED_ALLOW_IPS
 
         return cls(
             host=host,
@@ -269,6 +350,16 @@ class ServerConfig:
             login_mode=login_mode,
             oauth_client_secret_key=oauth_client_secret_key,
             cimd_enabled=cimd_enabled,
+            max_request_bytes=max_request_bytes,
+            mcp_per_minute=mcp_per_minute,
+            mcp_burst=mcp_burst,
+            write_per_minute=write_per_minute,
+            write_burst=write_burst,
+            oauth_per_minute=oauth_per_minute,
+            oauth_burst=oauth_burst,
+            webhook_per_minute=webhook_per_minute,
+            webhook_burst=webhook_burst,
+            forwarded_allow_ips=forwarded_allow_ips,
         )
 
 
@@ -282,6 +373,32 @@ def _parse_port(raw: str | None) -> int:
     if not 1 <= port <= 65535:
         raise ServerConfigError(f"PORT must be between 1 and 65535, got {port}")
     return port
+
+
+def _parse_positive_int(environ: dict[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _parse_positive_float(environ: dict[str, str], name: str, default: float) -> float:
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
 
 
 def _resolve_allowed_origins(raw: str | None, public_url: str | None) -> tuple[str, ...]:

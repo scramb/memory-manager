@@ -61,7 +61,7 @@ from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path, 
 from memory_manager.vault.ulid import is_ulid, new_ulid
 from memory_manager.vault.validate import NOTE_TYPES
 
-__all__ = ["INSTRUCTIONS", "build_server", "current_client"]
+__all__ = ["INSTRUCTIONS", "build_server", "current_actor", "current_client"]
 
 _logger = logging.getLogger(__name__)
 
@@ -188,6 +188,34 @@ def current_client() -> str:
     if token.claims is not None and "client_label" in token.claims:
         return str(token.claims["client_label"])
     return _DEFAULT_CLIENT
+
+
+_STDIO_ACTOR = "stdio"
+# Mirrors `auth.verifier`'s own private `_CLIENT_ID_PREFIX` - a static
+# token's `AccessToken.client_id` (not re-exported, so duplicated as a
+# literal here rather than importing a private name).
+_STATIC_CLIENT_ID_PREFIX = "static:"
+
+
+def current_actor() -> str:
+    """Who asked for the write this process is about to make, for the audit log (#39).
+
+    An OAuth access token (#36) carries its own subject in
+    `AccessToken.subject` - the human who logged in and authorized the
+    client, independent of `current_client()`'s committer label. A static
+    token (#34) carries no subject of its own; its `client_id` is
+    `"static:<name>"` (`auth.verifier._verify_static_token`), so the token's
+    name is what identifies it here instead. Stdio mode has no token at all,
+    so it is always `"stdio"` - never guessed from `MEMORY_CLIENT`, which
+    names the *committer* `current_client()` returns, not who is actually
+    running the local session.
+    """
+    token = current_access_token()
+    if token is None:
+        return _STDIO_ACTOR
+    if token.subject is not None:
+        return token.subject
+    return token.client_id.removeprefix(_STATIC_CLIENT_ID_PREFIX)
 
 
 # Each tool's description is built from `TOOL_DATA_SENTENCE` rather than repeating the
@@ -464,6 +492,7 @@ def build_server(
             op="write",
             path=path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             content=prepared.content,
             message=message,
@@ -497,6 +526,7 @@ def build_server(
             op="edit",
             path=path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             old_str=old_str,
             new_str=new_str,
@@ -540,6 +570,7 @@ def build_server(
             path=resolved_old,
             new_path=new_path,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             content=prepared.content,
             message=message,
@@ -579,6 +610,7 @@ def build_server(
             op="archive",
             path=resolved,
             client=current_client(),
+            actor=current_actor(),
             if_version=if_version,
             message=message,
         )
