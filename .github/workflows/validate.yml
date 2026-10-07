@@ -19,6 +19,26 @@ jobs:
       - name: Planning skeleton
         run: scripts/check-docs.sh
 
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFORM_VERSION: v0.6.7
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install kubeconform
+        run: |
+          curl -sL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/kubeconform
+      - name: Render and validate the Kustomize base (incl. CRD schemas)
+        run: |
+          kubectl kustomize deploy \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: No operator-specific hostnames or IPs
+        run: scripts/check-deploy-placeholders.sh
+
   python:
     runs-on: ubuntu-latest
     services:

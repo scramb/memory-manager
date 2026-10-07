@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,6 +79,8 @@ class Repo:
 
     def __init__(self, config: VaultConfig) -> None:
         self._config = config
+        # Filled in lazily, at most once, by `_resolved_ssh_key_file()`.
+        self._resolved_ssh_key_file: Path | None = None
 
     def ensure_clone(self) -> None:
         """Make sure `config.dir` holds a working copy of `config.remote`.
@@ -448,13 +451,53 @@ class Repo:
         return Git(cwd=self._config.dir, env_extra=self._env_extra(), secrets=self._secrets())
 
     def _env_extra(self) -> dict[str, str]:
-        if self._config.ssh_key_file is None:
+        configured_key_file = self._config.ssh_key_file
+        if configured_key_file is None:
             return {}
-        ssh_command = (
-            f"ssh -i {self._config.ssh_key_file} "
-            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        key_file = self._ssh_key_file(configured_key_file)
+        known_hosts = self._config.ssh_known_hosts_file
+        # A pinned `known_hosts` is the production-recommended setting
+        # (deploy/README.md): without one, `accept-new` trusts whatever host
+        # key the remote presents on first contact, which is fine for a
+        # throwaway/local remote but not for an operator's real deploy key.
+        host_key_option = (
+            f"-o UserKnownHostsFile={known_hosts} -o StrictHostKeyChecking=yes"
+            if known_hosts is not None
+            else "-o StrictHostKeyChecking=accept-new"
         )
+        ssh_command = f"ssh -i {key_file} -o IdentitiesOnly=yes {host_key_option}"
         return {"GIT_SSH_COMMAND": ssh_command}
+
+    def _ssh_key_file(self, configured: Path) -> Path:
+        """`configured`, or a private 0600 copy of it.
+
+        A Kubernetes Secret volume mounts its keys root-owned/0440 or 0644
+        under `fsGroup` (there is no per-key `defaultMode` granular enough
+        to land exactly on 0600 for one key among others in the same
+        volume) - `ssh` refuses a key file that is group- or
+        other-readable at all ("UNPROTECTED PRIVATE KEY FILE"), regardless
+        of who can actually read it through that mode. When `configured`
+        is not already safe for `ssh` to use as-is, it is copied once, the
+        first time this is called, into a fresh `mkstemp` file (private to
+        this process's uid, mode 0600 by construction) and every later
+        call reuses that same copy rather than copying again.
+        """
+        if self._resolved_ssh_key_file is not None:
+            return self._resolved_ssh_key_file
+        if _is_private_key_file(configured):
+            self._resolved_ssh_key_file = configured
+            return configured
+
+        fd, tmp_name = tempfile.mkstemp(prefix="memory-manager-ssh-key-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(configured.read_bytes())
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp_name)
+            raise
+        self._resolved_ssh_key_file = Path(tmp_name)
+        return self._resolved_ssh_key_file
 
     def _secrets(self) -> tuple[str, ...]:
         token = self._config.https_token
@@ -466,6 +509,23 @@ class Repo:
             return ()
         encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
         return ("-c", f"http.extraHeader=Authorization: Basic {encoded}")
+
+
+def _is_private_key_file(path: Path) -> bool:
+    """Whether `ssh` already accepts `path` as a private key file as-is.
+
+    `ssh` checks this as an exact bit mask against the file's own mode -
+    0600 or 0400, nothing else - plus ownership by the user running it; it
+    is not the broader "can anyone but me read this" POSIX question. Any
+    `OSError` (missing file, permission denied even to `stat` it) is "no",
+    the same outcome ssh itself would eventually produce.
+    """
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return False
+    mode = stat.S_IMODE(file_stat.st_mode)
+    return file_stat.st_uid == os.getuid() and mode in (0o600, 0o400)
 
 
 def _atomic_write(path: Path, content: bytes) -> None:

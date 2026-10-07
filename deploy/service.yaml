@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+spec:
+  selector:
+    app.kubernetes.io/name: memory-manager
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

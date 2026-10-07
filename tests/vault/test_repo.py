@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -173,3 +175,95 @@ class TestSecurity:
         repo.ensure_clone()
         sha = repo.commit_file("personal/fact/a.md", b"content\n", author_for("human"), "add a")
         assert sha
+
+
+class TestSshEnv:
+    """`GIT_SSH_COMMAND` construction and the Kubernetes Secret key-mode fix.
+
+    None of these need a real SSH remote - `_env_extra()`/`_ssh_key_file()`
+    only build a command string / resolve a key file path, which `_git()`
+    passes straight through as `env_extra` without ever touching the
+    network (`Git.run`'s own fixed-env test coverage is what exercises
+    that it actually lands in the subprocess environment).
+    """
+
+    def test_no_key_file_means_no_ssh_env(self, vault_config: VaultConfig) -> None:
+        assert vault_config.ssh_key_file is None
+        assert Repo(vault_config)._env_extra() == {}
+
+    def test_default_host_key_checking_is_accept_new(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        key_file = tmp_path / "id_ed25519"
+        key_file.write_text("fake key\n")
+        key_file.chmod(0o600)
+        config = replace(vault_config, ssh_key_file=key_file)
+
+        env = Repo(config)._env_extra()
+        assert "-o StrictHostKeyChecking=accept-new" in env["GIT_SSH_COMMAND"]
+        assert "UserKnownHostsFile" not in env["GIT_SSH_COMMAND"]
+
+    def test_known_hosts_file_switches_to_strict_checking(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        key_file = tmp_path / "id_ed25519"
+        key_file.write_text("fake key\n")
+        key_file.chmod(0o600)
+        known_hosts = tmp_path / "known_hosts"
+        known_hosts.write_text("# pinned host keys\n")
+        config = replace(vault_config, ssh_key_file=key_file, ssh_known_hosts_file=known_hosts)
+
+        env = Repo(config)._env_extra()
+        ssh_command = env["GIT_SSH_COMMAND"]
+        assert f"-o UserKnownHostsFile={known_hosts}" in ssh_command
+        assert "-o StrictHostKeyChecking=yes" in ssh_command
+        assert "accept-new" not in ssh_command
+
+    def test_key_file_already_0600_is_used_as_is(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        key_file = tmp_path / "id_ed25519"
+        key_file.write_text("fake key\n")
+        key_file.chmod(0o600)
+        config = replace(vault_config, ssh_key_file=key_file)
+
+        repo = Repo(config)
+        env = repo._env_extra()
+        assert f"-i {key_file} " in env["GIT_SSH_COMMAND"]
+
+    def test_group_readable_key_file_is_copied_to_a_private_0600_file(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        """A Kubernetes Secret volume mounts keys root-owned/0440 or 0644
+        under `fsGroup` - `ssh` refuses such a key outright ("UNPROTECTED
+        PRIVATE KEY FILE"). `_ssh_key_file()` must copy it to a private
+        0600 file instead of handing the unsafe path straight to `ssh`."""
+        key_file = tmp_path / "id_ed25519"
+        key_file.write_text("fake key\n")
+        key_file.chmod(0o640)
+        config = replace(vault_config, ssh_key_file=key_file)
+
+        repo = Repo(config)
+        env = repo._env_extra()
+        ssh_command = env["GIT_SSH_COMMAND"]
+        assert str(key_file) not in ssh_command
+
+        resolved = repo._ssh_key_file(key_file)
+        assert resolved != key_file
+        assert resolved.read_text() == "fake key\n"
+        mode = os.stat(resolved).st_mode & 0o777
+        assert mode == 0o600
+
+    def test_copied_key_file_is_reused_on_later_calls(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        key_file = tmp_path / "id_ed25519"
+        key_file.write_text("fake key\n")
+        key_file.chmod(0o644)
+        config = replace(vault_config, ssh_key_file=key_file)
+
+        repo = Repo(config)
+        first = repo._ssh_key_file(key_file)
+        second = repo._ssh_key_file(key_file)
+        assert first == second
+        assert first.exists()
