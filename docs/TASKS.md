@@ -130,7 +130,7 @@ Goal: reproducible deployment in < 5 minutes locally and via Helm/Flux on Kubern
 ### WP-13 — Kubernetes · Branch: `wp/13-kubernetes`
 
 - [x] #44 Generic Kustomize base in `deploy/` + deployment guide, consumable by any Flux setup via an operator overlay (HTTPRoute, CNPG, ExternalSecret)
-- [ ] #45 Helm chart (restricted PSS, NetworkPolicy, optional CNPG Postgres, single-writer)
+- [x] #45 Helm chart (restricted PSS, NetworkPolicy, optional CNPG Postgres, single-writer)
 - [ ] #46 Flux example with HelmRelease + SOPS secrets in `deploy/flux/`
 - [ ] #47 Docs: Cloudflare Tunnel as ingress alternative
 

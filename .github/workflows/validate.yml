@@ -36,6 +36,20 @@ jobs:
             | kubeconform -strict -summary \
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Lint the Helm chart
+        run: helm lint charts/memory-manager
+      - name: Render and validate the Helm chart (default values)
+        run: |
+          helm template t charts/memory-manager \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Render and validate the Helm chart (every optional feature on)
+        run: |
+          helm template t charts/memory-manager -f charts/memory-manager/ci/all-features-values.yaml \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
       - name: No operator-specific hostnames or IPs
         run: scripts/check-deploy-placeholders.sh
 

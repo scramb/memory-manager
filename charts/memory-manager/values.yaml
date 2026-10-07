@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Default values for memory-manager. Every hostname/email/secret-store
+# name below is a placeholder (CLAUDE.md: a public repository carries no
+# operator-specific values) - set your own in a `-f my-values.yaml` file,
+# never by editing this one in place. `charts/memory-manager/README.md`
+# documents every key in a table; this file is the inline reference.
+
+# Fixed at 1 (also enforced by values.schema.json: maximum 1) -
+# memory-manager is a single writer to the vault's git remote and the
+# in-process OAuth login rate limiter is per-process state
+# (deploy/deployment.yaml's own comment); two replicas would mean two
+# independent writers/limiters, not one scaled service. 0 is allowed, to
+# scale the deployment down deliberately.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/scramb/memory-manager
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's own appVersion when empty - never "latest"
+  # (otherwise Git stops being what actually runs, deploy/README.md's own
+  # "Rollout" section).
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Off by default: the pod sets automountServiceAccountToken: false and
+  # needs no Kubernetes identity (deploy/deployment.yaml). Turn on for
+  # IRSA/Workload Identity or a policy bound to a ServiceAccount.
+  create: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+# Restricted Pod Security Standard - matches deploy/deployment.yaml
+# exactly; not meant to be loosened per install.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+probes:
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 20
+    timeoutSeconds: 3
+  readiness:
+    # 503 while the vault clone or the database is unreachable - a longer
+    # failureThreshold than liveness's, so a slow initial vault clone does
+    # not get the pod killed before it ever becomes ready.
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 6
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# The server's own canonical URL - must equal the HTTPRoute/Ingress
+# hostname exactly, scheme included (ADR-0004: must match exactly what a
+# client is told). Placeholder; set your own.
+publicUrl: https://memory.example.com
+
+vault:
+  # The vault's git remote - not read-only: the server pushes every write
+  # back. Placeholder; set your own.
+  remote: "git@git.example.com:memory-manager/vault.git"
+  branch: main
+
+# Login at /authorize (ADR-0004 L2). "oidc" (default, production) needs an
+# upstream provider; "password" (deploy/README.md's quickstart
+# alternative) needs the secrets block's own "values" adminPasswordHash
+# field (or its "existingSecret"'s ADMIN_PASSWORD_HASH key) instead,
+# generated with `memory-manager hash-password`.
+login:
+  mode: oidc
+  oidc:
+    issuer: https://idp.example.com
+    clientId: memory-manager
+    # Deny-by-default allowlist (ADR-0004 addendum), comma-separated.
+    allowedEmails: you@example.com
+  # Subjects with no entry in LOGIN_NAMESPACE_MAP fall back to this.
+  namespaces: personal
+
+# Every embedding API is optional and pluggable (PLAN/CLAUDE.md); "none"
+# (default) means full-text search only. "ollama"/"openai" need `url` and,
+# for "openai", `model`; `apiKeySecretKey` names a key in the secrets
+# block's existingSecret (or the chart-managed secret) to read
+# EMBEDDING_API_KEY from, if the provider needs one.
+embedding:
+  provider: none
+  url: ""
+  model: ""
+  dimensions: null
+  apiKeySecretKey: ""
+
+metrics:
+  # /metrics on the same port as the MCP endpoint; no auth of its own -
+  # restrict with networkPolicy or a ServiceMonitor-scraping-only setup.
+  enabled: true
+
+logFormat: json
+
+secrets:
+  # An operator-managed Secret carrying the keys deploy/secrets.yaml
+  # documents (SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS, VAULT_WEBHOOK_SECRET,
+  # OIDC_CLIENT_SECRET, OAUTH_CLIENT_SECRET_KEY, and ADMIN_PASSWORD_HASH
+  # when login's own mode is "password") - recommended for every real
+  # install. Defaults to "<release>-memory-manager-secrets" when empty.
+  existingSecret: ""
+  # Chart-managed Secret from this block's own "values" below instead - a
+  # quick-install convenience, NOT for production (templates/secret.yaml):
+  # plain values end up in `helm get values`/release history.
+  create: false
+  values: {}
+    # sshPrivateKey: ""
+    # sshKnownHosts: ""
+    # vaultWebhookSecret: ""
+    # oidcClientSecret: ""
+    # oauthClientSecretKey: ""
+    # adminPasswordHash: ""
+
+database:
+  cnpg:
+    # Renders a CloudNativePG Cluster (deploy/database.yaml) and points
+    # DATABASE_URL at the Secret CNPG derives from it. Requires the CNPG
+    # operator installed in the cluster already (not this chart's job).
+    # Set to false and use this block's own "url"/"existingSecret" for an
+    # external Postgres instead.
+    enabled: true
+    instances: 1
+    imageName: docker.io/pgvector/pgvector:pg16
+    storage:
+      size: 5Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+  # Used only when the cnpg block above is disabled.
+  url: ""
+  existingSecret:
+    name: ""
+    key: uri
+
+# Gateway API HTTPRoute (deploy/httproute.yaml) - the whole host goes to
+# the app, which decides who gets in on its own. Mutually exclusive with
+# ingress below in practice (pick whichever your cluster's ingress
+# controller supports); both can render at once if you really want to.
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: gateway-name
+      namespace: gateway-namespace
+  hostnames:
+    - memory.example.com
+
+# Classic Ingress, for clusters without Gateway API. Off by default.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: memory.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Off by default (documented, not a default-on guardrail - CLAUDE.md
+# still wants it available). Remote IPs for the vault's git remote, the
+# OIDC issuer and an embedding provider are operator-specific and unknown
+# to this chart, so the default egress when enabled is allow-all-with-DNS;
+# set this block's own "allowAll" to false and list your own "rules" (raw
+# NetworkPolicyEgressRule entries) to lock it down further.
+networkPolicy:
+  enabled: false
+  ingress:
+    namespaceSelector: {}
+    podSelector: {}
+  egress:
+    allowAll: true
+    rules: []
+
+# Prometheus Operator ServiceMonitor (observability/metrics.py's own
+# /metrics) - off by default, needs the Prometheus Operator CRDs
+# installed.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}

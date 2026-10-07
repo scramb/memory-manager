@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Postgres 16 + pgvector (PLAN: a derived, fully rebuildable search index -
+# `memory-manager reindex --full` repopulates it from the vault, so losing
+# this Cluster loses only the index, never a note). Requires the
+# CloudNativePG operator already installed in the cluster - this chart
+# only renders the Cluster custom resource, not the operator itself.
+# `docker.io/pgvector/pgvector:pg16` (the same image compose.yaml runs
+# locally) rather than CloudNativePG's own postgresql images: a stock
+# PostgreSQL 16 image plus the compiled vector extension is all CNPG's
+# instance manager needs - memory-manager's own migrations run
+# `CREATE EXTENSION IF NOT EXISTS vector` and the rest of the schema.
+{{- if .Values.database.cnpg.enabled }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "memory-manager.cnpgClusterName" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.database.cnpg.instances }}
+  imageName: {{ .Values.database.cnpg.imageName }}
+  bootstrap:
+    initdb:
+      database: memory_manager
+      owner: memory_manager
+  storage:
+    {{- with .Values.database.cnpg.storage.storageClassName }}
+    storageClass: {{ . }}
+    {{- end }}
+    size: {{ .Values.database.cnpg.storage.size }}
+  resources:
+    {{- toYaml .Values.database.cnpg.resources | nindent 4 }}
+{{- end }}

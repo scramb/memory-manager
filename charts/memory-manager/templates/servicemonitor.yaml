@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default, needs the Prometheus Operator's CRDs installed.
+# observability/metrics.py's own /metrics - no auth of its own, scraped
+# only from inside the cluster; restrict further with networkPolicy if
+# the Prometheus Operator is not in the same namespace.
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "memory-manager.fullname" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "memory-manager.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

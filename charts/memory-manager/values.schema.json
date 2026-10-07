@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "memory-manager",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Fixed at 0 or 1 - memory-manager is a single writer to the vault's git remote, never a scaled service."
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+        "tag": { "type": "string" }
+      },
+      "required": ["repository"]
+    },
+    "imagePullSecrets": { "type": "array" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "create": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "name": { "type": "string" }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podSecurityContext": { "type": "object", "additionalProperties": true },
+    "securityContext": { "type": "object", "additionalProperties": true },
+    "service": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "resources": { "type": "object", "additionalProperties": true },
+    "probes": { "type": "object", "additionalProperties": true },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "publicUrl": { "type": "string", "minLength": 1 },
+    "vault": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "remote": { "type": "string", "minLength": 1 },
+        "branch": { "type": "string", "minLength": 1 }
+      },
+      "required": ["remote"]
+    },
+    "login": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "mode": { "type": "string", "enum": ["oidc", "password"] },
+        "oidc": { "type": "object", "additionalProperties": true },
+        "namespaces": { "type": "string" }
+      }
+    },
+    "embedding": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "provider": { "type": "string", "enum": ["none", "ollama", "openai"] },
+        "url": { "type": "string" },
+        "model": { "type": "string" },
+        "dimensions": { "type": ["integer", "null"], "minimum": 1 },
+        "apiKeySecretKey": { "type": "string" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "logFormat": { "type": "string" },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "existingSecret": { "type": "string" },
+        "create": { "type": "boolean" },
+        "values": { "type": "object" }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "cnpg": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "instances": { "type": "integer", "minimum": 1 },
+            "imageName": { "type": "string", "minLength": 1 },
+            "storage": { "type": "object", "additionalProperties": true },
+            "resources": { "type": "object", "additionalProperties": true }
+          }
+        },
+        "url": { "type": "string" },
+        "existingSecret": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "parentRefs": { "type": "array" },
+        "hostnames": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "hosts": { "type": "array" },
+        "tls": { "type": "array" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingress": { "type": "object", "additionalProperties": true },
+        "egress": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "allowAll": { "type": "boolean" },
+            "rules": { "type": "array" }
+          }
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string" },
+        "labels": { "type": "object" }
+      }
+    }
+  },
+  "required": ["image", "service", "publicUrl", "vault"]
+}

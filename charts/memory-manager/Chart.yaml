@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Helm packaging of the same server deploy/ ships as a generic Kustomize
+# base (#44) - this chart renders the equivalent Deployment/Service plus
+# the same optional pieces (HTTPRoute, NetworkPolicy, CNPG `Cluster`), for
+# operators who prefer Helm over Flux+Kustomize. Chart publishing
+# (chart-releaser) is separate, later work (#52); for now this chart is
+# installed straight from a checkout (`helm install ... ./charts/memory-manager`).
+apiVersion: v2
+name: memory-manager
+description: Self-hosted long-term memory for Claude - Markdown notes in Git as the source of truth, a derived Postgres search index, and a remote MCP server.
+type: application
+version: 0.1.0
+appVersion: "0.0.0"
+home: https://github.com/scramb/memory-manager
+sources:
+  - https://github.com/scramb/memory-manager
+keywords:
+  - mcp
+  - claude
+  - memory
+  - git

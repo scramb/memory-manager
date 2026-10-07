@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# One replica, `strategy: Recreate`: memory-manager is a single writer to
+# the vault's git remote (ADR-0003/the write queue) and the in-process
+# OAuth login rate limiter (ADR-0004) is per-process state - two replicas
+# would mean two independent writers/limiters, not one scaled service
+# (replicaCount is fixed at 1 by values.schema.json). `Recreate` guarantees
+# the old pod is gone before the new one starts, so there is never a
+# moment with two running at once during a rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memory-manager.fullname" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "memory-manager.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "memory-manager.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "memory-manager.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: memory-manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Must match exactly what a client is told (ADR-0004).
+            - name: PUBLIC_URL
+              value: {{ .Values.publicUrl | quote }}
+            {{- if .Values.database.cnpg.enabled }}
+            # Assembled by CloudNativePG into the Secret
+            # "<cluster-name>-app" (templates/cnpg-cluster.yaml); "uri" is
+            # the full libpq connection string, including the generated
+            # password.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.cnpgClusterName" . }}-app
+                  key: uri
+            {{- else if .Values.database.existingSecret.name }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret.name }}
+                  key: {{ .Values.database.existingSecret.key | default "uri" }}
+            {{- else }}
+            - name: DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            {{- end }}
+            # The vault's own git remote. VAULT_DIR defaults to
+            # /data/vault (the image's own ENV), which is exactly where
+            # the "vault-data" emptyDir below is mounted: Git is the
+            # source of truth, so this clone is rebuilt from VAULT_REMOTE
+            # on every pod start, never persisted on its own.
+            - name: VAULT_REMOTE
+              value: {{ .Values.vault.remote | quote }}
+            - name: VAULT_BRANCH
+              value: {{ .Values.vault.branch | quote }}
+            - name: VAULT_SSH_KEY_FILE
+              value: /etc/memory-manager/ssh/id_ed25519
+            # Pins the remote's host key instead of trusting whoever
+            # answers on first contact - recommended for every production
+            # deployment (deploy/README.md's "SSH runtime notes").
+            - name: VAULT_SSH_KNOWN_HOSTS
+              value: /etc/memory-manager/ssh/known_hosts
+            - name: VAULT_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: VAULT_WEBHOOK_SECRET
+            # Login at /authorize (ADR-0004 L2) - upstream OIDC in
+            # production; setting login's own mode to "password" (plus an
+            # ADMIN_PASSWORD_HASH secret key) is the quickstart alternative.
+            - name: LOGIN_MODE
+              value: {{ .Values.login.mode | quote }}
+            {{- if eq .Values.login.mode "oidc" }}
+            - name: OIDC_ISSUER
+              value: {{ .Values.login.oidc.issuer | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ .Values.login.oidc.clientId | quote }}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: OIDC_CLIENT_SECRET
+            # Deny-by-default allowlist (ADR-0004 addendum).
+            - name: OIDC_ALLOWED_EMAILS
+              value: {{ .Values.login.oidc.allowedEmails | quote }}
+            {{- else }}
+            - name: ADMIN_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: ADMIN_PASSWORD_HASH
+            {{- end }}
+            # Subjects with no entry in LOGIN_NAMESPACE_MAP fall back to
+            # this; adjust to your own vault layout.
+            - name: LOGIN_NAMESPACES
+              value: {{ .Values.login.namespaces | quote }}
+            - name: OAUTH_CLIENT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: OAUTH_CLIENT_SECRET_KEY
+            {{- if ne .Values.embedding.provider "none" }}
+            - name: EMBEDDING_PROVIDER
+              value: {{ .Values.embedding.provider | quote }}
+            - name: EMBEDDING_URL
+              value: {{ .Values.embedding.url | quote }}
+            {{- if .Values.embedding.model }}
+            - name: EMBEDDING_MODEL
+              value: {{ .Values.embedding.model | quote }}
+            {{- end }}
+            {{- if .Values.embedding.dimensions }}
+            - name: EMBEDDING_DIMENSIONS
+              value: {{ .Values.embedding.dimensions | quote }}
+            {{- end }}
+            {{- if .Values.embedding.apiKeySecretKey }}
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: {{ .Values.embedding.apiKeySecretKey }}
+            {{- end }}
+            {{- end }}
+            {{- if not .Values.metrics.enabled }}
+            - name: METRICS_ENABLED
+              value: "false"
+            {{- end }}
+            - name: LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          # 503 while the vault clone or the database is unreachable.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            # VAULT_DIR (/data/vault, the image's default) and the vault
+            # webhook both live here; emptyDir on purpose - Git is the
+            # source of truth, this clone is rebuilt on every start, never
+            # a thing to persist or back up on its own.
+            - name: vault-data
+              mountPath: /data
+            # Read-only; the Kubernetes Secret volume may mount these
+            # keys group-/other-readable under fsGroup - the server itself
+            # copies an unsafe key to a private 0600 temp file before ever
+            # handing it to `ssh` (vault/repo.py's `_ssh_key_file()`).
+            - name: ssh
+              mountPath: /etc/memory-manager/ssh
+              readOnly: true
+            # HOME=/tmp (the image's own ENV) and the read-only root
+            # filesystem both need this writable.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: vault-data
+          emptyDir: {}
+        - name: ssh
+          secret:
+            secretName: {{ include "memory-manager.secretName" . }}
+            items:
+              - key: SSH_PRIVATE_KEY
+                path: id_ed25519
+              - key: SSH_KNOWN_HOSTS
+                path: known_hosts
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

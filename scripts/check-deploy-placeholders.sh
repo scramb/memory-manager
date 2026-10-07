@@ -30,6 +30,7 @@ allowed_suffixes=(
   example.com example.org localhost svc.cluster.local
   github.com ghcr.io docker.io
   kubernetes.io k8s.io fluxcd.io cnpg.io external-secrets.io
+  monitoring.coreos.com githubusercontent.com
   py sh yaml yml md json toml lock txt cfg ini
 )
 
@@ -53,12 +54,28 @@ is_allowed_host() {
 }
 
 # A DNS label sequence with at least one dot - the shape of both a real
-# hostname and a git remote's "<repo>.git" suffix.
-host_regex='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
+# hostname and a git remote's "<repo>.git" suffix - optionally followed by
+# a single `/<label>` path segment, the shape of a Kubernetes qualified
+# name (`<DNS subdomain>/<name>`, e.g. `kubernetes.io/ingress.class`): the
+# API convention itself guarantees the part after the slash is never an
+# operator-specific hostname, only the part before it can be, so that is
+# the only part `is_allowed_host` below ever checks.
+host_regex='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+(/[A-Za-z0-9][A-Za-z0-9.-]*)?'
 # Exactly four dot-separated numeric groups - what actually makes a token
 # an IPv4 address, as opposed to e.g. a "0.0.0" placeholder version number
 # (two dots, three groups) that `host_regex` would also match.
 ipv4_regex='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
+
+# Helm templates (`charts/**/templates/*.yaml`, `_helpers.tpl`) hold Go
+# template expressions like `{{ .Values.database.cnpg.enabled }}` or
+# `{{ include "memory-manager.fullname" . }}` - code, not literal file
+# content, and never a hostname by themselves (whatever they render to at
+# install time is checked once rendered, not here). Stripped before
+# either regex runs below; a no-op on deploy/'s plain Kustomize YAML,
+# which never contains `{{ }}` in the first place.
+strip_templating() {
+  sed -E 's/\{\{-?[^}]*-?\}\}//g' "$1"
+}
 
 while IFS=: read -r file line match; do
   [[ -z "${match:-}" ]] && continue
@@ -68,11 +85,18 @@ while IFS=: read -r file line match; do
   # "<name>.git" is a git remote's path suffix, not a hostname - the
   # remote's actual host (if any) is its own, separately matched token.
   [[ "$match" == *.git ]] && continue
-  if is_allowed_host "$match"; then
+  # Only the part before a Kubernetes qualified name's "/" is ever
+  # checked against the allowlist (see host_regex's own comment above).
+  if is_allowed_host "${match%%/*}"; then
     continue
   fi
   err "$file:$line: hostname not in the placeholder allowlist: $match"
-done < <(grep -rnoE "$host_regex" "${dirs[@]}" --include='*.yaml' --include='*.yml' --include='*.md' || true)
+done < <(
+  find "${dirs[@]}" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.tpl' \) -print0 \
+    | while IFS= read -r -d '' f; do
+        strip_templating "$f" | grep -noE "$host_regex" | sed "s#^#${f}:#"
+      done || true
+)
 
 while IFS=: read -r file line match; do
   [[ -z "${match:-}" ]] && continue
@@ -81,7 +105,12 @@ while IFS=: read -r file line match; do
     continue
   fi
   err "$file:$line: IPv4 address other than 0.0.0.0/127.0.0.1: $match"
-done < <(grep -rnoE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' "${dirs[@]}" --include='*.yaml' --include='*.yml' --include='*.md' || true)
+done < <(
+  find "${dirs[@]}" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.md' -o -name '*.tpl' \) -print0 \
+    | while IFS= read -r -d '' f; do
+        strip_templating "$f" | grep -noE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | sed "s#^#${f}:#"
+      done || true
+)
 
 [[ $fail -eq 0 ]] && echo "deploy placeholder check OK"
 exit $fail
