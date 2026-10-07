@@ -15,14 +15,57 @@ section for `CHANGELOG.md` being generated, never hand-edited.
   `version`, the two files below that carry an `x-release-please-version`
   marker, and `CHANGELOG.md` — never edited by hand (`CLAUDE.md`).
   Merging it tags the repo `vX.Y.Z` and creates the matching GitHub
-  release (empty of assets at that point).
-- **`.github/workflows/release.yml`** runs on every push of a `v*` tag —
-  both the stable tag release-please just created above, and a
-  pre-release tag (e.g. `v0.0.1-rc.1`) pushed by hand for a release
-  candidate. It builds, signs and publishes the image and the chart, then
-  attaches the SBOM and the chart archive to the GitHub release (creating
-  a `--prerelease` one first if release-please didn't, i.e. for a
-  hand-pushed pre-release tag).
+  release (empty of assets at that point), then this workflow explicitly
+  dispatches `release.yml` for that tag (see "Why the tag push doesn't
+  trigger `release.yml` on its own" below).
+- **`.github/workflows/release.yml`** builds, signs and publishes the
+  image and the chart, then attaches the SBOM and the chart archive to
+  the GitHub release (creating a `--prerelease` one first if
+  release-please didn't, i.e. for a hand-pushed pre-release tag). It runs
+  on:
+  - a hand-pushed `v*` tag (e.g. a release candidate `v0.0.1-rc.1`) —
+    the normal `push: tags:` trigger works here because a human pushed
+    it with their own credentials;
+  - `workflow_dispatch`, with the run's ref pointing at the tag —
+    how `release-please.yml` starts it for a stable release (see below).
+
+## Why the tag push doesn't trigger `release.yml` on its own
+
+`release-please-action` tags and releases through the GitHub API using
+the workflow's `GITHUB_TOKEN`. Per GitHub's own docs on
+[triggering a workflow from a workflow](https://docs.github.com/en/actions/using-workflows/triggering-a-workflow-from-a-workflow#triggering-a-workflow-from-a-workflow)
+(retrieved 2026-10-07):
+
+> When you use the repository's `GITHUB_TOKEN` to perform tasks, events
+> triggered by the `GITHUB_TOKEN` will not create a new workflow run.
+> This prevents you from accidentally creating recursive workflow runs.
+
+That rule has exactly two exceptions, both event types designed to be
+started *by* another workflow: `workflow_dispatch` and
+`repository_dispatch`. So without this workflow's explicit dispatch
+step, merging the release-please PR would create tag `vX.Y.Z` and an
+empty GitHub release, but `release.yml`'s `push: tags:` trigger would
+never fire — no image, no signature, no chart. The same applies to the
+release PR itself: release-please opens/updates it with `GITHUB_TOKEN`,
+so its `pull_request` events never reach `validate.yml` either, which is
+why `release-please.yml` dispatches `validate.yml` on the PR's head
+branch as well (`dco.yml` is left out: it needs `pull_request` event
+context for the base/head SHAs, and release-please's own commits are
+exempt from that check regardless — see "Cutting a release" below).
+
+`release-please.yml` therefore needs `permissions: actions: write` to
+call `gh workflow run`, and reads the action's own outputs
+(`release_created`, `tag_name`, `pr`) to know what to dispatch and
+where — a hand-pushed pre-release tag skips all of this and reaches
+`release.yml` through the ordinary tag-push trigger instead.
+
+`release.yml`'s `workflow_dispatch` trigger takes no inputs: a dispatch
+run's `github.ref`/`github.ref_name` already reflect whatever ref was
+passed to `--ref` (here, the tag), exactly as for a real tag push, so
+the rest of the workflow (version, image tags, cosign identity) derives
+from `github.ref_name` unchanged. A guard step rejects any dispatch run
+that isn't on a `v*` tag ref, so a stray manual dispatch on a branch
+can't produce a broken "release".
 
 ## Version markers kept in sync by release-please
 

@@ -17,6 +17,12 @@ on:
   push:
     tags:
       - "v*"
+  # release-please.yml dispatches this explicitly after it tags a stable
+  # release: a push made with GITHUB_TOKEN does not re-trigger other
+  # workflows, `workflow_dispatch` is the exception - see docs/releasing.md.
+  # No inputs needed: `--ref <tag>` already puts GITHUB_REF_NAME/ref_name
+  # on the tag, same as a real tag push.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -30,6 +36,13 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Guard - must run against a version tag
+        run: |
+          if [[ "${{ github.ref_type }}" != "tag" || "${{ github.ref_name }}" != v* ]]; then
+            echo "::error::release.yml must run against a tag ref starting with 'v' (got ref_type=${{ github.ref_type }}, ref_name=${{ github.ref_name }})"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 

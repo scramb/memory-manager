@@ -3,6 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dispatched by release-please.yml for the release PR's head branch -
+  # its own pull_request events don't fire because release-please opens
+  # and updates it with GITHUB_TOKEN. See docs/releasing.md.
+  workflow_dispatch: {}
 
 permissions:
   contents: read

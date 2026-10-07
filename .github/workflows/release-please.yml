@@ -2,8 +2,13 @@ name: release-please
 
 # Opens/updates the "chore(release): x.y.z" PR on every push to main,
 # tracking the next release in release-please-config.json /
-# .release-please-manifest.json. Merging that PR is what actually tags
-# the repo (`v*`) and triggers .github/workflows/release.yml.
+# .release-please-manifest.json. Merging that PR tags the repo (`v*`)
+# and creates the GitHub release, both done via GITHUB_TOKEN - which
+# does NOT trigger .github/workflows/release.yml on its own (see
+# docs/releasing.md), so this workflow dispatches it explicitly below.
+# The same applies to the release PR itself: its `pull_request` events
+# never trigger validate.yml, so that is dispatched here too, once per
+# push to main that opens/updates the PR.
 
 on:
   push:
@@ -12,6 +17,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}
@@ -21,8 +27,32 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - id: rp
+        uses: googleapis/release-please-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Dispatch release.yml for the tag just created
+        if: steps.rp.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ steps.rp.outputs.tag_name }}"
+
+      - name: Dispatch validate.yml on the release PR's head branch
+        # dco.yml is intentionally not dispatched here: it needs
+        # pull_request event context (base/head SHAs), and release-please's
+        # own commits are exempt from the DCO check anyway.
+        if: steps.rp.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run validate.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ fromJSON(steps.rp.outputs.pr).headBranchName }}"
