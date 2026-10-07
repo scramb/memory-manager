@@ -30,14 +30,22 @@ network list, still run afterwards anyway, as defence in depth against a future 
 `is_global` change alone silently reopening one of these - and NAT64 (`64:ff9b::/96`,
 RFC 6052) gets its own recursive check of the embedded IPv4 address, because
 `is_global` does not look inside that wrapper at all (`64:ff9b::7f00:1` - which embeds
-`127.0.0.1` - is itself `is_global`). A request is then pinned to the first address
-that passed every one of those checks (`Host`/SNI still carry the original hostname,
-so TLS certificate validation and virtual-hosting both still see the right name)
-rather than letting the HTTP client re-resolve DNS a second time between the check and
-the connection, no redirects followed (a redirect response is simply rejected, the
-same as any other non-200), a 5-second total timeout, a 64 KiB response-body cap
-enforced while streaming (not after buffering the whole body), and `Content-Type` must
-be JSON. Successful and failed fetches are both cached by URL (`ClientMetadataFetcher.
+`127.0.0.1` - is itself `is_global`). A request is then pinned to each address that
+passed every one of those checks, in `getaddrinfo` order (`Host`/SNI still carry the
+original hostname, so TLS certificate validation and virtual-hosting both still see
+the right name) rather than letting the HTTP client re-resolve DNS a second time
+between the check and the connection, no redirects followed (a redirect response is
+simply rejected, the same as any other non-200). A host with more than one validated
+address (claude.ai's own `client_id` resolves to both an IPv4 and an IPv6 address, #82)
+is tried address by address on a connection-level failure (`httpx.ConnectError`/
+`ConnectTimeout`, or a raw `OSError` from the transport) - never on an HTTP status
+error or an invalid document, since neither of those is a reason to believe a
+*different* address would behave any differently. The 5-second total timeout is split
+evenly across however many addresses there are to try, so a host with several
+unreachable addresses still fails within the same 5 seconds a single-address host
+would. A 64 KiB response-body cap is enforced while streaming (not after buffering the
+whole body), and `Content-Type` must be JSON. Successful and failed fetches are both
+cached by URL (`ClientMetadataFetcher.
 fetch` on a cache hit never touches the network at all) - successes for
 `Cache-Control: max-age` clamped to `[_MIN_CACHE_SECONDS, _MAX_CACHE_SECONDS]`
 (defaulting to the minimum when the header is absent or unparseable), failures for
@@ -121,9 +129,11 @@ Resolver = Callable[[str], Sequence[str]]
 
 def default_resolver(host: str) -> Sequence[str]:
     """`socket.getaddrinfo(host, None)`, deduplicated - every address this host
-    currently resolves to, IPv4 and IPv6 alike."""
+    currently resolves to, IPv4 and IPv6 alike, in the order `getaddrinfo` returned
+    them (`dict.fromkeys` dedupes without reordering - a plain `set()` does not
+    preserve this, and the fetch fallback order below depends on it, #82)."""
     infos = socket.getaddrinfo(host, None)
-    addresses = {str(info[4][0]) for info in infos}
+    addresses = dict.fromkeys(str(info[4][0]) for info in infos)
     return tuple(addresses)
 
 
@@ -178,44 +188,51 @@ class ClientMetadataFetcher:
         return document
 
     async def _fetch_uncached(self, url: str) -> tuple[ClientMetadataDocument, float]:
-        host, pinned_url = await self._resolve_and_pin(url)
+        host, pinned_urls = await self._resolve_and_pin(url)
+        # The 5-second budget is shared equally across every validated address - a host
+        # with two addresses still fails within 5 seconds total if both are unreachable,
+        # rather than taking up to 10 (#82).
+        per_attempt_timeout = _REQUEST_TIMEOUT_SECONDS / len(pinned_urls)
 
+        connection_errors: list[str] = []
         async with httpx.AsyncClient(
             transport=self._transport,
             follow_redirects=False,
-            timeout=_REQUEST_TIMEOUT_SECONDS,
+            timeout=per_attempt_timeout,
         ) as http_client:
-            try:
-                async with http_client.stream(
-                    "GET",
-                    pinned_url,
-                    headers={"Host": host, "Accept": "application/json"},
-                    extensions={"sni_hostname": host},
-                ) as response:
-                    if response.status_code != 200:
-                        raise CimdError(
-                            f"{url!r} returned HTTP {response.status_code}, expected 200"
-                        )
-                    content_type = response.headers.get("content-type", "")
-                    if "json" not in content_type.lower():
-                        raise CimdError(
-                            f"{url!r} did not return JSON (Content-Type: {content_type!r})"
-                        )
-                    body = await _read_capped(response, _MAX_DOCUMENT_BYTES)
-                    ttl_seconds = _cache_ttl_seconds(response.headers.get("cache-control"))
-            except httpx.TimeoutException as exc:
-                raise CimdError(f"timed out fetching {url!r}: {exc}") from exc
-            except httpx.HTTPError as exc:
-                raise CimdError(f"could not fetch {url!r}: {exc}") from exc
+            for pinned_url in pinned_urls:
+                try:
+                    async with http_client.stream(
+                        "GET",
+                        pinned_url,
+                        headers={"Host": host, "Accept": "application/json"},
+                        extensions={"sni_hostname": host},
+                    ) as response:
+                        return await _read_document(url, response)
+                except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as exc:
+                    # Connection-level failure only - the host may still be reachable at
+                    # a different one of its validated addresses, so this one address is
+                    # not fatal on its own. An HTTP status error or an invalid document
+                    # (below, inside `_read_document`) is not caught here: a different
+                    # address would not behave any differently.
+                    connection_errors.append(f"{pinned_url}: {exc}")
+                    continue
+                except httpx.TimeoutException as exc:
+                    raise CimdError(f"timed out fetching {url!r}: {exc}") from exc
+                except httpx.HTTPError as exc:
+                    raise CimdError(f"could not fetch {url!r}: {exc}") from exc
 
-        document = _parse_document(url, body)
-        return document, ttl_seconds
+        raise CimdError(
+            f"could not connect to any resolved address for {host!r} ({url!r}): "
+            + "; ".join(connection_errors)
+        )
 
-    async def _resolve_and_pin(self, url: str) -> tuple[str, str]:
-        """Validate `url`'s shape, resolve its host and reject any disallowed address,
-        then return `(host, pinned_url)` - `pinned_url` has the host replaced by the
-        first address that passed the check, for `_fetch_uncached` to connect to
-        directly rather than trusting a second DNS lookup to resolve the same way."""
+    async def _resolve_and_pin(self, url: str) -> tuple[str, list[str]]:
+        """Validate `url`'s shape, resolve its host and reject the whole host if any
+        one resolved address is disallowed, then return `(host, pinned_urls)` -
+        `pinned_urls` has the host replaced by each validated address in turn, in
+        `getaddrinfo` order, for `_fetch_uncached` to connect to directly rather than
+        trusting a second DNS lookup to resolve the same way."""
         parsed = urlsplit(url)
         if parsed.scheme != "https":
             raise CimdError(f"client_id must be an https URL, got {url!r}")
@@ -237,12 +254,34 @@ class ClientMetadataFetcher:
             _reject_unsafe_address(address, host)
 
         port = parsed.port or 443
-        pinned_host = addresses[0]
-        pinned_netloc = f"[{pinned_host}]:{port}" if ":" in pinned_host else f"{pinned_host}:{port}"
-        pinned_url = f"https://{pinned_netloc}{parsed.path}"
-        if parsed.query:
-            pinned_url = f"{pinned_url}?{parsed.query}"
-        return host, pinned_url
+        pinned_urls = [_pin_url(parsed.path, parsed.query, address, port) for address in addresses]
+        return host, pinned_urls
+
+
+def _pin_url(path: str, query: str, address: str, port: int) -> str:
+    netloc = f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+    pinned_url = f"https://{netloc}{path}"
+    if query:
+        pinned_url = f"{pinned_url}?{query}"
+    return pinned_url
+
+
+async def _read_document(
+    url: str, response: httpx.Response
+) -> tuple[ClientMetadataDocument, float]:
+    """`response`'s body, validated and parsed into a `ClientMetadataDocument` -
+    everything that happens after a connection to a pinned address has already
+    succeeded, so a failure here is about `url` itself, not about which address of
+    `host` it happened to be tried at."""
+    if response.status_code != 200:
+        raise CimdError(f"{url!r} returned HTTP {response.status_code}, expected 200")
+    content_type = response.headers.get("content-type", "")
+    if "json" not in content_type.lower():
+        raise CimdError(f"{url!r} did not return JSON (Content-Type: {content_type!r})")
+    body = await _read_capped(response, _MAX_DOCUMENT_BYTES)
+    ttl_seconds = _cache_ttl_seconds(response.headers.get("cache-control"))
+    document = _parse_document(url, body)
+    return document, ttl_seconds
 
 
 #: Defence in depth alongside `ip.is_global` (this module's docstring explains why

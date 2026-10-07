@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import secrets
+import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +34,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse, Response
 
 from memory_manager.app import open_services
+from memory_manager.auth import cimd
 from memory_manager.auth.cimd import CimdError, ClientMetadataFetcher
 from memory_manager.auth.login import BoundCompleter, PendingAuthorization
 from memory_manager.auth.provider import MemoryManagerOAuthProvider
@@ -45,6 +48,7 @@ from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 _CLIENT_URL = "https://client.example.test/metadata.json"
 _LOOPBACK_REDIRECT = "http://127.0.0.1/callback"
 _PUBLIC_ADDRESS = "8.8.8.8"
+_PUBLIC_ADDRESS_2 = "9.9.9.9"
 _PRIVATE_ADDRESS = "10.1.2.3"
 
 
@@ -94,6 +98,33 @@ def _public_resolver(_host: str) -> list[str]:
 
 def _private_resolver(_host: str) -> list[str]:
     return [_PRIVATE_ADDRESS]
+
+
+def _two_address_resolver(_host: str) -> list[str]:
+    # Order matters for the fallback tests below - `_PUBLIC_ADDRESS` is always tried
+    # first, matching `getaddrinfo` order (#82).
+    return [_PUBLIC_ADDRESS, _PUBLIC_ADDRESS_2]
+
+
+def _connect_error_for(unreachable_address: str) -> httpx.MockTransport:
+    """A transport that raises `httpx.ConnectError` for `unreachable_address` and
+    serves the happy-path document for any other pinned address."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == unreachable_address:
+            raise httpx.ConnectError("simulated connection refused")
+        return httpx.Response(
+            200, headers={"content-type": "application/json"}, json=_document_json()
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _always_connect_error() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated connection refused")
+
+    return httpx.MockTransport(handler)
 
 
 # --- Unit tests: ClientMetadataFetcher's SSRF guards and validation ----------------
@@ -272,6 +303,77 @@ async def test_fetch_caches_a_failure_negatively() -> None:
     assert len(calls) == 0
 
 
+# --- Multi-address fallback (#82): a host with more than one validated address -------
+
+
+async def test_fetch_falls_back_to_the_next_address_on_a_connection_error() -> None:
+    # The first pinned address (`_PUBLIC_ADDRESS`) refuses the connection; the fetch
+    # must still succeed by trying the second one, not surface the first address's
+    # failure as the whole fetch's outcome.
+    fetcher = ClientMetadataFetcher(
+        transport=_connect_error_for(_PUBLIC_ADDRESS), resolver=_two_address_resolver
+    )
+    document = await fetcher.fetch_client_metadata(_CLIENT_URL)
+    assert document.client_id == _CLIENT_URL
+
+
+async def test_fetch_raises_when_every_resolved_address_is_unreachable() -> None:
+    fetcher = ClientMetadataFetcher(
+        transport=_always_connect_error(), resolver=_two_address_resolver
+    )
+    with pytest.raises(CimdError, match="could not connect to any resolved address"):
+        await fetcher.fetch_client_metadata(_CLIENT_URL)
+
+
+async def test_fetch_rejects_the_whole_host_when_one_of_several_addresses_is_disallowed() -> None:
+    # The existing fail-closed rule (#38) still applies with more than one address:
+    # a single disallowed address rejects the host outright, it is not simply skipped
+    # in favour of the other, allowed one.
+    def mixed_resolver(_host: str) -> list[str]:
+        return [_PUBLIC_ADDRESS, _PRIVATE_ADDRESS]
+
+    fetcher = ClientMetadataFetcher(transport=_ok_handler(), resolver=mixed_resolver)
+    with pytest.raises(CimdError):
+        await fetcher.fetch_client_metadata(_CLIENT_URL)
+
+
+async def test_fetch_does_not_fall_back_on_an_http_status_error() -> None:
+    # A connection-level failure on one address is retried at the next; an HTTP status
+    # error from an address that *did* connect is not - a different address would not
+    # answer the same request any differently.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        return httpx.Response(500)
+
+    fetcher = ClientMetadataFetcher(
+        transport=httpx.MockTransport(handler), resolver=_two_address_resolver
+    )
+    with pytest.raises(CimdError, match="HTTP 500"):
+        await fetcher.fetch_client_metadata(_CLIENT_URL)
+    assert calls == [_PUBLIC_ADDRESS]
+
+
+def test_default_resolver_preserves_getaddrinfo_order_while_deduping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # claude.ai's real `client_id` host resolves to one IPv4 and one IPv6 address
+    # (#82's live diagnosis) - the old `set()`-based dedupe randomized this order.
+    def fake_getaddrinfo(host: str, port: object) -> list[tuple[object, ...]]:
+        return [
+            (socket.AF_INET6, None, None, None, ("2607:6bc0::10", 0, 0, 0)),
+            (socket.AF_INET, None, None, None, ("160.79.104.10", 0)),
+            (socket.AF_INET6, None, None, None, ("2607:6bc0::10", 0, 0, 0)),  # duplicate
+        ]
+
+    # `cimd.socket is socket`: patching the module everyone imports, not a private
+    # attribute of `cimd` - `mypy --strict` rejects `cimd.socket` as an attribute this
+    # module never explicitly re-exports.
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert cimd.default_resolver("claude.ai") == ("2607:6bc0::10", "160.79.104.10")
+
+
 # --- MemoryManagerOAuthProvider.get_client: CIMD vs. DCR routing, loopback matching -
 
 
@@ -360,6 +462,23 @@ async def test_get_client_returns_none_for_an_unfetchable_cimd_url(pool: asyncpg
     provider = _provider(pool, cimd_fetcher=fetcher)
 
     assert await provider.get_client(_CLIENT_URL) is None
+
+
+async def test_get_client_logs_a_warning_when_a_cimd_fetch_is_rejected(
+    pool: asyncpg.Pool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #82: `/authorize`'s own "not found" response never says why - the reason must at
+    # least reach the server's logs.
+    fetcher = ClientMetadataFetcher(transport=_ok_handler(), resolver=_private_resolver)
+    provider = _provider(pool, cimd_fetcher=fetcher)
+
+    with caplog.at_level(logging.WARNING):
+        client = await provider.get_client(_CLIENT_URL)
+
+    assert client is None
+    assert any(
+        "rejected" in record.message and _CLIENT_URL in record.message for record in caplog.records
+    )
 
 
 async def test_get_client_with_cimd_disabled_does_not_resolve_url_client_ids(

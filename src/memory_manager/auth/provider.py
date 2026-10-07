@@ -57,6 +57,7 @@ intersected with the supported set rather than trusted outright.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import timedelta
 from urllib.parse import urlsplit
@@ -83,6 +84,8 @@ from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_beare
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
 __all__ = ["MemoryManagerOAuthProvider"]
+
+_logger = logging.getLogger(__name__)
 
 _REFRESH_TOKEN_PREFIX = "mmr_"  # noqa: S105 - a format marker, not a credential
 _TOKEN_ENTROPY_BYTES = 32
@@ -245,7 +248,12 @@ class MemoryManagerOAuthProvider(
         """
         try:
             document = await cimd_fetcher.fetch_client_metadata(client_id)
-        except CimdError:
+        except CimdError as exc:
+            # Logged here, not inside `cimd.py` itself: this is the one call site that
+            # decides a CIMD failure is actually a login-blocking event, not merely a
+            # cache miss - #82's live diagnosis was only possible because `/authorize`'s
+            # "not found" response alone did not say why.
+            _logger.warning("CIMD client_id %s rejected: %s", client_id, exc)
             return None
         info: dict[str, object] = {
             "client_id": document.client_id,
