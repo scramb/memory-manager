@@ -74,3 +74,7 @@ Checked against the guardrails:
 ## Reversibility
 
 Cheap. Shared state sits behind one small interface and is loss-tolerant, so switching between Valkey and Postgres needs no migration. The transport mode is a single flag.
+
+## Addendum 2026-10-07 — container image ships the `valkey` extra
+
+The owner decided that the published container image installs the optional `valkey` extra (redis-py, MIT, no transitive dependencies), so one image serves single- and multi-replica deployments and the Helm enterprise profile (WP-29) can use Valkey without a second image. This replaces the wording "only installed for Valkey" under *Checked against the guardrails* for the image; source installs keep the extra optional. Implemented with WP-29.
