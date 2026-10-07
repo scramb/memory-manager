@@ -18,7 +18,6 @@ import base64
 import hashlib
 import html
 import secrets
-from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,12 +41,7 @@ from memory_manager.auth.login import (
     resolve_namespaces,
 )
 from memory_manager.auth.login_oidc import CALLBACK_PATH, OidcAuthenticator
-from memory_manager.auth.login_password import (
-    PasswordAuthenticator,
-    _FailureWindow,
-    _window_for,
-    hash_password,
-)
+from memory_manager.auth.login_password import PasswordAuthenticator, hash_password
 from memory_manager.cli import main as cli_main
 from memory_manager.config import ServerConfig, ServerConfigError
 from memory_manager.http import create_app
@@ -243,45 +237,6 @@ class TestPasswordAuthenticatorFromEnv:
             {"ADMIN_PASSWORD_HASH": hash_password(_ADMIN_PASSWORD)}
         )
         assert isinstance(authenticator, PasswordAuthenticator)
-
-
-# === _window_for: bounded per-IP brute-force tracking ===============================
-
-
-class TestWindowForEviction:
-    def test_a_third_ip_evicts_the_least_recently_used_one_beyond_max_tracked(self) -> None:
-        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
-
-        _window_for(by_ip, "1.1.1.1", max_tracked=2)
-        _window_for(by_ip, "2.2.2.2", max_tracked=2)
-        assert list(by_ip) == ["1.1.1.1", "2.2.2.2"]
-
-        _window_for(by_ip, "3.3.3.3", max_tracked=2)
-
-        assert len(by_ip) == 2
-        assert "1.1.1.1" not in by_ip
-        assert set(by_ip) == {"2.2.2.2", "3.3.3.3"}
-
-    def test_revisiting_an_ip_keeps_it_from_being_evicted_next(self) -> None:
-        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
-
-        _window_for(by_ip, "1.1.1.1", max_tracked=2)
-        _window_for(by_ip, "2.2.2.2", max_tracked=2)
-        _window_for(by_ip, "1.1.1.1", max_tracked=2)  # refreshes "1.1.1.1"'s position
-        _window_for(by_ip, "3.3.3.3", max_tracked=2)
-
-        assert set(by_ip) == {"1.1.1.1", "3.3.3.3"}
-
-    def test_an_evicted_ips_failure_history_is_gone(self) -> None:
-        by_ip: OrderedDict[str, _FailureWindow] = OrderedDict()
-        window = _window_for(by_ip, "1.1.1.1", max_tracked=1)
-        window.record(0.0)
-
-        _window_for(by_ip, "2.2.2.2", max_tracked=1)  # evicts "1.1.1.1"
-
-        fresh = _window_for(by_ip, "1.1.1.1", max_tracked=1)
-        assert fresh is not window
-        assert fresh.blocked(0.0) is False
 
 
 # === OidcAuthenticator.from_env =====================================================
@@ -651,6 +606,35 @@ async def test_oidc_callback_rejects_an_unknown_state(
             state_override="not-the-real-state",
         )
         assert callback_response.status_code == 400
+
+
+async def test_login_rejects_an_oidc_pending_state_value_as_its_own_pending_id(
+    bare_remote: Path, tmp_path: Path, test_database_url: str, fake_oidc_provider: Any
+) -> None:
+    """A `state` value `OidcAuthenticator` parks on `SharedState` (`kind=
+    'login_pending'` in `oauth_pending`, #103) must never be mistaken for one of
+    `auth.store.save_pending`'s own `kind='authorize'` rows, even though both now live
+    in the same table: `GET /login?pending=<that state>` has to return 400 like any
+    other unknown pending id, not crash trying to parse a `login_pending` row's params
+    as a `PendingRow`."""
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    authenticator = _oidc_authenticator(
+        fake_oidc_provider, allowed_subjects=frozenset({"alice-sub"})
+    )
+    async with _running_app(environ, config, authenticator=authenticator) as (_app, client):
+        client_id = await _register_client(client)
+        _verifier, code_challenge = _pkce_pair()
+
+        interstitial_response = await _start_authorize(
+            client, client_id=client_id, code_challenge=code_challenge
+        )
+        redirect_response = await _confirm_interstitial(client, interstitial_response)
+        assert redirect_response.status_code == 302, redirect_response.text
+        state = _query(_location(redirect_response))["state"][0]
+
+        response = await client.get(LOGIN_PATH, params={"pending": state})
+        assert response.status_code == 400
 
 
 async def test_oidc_discovery_issuer_mismatch_is_rejected(

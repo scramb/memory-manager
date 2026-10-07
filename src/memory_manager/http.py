@@ -110,6 +110,7 @@ from memory_manager.auth.prm import (
 )
 from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.auth.ratelimit import RateLimiter
+from memory_manager.auth.shared_state import InMemorySharedState, PostgresSharedState, SharedState
 from memory_manager.auth.verifier import StaticTokenVerifier
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -159,6 +160,34 @@ class _OAuthProviderCell:
     provider: MemoryManagerOAuthProvider | None = None
 
 
+class _SharedStateHandle:
+    """Forwards every `SharedState` call to whatever `backend` is currently set.
+
+    Built once by `create_app` (default `InMemorySharedState` - today's
+    single-replica behaviour, in effect until and unless `lifespan` swaps it) and
+    handed, as this one object, to every `RateLimiter` and to `bind_shared_state` on
+    a `PasswordAuthenticator`/`OidcAuthenticator` - the same "build now, fill in
+    later" shape `_OAuthProviderCell` uses for the OAuth provider: `lifespan` sets
+    `backend` to a `PostgresSharedState` once `services.pool` exists, and every
+    holder of this handle picks that up on its next call, with nothing re-wired.
+    """
+
+    def __init__(self) -> None:
+        self.backend: SharedState = InMemorySharedState()
+
+    async def window_hit(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        return await self.backend.window_hit(key, window_seconds=window_seconds)
+
+    async def window_peek(self, key: str, *, window_seconds: float) -> tuple[int, float]:
+        return await self.backend.window_peek(key, window_seconds=window_seconds)
+
+    async def put_pending(self, key: str, payload: str, *, ttl_seconds: float) -> None:
+        await self.backend.put_pending(key, payload, ttl_seconds=ttl_seconds)
+
+    async def take_pending(self, key: str) -> str | None:
+        return await self.backend.take_pending(key)
+
+
 def create_app(
     services_factory: ServicesFactory,
     config: ServerConfig,
@@ -202,10 +231,32 @@ def create_app(
     """
 
     oauth_cell = _OAuthProviderCell()
+    shared_state = _SharedStateHandle()
+    if isinstance(authenticator, (PasswordAuthenticator, OidcAuthenticator)):
+        # Bound now, against the handle - not the backend it starts with: `lifespan`
+        # below swaps `shared_state.backend` once `services.pool` exists, and this
+        # authenticator (built outside `create_app`, by `build_authenticator`) picks
+        # that up on its next call without being touched again.
+        authenticator.bind_shared_state(shared_state)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         async with services_factory() as services:
+            if services.pool is not None:
+                # Rate limits, the login brute-force window and pending OIDC login
+                # state move to Postgres once a database is configured (ADR-0009 §2,
+                # #103) - the same condition `_build_oauth_provider`/`token_verifier`
+                # already gate on below. The cipher is only needed for pending OIDC
+                # login state (`PostgresSharedState.put_pending`); `None` when no
+                # `OAUTH_CLIENT_SECRET_KEY` is configured still lets rate limiting work,
+                # `put_pending` itself refuses to run without one.
+                cipher = (
+                    store.ClientSecretCipher(config.oauth_client_secret_key)
+                    if config.oauth_client_secret_key is not None
+                    else None
+                )
+                shared_state.backend = PostgresSharedState(services.pool, cipher=cipher)
+
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
 
@@ -325,11 +376,19 @@ def create_app(
             mcp_path=config.mcp_path,
             webhook_path=WEBHOOK_PATH,
             max_request_bytes=config.max_request_bytes,
-            mcp_limiter=RateLimiter(per_minute=config.mcp_per_minute, burst=config.mcp_burst),
-            write_limiter=RateLimiter(per_minute=config.write_per_minute, burst=config.write_burst),
-            oauth_limiter=RateLimiter(per_minute=config.oauth_per_minute, burst=config.oauth_burst),
+            mcp_limiter=RateLimiter(
+                state=shared_state, per_minute=config.mcp_per_minute, burst=config.mcp_burst
+            ),
+            write_limiter=RateLimiter(
+                state=shared_state, per_minute=config.write_per_minute, burst=config.write_burst
+            ),
+            oauth_limiter=RateLimiter(
+                state=shared_state, per_minute=config.oauth_per_minute, burst=config.oauth_burst
+            ),
             webhook_limiter=RateLimiter(
-                per_minute=config.webhook_per_minute, burst=config.webhook_burst
+                state=shared_state,
+                per_minute=config.webhook_per_minute,
+                burst=config.webhook_burst,
             ),
         ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
@@ -513,7 +572,8 @@ class _McpMount:
 
 
 class _LimitsMiddleware:
-    """Body-size cap plus per-key token-bucket rate limiting (#39).
+    """Body-size cap plus per-key fixed-window rate limiting on a shared backend
+    (#39, #103).
 
     Three route classes, matched on `scope["path"]` directly (the same
     style `_OriginValidationMiddleware` below uses, not a Starlette
@@ -538,6 +598,13 @@ class _LimitsMiddleware:
     Every other path (health/ready, PRM, login, the AS metadata document)
     passes through unlimited; none of them is a meaningful target for
     either abuse this middleware defends against.
+
+    Every limiter call goes through `_allow`, which fails *open* (allows the
+    request, logs a warning) if the shared `SharedState` backend raises -
+    once a database is configured (`create_app`'s `lifespan`), a limiter
+    check is a Postgres round trip, and a transient database outage must
+    never itself turn into "every request gets rejected" on top of whatever
+    else that outage already breaks.
     """
 
     def __init__(
@@ -586,7 +653,7 @@ class _LimitsMiddleware:
         limiter: RateLimiter,
         key_of: Callable[[Scope], str],
     ) -> None:
-        allowed, retry_after = limiter.allow(key_of(scope))
+        allowed, retry_after = await _allow_or_fail_open(limiter, key_of(scope))
         if not allowed:
             await _send_rate_limited(scope, receive, send, retry_after)
             return
@@ -607,18 +674,31 @@ class _LimitsMiddleware:
             body = b""
             effective_receive = receive
 
-        allowed, retry_after = self._mcp_limiter.allow(key)
+        allowed, retry_after = await _allow_or_fail_open(self._mcp_limiter, key)
         if not allowed:
             await _send_rate_limited(scope, receive, send, retry_after)
             return
 
         if _is_write_tool_call(body):
-            allowed, retry_after = self._write_limiter.allow(key)
+            allowed, retry_after = await _allow_or_fail_open(self._write_limiter, key)
             if not allowed:
                 await _send_rate_limited(scope, receive, send, retry_after)
                 return
 
         await self._app(scope, effective_receive, send)
+
+
+async def _allow_or_fail_open(limiter: RateLimiter, key: str) -> tuple[bool, float]:
+    """`limiter.allow(key)`, but `(True, 0.0)` instead of raising if the underlying
+    `SharedState` backend fails (e.g. Postgres unreachable) - see `_LimitsMiddleware`'s
+    docstring for why failing open, not closed, is the right default here."""
+    try:
+        return await limiter.allow(key)
+    except Exception:
+        _logger.warning(
+            "rate-limit backend unavailable; failing open for key=%r", key, exc_info=True
+        )
+        return True, 0.0
 
 
 def _client_ip(scope: Scope) -> str:

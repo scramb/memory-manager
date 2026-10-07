@@ -13,11 +13,12 @@ Two round trips through this module, with the browser in between:
 
 1. `handle` (`GET {LOGIN_PATH}?pending=...`, reached the same way
    `PasswordAuthenticator.handle` is - `auth.login.login_routes`): generates
-   a PKCE pair, a `nonce` and a `state`, parks all three keyed by `state` in
-   `_state` (an in-memory, single-replica TTL map - ADR-0004's existing
-   caveat for rate-limiting state applies the same way here: this needs a
-   second place to live if this server ever runs more than one replica),
-   and redirects the browser to the upstream `authorization_endpoint`.
+   a PKCE pair, a `nonce` and a `state`, parks all three keyed by `state` on
+   a `SharedState` (`_shared_state`, `bind_shared_state` - defaults to an
+   `InMemorySharedState`, today's single-replica behaviour, until `http.py`'s
+   `create_app`/`lifespan` binds a shared one once a database is configured,
+   ADR-0009 §2, #103), and redirects the browser to the upstream
+   `authorization_endpoint`.
 2. `handle_callback` (`GET {CALLBACK_PATH}`, its own route - `oidc_routes`,
    mounted by `http.py` only when the configured `Authenticator` actually is
    one of these): looks `state` up (single-use - popped, not just read),
@@ -46,6 +47,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -69,6 +71,7 @@ from memory_manager.auth.login import (
     parse_namespaces,
     resolve_namespaces,
 )
+from memory_manager.auth.shared_state import InMemorySharedState, SharedState
 from memory_manager.auth.templates import (
     html_response,
     login_denied_page,
@@ -117,7 +120,6 @@ class _PendingState:
     pending_id: str
     code_verifier: str
     nonce: str
-    created_at: float
 
 
 class OidcAuthenticator:
@@ -152,7 +154,14 @@ class OidcAuthenticator:
         self._http = http_client or httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
         self._discovery: _Discovery | None = None
         self._discovery_at = 0.0
-        self._state: dict[str, _PendingState] = {}
+        self._shared_state: SharedState = InMemorySharedState()
+
+    def bind_shared_state(self, state: SharedState) -> None:
+        """Swap in a shared `SharedState` (a `PostgresSharedState`, once a database is
+        configured) - called once by `http.py`'s `create_app` lifespan. Until then, or
+        without a database at all, this authenticator's own `InMemorySharedState` keeps
+        today's single-replica behaviour unchanged."""
+        self._shared_state = state
 
     async def aclose(self) -> None:
         """Close the internally created `httpx.AsyncClient`, if `__init__` made one
@@ -248,13 +257,10 @@ class OidcAuthenticator:
         code_verifier = secrets.token_urlsafe(48)
         nonce = secrets.token_urlsafe(24)
         state = secrets.token_urlsafe(32)
-        self._prune_state()
-        self._state[state] = _PendingState(
-            pending_id=pending.id,
-            code_verifier=code_verifier,
-            nonce=nonce,
-            created_at=time.monotonic(),
+        payload = json.dumps(
+            {"pending_id": pending.id, "code_verifier": code_verifier, "nonce": nonce}
         )
+        await self._shared_state.put_pending(state, payload, ttl_seconds=_STATE_TTL)
 
         params = {
             "response_type": "code",
@@ -284,7 +290,7 @@ class OidcAuthenticator:
             )
 
         code = params.get("code")
-        pending_state = self._pop_state(params.get("state", ""))
+        pending_state = await self._pop_state(params.get("state", ""))
         if pending_state is None or not code:
             return html_response(
                 login_error_page(
@@ -345,19 +351,26 @@ class OidcAuthenticator:
             return True
         return email is not None and email_verified and email in self._allowed_emails
 
-    # ---- state TTL map --------------------------------------------------------------
+    # ---- pending state (SharedState) -------------------------------------------------
 
-    def _pop_state(self, state: str) -> _PendingState | None:
-        self._prune_state()
+    async def _pop_state(self, state: str) -> _PendingState | None:
+        """`_PendingState` parked under `state` (single-use - `SharedState.take_pending`
+        deletes it in the same round trip), or `None` if `state` is empty, unknown,
+        already used, or past `_STATE_TTL`."""
         if not state:
             return None
-        return self._state.pop(state, None)
-
-    def _prune_state(self) -> None:
-        now = time.monotonic()
-        expired = [key for key, value in self._state.items() if now - value.created_at > _STATE_TTL]
-        for key in expired:
-            del self._state[key]
+        payload = await self._shared_state.take_pending(state)
+        if payload is None:
+            return None
+        try:
+            data = json.loads(payload)
+            return _PendingState(
+                pending_id=data["pending_id"],
+                code_verifier=data["code_verifier"],
+                nonce=data["nonce"],
+            )
+        except (ValueError, KeyError, TypeError):  # pragma: no cover - defensive
+            return None
 
     # ---- discovery / token / userinfo ------------------------------------------------
 

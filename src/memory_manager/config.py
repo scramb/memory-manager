@@ -261,14 +261,18 @@ class ServerConfig:
     `oauth_per_minute`/`oauth_burst` and `webhook_per_minute`/`webhook_burst`
     (`RATE_LIMIT_MCP_PER_MINUTE`/`RATE_LIMIT_MCP_BURST`/... ) feed one
     `auth.ratelimit.RateLimiter` each (#39), all built once in `http.py`'s
-    `create_app`: every request to `mcp_path` against the `mcp_*` pair,
-    keyed by the hashed bearer token (or the client IP, unauthenticated);
-    every `memory_write`/`memory_edit`/`memory_supersede`/`memory_archive`
-    tool call *additionally* against the tighter `write_*` pair, same key;
-    every request to `/register`/`/token`/`/authorize` against `oauth_*`,
-    keyed by client IP; every request to the vault webhook against
-    `webhook_*`, keyed by client IP. A key over its limit gets a 429 with
-    `Retry-After`.
+    `create_app`, on a shared `auth.shared_state.SharedState` (Postgres once a
+    database is configured, in-process otherwise - ADR-0009 §2, #103): `burst`
+    calls (`max(1, floor(burst))`) within a fixed window of `burst * 60 /
+    per_minute` seconds, the average throughput a token bucket of that
+    capacity and refill rate would allow. Every request to `mcp_path` counts
+    against the `mcp_*` pair, keyed by the hashed bearer token (or the client
+    IP, unauthenticated); every `memory_write`/`memory_edit`/
+    `memory_supersede`/`memory_archive` tool call *additionally* against the
+    tighter `write_*` pair, same key; every request to `/register`/`/token`/
+    `/authorize` against `oauth_*`, keyed by client IP; every request to the
+    vault webhook against `webhook_*`, keyed by client IP. A key over its
+    limit gets a 429 with `Retry-After`.
 
     `forwarded_allow_ips` (`FORWARDED_ALLOW_IPS`, default `127.0.0.1`) names
     the proxy IPs/CIDRs this server should trust `X-Forwarded-For` from when

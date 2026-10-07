@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Tests for rate limiting, the request body cap and the audit log (#39).
+"""Tests for rate limiting, the request body cap and the audit log (#39, #103).
 
 Four layers, bottom to top:
 
-- `memory_manager.auth.ratelimit.TokenBucket`/`RateLimiter` against a fake
-  clock - burst, refill, per-key isolation and the bounded-LRU eviction,
-  none of which need real time or an ASGI app at all.
+- `memory_manager.auth.ratelimit.RateLimiter` against an `InMemorySharedState`
+  with a fake clock - window limits, rollover and per-key isolation, none of
+  which need real time or an ASGI app at all. `InMemorySharedState`'s own
+  bounded-LRU eviction is `tests/auth/test_shared_state.py`'s to test, not
+  this file's (#103) - it has no `PostgresSharedState` equivalent.
 - `memory_manager.http`'s `_LimitsMiddleware`, driven through a real
   `create_app`/`open_services` pair the same way `tests/auth/
   test_static_tokens.py` drives bearer auth: a plain `httpx.AsyncClient`
@@ -52,6 +54,7 @@ from starlette.types import Message, Scope
 from memory_manager import cli
 from memory_manager.app import open_services
 from memory_manager.auth.ratelimit import RateLimiter
+from memory_manager.auth.shared_state import InMemorySharedState
 from memory_manager.auth.tokens import ALL_NAMESPACES, create_token
 from memory_manager.config import ServerConfig, ServerConfigError, VaultConfig
 from memory_manager.http import create_app
@@ -90,7 +93,7 @@ def _new_note_content(path: str) -> str:
     )
 
 
-# --- `auth.ratelimit.RateLimiter`/`TokenBucket` against a fake clock -------
+# --- `auth.ratelimit.RateLimiter` against an `InMemorySharedState`, fake clock --
 
 
 class _FakeClock:
@@ -101,51 +104,40 @@ class _FakeClock:
         return self.now
 
 
-def test_rate_limiter_allows_bursts_up_to_capacity_then_rejects_with_retry_after() -> None:
+async def test_rate_limiter_allows_up_to_the_window_limit_then_rejects_with_retry_after() -> None:
     clock = _FakeClock()
-    limiter = RateLimiter(per_minute=60, burst=3, clock=clock)
+    state = InMemorySharedState(clock=clock)
+    limiter = RateLimiter(state=state, per_minute=60, burst=3)  # limit=3, window=180s
 
-    assert limiter.allow("k") == (True, 0.0)
-    assert limiter.allow("k") == (True, 0.0)
-    assert limiter.allow("k") == (True, 0.0)
-    allowed, retry_after = limiter.allow("k")
+    assert await limiter.allow("k") == (True, 0.0)
+    assert await limiter.allow("k") == (True, 0.0)
+    assert await limiter.allow("k") == (True, 0.0)
+    allowed, retry_after = await limiter.allow("k")
 
     assert allowed is False
     assert retry_after > 0
 
 
-def test_rate_limiter_refills_after_time_advances_on_the_injected_clock() -> None:
+async def test_rate_limiter_rolls_over_once_the_window_passes_on_the_injected_clock() -> None:
     clock = _FakeClock()
-    limiter = RateLimiter(per_minute=60, burst=1, clock=clock)  # 1 token/second
-    assert limiter.allow("k")[0] is True
-    assert limiter.allow("k")[0] is False
+    state = InMemorySharedState(clock=clock)
+    limiter = RateLimiter(state=state, per_minute=60, burst=1)  # limit=1, window=60s
+    assert (await limiter.allow("k"))[0] is True
+    assert (await limiter.allow("k"))[0] is False
 
-    clock.now += 1.0
+    clock.now += 60.0
 
-    assert limiter.allow("k")[0] is True
+    assert (await limiter.allow("k"))[0] is True
 
 
-def test_rate_limiter_isolates_two_keys_from_each_other() -> None:
+async def test_rate_limiter_isolates_two_keys_from_each_other() -> None:
     clock = _FakeClock()
-    limiter = RateLimiter(per_minute=60, burst=1, clock=clock)
+    state = InMemorySharedState(clock=clock)
+    limiter = RateLimiter(state=state, per_minute=60, burst=1)
 
-    assert limiter.allow("a")[0] is True
-    assert limiter.allow("a")[0] is False
-    assert limiter.allow("b")[0] is True
-
-
-def test_rate_limiter_evicts_the_least_recently_used_key_beyond_max_keys() -> None:
-    clock = _FakeClock()
-    limiter = RateLimiter(per_minute=60, burst=1, max_keys=2, clock=clock)
-
-    assert limiter.allow("a")[0] is True
-    assert limiter.allow("a")[0] is False  # "a"'s one token is spent
-    assert limiter.allow("b")[0] is True
-
-    assert limiter.allow("c")[0] is True  # a third key evicts "a" (least recently used)
-
-    # "a" is a brand new bucket now - its previous, spent state is gone.
-    assert limiter.allow("a")[0] is True
+    assert (await limiter.allow("a"))[0] is True
+    assert (await limiter.allow("a"))[0] is False
+    assert (await limiter.allow("b"))[0] is True
 
 
 # --- `ServerConfig`'s limits knobs ------------------------------------------
@@ -288,8 +280,10 @@ async def test_mcp_requests_beyond_the_burst_get_429_with_retry_after(
     bare_remote: Path, tmp_path: Path
 ) -> None:
     config = ServerConfig(
+        # per_minute == burst keeps the fixed window at 60s (burst * 60 / per_minute) -
+        # long enough that this test's handful of requests can never roll over mid-run.
         public_url=_PUBLIC_URL,
-        mcp_per_minute=600,
+        mcp_per_minute=2,
         mcp_burst=2,
         write_per_minute=600,
         write_burst=600,
@@ -311,7 +305,7 @@ async def test_mcp_requests_beyond_the_burst_get_429_with_retry_after(
 async def test_mcp_rate_limit_is_isolated_per_token(bare_remote: Path, tmp_path: Path) -> None:
     config = ServerConfig(
         public_url=_PUBLIC_URL,
-        mcp_per_minute=600,
+        mcp_per_minute=1,
         mcp_burst=1,
         write_per_minute=600,
         write_burst=600,
@@ -334,7 +328,7 @@ async def test_mcp_rate_limit_is_isolated_per_token(bare_remote: Path, tmp_path:
 async def test_oauth_endpoints_are_rate_limited_by_client_ip(
     bare_remote: Path, tmp_path: Path
 ) -> None:
-    config = ServerConfig(public_url=_PUBLIC_URL, oauth_per_minute=600, oauth_burst=1)
+    config = ServerConfig(public_url=_PUBLIC_URL, oauth_per_minute=1, oauth_burst=1)
     async with _running_app(_environ(bare_remote, tmp_path), config) as app:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -348,7 +342,7 @@ async def test_oauth_endpoints_are_rate_limited_by_client_ip(
 async def test_vault_webhook_is_rate_limited_by_client_ip(
     bare_remote: Path, tmp_path: Path
 ) -> None:
-    config = ServerConfig(public_url=_PUBLIC_URL, webhook_per_minute=600, webhook_burst=1)
+    config = ServerConfig(public_url=_PUBLIC_URL, webhook_per_minute=1, webhook_burst=1)
     async with _running_app(_environ(bare_remote, tmp_path), config) as app:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -357,6 +351,28 @@ async def test_vault_webhook_is_rate_limited_by_client_ip(
 
     assert first.status_code != 429
     assert second.status_code == 429
+
+
+async def test_mcp_rate_limiting_writes_to_the_shared_postgres_state(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    """Once a database is configured, `_LimitsMiddleware`'s limiter is backed by
+    `auth.shared_state.PostgresSharedState` (#103) - a request against `mcp_path`
+    must leave a row in `rate_limits`, not just a local, in-process counter."""
+    config = ServerConfig(public_url=_PUBLIC_URL, mcp_per_minute=60, mcp_burst=60)
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config) as app:
+        pool: asyncpg.Pool = app.state.services.pool
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(config.mcp_path, json=_PING, headers=headers)
+        assert response.status_code != 429
+
+        row = await pool.fetchrow("select count from rate_limits")
+
+    assert row is not None
+    assert row["count"] == 1
 
 
 async def test_oversized_chunked_mcp_body_with_no_content_length_is_413(

@@ -187,7 +187,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ### WP-20 — Shared state and replicas · F-01 · Branch: `wp/20-shared-state` · PR: open
 
-- [ ] #103 Rate limits, the login brute-force window and pending login state live in a Postgres-backed `SharedState`
+- [x] #103 Rate limits, the login brute-force window and pending login state live in a Postgres-backed `SharedState`
 - [ ] #104 A Valkey implementation of `SharedState` passes the same contract suite ⛔ blocked by #103
 - [ ] #105 Shutdown drains in-flight requests and the stateless transport behaviour is pinned by tests
 - [ ] #106 Two server processes serve one Postgres dataset consistently ⛔ blocked by #97, #101, #103

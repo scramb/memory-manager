@@ -253,9 +253,16 @@ async def save_pending(
 
 
 async def get_pending(pool: asyncpg.Pool, pending_id: str) -> PendingRow | None:
-    """The parked parameters for `pending_id`, or `None` if unknown or expired."""
+    """The parked parameters for `pending_id`, or `None` if unknown or expired.
+
+    Filtered to `kind = 'authorize'` (`db/migrations/0006_shared_state.sql`) so a
+    pending login `auth.shared_state.PostgresSharedState` parked in this same table
+    (`kind != 'authorize'`, no `client_id` of its own) can never be mistaken for one
+    of this function's own rows, even on an `id_hash` collision.
+    """
     row = await pool.fetchrow(
-        "select client_id, params from oauth_pending where id_hash = $1 and expires_at > now()",
+        "select client_id, params from oauth_pending "
+        "where id_hash = $1 and kind = 'authorize' and expires_at > now()",
         _hash(pending_id),
     )
     if row is None:
