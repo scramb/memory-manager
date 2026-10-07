@@ -47,6 +47,7 @@ class VaultConfig:
     dir: Path
     branch: str = _DEFAULT_BRANCH
     ssh_key_file: Path | None = None
+    ssh_known_hosts_file: Path | None = None
     https_token: str | None = field(default=None, repr=False)
     poll_seconds: int = _DEFAULT_POLL_SECONDS
 
@@ -61,6 +62,7 @@ class VaultConfig:
         vault_dir = _require(environ, "VAULT_DIR", VaultConfigError)
         branch = environ.get("VAULT_BRANCH", _DEFAULT_BRANCH)
         ssh_key_file_raw = environ.get("VAULT_SSH_KEY_FILE")
+        ssh_known_hosts_file_raw = environ.get("VAULT_SSH_KNOWN_HOSTS")
         https_token = environ.get("VAULT_HTTPS_TOKEN")
         poll_seconds_raw = environ.get("VAULT_POLL_SECONDS")
 
@@ -80,6 +82,9 @@ class VaultConfig:
             dir=Path(vault_dir),
             branch=branch,
             ssh_key_file=Path(ssh_key_file_raw) if ssh_key_file_raw else None,
+            ssh_known_hosts_file=(
+                Path(ssh_known_hosts_file_raw) if ssh_known_hosts_file_raw else None
+            ),
             https_token=https_token,
             poll_seconds=poll_seconds,
         )

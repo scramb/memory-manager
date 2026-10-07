@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Generic Kustomize base for memory-manager (#44, WP-13). Deliberately
+# operator-agnostic (CLAUDE.md: "public repository, no operator-specific
+# values") - no `namespace:` here, that is for the operator's own
+# Kustomization (`targetNamespace`, see deploy/README.md) to set. The
+# host, gateway reference, secret store and image tag below are all
+# placeholders an operator overlay patches; `scripts/check-deploy-
+# placeholders.sh` fails the build if a real one ever creeps in instead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# `app.kubernetes.io/name: memory-manager` is set directly in each
+# resource's own metadata/selector below (same pattern as the
+# bring--mcp reference) rather than through this file's `labels:`
+# transformer, so the Deployment's own selector stays exactly what
+# that manifest says - no implicit rewrite from here.
+resources:
+  - database.yaml
+  - secrets.yaml
+  - deployment.yaml
+  - service.yaml
+  - httproute.yaml
+
+# The one place the running version is decided: a release tag of this
+# repo (the `Release` workflow's own build), never `latest` - otherwise
+# Git stops being what actually runs. No image automation; a rollout is
+# a commit that bumps this, in the operator's own overlay.
+images:
+  - name: ghcr.io/scramb/memory-manager
+    newTag: "0.0.0"

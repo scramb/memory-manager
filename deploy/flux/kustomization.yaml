@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Generic Flux example (#46, WP-13): installs the Helm chart
+# `charts/memory-manager` (#45) ships via a `HelmRelease`, with its secrets
+# supplied by an `ExternalSecret` - the primary secrets path documented in
+# `README.md` here, SOPS shown as an alternative via the
+# `sops-secret.example.yaml`/`.sops.yaml` pair, which this kustomization
+# deliberately does NOT list as a resource (an encrypted Secret only
+# decrypts inside a Flux `Kustomization` with its own `decryption` field
+# configured - `kubectl kustomize`/`kubeconform` here would otherwise see
+# ciphertext where a base64 Secret value belongs, see README.md).
+#
+# An operator applies this through their own Flux `Kustomization` pointed
+# at this directory (same shape as `deploy/README.md`'s own example, with
+# `path: ./deploy/flux` instead), patching the placeholders below to their
+# own values - never by editing them in place here (CLAUDE.md: a public
+# repository carries no operator-specific values).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: memory-manager
+
+resources:
+  - namespace.yaml
+  - helmrepository.yaml
+  - externalsecret.yaml
+  - helmrelease.yaml
