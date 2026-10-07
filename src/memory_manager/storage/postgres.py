@@ -28,15 +28,56 @@ exists under a *different* path surfaces as a plain Postgres
 `UniqueViolationError` on the primary key, mapped here to `InvalidNote` -
 `path` is the only conflict target this flow resolves by re-reading and
 raising `VersionConflict`.
+
+`archive` reuses the same conditional-`UPDATE` idiom, just with `path`
+itself in the `SET` list: the row's identity (`id`) is unchanged, only
+where it lives moves, under the same `current_revision` guard. A
+concurrent `edit` racing an `archive` on the same note is reported as
+`VersionConflict`, never `WriteFailed`: whichever of the two loses its
+conditional `UPDATE` re-reads by the *original* `path` - if `archive` won,
+that re-read now finds nothing there at all (`(None, None)`, the same
+shape `VersionConflict` already uses for "does not exist"), not an
+unreachable error. `supersede` runs the old note's `UPDATE` through the
+same path (its `path` never changes, only `content`/`valid_to`) and the
+new note's insert through the same `ON CONFLICT (path) DO NOTHING` `write`
+uses for `if_version="new"` - but reports a lost race there as
+`InvalidNote`, not `VersionConflict`: `new_path` carries no `if_version`
+to compare against, only the existence check `rules.prepare_supersede_content`
+already made moments earlier, so losing the race afterwards is "the path
+turned out to be taken after all", not a version mismatch.
+
+`changes_since` is the one method that never takes a row lock or competes
+with a write: it opens its own read-only `REPEATABLE READ` transaction
+and uses `pg_snapshot_xmin(pg_current_snapshot())` as the cursor, not
+`now()`, `max(xid)` or `current_revision`. `xid8` order, not `created_at`
+or `revision`, is what makes this correct under concurrent writers: a
+transaction that is still in flight when one call takes its snapshot
+keeps the snapshot's `xmin` from moving past it even if that transaction
+commits *after* this call already returned - the next call's window
+starts exactly there, so a lower `xid` committing late is picked up
+instead of skipped, and a long-running transaction anywhere in the
+cluster only delays how soon its own change is reported, never drops it.
+Within one call's window `[cursor, new_xmin)`, a revision whose `path`
+differs from its own note's immediately preceding revision (an `archive`)
+contributes *both* paths to the touched set - the vacated path otherwise
+never appears in this window, since nothing was written there - and every
+touched path is then classified by one more lookup, in the same snapshot:
+present in `vault_notes` means `changed` (covers a path archived and then
+reoccupied within this very window), absent means `deleted`.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 import asyncpg
 
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
     InvalidNote,
+    NotFound,
+    StorageChanges,
     StoredNote,
     VersionConflict,
     WriteFailed,
@@ -44,7 +85,7 @@ from memory_manager.storage.base import (
     WriteResult,
 )
 from memory_manager.vault.note import parse, version
-from memory_manager.vault.paths import parse_note_path
+from memory_manager.vault.paths import PathRejected, parse_note_path
 
 __all__ = ["PostgresBackend"]
 
@@ -52,6 +93,12 @@ _SELECT_CURRENT = """
 select id, content, version, current_revision
 from vault_notes
 where path = $1
+"""
+
+_SELECT_LIST = """
+select path, content, version
+from vault_notes
+order by path
 """
 
 _INSERT_NEW = """
@@ -68,22 +115,57 @@ where id = $3 and current_revision = $4
 returning id, current_revision
 """
 
+_UPDATE_ARCHIVE = """
+update vault_notes
+set path = $1, content = $2, version = $3,
+    current_revision = current_revision + 1, updated_at = now()
+where id = $4 and current_revision = $5
+returning id, current_revision
+"""
+
 _INSERT_REVISION = """
 insert into vault_revisions (note_id, revision, path, content, version, author, client, message)
 values ($1, $2, $3, $4, $5, $6, $7, $8)
 """
 
+#: Not cast to `::text`: asyncpg already decodes `xid8` straight to a plain
+#: Python `int` (unlike some other Postgres-specific types), which is also
+#: what `_SELECT_CHANGED_REVISIONS` below needs to bind back in as `$1`/`$2`
+#: - the cursor string callers see is `str()` of this value, round-tripped
+#: back to `int()` on the next call.
+_SELECT_SNAPSHOT_XMIN = "select pg_snapshot_xmin(pg_current_snapshot()) as xmin"
+
+_SELECT_CHANGED_REVISIONS = """
+select r.path as path, prev.path as prev_path
+from vault_revisions r
+left join vault_revisions prev
+    on prev.note_id = r.note_id and prev.revision = r.revision - 1
+where r.xid >= $1::xid8 and r.xid < $2::xid8
+order by r.xid, r.revision
+"""
+
+_SELECT_EXISTING_PATHS = """
+select path from vault_notes where path = any($1::text[])
+"""
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
 
 class PostgresBackend:
     """`StorageBackend` backed by `vault_notes`/`vault_revisions` (ADR-0007 §2).
 
-    Only `read`/`write`/`edit` are implemented (#96): `list`, `supersede`,
-    `archive` and `changes_since` are #97's job, so this class does not
-    satisfy the full `StorageBackend` protocol yet.
+    Implements the full `StorageBackend` protocol: `read`/`write`/`edit`
+    (#96) plus `list`/`supersede`/`archive`/`changes_since` (#97). `clock`
+    is injectable for tests, the same pattern `WriteQueue.__init__` uses -
+    it is only ever consulted for `archive`'s and `supersede`'s `updated`/
+    `valid_to` stamps, truncated to whole seconds like the Git backend's.
     """
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, *, clock: Callable[[], datetime] = _utc_now) -> None:
         self._pool = pool
+        self._clock = clock
 
     async def read(self, path: str) -> StoredNote | None:
         """The note at `path`, or `None` if it does not exist.
@@ -97,6 +179,31 @@ class PostgresBackend:
         if row is None:
             return None
         return StoredNote(path=path, content=bytes(row["content"]), version=row["version"])
+
+    async def list(self, *, include_archived: bool = False) -> list[StoredNote]:
+        """Every note in `vault_notes`, in path order.
+
+        Mirrors `GitBackend.list`'s `_archive/`-prefix filter
+        (`storage/git.py`): a path that fails `parse_note_path` is skipped
+        rather than raised on - nothing in this backend's write path can
+        ever produce one, but a row is not reparsed against the write-time
+        rules just to read it back. Archived notes are included only when
+        `include_archived` is set.
+        """
+        rows = await self._pool.fetch(_SELECT_LIST)
+        entries: list[StoredNote] = []
+        for row in rows:
+            path = row["path"]
+            try:
+                note_path = parse_note_path(path, allow_archive=True)
+            except PathRejected:
+                continue
+            if note_path.archived and not include_archived:
+                continue
+            entries.append(
+                StoredNote(path=path, content=bytes(row["content"]), version=row["version"])
+            )
+        return entries
 
     async def write(
         self,
@@ -261,16 +368,250 @@ class PostgresBackend:
 
     async def _reread_for_conflict(
         self, conn: asyncpg.pool.PoolConnectionProxy, path: str
-    ) -> tuple[str, str]:
+    ) -> tuple[str | None, str | None]:
         """`(version, content)` of the row a losing writer's conflict is reported against.
 
         Re-read inside the same transaction right after losing an `INSERT
-        ... ON CONFLICT`/conditional `UPDATE` race, so this always reflects
-        the winner, never a stale snapshot. The row is guaranteed to exist:
-        something else just committed it, in the same transaction's view.
+        ... ON CONFLICT`/conditional `UPDATE` race. Usually reflects the
+        winner, which just committed in this same transaction's view - but
+        a racing `archive` can have moved the row to a different path in
+        that same instant, so `path` now has no row there at all: reported
+        as `(None, None)`, the same shape `VersionConflict` already uses
+        for "does not exist", never `WriteFailed`.
         """
         winner = await conn.fetchrow(_SELECT_CURRENT, path)
-        if winner is None:  # pragma: no cover - defensive, should be unreachable
-            raise WriteFailed(f"'{path}' vanished mid-transaction")
+        if winner is None:
+            return None, None
         content = bytes(winner["content"]).decode("utf-8", errors="replace")
         return winner["version"], content
+
+    async def archive(
+        self,
+        path: str,
+        *,
+        if_version: str,
+        client: str,
+        actor: str = "stdio",
+        message: str | None = None,
+    ) -> WriteResult:
+        """Move the note at `path` to its `_archive/` counterpart, in one transaction.
+
+        `if_version` is checked first (`rules.check_version`), before
+        `path`'s existence is: the same order `queue.py`'s `_process`
+        uses, so `if_version="new"` against a missing `path` passes that
+        check (there is nothing to conflict with) and only then surfaces
+        as `NotFound` from `rules.prepare_archive` - never masked by a
+        spurious `VersionConflict`. The move itself reuses the conditional
+        `UPDATE` `write`/`edit` use, just with `path` in the `SET` list
+        too: a concurrent `edit` racing this on the same note loses (or
+        wins) the same `WHERE id = $id AND current_revision = $n` guard
+        and is reported through `_reread_for_conflict` exactly like
+        `write`/`edit` would.
+        """
+        try:
+            async with self._pool.acquire() as conn, conn.transaction():
+                current_row = await conn.fetchrow(_SELECT_CURRENT, path)
+                current = bytes(current_row["content"]) if current_row is not None else None
+                current_version = current_row["version"] if current_row is not None else None
+
+                request = WriteRequest(
+                    op="archive", path=path, client=client, if_version=if_version, actor=actor
+                )
+                rules.check_version(request, current_version, current)
+
+                if current is None or current_row is None:
+                    raise NotFound(path)
+                note_path = rules.parse_note_path_or_raise(path)
+                archive_rel = note_path.archive_path().relative
+                archive_row = await conn.fetchrow(_SELECT_CURRENT, archive_rel)
+
+                now = self._clock().astimezone(UTC).replace(microsecond=0)
+                archived_bytes = rules.prepare_archive(
+                    path, current, archive_exists=archive_row is not None, now=now
+                )
+                new_version = version(archived_bytes)
+                final_message = message or f"archive {path}"
+
+                updated = await conn.fetchrow(
+                    _UPDATE_ARCHIVE,
+                    archive_rel,
+                    archived_bytes,
+                    new_version,
+                    current_row["id"],
+                    current_row["current_revision"],
+                )
+                if updated is None:
+                    raise VersionConflict(path, *await self._reread_for_conflict(conn, path))
+                note_id = str(updated["id"])
+                revision = int(updated["current_revision"])
+
+                await conn.execute(
+                    _INSERT_REVISION,
+                    note_id,
+                    revision,
+                    archive_rel,
+                    archived_bytes,
+                    new_version,
+                    actor,
+                    client,
+                    final_message,
+                )
+        except asyncpg.UniqueViolationError as exc:
+            raise InvalidNote(path, str(exc)) from exc
+        except asyncpg.PostgresError as exc:
+            raise WriteFailed(str(exc)) from exc
+
+        return WriteResult(path=archive_rel, version=new_version, commit=f"{note_id}@{revision}")
+
+    async def supersede(
+        self,
+        path: str,
+        new_path: str,
+        content: bytes,
+        *,
+        if_version: str,
+        client: str,
+        actor: str = "stdio",
+        message: str | None = None,
+    ) -> WriteResult:
+        """Replace the note at `path` with a new note at `new_path`, in one transaction.
+
+        The old note's row keeps its `path`, just like an `edit` would -
+        only `content`/`version` change, through the same `_update_existing`
+        conditional `UPDATE`, so a concurrent `edit` of the old note races
+        and is reported exactly the same way. The new note's row is
+        inserted through the same `ON CONFLICT (path) DO NOTHING` `write`
+        uses for `if_version="new"`, but losing that race is reported as
+        `InvalidNote`, not `VersionConflict`: `new_path` carries no
+        `if_version` to compare against, only the existence check
+        `rules.prepare_supersede_content` already made moments earlier -
+        losing afterwards is "the path turned out to be taken after all",
+        the same wording a non-racing caller gets from that check.
+        """
+        try:
+            async with self._pool.acquire() as conn, conn.transaction():
+                old_row = await conn.fetchrow(_SELECT_CURRENT, path)
+                old_current = bytes(old_row["content"]) if old_row is not None else None
+                old_version = old_row["version"] if old_row is not None else None
+
+                request = WriteRequest(
+                    op="supersede", path=path, client=client, if_version=if_version, actor=actor
+                )
+                rules.check_version(request, old_version, old_current)
+
+                old_note_path, new_note_path, checked_new_path, new_content, old_bytes = (
+                    rules.prepare_supersede_paths(path, new_path, content, old_current)
+                )
+                if old_row is None:  # pragma: no cover - prepare_supersede_paths already raised
+                    raise NotFound(path)
+
+                new_row = await conn.fetchrow(_SELECT_CURRENT, checked_new_path)
+
+                now = self._clock().astimezone(UTC).replace(microsecond=0)
+                new_final_bytes, old_final_bytes = rules.prepare_supersede_content(
+                    path,
+                    checked_new_path,
+                    new_content,
+                    old_bytes,
+                    old_note_path=old_note_path,
+                    new_note_path=new_note_path,
+                    new_target_exists=new_row is not None,
+                    now=now,
+                )
+
+                old_new_version = version(old_final_bytes)
+                new_new_version = version(new_final_bytes)
+                final_message = message or f"supersede {path} with {checked_new_path}"
+
+                old_note_id, old_revision = await self._update_existing(
+                    conn,
+                    path,
+                    old_final_bytes,
+                    old_new_version,
+                    old_row["id"],
+                    old_row["current_revision"],
+                )
+                await conn.execute(
+                    _INSERT_REVISION,
+                    old_note_id,
+                    old_revision,
+                    path,
+                    old_final_bytes,
+                    old_new_version,
+                    actor,
+                    client,
+                    final_message,
+                )
+
+                new_note_id = parse(new_final_bytes).id
+                inserted = await conn.fetchrow(
+                    _INSERT_NEW,
+                    new_note_id,
+                    new_note_path.namespace,
+                    checked_new_path,
+                    new_final_bytes,
+                    new_new_version,
+                )
+                if inserted is None:
+                    raise InvalidNote(
+                        checked_new_path, "already exists, supersede needs an unused path"
+                    )
+                new_revision = int(inserted["current_revision"])
+                await conn.execute(
+                    _INSERT_REVISION,
+                    str(inserted["id"]),
+                    new_revision,
+                    checked_new_path,
+                    new_final_bytes,
+                    new_new_version,
+                    actor,
+                    client,
+                    final_message,
+                )
+        except asyncpg.UniqueViolationError as exc:
+            raise InvalidNote(new_path, str(exc)) from exc
+        except asyncpg.PostgresError as exc:
+            raise WriteFailed(str(exc)) from exc
+
+        return WriteResult(
+            path=checked_new_path,
+            version=new_new_version,
+            commit=f"{inserted['id']}@{new_revision}",
+            related={path: old_new_version},
+        )
+
+    async def changes_since(self, cursor: str | None) -> StorageChanges:
+        """Notes added, modified or deleted since `cursor` (ADR-0007 §2).
+
+        Runs in its own read-only `REPEATABLE READ` transaction, never
+        competing with a write for a row lock. `cursor` round-trips
+        `pg_snapshot_xmin(pg_current_snapshot())` - see the module
+        docstring for why `xid8` order, not `created_at`/`revision`, is
+        what makes a late-committing lower `xid` never get skipped, and
+        why a long-running transaction anywhere in the cluster only delays
+        how soon its own change is reported, never drops it.
+        """
+        lower = int(cursor) if cursor is not None else 0
+
+        async with (
+            self._pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            new_xmin: int = await conn.fetchval(_SELECT_SNAPSHOT_XMIN)
+            rows = await conn.fetch(_SELECT_CHANGED_REVISIONS, lower, new_xmin)
+
+            touched: set[str] = set()
+            for row in rows:
+                touched.add(row["path"])
+                prev_path = row["prev_path"]
+                if prev_path is not None and prev_path != row["path"]:
+                    touched.add(prev_path)
+
+            existing: set[str] = set()
+            if touched:
+                existing_rows = await conn.fetch(_SELECT_EXISTING_PATHS, list(touched))
+                existing = {row["path"] for row in existing_rows}
+
+        changed = tuple(sorted(path for path in touched if path in existing))
+        deleted = tuple(sorted(path for path in touched if path not in existing))
+        return StorageChanges(cursor=str(new_xmin), changed=changed, deleted=deleted)

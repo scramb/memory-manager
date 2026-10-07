@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """`PostgresBackend` against the backend-agnostic contract suite, plus the
-Postgres-specific guarantees ADR-0007 §2 adds on top of it (#96):
+Postgres-specific guarantees ADR-0007 §2 adds on top of it (#96, #97):
 `vault_revisions` stays append-only and exactly one row per actual change,
 and a stale `if_version` - including the two writers racing each other
 directly, not just one arriving after the other - never loses a write
 silently (CLAUDE.md).
 
-`backend` is typed `AsyncIterator[PostgresBackend]`, not `StorageBackend`:
-this backend only implements `read`/`write`/`edit` so far (`list`,
-`supersede`, `archive`, `changes_since` are #97), so it does not satisfy
-the full protocol yet. Assertions on `vault_notes`/`vault_revisions` below
+`backend` is typed `AsyncIterator[StorageBackend]`: this backend now
+implements the full protocol (`read`/`write`/`edit`/`list`/`supersede`/
+`archive`/`changes_since`), so it runs every capability mixin in
+`storage.contract`, the same as `GitBackend` does in
+`test_git_backend.py`. Assertions on `vault_notes`/`vault_revisions` below
 go through a short-lived connection of their own rather than reaching into
 `backend`'s internals, same as any other caller could.
 """
@@ -23,18 +24,31 @@ from datetime import UTC, datetime
 import asyncpg
 import pytest
 import pytest_asyncio
-from storage.contract import ReadWriteEditContract, note_bytes
+from storage.contract import (
+    ChangesSinceContract,
+    ListContract,
+    ReadWriteEditContract,
+    SupersedeArchiveContract,
+    note_bytes,
+)
 
 from memory_manager.db.migrate import migrate
-from memory_manager.storage.base import InvalidNote, SecretRejected, VersionConflict, WriteResult
+from memory_manager.storage.base import (
+    InvalidNote,
+    SecretRejected,
+    StorageBackend,
+    VersionConflict,
+    WriteResult,
+)
 from memory_manager.storage.postgres import PostgresBackend
+from memory_manager.vault.note import parse, version
 from memory_manager.vault.ulid import new_ulid
 
 _CREATED = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 @pytest_asyncio.fixture
-async def backend(test_database_url: str) -> AsyncIterator[PostgresBackend]:
+async def backend(test_database_url: str) -> AsyncIterator[StorageBackend]:
     """A `PostgresBackend` over a freshly migrated, empty test database."""
     conn = await asyncpg.connect(test_database_url)
     try:
@@ -79,6 +93,18 @@ async def _notes_with_id(test_database_url: str, note_id: str) -> int:
 
 
 class TestReadWriteEdit(ReadWriteEditContract):
+    pass
+
+
+class TestSupersedeArchive(SupersedeArchiveContract):
+    pass
+
+
+class TestList(ListContract):
+    pass
+
+
+class TestChangesSince(ChangesSinceContract):
     pass
 
 
@@ -212,3 +238,149 @@ class TestRevisions:
 
         assert await backend.read("personal/fact/b.md") is None
         assert await _notes_with_id(test_database_url, shared_id) == 1
+
+
+class TestArchiveAndSupersedeConcurrency:
+    """Postgres-specific guarantees on top of `SupersedeArchiveContract` (#97)."""
+
+    async def test_archive_appends_a_revision_with_the_new_path_and_bumps_current_revision(
+        self, backend: PostgresBackend, test_database_url: str
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/a.md", note_bytes(), if_version="new", client="claude-code"
+        )
+
+        await backend.archive(
+            "personal/fact/a.md", if_version=written.version, client="claude-code"
+        )
+
+        rows = await _revision_rows(test_database_url, "_archive/personal/fact/a.md")
+        assert len(rows) == 1
+        assert rows[0]["revision"] == 2
+        assert await _current_revision(test_database_url, "_archive/personal/fact/a.md") == 2
+
+    async def test_concurrent_edit_racing_archive_yields_version_conflict_never_write_failed(
+        self, backend: PostgresBackend, test_database_url: str
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/a.md",
+            note_bytes(body="Original body.\n"),
+            if_version="new",
+            client="c",
+        )
+
+        results = await asyncio.gather(
+            backend.archive("personal/fact/a.md", if_version=written.version, client="c"),
+            backend.edit(
+                "personal/fact/a.md",
+                "Original",
+                "Edited",
+                if_version=written.version,
+                client="c",
+            ),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if isinstance(r, WriteResult)]
+        conflicts = [r for r in results if isinstance(r, VersionConflict)]
+        others = [
+            r for r in results if isinstance(r, Exception) and not isinstance(r, VersionConflict)
+        ]
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert others == []
+
+    async def test_supersede_onto_occupied_target_leaves_nothing_behind(
+        self, backend: PostgresBackend, test_database_url: str
+    ) -> None:
+        old = await backend.write(
+            "personal/fact/old.md", note_bytes(), if_version="new", client="c"
+        )
+        await backend.write(
+            "personal/fact/new.md",
+            note_bytes(title="Already there"),
+            if_version="new",
+            client="c",
+        )
+
+        with pytest.raises(InvalidNote):
+            await backend.supersede(
+                "personal/fact/old.md",
+                "personal/fact/new.md",
+                note_bytes(title="New note"),
+                if_version=old.version,
+                client="c",
+            )
+
+        old_rows = await _revision_rows(test_database_url, "personal/fact/old.md")
+        assert len(old_rows) == 1  # just the initial write, the failed supersede appended nothing
+
+        stored_old = await backend.read("personal/fact/old.md")
+        assert stored_old is not None
+        assert parse(stored_old.content).valid_to is None
+
+
+class TestChangesSinceConcurrency:
+    """Postgres-specific guarantees `changes_since`'s `xid8` cursor adds (#97)."""
+
+    async def test_does_not_skip_a_lower_xid_committing_later(
+        self, backend: PostgresBackend, test_database_url: str
+    ) -> None:
+        conn_a = await asyncpg.connect(test_database_url)
+        tr_a = conn_a.transaction()
+        await tr_a.start()
+        try:
+            note_a = note_bytes(title="A")
+            note_a_id = parse(note_a).id
+            await conn_a.execute(
+                "insert into vault_notes "
+                "(id, namespace, path, content, version, current_revision) "
+                "values ($1, 'personal', 'personal/fact/a.md', $2, $3, 1)",
+                note_a_id,
+                note_a,
+                version(note_a),
+            )
+            await conn_a.execute(
+                "insert into vault_revisions "
+                "(note_id, revision, path, content, version, author, client) "
+                "values ($1, 1, 'personal/fact/a.md', $2, $3, 'tester', 'test')",
+                note_a_id,
+                note_a,
+                version(note_a),
+            )
+
+            # B writes and commits on an unrelated connection while A is still
+            # open - A's lower, still in-flight xid holds the snapshot xmin
+            # back, so B's already-committed write must not be reported yet
+            # either: the window can never advance past A.
+            await backend.write(
+                "personal/fact/b.md", note_bytes(title="B"), if_version="new", client="c"
+            )
+
+            baseline = await backend.changes_since(None)
+            assert "personal/fact/a.md" not in baseline.changed
+            assert "personal/fact/b.md" not in baseline.changed
+
+            await tr_a.commit()
+        finally:
+            await conn_a.close()
+
+        after = await backend.changes_since(baseline.cursor)
+        assert "personal/fact/a.md" in after.changed
+
+    async def test_archived_then_reoccupied_path_is_changed_not_deleted(
+        self, backend: PostgresBackend, test_database_url: str
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/a.md", note_bytes(), if_version="new", client="c"
+        )
+        baseline = await backend.changes_since(None)
+
+        await backend.archive("personal/fact/a.md", if_version=written.version, client="c")
+        await backend.write(
+            "personal/fact/a.md", note_bytes(title="Reoccupied"), if_version="new", client="c"
+        )
+
+        changes = await backend.changes_since(baseline.cursor)
+        assert "personal/fact/a.md" in changes.changed
+        assert "personal/fact/a.md" not in changes.deleted

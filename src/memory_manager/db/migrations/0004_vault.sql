@@ -29,8 +29,19 @@ create table vault_revisions (
     client text not null,
     message text,
     created_at timestamptz not null default now(),
+    -- The committing transaction's id, used as `changes_since`'s cursor
+    -- (ADR-0007 §2): a new cursor is `pg_snapshot_xmin(pg_current_snapshot())`
+    -- taken in a `REPEATABLE READ` transaction, and the next call's window is
+    -- every revision with `xid >= <previous cursor>`. Ordering by `xid`
+    -- rather than `created_at`/`revision` is what makes a transaction that
+    -- commits late, with a lower `xid` than one that raced ahead and
+    -- committed first, still show up instead of being skipped by a cursor
+    -- that already moved past it.
+    xid xid8 not null default pg_current_xact_id(),
     primary key (note_id, revision)
 );
+
+create index vault_revisions_xid_idx on vault_revisions (xid);
 
 create table namespaces (
     id bigint generated always as identity primary key,

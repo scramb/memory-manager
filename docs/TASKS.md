@@ -175,9 +175,10 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 ### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: open
 
 - [x] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests
-- [ ] #97 `serve` runs on the Postgres backend with supersede, archive and listing ⛔ blocked by #95, #96
-- [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #97
-- [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #97
+- [x] #97 `PostgresBackend` passes the full storage contract suite
+- [ ] #112 `serve` runs on `STORAGE_BACKEND=postgres` and passes the MCP conformance tests ⛔ blocked by #97
+- [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #97, #112
+- [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #97, #112
 
 ### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: open
 
@@ -193,9 +194,9 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ### WP-21 — Latency baseline · F-01 · Branch: `wp/21-load-baseline` · PR: open
 
-- [ ] #106 Two server processes serve one Postgres dataset consistently ⛔ blocked by #97, #101, #103
+- [ ] #106 Two server processes serve one Postgres dataset consistently ⛔ blocked by #97, #112, #101, #103
 - [ ] #107 A deterministic generator produces a synthetic vault of configurable size
-- [ ] #108 k6 scenarios measure search, read and write latency against one replica ⛔ blocked by #97, #107
+- [ ] #108 k6 scenarios measure search, read and write latency against one replica ⛔ blocked by #97, #112, #107
 - [ ] #109 A 100k-note baseline records per-tool latency and the RLS function cost ⛔ blocked by #100, #108
 
 ---
