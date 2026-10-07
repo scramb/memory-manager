@@ -176,9 +176,9 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 - [x] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests
 - [x] #97 `PostgresBackend` passes the full storage contract suite
-- [ ] #112 `serve` runs on `STORAGE_BACKEND=postgres` and passes the MCP conformance tests ⛔ blocked by #97
-- [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #97, #112
-- [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #97, #112
+- [x] #112 `serve` runs on `STORAGE_BACKEND=postgres` and passes the MCP conformance tests
+- [ ] #98 The indexer builds the search index from `vault_notes` in the write transaction ⛔ blocked by #112
+- [ ] #99 Parallel writers in two processes against one Postgres lose no writes ⛔ blocked by #112
 
 ### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: open
 

@@ -5,11 +5,19 @@
 `None`) - `memory_index`/`memory_read` never touch Postgres, so the read
 tools are exercised the same way whether or not `DATABASE_URL` is set. The
 seeded notes' paths are deterministic (see `SEEDED_NOTES` below); tests read
-their content straight off `services.vault_root` rather than importing
-`SEEDED_NOTES` from here - a bare `from conftest import ...` is ambiguous
-once more than one directory under `tests/` has its own `conftest.py`
-(`pyproject.toml`'s `mypy_path` comment), so this module's data stays
-private to the `services` fixture.
+their content straight off the `vault_root` fixture below rather than
+importing `SEEDED_NOTES` from here - a bare `from conftest import ...` is
+ambiguous once more than one directory under `tests/` has its own
+`conftest.py` (`pyproject.toml`'s `mypy_path` comment), so this module's
+data stays private to the `services` fixture.
+
+`vault_root` is `services.vault_root`, narrowed non-`None`: every fixture
+in this module builds a `"git"`-backed `Services` except
+`services_with_postgres_backend`, which has none (`Services.vault_root` is
+`Path | None` since WP-18/ADR-0007 §2 added the `postgres` backend) - a
+plain pytest fixture, not a bare helper function, for the same "no
+unambiguous import" reason `SEEDED_NOTES` stays private to this module:
+pytest injects fixtures by name without an import at all.
 
 `human_commit`/`human_delete`/`human_rename` are re-exported for the same
 reason `tests/vault/conftest.py` re-exports them: at runtime, `tests/`'s and
@@ -28,6 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import pytest_asyncio
 from git_fixtures import (
     bare_remote,
@@ -54,7 +63,9 @@ __all__ = [
     "seed_notes",
     "services",
     "services_with_db",
+    "services_with_postgres_backend",
     "vault_config",
+    "vault_root",
 ]
 
 _NOW = datetime(2025, 6, 1, tzinfo=UTC)
@@ -193,3 +204,28 @@ async def services_with_db(
     }
     async with open_services(environ) as services:
         yield services
+
+
+@pytest_asyncio.fixture
+async def services_with_postgres_backend(test_database_url: str) -> AsyncIterator[Services]:
+    """A `Services` against the `postgres` backend (ADR-0007 §2, WP-18) - no vault,
+    no clone, nothing seeded. Tests write their own fixture notes through
+    `memory_write`, the same way `services_with_db`'s own "with database" tests in
+    `tests/mcp/test_search_tool.py` do, since there is no vault here to seed through
+    `seed_notes` at all.
+    """
+    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    async with open_services(environ) as services:
+        yield services
+
+
+@pytest.fixture
+def vault_root(services: Services) -> Path:
+    """`services.vault_root`, narrowed non-`None` for this module's `"git"`-backed
+    `services` fixture (`Services.vault_root` is `Path | None` since WP-18/ADR-0007
+    §2 added the `postgres` backend, which has none) - the one place that mypy
+    fallout is absorbed, instead of a bare assert scattered across every test that
+    reads the vault's working copy directly.
+    """
+    assert services.vault_root is not None
+    return services.vault_root

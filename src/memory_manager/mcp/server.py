@@ -12,9 +12,13 @@ calls only the interface, never a backend's own internals), and
 - all five surface a conflict as an error result carrying the current
 content and version instead of ever overwriting silently (CLAUDE.md "Never
 overwrite silently"). `memory_search` (#30) ranks notes with
-`memory_manager.search.hybrid_search` when a database is configured,
-falling back to `memory_manager.search_fallback.scan_search` over the plain
-working copy otherwise. `memory_index`/`memory_read`/`memory_search` all
+`memory_manager.search.hybrid_search` when `Services.indexer` is set (the
+`git` backend with `DATABASE_URL` configured), falls back to
+`memory_manager.search_fallback.scan_search` over the plain working copy
+for `git` without one, and to `search_fallback.scan_notes` over
+`Services.storage.list()` for the `postgres` backend (ADR-0007 §2, WP-18 -
+an interim O(n) scan until #98 adds real indexing there too).
+`memory_index`/`memory_read`/`memory_search` all
 narrow their namespace handling through `mcp/authz.py`'s
 `readable_namespaces` hook, and every tool calls `mcp/authz.py`'s
 `require_scope` (write tools also `require_writable_namespace`) before
@@ -56,7 +60,7 @@ from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.observability import instrument_tool
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
-from memory_manager.search_fallback import ScanHit, scan_search
+from memory_manager.search_fallback import ScanHit, scan_notes, scan_search
 from memory_manager.storage import NotFound, StorageBackend, WriteError
 from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
 from memory_manager.vault.paths import PathRejected, parse_note_path
@@ -462,7 +466,11 @@ def build_server(
             include_archived=include_archived,
         )
 
-        if services.pool is not None:
+        if services.indexer is not None:
+            if services.pool is None:
+                raise AssertionError(  # pragma: no cover - open_services always pairs these
+                    "Services.indexer is set but Services.pool is None"
+                )
             note_hits = await hybrid_search(
                 services.pool,
                 query,
@@ -471,10 +479,20 @@ def build_server(
                 limit=clamped_limit,
             )
             results = [_note_hit_result(hit) for hit in note_hits]
-        else:
+        elif services.vault_root is not None:
             scan_hits = scan_search(
                 services.vault_root, query, filters=filters, limit=clamped_limit
             )
+            results = [_scan_hit_result(hit) for hit in scan_hits]
+        else:
+            # The `postgres` backend (ADR-0007 §2, WP-18), no indexer yet
+            # (#98 adds real indexing there): the same per-note
+            # filter/scoring `scan_search` uses for `git`, applied to every
+            # note `services.storage.list()` returns - O(n) in the number
+            # of notes the backend holds, since every one of them is
+            # parsed and scored on every call until then.
+            notes = await services.storage.list(include_archived=True)
+            scan_hits = scan_notes(notes, query, filters=filters, limit=clamped_limit)
             results = [_scan_hit_result(hit) for hit in scan_hits]
 
         return {"results": results, "mode": mode}
@@ -738,7 +756,7 @@ def _search_mode(services: Services) -> str:
     still report the `mode` a caller would otherwise have gotten, instead of skipping it
     along with the query.
     """
-    if services.pool is None:
+    if services.indexer is None:
         return "scan"
     return "hybrid" if services.provider is not None else "fulltext"
 

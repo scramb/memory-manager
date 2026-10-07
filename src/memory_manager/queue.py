@@ -58,6 +58,7 @@ from typing import NoReturn
 from memory_manager.observability.metrics import QUEUE_DEPTH, record_queue_write
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
+    AuditHook,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -101,16 +102,9 @@ _MAX_PUSH_ATTEMPTS = 3
 
 WriteHook = Callable[["WriteResult", "WriteRequest", tuple[str, ...]], Awaitable[None]]
 SyncHook = Callable[[ChangeSet], Awaitable[None]]
-#: Called exactly once for every processed `WriteRequest`, success and
-#: rejection alike (`WriteHook` above only ever fires on success) - the seam
-#: `memory_manager.app` wires an `memory_manager.audit.AuditWriter` through
-#: (#39). `result` and `error` are mutually exclusive: exactly one is
-#: `None`. `error` is typed `Exception`, not `WriteError`, only because
-#: `_run_write_job` catches broadly in case of a bug elsewhere in `_process`
-#: - every error this queue itself ever raises is a `WriteError` subclass.
-#: Same failure contract as `WriteHook`/`SyncHook`: a raising hook is
-#: logged, never allowed to affect the write it was notified about.
-AuditHook = Callable[["WriteRequest", "WriteResult | None", Exception | None], Awaitable[None]]
+#: `AuditHook` moved to `storage.base` (WP-18) so `storage.postgres.PostgresBackend`
+#: can share it without importing this module - re-exported here unchanged, see
+#: that module's docstring for the full contract.
 
 
 def _utc_now() -> datetime:

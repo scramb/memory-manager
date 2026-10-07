@@ -1,32 +1,46 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Assembles the services a running memory-manager process needs (#17).
 
-`open_services` is the one place that turns the process environment into a
-working `Repo` + `WriteQueue`, synced to the remote, with the derived
-Postgres index wired in when `DATABASE_URL` is set: a startup reindex brings
-the index in step with whatever the vault currently holds, a write-queue
-hook keeps it in step with every write this process makes, a sync hook
-keeps it in step with every change a sync - any sync - picks up, and a
-`vault.sync.poll_loop` is what keeps triggering syncs on a timer. Without
-`DATABASE_URL` the vault and write queue still come up - full-text/vector
-search and `memory_search` degrade, note read/write do not (`CLAUDE.md`:
-Postgres is a derived index, never the only place a client's data lives).
+`open_services` is the one place that turns the process environment into
+the configured `STORAGE_BACKEND` (ADR-0007), ready to serve. For the
+default `"git"` backend, that means a working `Repo` + `WriteQueue`, synced
+to the remote, with the derived Postgres index wired in when `DATABASE_URL`
+is set: a startup reindex brings the index in step with whatever the vault
+currently holds, a write-queue hook keeps it in step with every write this
+process makes, a sync hook keeps it in step with every change a sync - any
+sync - picks up, and a `vault.sync.poll_loop` is what keeps triggering syncs
+on a timer. Without `DATABASE_URL` the vault and write queue still come up -
+full-text/vector search and `memory_search` degrade, note read/write do not
+(`CLAUDE.md`: Postgres is a derived index, never the only place a client's
+data lives, for this backend).
 
-`Services` is what the MCP tool layer (`mcp/server.py`) and future write
-tools (#18/#19) are built against; nothing outside this module touches
+For `"postgres"` (enterprise mode, ADR-0007 §2/§7, WP-18), `DATABASE_URL` is
+required (`storage_backend_from_env` enforces this before anything else
+runs) and there is no vault at all: no clone, no `Repo`/`WriteQueue`, no
+poll loop, no vault webhook (ADR-0009) - `Services.repo`/`queue`/
+`vault_root` are all `None`, and `Services.pool` is the
+`storage.postgres.PostgresBackend`'s own connection pool rather than one
+`_open_index` builds separately. Indexing notes into `notes`/`chunks` for
+search (`Services.indexer`) is `None` in this mode too - that is #98's job,
+not this one's; `memory_search` falls back to `search_fallback.scan_notes`
+over `storage.list()` until then (`mcp/server.py`).
+
+`Services` is what the MCP tool layer (`mcp/server.py`) and the write tools
+(#18/#19) are built against; nothing outside this module touches
 `asyncpg`/`Indexer` construction directly.
 
-Every `repo.sync()`/commit/push/rebase/reset in this process goes through
-`WriteQueue`'s one consumer (#33): the poll loop's timer tick, the HTTP
-transport's vault webhook (`Services.trigger_sync`, `http.py`), and the
-pre-write sync inside every `queue.submit()` all end up calling
+Every `repo.sync()`/commit/push/rebase/reset in a `"git"`-backend process
+goes through `WriteQueue`'s one consumer (#33): the poll loop's timer tick,
+the HTTP transport's vault webhook (`Services.trigger_sync`, `http.py`),
+and the pre-write sync inside every `queue.submit()` all end up calling
 `queue.sync()`/being served by the same consumer task, so none of them
 ever runs a working-copy operation concurrently with another - the
 single-writer rule `docs/PLAN.md` describes, covering every operation on
-the clone, not just writes. `Services.trigger_sync` is `None` only on a
+the clone, not just writes. `Services.trigger_sync` is `None` on a
+`"postgres"`-backend `Services` (there is nothing to sync) and on a
 `Services` built by hand rather than through `open_services` (stdio-era
 test fixtures); only the webhook calls it, and only on a `Services`
-`open_services` built.
+`open_services` built for the `"git"` backend.
 """
 
 from __future__ import annotations
@@ -64,6 +78,7 @@ from memory_manager.queue import (
 )
 from memory_manager.storage.base import StorageBackend
 from memory_manager.storage.git import GitBackend
+from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
@@ -74,11 +89,18 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class Services:
-    """Everything a running memory-manager process (MCP server, CLI) acts through."""
+    """Everything a running memory-manager process (MCP server, CLI) acts through.
 
-    repo: Repo
-    queue: WriteQueue
-    vault_root: Path
+    `repo`/`queue`/`vault_root` are `None` on a `"postgres"`-backend
+    `Services` (ADR-0007 §2, WP-18): there is no vault, no clone, no
+    working copy to point at. Every caller that reaches for one of them
+    (`mcp/server.py`'s scan fallback, `http.py`'s `/readyz`) is a `"git"`
+    backend-specific path and narrows accordingly.
+    """
+
+    repo: Repo | None
+    queue: WriteQueue | None
+    vault_root: Path | None
     pool: asyncpg.Pool | None
     indexer: Indexer | None
     provider: EmbeddingProvider | None
@@ -86,23 +108,60 @@ class Services:
     trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
 
 
+@dataclass
+class _BackendHandle:
+    """What `_open_backend` hands back: the backend, plus its `"git"`-only innards.
+
+    `repo`/`queue` are `None` for `"postgres"`. `pool` is `None` for
+    `"git"` (that backend's own index pool, if any, is `_open_index`'s
+    separate concern) and the backend's own connection pool for
+    `"postgres"` - `open_services` reuses it for the audit writer and
+    `Services.pool` instead of opening a second one.
+    """
+
+    storage: StorageBackend
+    repo: Repo | None
+    queue: WriteQueue | None
+    pool: asyncpg.Pool | None
+
+
 @asynccontextmanager
 async def _open_backend(
-    backend_name: str, vault_config: VaultConfig
-) -> AsyncIterator[tuple[StorageBackend, Repo, WriteQueue]]:
+    backend_name: str, *, vault_config: VaultConfig | None, database_url: str | None
+) -> AsyncIterator[_BackendHandle]:
     """Build the `STORAGE_BACKEND` named by `backend_name`, torn down on exit.
 
-    Only `"git"` exists today - `storage_backend_from_env` already rejected
-    anything else before this is ever called. `repo`/`queue` are `GitBackend`'s
-    own innards, handed back alongside it so `open_services`'s hooks, indexer,
-    poll loop and webhook can keep reaching the working copy directly
-    (ADR-0007 §1: the Git backend is unchanged, single-writer, derived index).
-    A future `"postgres"` branch (WP-18) would yield its own pool-backed
-    handle here instead; `open_storage`'s callers, which only ever use the
-    `StorageBackend` itself, would not change at all.
+    `"git"` needs `vault_config` (never `None` for it - `open_services`/
+    `open_storage` only build one for this backend) and clones/syncs/starts
+    a `WriteQueue` exactly as before. `"postgres"` needs `database_url`
+    instead (already guaranteed non-`None` by `storage_backend_from_env`,
+    ADR-0007 §2) and builds its own connection-pool-backed
+    `storage.postgres.PostgresBackend` with no clone, no working copy and no
+    `Repo`/`WriteQueue` at all (ADR-0007 §2/§7, ADR-0009: no clone, no poll,
+    no vault webhook in this mode) - `repo`/`queue` come back `None`.
     """
+    if backend_name == "postgres":
+        if (
+            database_url is None
+        ):  # pragma: no cover - storage_backend_from_env already required this
+            raise AssertionError("_open_backend('postgres', ...) called without a database_url")
+        migration_conn = await asyncpg.connect(database_url)
+        try:
+            await migrate(migration_conn)
+        finally:
+            await migration_conn.close()
+
+        pool = await asyncpg.create_pool(database_url)
+        try:
+            yield _BackendHandle(storage=PostgresBackend(pool), repo=None, queue=None, pool=pool)
+        finally:
+            await pool.close()
+        return
+
     if backend_name != "git":  # pragma: no cover - storage_backend_from_env already rejected this
         raise AssertionError(f"unknown storage backend {backend_name!r}")
+    if vault_config is None:  # pragma: no cover - open_services/open_storage always build one
+        raise AssertionError("_open_backend('git', ...) called without a vault_config")
 
     repo = Repo(vault_config)
     await asyncio.to_thread(repo.ensure_clone)
@@ -111,7 +170,9 @@ async def _open_backend(
     queue = WriteQueue(repo)
     await queue.start()
     try:
-        yield GitBackend(queue, repo, vault_config.dir), repo, queue
+        yield _BackendHandle(
+            storage=GitBackend(queue, repo, vault_config.dir), repo=repo, queue=queue, pool=None
+        )
     finally:
         await queue.stop()
 
@@ -125,12 +186,17 @@ async def open_storage(environ: Mapping[str, str]) -> AsyncIterator[StorageBacke
     - no Postgres index, audit log or poll loop, unlike `open_services`.
     Raises `VaultConfigError`/`StorageConfigError` if the matching
     environment variables are missing or malformed, before anything is
-    cloned.
+    cloned. `STORAGE_BACKEND` is read first, and `VaultConfig` is only ever
+    built for the `"git"` backend - a `"postgres"` call needs no `VAULT_*`
+    variable at all (ADR-0007 §2).
     """
-    vault_config = VaultConfig.from_env(dict(environ))
     storage_backend_name = storage_backend_from_env(dict(environ))
-    async with _open_backend(storage_backend_name, vault_config) as (storage, _repo, _queue):
-        yield storage
+    vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
+    database_url = environ.get("DATABASE_URL")
+    async with _open_backend(
+        storage_backend_name, vault_config=vault_config, database_url=database_url
+    ) as handle:
+        yield handle.storage
 
 
 @asynccontextmanager
@@ -139,53 +205,83 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
 
     Raises `VaultConfigError`/`EmbeddingConfigError`/`StorageConfigError` if the
     matching `VAULT_*`/`EMBEDDING_*`/`STORAGE_BACKEND` variables are missing or
-    malformed; these surface before anything is started. With
-    `environ["DATABASE_URL"]` set, also migrates and reindexes the Postgres
-    index before yielding, so the index is never stale behind the vault for
-    the first request.
+    malformed; these surface before anything is started - `STORAGE_BACKEND`
+    is read first, and `VaultConfig` is only ever built for the `"git"`
+    backend (ADR-0007 §2: a `"postgres"` call needs no `VAULT_*` variable at
+    all). For `"git"` with `environ["DATABASE_URL"]` set, also migrates and
+    reindexes the Postgres index before yielding, so the index is never
+    stale behind the vault for the first request. For `"postgres"`, there is
+    no index to build yet (#98): only the audit hook is wired onto the
+    backend, and `Services.pool` is the backend's own pool.
     """
-    vault_config = VaultConfig.from_env(dict(environ))
-    embedding_config = EmbeddingConfig.from_env(dict(environ))
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
+    vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
+    embedding_config = EmbeddingConfig.from_env(dict(environ))
 
-    async with _open_backend(storage_backend_name, vault_config) as (storage, repo, queue):
-        pool: asyncpg.Pool | None = None
+    async with _open_backend(
+        storage_backend_name, vault_config=vault_config, database_url=database_url
+    ) as handle:
+        pool: asyncpg.Pool | None = handle.pool
+        index_pool: asyncpg.Pool | None = None
         indexer: Indexer | None = None
         provider: EmbeddingProvider | None = None
+        trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
+        poll_task: asyncio.Task[None] | None = None
+        poll_stop: asyncio.Event | None = None
 
         try:
-            if database_url:
-                pool, indexer, provider = await _open_index(
-                    database_url, vault_config.dir, embedding_config
-                )
-                queue.add_hook(_index_write_hook(indexer))
-                queue.add_sync_hook(_index_sync_hook(indexer))
-                queue.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
+            if storage_backend_name == "git":
+                queue = handle.queue
+                if queue is None or vault_config is None:
+                    raise AssertionError(  # pragma: no cover - _open_backend's own invariant
+                        "_open_backend('git', ...) returned no queue/vault_config"
+                    )
+                if database_url:
+                    pool, indexer, provider = await _open_index(
+                        database_url, vault_config.dir, embedding_config
+                    )
+                    index_pool = pool
+                    queue.add_hook(_index_write_hook(indexer))
+                    queue.add_sync_hook(_index_sync_hook(indexer))
+                    queue.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
 
-            poll_stop = asyncio.Event()
-            poll_task = asyncio.create_task(
-                poll_loop(queue.sync, vault_config.poll_seconds, stop=poll_stop)
-            )
+                poll_stop = asyncio.Event()
+                poll_task = asyncio.create_task(
+                    poll_loop(queue.sync, vault_config.poll_seconds, stop=poll_stop)
+                )
+                trigger_sync = queue.sync
+            elif pool is None or not isinstance(handle.storage, PostgresBackend):
+                raise AssertionError(  # pragma: no cover - _open_backend's own invariant
+                    "_open_backend('postgres', ...) returned no pool/PostgresBackend"
+                )
+            else:
+                handle.storage.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
+
             try:
                 yield Services(
-                    repo=repo,
-                    queue=queue,
-                    vault_root=vault_config.dir,
+                    repo=handle.repo,
+                    queue=handle.queue,
+                    vault_root=vault_config.dir if vault_config is not None else None,
                     pool=pool,
                     indexer=indexer,
                     provider=provider,
-                    storage=storage,
-                    trigger_sync=queue.sync,
+                    storage=handle.storage,
+                    trigger_sync=trigger_sync,
                 )
             finally:
-                poll_stop.set()
-                poll_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await poll_task
+                if poll_task is not None:
+                    if poll_stop is None:
+                        raise AssertionError(  # pragma: no cover - set together, just above
+                            "poll_task is set but poll_stop is None"
+                        )
+                    poll_stop.set()
+                    poll_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await poll_task
         finally:
-            if pool is not None:
-                await pool.close()
+            if index_pool is not None:
+                await index_pool.close()
 
 
 def _index_sync_hook(indexer: Indexer) -> SyncHook:

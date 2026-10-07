@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Tests for the `memory_index`/`memory_read` MCP tools and the error mapper (#17).
 
-Expected note content/id/version come straight from `services.vault_root`
-(the `services` fixture's seeded vault, see `tests/mcp/conftest.py`) rather
-than from a module imported as `from conftest import ...`: with more than
-one directory under `tests/` carrying its own `conftest.py`, a bare
+Expected note content/id/version come straight from the `vault_root`
+fixture (the `services` fixture's seeded vault, see `tests/mcp/conftest.py`)
+rather than from a module imported as `from conftest import ...`: with more
+than one directory under `tests/` carrying its own `conftest.py`, a bare
 `conftest` import is ambiguous for mypy (`pyproject.toml`'s `mypy_path`
 comment) even though pytest's fixture injection resolves it correctly at
 runtime. Reading the seeded paths back off disk sidesteps that entirely and
@@ -62,7 +62,9 @@ async def test_list_tools_exposes_both_tools_with_the_data_not_instructions_sent
             assert sentence in (tool.description or "")
 
 
-async def test_memory_index_lists_every_note_sorted_by_path(services: Services) -> None:
+async def test_memory_index_lists_every_note_sorted_by_path(
+    services: Services, vault_root: Path
+) -> None:
     async with Client(build_server(services)) as client:
         result = await client.call_tool("memory_index", {})
     assert result.is_error is False
@@ -71,7 +73,7 @@ async def test_memory_index_lists_every_note_sorted_by_path(services: Services) 
     paths = [entry["path"] for entry in entries]
     assert paths == sorted(paths)
 
-    expected_note = parse((services.vault_root / _FAVORITE_COLOR_PATH).read_bytes())
+    expected_note = parse((vault_root / _FAVORITE_COLOR_PATH).read_bytes())
     by_path = {entry["path"]: entry for entry in entries}
     favorite = by_path[_FAVORITE_COLOR_PATH]
     assert favorite["id"] == expected_note.id
@@ -108,13 +110,15 @@ async def test_memory_index_include_archived(services: Services) -> None:
     assert _RETIRED_FACT_PATH in paths
 
 
-async def test_memory_index_never_follows_a_symlinked_note_file(services: Services) -> None:
+async def test_memory_index_never_follows_a_symlinked_note_file(
+    services: Services, vault_root: Path
+) -> None:
     # A client can never write a symlink through the MCP write path (`vault.paths.resolve`
     # rejects one); this is the human-pushed-straight-to-the-remote case `vault.paths.
     # iter_md_files` guards `_iter_vault_notes` against - a `*.md` symlink must never have
     # its target's content read, parsed and reported back through `memory_index` as if it
     # were a real note in the vault, even when the target happens to parse as a valid one.
-    outside = services.vault_root.parent / "outside-the-vault.md"
+    outside = vault_root.parent / "outside-the-vault.md"
     outside.write_text(
         "---\n"
         "id: 01J8Z3K9N2M4P6Q8R0S2T4V6W9\n"
@@ -128,7 +132,7 @@ async def test_memory_index_never_follows_a_symlinked_note_file(services: Servic
         encoding="utf-8",
     )
     symlinked_path = "personal/fact/symlinked.md"
-    (services.vault_root / symlinked_path).symlink_to(outside)
+    (vault_root / symlinked_path).symlink_to(outside)
 
     async with Client(build_server(services)) as client:
         result = await client.call_tool("memory_index", {})
@@ -143,8 +147,10 @@ async def test_memory_index_never_follows_a_symlinked_note_file(services: Servic
     assert read_items[0]["error"]["error"] == "NotFound"
 
 
-async def test_memory_read_by_path_returns_content_and_version(services: Services) -> None:
-    expected_bytes = (services.vault_root / _FAVORITE_COLOR_PATH).read_bytes()
+async def test_memory_read_by_path_returns_content_and_version(
+    services: Services, vault_root: Path
+) -> None:
+    expected_bytes = (vault_root / _FAVORITE_COLOR_PATH).read_bytes()
     expected_note = parse(expected_bytes)
 
     async with Client(build_server(services)) as client:
@@ -159,8 +165,10 @@ async def test_memory_read_by_path_returns_content_and_version(services: Service
     assert item["content"] == expected_bytes.decode("utf-8")
 
 
-async def test_memory_read_by_id_resolves_to_the_same_note(services: Services) -> None:
-    expected_bytes = (services.vault_root / _FAVORITE_COLOR_PATH).read_bytes()
+async def test_memory_read_by_id_resolves_to_the_same_note(
+    services: Services, vault_root: Path
+) -> None:
+    expected_bytes = (vault_root / _FAVORITE_COLOR_PATH).read_bytes()
     expected_id = parse(expected_bytes).id
 
     async with Client(build_server(services)) as client:
@@ -218,15 +226,15 @@ async def test_memory_read_rejects_more_than_twenty_items(services: Services) ->
 
 
 async def test_open_services_indexes_seeded_notes_on_startup(
-    tmp_path: Path, services: Services, bare_remote: Path, test_database_url: str
+    tmp_path: Path, services: Services, vault_root: Path, bare_remote: Path, test_database_url: str
 ) -> None:
     # Reuse the vault `services` already seeded and synced (its remote is
     # `bare_remote`) to point a second, DB-backed `open_services` at the same
     # notes, into a fresh local clone directory.
     seeded_paths = sorted(
-        str(path.relative_to(services.vault_root))
-        for path in services.vault_root.rglob("*.md")
-        if ".git" not in path.relative_to(services.vault_root).parts
+        str(path.relative_to(vault_root))
+        for path in vault_root.rglob("*.md")
+        if ".git" not in path.relative_to(vault_root).parts
     )
 
     environ = {

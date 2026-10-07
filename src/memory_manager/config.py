@@ -32,7 +32,7 @@ _DEFAULT_EMBEDDING_PROVIDER = "none"
 _EMBEDDING_PROVIDERS = ("none", "ollama", "openai")
 _DEFAULT_OLLAMA_MODEL = "bge-m3"
 _DEFAULT_STORAGE_BACKEND = "git"
-_STORAGE_BACKENDS = ("git",)
+_STORAGE_BACKENDS = ("git", "postgres")
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8080
@@ -136,15 +136,24 @@ class StorageConfigError(VaultConfigError):
 def storage_backend_from_env(environ: dict[str, str]) -> str:
     """The configured storage backend's name (`STORAGE_BACKEND`, default `"git"`).
 
-    Only `"git"` (`memory_manager.storage.git.GitBackend`) is implemented
-    today; `"postgres"` is enterprise scope (WP-18, ADR-0007). Raises
-    `StorageConfigError` for any other value - the same
-    `EMBEDDING_PROVIDER` pattern `EmbeddingConfig.from_env` uses above.
+    `"git"` (`memory_manager.storage.git.GitBackend`) and `"postgres"`
+    (`memory_manager.storage.postgres.PostgresBackend`, enterprise mode,
+    ADR-0007 §2, WP-18) are both implemented; any other value raises
+    `StorageConfigError` - the same `EMBEDDING_PROVIDER` pattern
+    `EmbeddingConfig.from_env` uses above. `"postgres"` additionally
+    requires `DATABASE_URL`: there is no vault to fall back to in that
+    mode, so this raises `StorageConfigError` naming it if it is missing,
+    before anything is migrated, connected to or cloned.
     """
     backend = environ.get("STORAGE_BACKEND", _DEFAULT_STORAGE_BACKEND)
     if backend not in _STORAGE_BACKENDS:
         raise StorageConfigError(
             f"STORAGE_BACKEND must be one of {_STORAGE_BACKENDS}, got {backend!r}"
+        )
+    if backend == "postgres" and not environ.get("DATABASE_URL"):
+        raise StorageConfigError(
+            "DATABASE_URL is required when STORAGE_BACKEND=postgres (ADR-0007 §2): "
+            "the postgres backend is the source of truth and has no vault to fall back to"
         )
     return backend
 

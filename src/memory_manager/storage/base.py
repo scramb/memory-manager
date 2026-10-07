@@ -23,10 +23,12 @@ implementation that itself imports `WriteQueue`).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 __all__ = [
+    "AuditHook",
     "EditMismatch",
     "InvalidNote",
     "NotFound",
@@ -90,6 +92,21 @@ class WriteResult:
     version: str
     commit: str
     related: dict[str, str] | None = None
+
+
+#: Called exactly once for every processed write (`write`/`edit`/`supersede`/
+#: `archive`), success and rejection alike - the seam `memory_manager.app`
+#: wires an `memory_manager.audit.AuditWriter` through (#39), shared
+#: verbatim by `queue.WriteQueue.add_audit_hook` (the `git` backend) and
+#: `storage.postgres.PostgresBackend.add_audit_hook` (ADR-0007 §2, WP-18) -
+#: both backends enforce "audit log for every write" (`CLAUDE.md`)
+#: identically. `result` and `error` are mutually exclusive: exactly one is
+#: `None`. `error` is typed `Exception`, not `WriteError`, only because the
+#: call site that raises it catches broadly in case of a bug elsewhere, not
+#: because either backend ever raises anything but a `WriteError` subclass
+#: on purpose. Same failure contract everywhere this is called: a raising
+#: hook is logged, never allowed to affect the write it was notified about.
+AuditHook = Callable[["WriteRequest", "WriteResult | None", Exception | None], Awaitable[None]]
 
 
 class WriteError(Exception):

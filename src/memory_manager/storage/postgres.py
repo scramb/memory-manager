@@ -68,6 +68,7 @@ reoccupied within this very window), absent means `deleted`.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -75,6 +76,7 @@ import asyncpg
 
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
+    AuditHook,
     InvalidNote,
     NotFound,
     StorageChanges,
@@ -88,6 +90,8 @@ from memory_manager.vault.note import parse, version
 from memory_manager.vault.paths import PathRejected, parse_note_path
 
 __all__ = ["PostgresBackend"]
+
+_logger = logging.getLogger(__name__)
 
 _SELECT_CURRENT = """
 select id, content, version, current_revision
@@ -166,6 +170,28 @@ class PostgresBackend:
     def __init__(self, pool: asyncpg.Pool, *, clock: Callable[[], datetime] = _utc_now) -> None:
         self._pool = pool
         self._clock = clock
+        self._audit_hooks: list[AuditHook] = []
+
+    def add_audit_hook(self, hook: AuditHook) -> None:
+        """Register `hook`, awaited after every `write`/`edit`/`supersede`/`archive`.
+
+        Same contract as `queue.WriteQueue.add_audit_hook` (`storage.base.AuditHook`'s
+        docstring, ADR-0007 §2: both backends enforce "audit log for every write"
+        identically) - called exactly once per op, success or rejection alike, after
+        the transaction has already committed or failed but before the result is
+        returned or the error raised to this method's own caller. A raising hook is
+        logged, never propagated.
+        """
+        self._audit_hooks.append(hook)
+
+    async def _run_audit_hooks(
+        self, request: WriteRequest, result: WriteResult | None, error: Exception | None
+    ) -> None:
+        for hook in self._audit_hooks:
+            try:
+                await hook(request, result, error)
+            except Exception:
+                _logger.exception("postgres backend audit hook failed for %s", request.path)
 
     async def read(self, path: str) -> StoredNote | None:
         """The note at `path`, or `None` if it does not exist.
@@ -252,6 +278,22 @@ class PostgresBackend:
         )
 
     async def _write_or_edit(self, request: WriteRequest) -> WriteResult:
+        """`write`/`edit`'s audited entry point: run `_write_or_edit_inner`, then audit.
+
+        The audit hook fires exactly once, after the transaction has
+        committed or failed, before the result is returned or the error
+        raised - same ordering `queue.py`'s own audit hook uses for the
+        `"git"` backend.
+        """
+        try:
+            result = await self._write_or_edit_inner(request)
+        except Exception as exc:
+            await self._run_audit_hooks(request, None, exc)
+            raise
+        await self._run_audit_hooks(request, result, None)
+        return result
+
+    async def _write_or_edit_inner(self, request: WriteRequest) -> WriteResult:
         """`write`/`edit`'s shared flow: validate, then one `READ COMMITTED` transaction.
 
         `WriteResult.commit` is `"<note id>@<revision>"` - a stable, unique
@@ -406,17 +448,33 @@ class PostgresBackend:
         too: a concurrent `edit` racing this on the same note loses (or
         wins) the same `WHERE id = $id AND current_revision = $n` guard
         and is reported through `_reread_for_conflict` exactly like
-        `write`/`edit` would.
+        `write`/`edit` would. Audited exactly once, success or rejection
+        alike, same as `_write_or_edit` above.
         """
+        request = WriteRequest(
+            op="archive",
+            path=path,
+            client=client,
+            if_version=if_version,
+            actor=actor,
+            message=message,
+        )
+        try:
+            result = await self._archive_inner(request)
+        except Exception as exc:
+            await self._run_audit_hooks(request, None, exc)
+            raise
+        await self._run_audit_hooks(request, result, None)
+        return result
+
+    async def _archive_inner(self, request: WriteRequest) -> WriteResult:
+        path = request.path
         try:
             async with self._pool.acquire() as conn, conn.transaction():
                 current_row = await conn.fetchrow(_SELECT_CURRENT, path)
                 current = bytes(current_row["content"]) if current_row is not None else None
                 current_version = current_row["version"] if current_row is not None else None
 
-                request = WriteRequest(
-                    op="archive", path=path, client=client, if_version=if_version, actor=actor
-                )
                 rules.check_version(request, current_version, current)
 
                 if current is None or current_row is None:
@@ -430,7 +488,7 @@ class PostgresBackend:
                     path, current, archive_exists=archive_row is not None, now=now
                 )
                 new_version = version(archived_bytes)
-                final_message = message or f"archive {path}"
+                final_message = request.message or f"archive {path}"
 
                 updated = await conn.fetchrow(
                     _UPDATE_ARCHIVE,
@@ -452,8 +510,8 @@ class PostgresBackend:
                     archive_rel,
                     archived_bytes,
                     new_version,
-                    actor,
-                    client,
+                    request.actor,
+                    request.client,
                     final_message,
                 )
         except asyncpg.UniqueViolationError as exc:
@@ -486,17 +544,45 @@ class PostgresBackend:
         `if_version` to compare against, only the existence check
         `rules.prepare_supersede_content` already made moments earlier -
         losing afterwards is "the path turned out to be taken after all",
-        the same wording a non-racing caller gets from that check.
+        the same wording a non-racing caller gets from that check. Audited
+        exactly once, success or rejection alike, same as `_write_or_edit`
+        above.
         """
+        request = WriteRequest(
+            op="supersede",
+            path=path,
+            client=client,
+            if_version=if_version,
+            new_path=new_path,
+            content=content,
+            message=message,
+            actor=actor,
+        )
+        try:
+            result = await self._supersede_inner(request)
+        except Exception as exc:
+            await self._run_audit_hooks(request, None, exc)
+            raise
+        await self._run_audit_hooks(request, result, None)
+        return result
+
+    async def _supersede_inner(self, request: WriteRequest) -> WriteResult:
+        path = request.path
+        new_path = request.new_path
+        if new_path is None or request.content is None:
+            raise AssertionError(  # pragma: no cover - supersede() above always sets both
+                "PostgresBackend._supersede_inner called without new_path/content"
+            )
+        content = request.content
+        client = request.client
+        actor = request.actor
+        message = request.message
         try:
             async with self._pool.acquire() as conn, conn.transaction():
                 old_row = await conn.fetchrow(_SELECT_CURRENT, path)
                 old_current = bytes(old_row["content"]) if old_row is not None else None
                 old_version = old_row["version"] if old_row is not None else None
 
-                request = WriteRequest(
-                    op="supersede", path=path, client=client, if_version=if_version, actor=actor
-                )
                 rules.check_version(request, old_version, old_current)
 
                 old_note_path, new_note_path, checked_new_path, new_content, old_bytes = (
