@@ -24,8 +24,11 @@ resources:
 
 # The one place the running version is decided: a release tag of this
 # repo (the `Release` workflow's own build), never `latest` - otherwise
-# Git stops being what actually runs. No image automation; a rollout is
-# a commit that bumps this, in the operator's own overlay.
+# Git stops being what actually runs. release-please keeps this base's
+# default in sync with the latest tag (release-please-config.json's
+# extra-files, docs/releasing.md) - an operator overlay still pins its
+# own rollout explicitly rather than inheriting this on every merge, see
+# deploy/README.md.
 images:
   - name: ghcr.io/scramb/memory-manager
-    newTag: "0.0.0"
+    newTag: "0.0.0" # x-release-please-version
