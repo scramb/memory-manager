@@ -15,19 +15,31 @@ any other value - including an unsupported one - goes to `handle_modern_request`
 an unsupported `MCP-Protocol-Version` header, both only reachable by sending the header
 by hand.
 
-The subprocess talks to a vault cloned from a throwaway local bare remote
-(`tests/git_fixtures.bare_remote`, no network), seeded with one note, and no
-`DATABASE_URL` - same as `test_stdio.py`. `MM_ALLOW_UNAUTHENTICATED` is not set: the
-subprocess binds to `127.0.0.1`, which `cli._is_loopback` always allows.
+`http_env` is parametrised over `STORAGE_BACKEND` (ADR-0007 §2, WP-18), so every
+test built on `http_server` runs against both: `"git"` talks to a vault cloned
+from a throwaway local bare remote (`tests/git_fixtures.bare_remote`, no
+network), seeded with one note, and no `DATABASE_URL` - same as `test_stdio.py`.
+`"postgres"` carries no `VAULT_*` variable at all (proving this mode never
+clones anything) and seeds its note straight through
+`storage.postgres.PostgresBackend.write`; `DATABASE_URL` always turns
+bearer-token auth on for `/mcp` in this mode (#34, ADR-0007 §2), so it also
+needs `PUBLIC_URL` and the `http_headers` fixture's bearer token - every test
+built on `http_server` sends `http_headers` with it, empty for `"git"` without
+a database. `MM_ALLOW_UNAUTHENTICATED` is not set: the subprocess binds to
+`127.0.0.1`, which `cli._is_loopback` always allows.
 
-`authenticated_http_server` (bottom of the module, #34) is the one exception: it sets
-`DATABASE_URL` to a fresh `test_database_url`, so the subprocess's own startup turns
-bearer-token auth on for `/mcp` (`http.py`) - a static token is then created directly
-against that same database once the subprocess is ready, and a real `mcp.Client`
-carries it as `Authorization: Bearer ...` the same way Claude Code or CI would, via
-`httpx2.AsyncClient(headers=...)` passed to `streamable_http_client` (the SDK's own
-seam for a client-supplied `httpx2.AsyncClient`, since `mcp.Client("http://...")`
-itself has no `headers=` parameter).
+`authenticated_http_server` (bottom of the module, #34) is a separate,
+non-parametrised fixture: it specifically exercises the `"git"` backend with
+`DATABASE_URL` set (bearer-token auth turning on for a backend that is
+otherwise unauthenticated), not backend conformance - a fresh
+`test_database_url`, so the subprocess's own startup turns bearer-token auth on
+for `/mcp` (`http.py`) - a static token is then created directly against that
+same database once the subprocess is ready, and a real `mcp.Client` carries it
+as `Authorization: Bearer ...` the same way Claude Code or CI would, via
+`httpx2.AsyncClient(headers=...)` passed to `streamable_http_client` (the SDK's
+own seam for a client-supplied `httpx2.AsyncClient`, since `mcp.Client("http://
+...")` itself has no `headers=` parameter) - the same seam `http_headers`
+reuses for the parametrised `"postgres"` case.
 """
 
 from __future__ import annotations
@@ -52,7 +64,9 @@ from mcp_types import METHOD_NOT_FOUND, UNSUPPORTED_PROTOCOL_VERSION
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
 from memory_manager.auth.tokens import ALL_NAMESPACES, create_token
+from memory_manager.db.migrate import migrate
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
+from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -78,6 +92,12 @@ _EXPECTED_TOOL_NAMES = frozenset(
 _SEEDED_PATH = "personal/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
 
+# DATABASE_URL set (always, for the `"postgres"` backend; on request, for
+# `authenticated_http_server`'s `"git"` + DATABASE_URL case) turns bearer-token
+# auth on (#34), which requires PUBLIC_URL (#35, ADR-0004) - unrelated to what
+# either case actually checks, but needed for the subprocess to start at all.
+_PUBLIC_URL = "https://mm.example.test"
+
 _PARAMETRIZE_VERSIONS = pytest.mark.parametrize(
     "version", [_HANDSHAKE_VERSION, _MODERN_VERSION], ids=["2025-11-25", "2026-07-28"]
 )
@@ -94,24 +114,67 @@ def test_negotiated_versions_match_the_sdks_registry() -> None:
     assert _MODERN_VERSION == LATEST_MODERN_VERSION
 
 
-@pytest.fixture
-def http_env(tmp_path: Path, bare_remote: Path) -> dict[str, str]:
-    """`VAULT_REMOTE`/`VAULT_DIR` for an HTTP subprocess, vault seeded with one note.
-
-    No `DATABASE_URL`, same reasoning as `test_stdio.py`'s `stdio_env`.
-    """
-    now = datetime(2025, 6, 1, tzinfo=UTC)
-    note = Note(
+def _seeded_note(now: datetime, body: str) -> Note:
+    return Note(
         id=new_ulid(now),
         title="Favorite color",
         description="The user's favorite color, seeded for HTTP conformance checks.",
         type="fact",
         created=now,
         updated=now,
-        body=_SEEDED_BODY,
+        body=body,
         tags=("color",),
     )
-    seed_notes(bare_remote, {_SEEDED_PATH: serialize(note)})
+
+
+async def _seed_postgres_note(database_url: str, content: bytes) -> None:
+    """Migrate `database_url`, then write `content` at `_SEEDED_PATH` through
+    `PostgresBackend` directly - the `"postgres"` backend's counterpart to
+    `git_fixtures.seed_notes`'s commit onto the bare remote (see
+    `tests/conformance/test_stdio.py`'s identical twin).
+    """
+    migration_conn = await asyncpg.connect(database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        await PostgresBackend(pool).write(
+            _SEEDED_PATH, content, if_version="new", client="conformance-seed"
+        )
+    finally:
+        await pool.close()
+
+
+@pytest_asyncio.fixture(params=["git", "postgres"], ids=["git", "postgres"])
+async def http_env(
+    request: pytest.FixtureRequest, tmp_path: Path, bare_remote: Path, test_database_url: str
+) -> dict[str, str]:
+    """An HTTP subprocess's env, backend seeded with one note (ADR-0007 §2, WP-18).
+
+    `"git"`: `VAULT_REMOTE`/`VAULT_DIR`, no `DATABASE_URL` - same reasoning as
+    `test_stdio.py`'s `stdio_env`. `"postgres"`: `STORAGE_BACKEND`/`DATABASE_URL`
+    only, no `VAULT_*` variable at all (proving this mode never clones
+    anything), plus `PUBLIC_URL` - `DATABASE_URL` always turns bearer-token
+    auth on for `/mcp` in this mode (#34, ADR-0007 §2), which requires it
+    (#35, ADR-0004). `http_headers` below is this fixture's companion: the
+    bearer token every test built on `http_server` needs to actually reach
+    anything in the `"postgres"` case.
+    """
+    note = _seeded_note(datetime(2025, 6, 1, tzinfo=UTC), _SEEDED_BODY)
+    content = serialize(note)
+
+    if request.param == "postgres":
+        await _seed_postgres_note(test_database_url, content)
+        return {
+            "STORAGE_BACKEND": "postgres",
+            "DATABASE_URL": test_database_url,
+            "PUBLIC_URL": _PUBLIC_URL,
+        }
+
+    seed_notes(bare_remote, {_SEEDED_PATH: content})
     return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
 
 
@@ -121,15 +184,56 @@ async def http_server(http_env: Mapping[str, str]) -> AsyncIterator[_Server]:
 
     `MM_ALLOW_UNAUTHENTICATED` is deliberately left unset: `HOST` defaults to
     `127.0.0.1`, which `cli._is_loopback` always allows, so the no-auth
-    refusal never fires here. No `DATABASE_URL` either, so `/mcp` itself has
-    no bearer-token auth turned on (#34) - see `authenticated_http_server`
-    below for that case.
+    refusal never fires here. The `"git"` case of `http_env` sets no
+    `DATABASE_URL`, so `/mcp` itself has no bearer-token auth turned on there
+    (#34) - see `authenticated_http_server` below for that case on its own
+    terms, and `http_headers` for the `"postgres"` case's bearer token.
     """
     async with run_http_server(http_env) as server:
         yield server
 
 
+@pytest_asyncio.fixture
+async def http_headers(http_env: Mapping[str, str]) -> dict[str, str]:
+    """The `Authorization` header every request against `http_server` needs - empty
+    for `"git"` without a database, a freshly created bearer token for `"postgres"`
+    (`DATABASE_URL` always turns bearer-token auth on there, #34/ADR-0007 §2).
+    Used by both `mcp.Client` (via `streamable_http_client(http_client=...)`) and the
+    raw `httpx`/`httpx2` checks below - the same seam `authenticated_http_server`
+    uses for its own, separately-created token.
+
+    `http_env`'s `"postgres"` branch has already migrated `database_url` by the
+    time this runs (through `_seed_postgres_note`), so `static_tokens` already
+    exists here too.
+    """
+    database_url = http_env.get("DATABASE_URL")
+    if not database_url:
+        return {}
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        plaintext, _info = await create_token(
+            pool, "conformance", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+        )
+    finally:
+        await pool.close()
+    return {"Authorization": f"Bearer {plaintext}"}
+
+
 # --- Bearer-token auth (#34): a real subprocess with `DATABASE_URL` set -----
+
+
+@pytest.fixture
+def _git_http_env(tmp_path: Path, bare_remote: Path) -> dict[str, str]:
+    """`VAULT_REMOTE`/`VAULT_DIR` for a `"git"`-backend-only HTTP subprocess, vault
+    seeded with one note - `authenticated_http_server`'s own env, deliberately not
+    the parametrised `http_env` above: that fixture's `"postgres"` case would
+    otherwise leak `STORAGE_BACKEND=postgres` into this git-plus-`DATABASE_URL`
+    scenario and needlessly double every test built on it, which is about `"git"`
+    gaining auth when a database is configured (#34), not backend conformance.
+    """
+    note = _seeded_note(datetime(2025, 6, 1, tzinfo=UTC), _SEEDED_BODY)
+    seed_notes(bare_remote, {_SEEDED_PATH: serialize(note)})
+    return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
 
 
 @dataclass
@@ -140,9 +244,10 @@ class _AuthenticatedServer:
 
 @pytest_asyncio.fixture
 async def authenticated_http_server(
-    http_env: Mapping[str, str], test_database_url: str
+    _git_http_env: Mapping[str, str], test_database_url: str
 ) -> AsyncIterator[_AuthenticatedServer]:
-    """Same subprocess as `http_server`, with `DATABASE_URL` set and one token created.
+    """Same kind of subprocess as `http_server`'s `"git"` case, with `DATABASE_URL`
+    set and one token created.
 
     The subprocess's own startup (`open_services`) migrates `test_database_url`
     before this fixture ever touches it, so by the time `run_http_server`'s
@@ -150,7 +255,7 @@ async def authenticated_http_server(
     created against that same database, not a separate one.
     """
     full_env = {
-        **http_env,
+        **_git_http_env,
         "DATABASE_URL": test_database_url,
         # DATABASE_URL set above turns bearer-token auth on (#34), which
         # requires PUBLIC_URL (#35, ADR-0004) - the subprocess refuses to
@@ -159,7 +264,7 @@ async def authenticated_http_server(
         # their own (`validate_token_resource=False`, `http.py`), so this
         # never has to match the loopback address the test client actually
         # talks to.
-        "PUBLIC_URL": "https://mm.example.test",
+        "PUBLIC_URL": _PUBLIC_URL,
     }
     async with run_http_server(full_env) as server:
         pool = await asyncpg.create_pool(test_database_url)
@@ -219,12 +324,18 @@ async def test_a_bearer_token_authenticates_a_real_client_over_the_wire(
     ids=["2025-11-25", "2026-07-28"],
 )
 async def test_handshake_and_tool_surface(
-    http_server: _Server, mode: str, expected_version: str
+    http_server: _Server, http_headers: dict[str, str], mode: str, expected_version: str
 ) -> None:
     # Same reasoning as `test_stdio.py`'s identically named test for `mode="auto"`
     # landing on the modern version: this server has no handshake-era fallback
-    # reason, so a real `server/discover` probe lands on 2026-07-28.
-    async with Client(http_server.mcp_url, mode=mode) as client:
+    # reason, so a real `server/discover` probe lands on 2026-07-28. Built through
+    # `streamable_http_client` rather than a bare URL string so `http_headers`'
+    # bearer token (empty for `"git"` without a database) reaches the `"postgres"`
+    # case, the same seam `authenticated_http_server`'s own test uses below.
+    transport = streamable_http_client(
+        http_server.mcp_url, http_client=httpx2.AsyncClient(headers=http_headers)
+    )
+    async with Client(transport, mode=mode) as client:
         assert client.protocol_version == expected_version
         assert client.instructions
         assert client.server_info is not None
@@ -277,7 +388,9 @@ def _modern_meta() -> dict[str, Any]:
     }
 
 
-async def test_unknown_method_is_a_json_rpc_method_not_found_error(http_server: _Server) -> None:
+async def test_unknown_method_is_a_json_rpc_method_not_found_error(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
     method = "not/a/real/method"
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {"_meta": _modern_meta()}}
     async with httpx.AsyncClient() as client:
@@ -285,6 +398,7 @@ async def test_unknown_method_is_a_json_rpc_method_not_found_error(http_server: 
             http_server.mcp_url,
             json=body,
             headers={
+                **http_headers,
                 "Accept": "application/json, text/event-stream",
                 "MCP-Protocol-Version": _MODERN_VERSION,
                 # The envelope ladder's rung 2 (`inbound.classify_inbound_request`):
@@ -300,7 +414,9 @@ async def test_unknown_method_is_a_json_rpc_method_not_found_error(http_server: 
     assert payload["error"]["code"] == METHOD_NOT_FOUND
 
 
-async def test_unsupported_protocol_version_header_is_rejected(http_server: _Server) -> None:
+async def test_unsupported_protocol_version_header_is_rejected(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
     bogus_version = "1999-01-01"
     method = "server/discover"
     body = {
@@ -320,6 +436,7 @@ async def test_unsupported_protocol_version_header_is_rejected(http_server: _Ser
             http_server.mcp_url,
             json=body,
             headers={
+                **http_headers,
                 "Accept": "application/json, text/event-stream",
                 # Not in `HANDSHAKE_PROTOCOL_VERSIONS`, so the session manager
                 # routes this to the modern handler, which then rejects the

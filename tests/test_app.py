@@ -21,6 +21,7 @@ from git_fixtures import human_commit
 from memory_manager.app import open_services
 from memory_manager.config import StorageConfigError
 from memory_manager.queue import WriteRequest
+from memory_manager.storage.base import VersionConflict
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -61,6 +62,7 @@ async def test_a_human_commit_ahead_of_a_write_reaches_the_index(
 
         # This write never touches `_HUMAN_PATH` - its own pre-write sync is what
         # fast-forwards the human commit above before the write commits.
+        assert services.queue is not None
         await services.queue.submit(
             WriteRequest(
                 op="write",
@@ -109,6 +111,23 @@ async def test_an_unknown_storage_backend_fails_before_the_vault_dir_is_created(
     environ = {
         "VAULT_REMOTE": str(bare_remote),
         "VAULT_DIR": str(vault_dir),
+        "STORAGE_BACKEND": "bogus",
+    }
+
+    with pytest.raises(StorageConfigError):
+        async with open_services(environ):
+            pass
+
+    assert not vault_dir.exists()
+
+
+async def test_postgres_backend_without_database_url_fails_before_the_vault_dir_is_created(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    vault_dir = tmp_path / "vault"
+    environ = {
+        "VAULT_REMOTE": str(bare_remote),
+        "VAULT_DIR": str(vault_dir),
         "STORAGE_BACKEND": "postgres",
     }
 
@@ -117,3 +136,60 @@ async def test_an_unknown_storage_backend_fails_before_the_vault_dir_is_created(
             pass
 
     assert not vault_dir.exists()
+
+
+# --- The `postgres` backend (ADR-0007 §2, WP-18) -----------------------------
+
+
+async def test_postgres_backend_opens_with_no_vault_env_at_all(test_database_url: str) -> None:
+    """No `VAULT_*` variable - proof this mode never clones anything (ADR-0007 §2).
+
+    `services.indexer` is set despite there being no vault at all (ADR-0007
+    §4, WP-18/#98): it indexes from `vault_notes`, not a working copy.
+    """
+    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+
+    async with open_services(environ) as services:
+        assert services.repo is None
+        assert services.queue is None
+        assert services.vault_root is None
+        assert services.indexer is not None
+        assert services.provider is None  # no EMBEDDING_* set
+        assert services.trigger_sync is None
+        assert services.pool is not None
+
+        result = await services.storage.write(
+            "personal/fact/new.md",
+            _note_bytes(title="New"),
+            if_version="new",
+            client="ci",
+        )
+        assert result.version
+
+
+async def test_postgres_backend_writes_get_exactly_one_audit_row_each_including_rejected(
+    test_database_url: str,
+) -> None:
+    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    path = "personal/fact/new.md"
+
+    async with open_services(environ) as services:
+        assert services.pool is not None
+
+        result = await services.storage.write(
+            path, _note_bytes(title="New"), if_version="new", client="ci"
+        )
+
+        with pytest.raises(VersionConflict):
+            await services.storage.write(
+                path, _note_bytes(title="Again"), if_version="new", client="ci"
+            )
+
+        rows = await services.pool.fetch("select * from audit_log order by id")
+
+    assert len(rows) == 2
+    assert rows[0]["op"] == "write"
+    assert rows[0]["outcome"] == "ok"
+    assert rows[0]["commit_sha"] == result.commit
+    assert rows[1]["op"] == "write"
+    assert rows[1]["outcome"] == "conflict"

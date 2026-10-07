@@ -3,8 +3,9 @@
 
 Every test drives the tools through an in-memory `mcp.Client`, exactly like
 `tests/mcp/test_read_tools.py`, and reads the resulting vault state straight
-off `services.vault_root`/`bare_remote` rather than re-deriving it, for the
-same reason that module gives (see its docstring).
+off the `vault_root` fixture (`tests/mcp/conftest.py`)/`bare_remote` rather
+than re-deriving it, for the same reason that module gives (see its
+docstring).
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ def _commit_author(remote: Path, commit: str) -> str:
 
 
 async def test_write_creates_a_new_note_with_generated_id_and_timestamps(
-    services: Services, bare_remote: Path
+    services: Services, bare_remote: Path, vault_root: Path
 ) -> None:
     content = _content(_base_fields())
 
@@ -74,7 +75,7 @@ async def test_write_creates_a_new_note_with_generated_id_and_timestamps(
     assert payload["path"] == _PATH
     assert is_ulid(payload["id"])
 
-    on_disk = parse((services.vault_root / _PATH).read_bytes())
+    on_disk = parse((vault_root / _PATH).read_bytes())
     assert on_disk.id == payload["id"]
     assert on_disk.created == on_disk.updated
     assert (
@@ -96,14 +97,16 @@ async def test_write_creating_with_explicit_new_id_marker_also_generates_an_id(
     assert is_ulid(result.structured_content["id"])
 
 
-async def test_write_update_keeps_created_and_forces_updated_to_now(services: Services) -> None:
+async def test_write_update_keeps_created_and_forces_updated_to_now(
+    services: Services, vault_root: Path
+) -> None:
     async with Client(build_server(services)) as client:
         created_result = await client.call_tool(
             "memory_write",
             {"path": _PATH, "content": _content(_base_fields()), "if_version": "new"},
         )
         first = created_result.structured_content
-        original = parse((services.vault_root / _PATH).read_bytes())
+        original = parse((vault_root / _PATH).read_bytes())
 
         updated_fields = _update_fields(id=first["id"], title="Changed title")
         update_result = await client.call_tool(
@@ -115,7 +118,7 @@ async def test_write_update_keeps_created_and_forces_updated_to_now(services: Se
             },
         )
     assert update_result.is_error is False
-    on_disk = parse((services.vault_root / _PATH).read_bytes())
+    on_disk = parse((vault_root / _PATH).read_bytes())
     assert on_disk.title == "Changed title"
     assert on_disk.created == original.created
     # `_update_fields`' placeholder `updated` (2026-01-01) is never trusted either.
@@ -123,7 +126,7 @@ async def test_write_update_keeps_created_and_forces_updated_to_now(services: Se
 
 
 async def test_write_stale_version_returns_conflict_with_current_content(
-    services: Services,
+    services: Services, vault_root: Path
 ) -> None:
     async with Client(build_server(services)) as client:
         created_result = await client.call_tool(
@@ -144,7 +147,7 @@ async def test_write_stale_version_returns_conflict_with_current_content(
     error = stale_result.structured_content
     assert error["error"] == "VersionConflict"
     assert error["current_version"] == first["version"]
-    current_on_disk = (services.vault_root / _PATH).read_bytes().decode("utf-8")
+    current_on_disk = (vault_root / _PATH).read_bytes().decode("utf-8")
     assert error["current_content"] == current_on_disk
 
 
@@ -231,7 +234,9 @@ async def test_write_path_traversal_is_rejected_as_a_path_error(services: Servic
     assert "escape.md" in error["message"]
 
 
-async def test_edit_happy_path_replaces_the_body_and_keeps_the_id(services: Services) -> None:
+async def test_edit_happy_path_replaces_the_body_and_keeps_the_id(
+    services: Services, vault_root: Path
+) -> None:
     async with Client(build_server(services)) as client:
         created_result = await client.call_tool(
             "memory_write",
@@ -256,7 +261,7 @@ async def test_edit_happy_path_replaces_the_body_and_keeps_the_id(services: Serv
     payload = result.structured_content
     assert payload["id"] == first["id"]
 
-    on_disk = parse((services.vault_root / _PATH).read_bytes())
+    on_disk = parse((vault_root / _PATH).read_bytes())
     assert on_disk.body == "New body.\n"
     assert on_disk.id == first["id"]
 

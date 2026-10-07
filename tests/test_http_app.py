@@ -124,6 +124,21 @@ async def test_readyz_is_503_when_the_database_is_unreachable(
     assert body["database"] is False
 
 
+async def test_readyz_is_ready_with_the_postgres_backend_and_no_vault(
+    test_database_url: str,
+) -> None:
+    """The `postgres` backend (ADR-0007 §2, WP-18) has no `vault_root` to check at
+    all - `vault` collapses to the same database reachability `database` reports.
+    """
+    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    config = ServerConfig(public_url="https://mm.example.test")
+    async with _running_app(environ, config) as (_app, client):
+        response = await client.get(READY_PATH)
+
+    assert response.status_code == 200
+    assert response.json() == {"ready": True, "vault": True, "database": True, "draining": False}
+
+
 # --- Origin validation -------------------------------------------------------
 
 
@@ -169,6 +184,22 @@ async def test_webhook_is_404_without_a_configured_secret(
 ) -> None:
     config = ServerConfig(webhook_secret=None)
     async with _running_app(_environ(bare_remote, tmp_path), config) as (_app, client):
+        response = await client.post(WEBHOOK_PATH, content=b"{}")
+
+    assert response.status_code == 404
+
+
+async def test_webhook_is_404_with_the_postgres_backend_even_with_a_secret_configured(
+    test_database_url: str,
+) -> None:
+    """The `postgres` backend (ADR-0007 §2, WP-18) has no vault and nothing a webhook
+    could ever resync (`Services.trigger_sync` is `None`) - 404 regardless of
+    whether `VAULT_WEBHOOK_SECRET` happens to be set, same as the endpoint not
+    existing at all.
+    """
+    environ = {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+    config = ServerConfig(public_url="https://mm.example.test", webhook_secret=_WEBHOOK_SECRET)
+    async with _running_app(environ, config) as (_app, client):
         response = await client.post(WEBHOOK_PATH, content=b"{}")
 
     assert response.status_code == 404

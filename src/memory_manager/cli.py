@@ -49,7 +49,9 @@ from memory_manager.config import (
     EmbeddingConfigError,
     ServerConfig,
     ServerConfigError,
+    StorageConfigError,
     VaultConfigError,
+    storage_backend_from_env,
 )
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
@@ -63,7 +65,7 @@ from memory_manager.importers.claude import ClaudeFormatError
 from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.markdown import collect as collect_markdown
 from memory_manager.index.embeddings import provider_from_config
-from memory_manager.index.indexer import Indexer, IndexStats
+from memory_manager.index.indexer import Indexer, IndexStats, VaultNotesSource
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import configure_logging_from_env
@@ -167,10 +169,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        storage_backend = storage_backend_from_env(dict(os.environ))
         database_url = _require_env("DATABASE_URL")
-        vault_dir = Path(_require_env("VAULT_DIR"))
+        vault_dir = Path(_require_env("VAULT_DIR")) if storage_backend == "git" else None
         embedding_config = EmbeddingConfig.from_env(dict(os.environ))
-    except (_MissingEnvironment, EmbeddingConfigError) as exc:
+    except (_MissingEnvironment, EmbeddingConfigError, StorageConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -611,8 +614,14 @@ async def _run_token_revoke(name: str) -> int:
 
 
 async def _reindex(
-    database_url: str, vault_dir: Path, embedding_config: EmbeddingConfig, *, full: bool
+    database_url: str, vault_dir: Path | None, embedding_config: EmbeddingConfig, *, full: bool
 ) -> int:
+    """Reindex `database_url` from `vault_dir` (`"git"`) or `vault_notes` (`"postgres"`).
+
+    `vault_dir` is `None` for the `postgres` backend (ADR-0007 §2, WP-18):
+    there is no vault to walk, `vault_notes` is `Indexer`'s source instead
+    (`VaultNotesSource`).
+    """
     # A plain connection for the migration, not one from the pool below:
     # `migrate` takes an `asyncpg.Connection`, not a pool's connection proxy.
     migration_conn = await asyncpg.connect(database_url)
@@ -623,8 +632,9 @@ async def _reindex(
 
     provider = provider_from_config(embedding_config)
     pool = await asyncpg.create_pool(database_url)
+    source = vault_dir if vault_dir is not None else VaultNotesSource()
     try:
-        stats = await Indexer(pool, vault_dir, provider).reindex(full=full)
+        stats = await Indexer(pool, source, provider).reindex(full=full)
     finally:
         await pool.close()
 

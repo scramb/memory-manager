@@ -36,6 +36,7 @@ class TestMigrate:
             "0001_index_schema",
             "0002_static_tokens",
             "0003_oauth",
+            "0004_vault",
             "0006_shared_state",
         ]
         tables = {
@@ -56,6 +57,9 @@ class TestMigrate:
             "oauth_auth_codes",
             "oauth_tokens",
             "rate_limits",
+            "vault_notes",
+            "vault_revisions",
+            "namespaces",
         }
 
     async def test_running_twice_applies_nothing_the_second_time(
@@ -68,6 +72,7 @@ class TestMigrate:
             "0001_index_schema",
             "0002_static_tokens",
             "0003_oauth",
+            "0004_vault",
             "0006_shared_state",
         ]
         assert second == []
@@ -87,6 +92,7 @@ class TestMigrate:
             "0001_index_schema",
             "0002_static_tokens",
             "0003_oauth",
+            "0004_vault",
             "0006_shared_state",
         ]
 
@@ -144,6 +150,7 @@ class TestMigrate:
                 "0001_index_schema",
                 "0002_static_tokens",
                 "0003_oauth",
+                "0004_vault",
                 "0006_shared_state",
             ]
         finally:

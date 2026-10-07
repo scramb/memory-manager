@@ -3,8 +3,8 @@
 
 Every test drives the tools through an in-memory `mcp.Client`, exactly like
 `tests/mcp/test_write_tools.py`, and reads the resulting vault state straight
-off `services.vault_root`/`bare_remote` rather than re-deriving it, for the
-same reason that module gives.
+off the `vault_root` fixture/`bare_remote` rather than re-deriving it, for
+the same reason that module gives.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ async def _write_old_note(client: Client) -> dict[str, object]:
 
 class TestSupersede:
     async def test_happy_path_commits_both_notes_and_links_them(
-        self, services: Services, bare_remote: Path
+        self, services: Services, bare_remote: Path, vault_root: Path
     ) -> None:
         async with Client(build_server(services)) as client:
             old = await _write_old_note(client)
@@ -75,10 +75,10 @@ class TestSupersede:
         assert payload["old"]["path"] == _OLD_PATH
         assert payload["old"]["valid_to"] == datetime.now(UTC).date().isoformat()
 
-        new_disk = parse((services.vault_root / _NEW_PATH).read_bytes())
+        new_disk = parse((vault_root / _NEW_PATH).read_bytes())
         assert new_disk.supersedes == (old["id"],)
 
-        old_disk = parse((services.vault_root / _OLD_PATH).read_bytes())
+        old_disk = parse((vault_root / _OLD_PATH).read_bytes())
         assert old_disk.id == old["id"]
         assert old_disk.valid_to is not None
         assert old_disk.valid_to.isoformat() == payload["old"]["valid_to"]
@@ -86,7 +86,7 @@ class TestSupersede:
         assert _committed_paths(bare_remote, payload["commit"]) == {_OLD_PATH, _NEW_PATH}
 
     async def test_stale_old_version_returns_conflict_with_current_content(
-        self, services: Services
+        self, services: Services, vault_root: Path
     ) -> None:
         async with Client(build_server(services)) as client:
             old = await _write_old_note(client)
@@ -105,7 +105,7 @@ class TestSupersede:
         error = result.structured_content
         assert error["error"] == "VersionConflict"
         assert error["current_version"] == old["version"]
-        assert not (services.vault_root / _NEW_PATH).exists()
+        assert not (vault_root / _NEW_PATH).exists()
 
     async def test_new_path_already_existing_is_a_conflict(self, services: Services) -> None:
         async with Client(build_server(services)) as client:
@@ -168,7 +168,7 @@ class TestSupersede:
 
 class TestArchive:
     async def test_happy_path_moves_the_note_and_keeps_it_readable(
-        self, services: Services
+        self, services: Services, vault_root: Path
     ) -> None:
         async with Client(build_server(services)) as client:
             old = await _write_old_note(client)
@@ -180,7 +180,7 @@ class TestArchive:
             payload = result.structured_content
             archived_path = payload["archived_path"]
             assert archived_path == "_archive/personal/fact/old.md"
-            assert not (services.vault_root / _OLD_PATH).exists()
+            assert not (vault_root / _OLD_PATH).exists()
 
             read_result = await client.call_tool("memory_read", {"items": [archived_path]})
 
@@ -191,7 +191,9 @@ class TestArchive:
         assert archived_note.title == "A note"
         assert archived_note.updated >= archived_note.created
 
-    async def test_stale_version_returns_conflict(self, services: Services) -> None:
+    async def test_stale_version_returns_conflict(
+        self, services: Services, vault_root: Path
+    ) -> None:
         async with Client(build_server(services)) as client:
             await _write_old_note(client)
 
@@ -201,7 +203,7 @@ class TestArchive:
 
         assert result.is_error is True
         assert result.structured_content["error"] == "VersionConflict"
-        assert (services.vault_root / _OLD_PATH).exists()
+        assert (vault_root / _OLD_PATH).exists()
 
     async def test_archiving_an_already_archived_path_is_an_error(self, services: Services) -> None:
         async with Client(build_server(services)) as client:

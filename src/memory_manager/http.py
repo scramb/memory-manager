@@ -980,7 +980,6 @@ async def _readyz(request: Request) -> Response:
         return JSONResponse({"ready": False, "draining": True}, status_code=503)
 
     services: Services = request.app.state.services
-    vault_ready = (services.vault_root / ".git").is_dir()
 
     database_ready = True
     if services.pool is not None:
@@ -989,6 +988,14 @@ async def _readyz(request: Request) -> Response:
         except Exception:
             # Any failure here means "not ready", not a crash of the endpoint itself.
             database_ready = False
+
+    if services.vault_root is not None:
+        vault_ready = (services.vault_root / ".git").is_dir()
+    else:
+        # The `postgres` backend (ADR-0007 §2, WP-18) has no vault clone to
+        # check at all - "vault ready" collapses to "the database holding
+        # every note is reachable", `database_ready` above.
+        vault_ready = database_ready
 
     ready = vault_ready and database_ready
     body = {
@@ -1003,16 +1010,24 @@ async def _readyz(request: Request) -> Response:
 async def _vault_webhook(request: Request) -> Response:
     """Verify a GitHub/Gitea push webhook's HMAC signature and trigger a sync.
 
-    404 when no `VAULT_WEBHOOK_SECRET` is configured at all (the endpoint
-    does not exist, rather than existing just to reject every call); 401 for
-    a missing or wrong signature; 413 over the 1 MiB body cap; 202 once a
-    verified webhook has triggered `Services.trigger_sync()` - deliberately
-    *after* the sync has run, not fire-and-forget, so the response means
-    what it says: the vault is caught up by the time the caller sees it.
+    404 when no `VAULT_WEBHOOK_SECRET` is configured at all, or when
+    `Services.trigger_sync` is `None` - the `postgres` backend (ADR-0007
+    §2, WP-18) has no vault and nothing a webhook could ever resync, so the
+    endpoint does not exist there either (the same "does not exist, rather
+    than existing just to reject every call" reasoning as the missing
+    secret); 401 for a missing or wrong signature; 413 over the 1 MiB body
+    cap; 202 once a verified webhook has triggered `Services.trigger_sync()`
+    - deliberately *after* the sync has run, not fire-and-forget, so the
+    response means what it says: the vault is caught up by the time the
+    caller sees it.
     """
     config: ServerConfig = request.app.state.config
     secret = config.webhook_secret
     if secret is None:
+        return PlainTextResponse("not found", status_code=404)
+
+    services: Services = request.app.state.services
+    if services.trigger_sync is None:
         return PlainTextResponse("not found", status_code=404)
 
     body = await _read_capped_body(request, _MAX_WEBHOOK_BODY_BYTES)
@@ -1023,11 +1038,6 @@ async def _vault_webhook(request: Request) -> Response:
         _logger.warning("rejected a %s request with an invalid or missing signature", WEBHOOK_PATH)
         return PlainTextResponse("invalid signature", status_code=401)
 
-    services: Services = request.app.state.services
-    if services.trigger_sync is None:
-        # create_app always builds Services through services_factory, which always sets
-        # trigger_sync - reaching this would be an open_services()/create_app() wiring bug.
-        raise RuntimeError("Services.trigger_sync is None on a Services built for the HTTP app")
     await services.trigger_sync()
     return PlainTextResponse("accepted", status_code=202)
 

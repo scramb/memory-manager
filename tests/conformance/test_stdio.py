@@ -26,9 +26,14 @@ Two complementary harnesses are used:
   is parsed as JSON before anything else happens, which is this module's running check
   that the server's stdout carries nothing but JSON-RPC messages.
 
-The subprocess talks to a vault cloned from a throwaway local bare remote
-(`tests/git_fixtures.bare_remote`, no network), seeded with one note, and no
-`DATABASE_URL` - `memory_index`/`memory_read` do not need Postgres (`app.open_services`).
+`stdio_env` is parametrised over `STORAGE_BACKEND` (ADR-0007 §2, WP-18), so every
+test built on it runs against both: `"git"` talks to a vault cloned from a
+throwaway local bare remote (`tests/git_fixtures.bare_remote`, no network), with
+no `DATABASE_URL` - `memory_index`/`memory_read` do not need Postgres
+(`app.open_services`); `"postgres"` carries no `VAULT_*` variable at all, proof
+that this mode never clones anything, and seeds its one note straight through
+`storage.postgres.PostgresBackend.write` after migrating, instead of
+`seed_notes`'s git commit.
 """
 
 from __future__ import annotations
@@ -43,12 +48,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import pytest
+import pytest_asyncio
 from git_fixtures import seed_notes
 from mcp import Client, MCPDeprecationWarning
 from mcp.client.stdio import StdioServerParameters
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
+from memory_manager.db.migrate import migrate
+from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -86,13 +95,18 @@ _PARAMETRIZE_VERSIONS = pytest.mark.parametrize(
 )
 
 
-@pytest.fixture
-def stdio_env(tmp_path: Path, bare_remote: Path) -> dict[str, str]:
-    """`VAULT_REMOTE`/`VAULT_DIR` for a stdio subprocess, vault seeded with one note.
+@pytest_asyncio.fixture(params=["git", "postgres"], ids=["git", "postgres"])
+async def stdio_env(
+    request: pytest.FixtureRequest, tmp_path: Path, bare_remote: Path, test_database_url: str
+) -> dict[str, str]:
+    """A stdio subprocess's env, backend seeded with one note (ADR-0007 §2, WP-18).
 
-    No `DATABASE_URL`: `memory_index`/`memory_read` work without Postgres
-    (`memory_manager.app.open_services`), and conformance here is about the wire
-    protocol, not the search index.
+    `"git"`: `VAULT_REMOTE`/`VAULT_DIR`, no `DATABASE_URL` -
+    `memory_index`/`memory_read` work without Postgres
+    (`memory_manager.app.open_services`), and conformance here is about the
+    wire protocol, not the search index. `"postgres"`: `STORAGE_BACKEND`/
+    `DATABASE_URL` only - no `VAULT_*` variable at all, proving this mode
+    never clones anything (`app._open_backend`'s `"postgres"` branch).
     """
     now = datetime(2025, 6, 1, tzinfo=UTC)
     note = Note(
@@ -105,8 +119,34 @@ def stdio_env(tmp_path: Path, bare_remote: Path) -> dict[str, str]:
         body=_SEEDED_BODY,
         tags=("color",),
     )
-    seed_notes(bare_remote, {_SEEDED_PATH: serialize(note)})
+    content = serialize(note)
+
+    if request.param == "postgres":
+        await _seed_postgres_note(test_database_url, content)
+        return {"STORAGE_BACKEND": "postgres", "DATABASE_URL": test_database_url}
+
+    seed_notes(bare_remote, {_SEEDED_PATH: content})
     return {"VAULT_REMOTE": str(bare_remote), "VAULT_DIR": str(tmp_path / "vault")}
+
+
+async def _seed_postgres_note(database_url: str, content: bytes) -> None:
+    """Migrate `database_url`, then write `content` at `_SEEDED_PATH` through
+    `PostgresBackend` directly - the `"postgres"` backend's counterpart to
+    `git_fixtures.seed_notes`'s commit onto the bare remote.
+    """
+    migration_conn = await asyncpg.connect(database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        await PostgresBackend(pool).write(
+            _SEEDED_PATH, content, if_version="new", client="conformance-seed"
+        )
+    finally:
+        await pool.close()
 
 
 def _stdio_params(env: Mapping[str, str]) -> StdioServerParameters:

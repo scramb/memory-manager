@@ -224,6 +224,26 @@ async def test_memory_search_without_database_valid_at_today_excludes_expired(
         assert with_today["results"] == []
 
 
+# -- the `postgres` backend, indexed in the write transaction (#98) -------------
+
+
+async def test_memory_search_with_postgres_backend_mode_is_fulltext_and_finds_the_note(
+    services_with_postgres_backend: Services,
+) -> None:
+    async with Client(build_server(services_with_postgres_backend)) as client:
+        await _write(
+            client,
+            "personal/fact/aardvark-routine.md",
+            title="Aardvark Routine",
+            body="A short note about an aardvark's nightly foraging routine.",
+        )
+
+        payload = await _search(client, "aardvark")
+
+    assert payload["mode"] == "fulltext"
+    assert {item["path"] for item in payload["results"]} == {"personal/fact/aardvark-routine.md"}
+
+
 # -- validation, shared by both modes -------------------------------------------
 
 

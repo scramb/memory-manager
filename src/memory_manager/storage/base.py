@@ -23,11 +23,15 @@ implementation that itself imports `WriteQueue`).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 __all__ = [
+    "AuditHook",
     "EditMismatch",
+    "IndexCommitHook",
+    "IndexHook",
     "InvalidNote",
     "NotFound",
     "Op",
@@ -90,6 +94,45 @@ class WriteResult:
     version: str
     commit: str
     related: dict[str, str] | None = None
+
+
+#: Called exactly once for every processed write (`write`/`edit`/`supersede`/
+#: `archive`), success and rejection alike - the seam `memory_manager.app`
+#: wires an `memory_manager.audit.AuditWriter` through (#39), shared
+#: verbatim by `queue.WriteQueue.add_audit_hook` (the `git` backend) and
+#: `storage.postgres.PostgresBackend.add_audit_hook` (ADR-0007 §2, WP-18) -
+#: both backends enforce "audit log for every write" (`CLAUDE.md`)
+#: identically. `result` and `error` are mutually exclusive: exactly one is
+#: `None`. `error` is typed `Exception`, not `WriteError`, only because the
+#: call site that raises it catches broadly in case of a bug elsewhere, not
+#: because either backend ever raises anything but a `WriteError` subclass
+#: on purpose. Same failure contract everywhere this is called: a raising
+#: hook is logged, never allowed to affect the write it was notified about.
+AuditHook = Callable[["WriteRequest", "WriteResult | None", Exception | None], Awaitable[None]]
+
+#: `storage.postgres.PostgresBackend`'s in-transaction indexing seam (ADR-0007
+#: §4, WP-18/#98): called with `(conn, path, content)` for every note a write
+#: touches, right after that write's revision is inserted but *before* its
+#: transaction commits - `conn` is the backend's own connection, already inside
+#: that transaction, so the derived index (`notes`/`chunks`/`links`) lands in the
+#: exact same commit as the write, and a rolled-back write takes its index rows
+#: with it for free. Typed `Any` for `conn` rather than `asyncpg.Connection`:
+#: this module stays independent of `asyncpg` (see the module docstring), the
+#: same reason `AuditHook` above never had to import anything from `queue.py`
+#: either - `index.indexer.Indexer.index_on_connection` is the one implementation
+#: today and is fully typed on its own side. Index errors propagate like any
+#: other exception raised inside the write's transaction: it rolls back, and
+#: the existing `PostgresError` -> `WriteFailed` mapping applies unchanged.
+IndexHook = Callable[[Any, str, bytes], Awaitable[None]]
+
+#: `PostgresBackend`'s post-commit indexing seam (ADR-0007 §4, WP-18/#98):
+#: called with the ids of every note a write just committed, once its
+#: transaction has already committed - never inside it, and never awaited by
+#: the write itself. `index.indexer.Indexer.schedule_embeddings` is the one
+#: implementation today: it starts background embedding tasks and returns
+#: immediately, so a slow or failing embedding call can never slow down or
+#: fail the write that triggered it.
+IndexCommitHook = Callable[[Sequence[str]], Awaitable[None]]
 
 
 class WriteError(Exception):
@@ -366,6 +409,10 @@ class StorageBackend(Protocol):
         Returns a fresh cursor to pass on the next call alongside the
         changes. Read-only and independent of any write in progress: a
         concurrent `read()` of a path this reports may briefly lag or lead
-        what `changes_since` itself just saw, by design (ADR-0007 §1).
+        what `changes_since` itself just saw, by design (ADR-0007 §1). May
+        report an already-committed change with a delay (a concurrent
+        transaction elsewhere can hold a backend's visibility window
+        back) but never drops one - a caller polls if it needs a change
+        to have shown up, rather than assuming the very next call will see it.
         """
         ...

@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""`memory_search`'s no-database fallback: term overlap over the vault (#30).
+"""`memory_search`'s no-index fallback: term overlap, scored per note (#30, WP-18).
 
 `scan_search` is what `mcp/server.py`'s `memory_search` falls back to when
-`services.pool` is `None` - no `DATABASE_URL` configured, see `app.py`'s
-module docstring ("full-text/vector search and `memory_search` degrade,
-note read/write do not"). It walks the working copy directly instead of
-querying Postgres: no stemming, no chunking, no fusion - just a
-case-insensitive term-overlap score over each note's own fields, title and
-aliases weighted higher than tags, description and body. Good enough to
-keep stdio usable without Postgres; not a substitute for `search.hybrid_search`.
+`services.indexer` is `None` - no `DATABASE_URL` configured for the `git`
+backend, see `app.py`'s module docstring ("full-text/vector search and
+`memory_search` degrade, note read/write do not"). The `postgres` backend
+always has an indexer (ADR-0007 §4, WP-18/#98), so it never falls back here.
+`scan_search` walks the working copy directly instead of querying Postgres:
+no stemming, no chunking, no fusion - just a case-insensitive term-overlap
+score over each note's own fields, title and aliases weighted higher than
+tags, description and body. Good enough to keep stdio usable without
+Postgres; not a substitute for `search.hybrid_search`.
 """
 
 from __future__ import annotations
@@ -46,14 +48,11 @@ def scan_search(
 ) -> list[ScanHit]:
     """Score every note under `vault_root` by term overlap with `query`.
 
-    A note-shaped file that fails to parse, or a file that is not
-    note-shaped at all, is skipped silently - there is no `warning` channel
-    in a search result the way `memory_index` has one. `filters` is applied
-    identically to `search.hybrid_search`'s. Ranked best score first, ties
-    broken by path; only notes scoring above zero are returned, at most
-    `limit` of them. Never follows a symlink (`vault.paths.iter_md_files`):
-    a symlink's target must never have its body read and surfaced in a
-    snippet as if it were a note in the vault.
+    `filters` is applied identically to `search.hybrid_search`'s. Ranked
+    best score first, ties broken by path; only notes scoring above zero
+    are returned, at most `limit` of them. Never follows a symlink
+    (`vault.paths.iter_md_files`): a symlink's target must never have its
+    body read and surfaced in a snippet as if it were a note in the vault.
     """
     terms = _terms(query)
     if not terms:
@@ -62,20 +61,38 @@ def scan_search(
     hits: list[ScanHit] = []
     for file in iter_md_files(vault_root):
         rel = "/".join(file.relative_to(vault_root).parts)
-        try:
-            note_path = parse_note_path(rel, allow_archive=True)
-        except PathRejected:
-            continue
-        try:
-            note = parse(file.read_bytes())
-        except NoteFormatError:
-            continue
-        if not _passes_filters(note, note_path, filters):
-            continue
-        score, snippet = _score(note, terms)
-        if score > 0:
-            hits.append(ScanHit(note=note, path=rel, snippet=snippet, score=score))
+        hit = _score_note(rel, file.read_bytes(), terms, filters)
+        if hit is not None:
+            hits.append(hit)
+    return _ranked(hits, limit)
 
+
+def _score_note(
+    path: str, data: bytes, terms: Sequence[str], filters: SearchFilters
+) -> ScanHit | None:
+    """`scan_search`'s per-note core: filter, then score.
+
+    A note-shaped file that fails to parse, or a path that is not
+    note-shaped at all, is skipped silently (returns `None`) - there is no
+    `warning` channel in a search result the way `memory_index` has one.
+    """
+    try:
+        note_path = parse_note_path(path, allow_archive=True)
+    except PathRejected:
+        return None
+    try:
+        note = parse(data)
+    except NoteFormatError:
+        return None
+    if not _passes_filters(note, note_path, filters):
+        return None
+    score, snippet = _score(note, terms)
+    if score <= 0:
+        return None
+    return ScanHit(note=note, path=path, snippet=snippet, score=score)
+
+
+def _ranked(hits: list[ScanHit], limit: int) -> list[ScanHit]:
     hits.sort(key=lambda hit: (-hit.score, hit.path))
     return hits[:limit]
 
