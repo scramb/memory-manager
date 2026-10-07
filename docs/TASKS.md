@@ -154,4 +154,5 @@ Goal: complete docs, security review done, importers, first signed release.
 - [x] #77 A deploy key without a trailing newline still loads
 - [x] #80 claude.ai connects through CIMD without a scope in its metadata
 - [x] #82 CIMD fetch falls back across resolved addresses and logs failures
-- [ ] #85 Access logs never contain OAuth codes or other secrets
+- [x] #85 Access logs never contain OAuth codes or other secrets
+- [ ] #89 uv.lock's package version follows releases automatically
