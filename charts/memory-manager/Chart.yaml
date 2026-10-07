@@ -1,21 +1,11 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-#
-# Helm packaging of the same server deploy/ ships as a generic Kustomize
-# base (#44) - this chart renders the equivalent Deployment/Service plus
-# the same optional pieces (HTTPRoute, NetworkPolicy, CNPG `Cluster`), for
-# operators who prefer Helm over Flux+Kustomize. Published as an OCI
-# artifact to ghcr.io/scramb/charts on every tag (#52, see
-# .github/workflows/release.yml and docs/releasing.md); until the first
-# tag, install straight from a checkout
-# (`helm install ... ./charts/memory-manager`).
 apiVersion: v2
 name: memory-manager
-description: Self-hosted long-term memory for Claude - Markdown notes in Git as the source of truth, a derived Postgres search index, and a remote MCP server.
+description: >-
+  Self-hosted long-term memory for Claude - Markdown notes in Git as the source
+  of truth, a derived Postgres search index, and a remote MCP server.
 type: application
-# Kept in lockstep with the git release tag by release-please
-# (release-please-config.json's extra-files) - never hand-edited.
-version: 0.1.0 # x-release-please-version
-appVersion: "0.0.0" # x-release-please-version
+version: 0.1.0
+appVersion: 0.0.0
 home: https://github.com/scramb/memory-manager
 sources:
   - https://github.com/scramb/memory-manager
