@@ -204,6 +204,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #117 Search stays fast for queries with very frequent terms
 - [x] #120 One API replica sustains the modelled load within the latency targets
 - [x] #108 k6 scenarios measure search, read and write latency against one replica
+- [x] #123 Concurrent replica startup never fails on app-role grants
 - [ ] #109 A 100k-note baseline records per-tool latency and the RLS function cost ⛔ blocked by #100, #108
 
 ---
