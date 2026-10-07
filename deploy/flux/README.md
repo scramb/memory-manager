@@ -15,7 +15,7 @@ a real one ever creeps into this directory instead.
 | File | What it is |
 |---|---|
 | `namespace.yaml` | the `memory-manager` namespace everything else renders into (`kustomization.yaml`'s own `namespace:` transformer adds it to the namespaced resources below; `Namespace` itself is cluster-scoped and stays untouched) |
-| `helmrepository.yaml` | an OCI `HelmRepository` pointing at `oci://ghcr.io/scramb/charts` - the chart registry #52 sets up; anonymous pull, no `secretRef` needed for a public package |
+| `helmrepository.yaml` | an OCI `HelmRepository` pointing at `oci://ghcr.io/scramb/charts` - published by `.github/workflows/release.yml` on every tag (`docs/releasing.md`); anonymous pull, no `secretRef` needed for a public package |
 | `helmrelease.yaml` | the `HelmRelease` that installs `charts/memory-manager` from that source, with the same values `charts/memory-manager/README.md`'s own "Values" table documents |
 | `externalsecret.yaml` | pulls the secrets `helmrelease.yaml`'s own `secrets` → `existingSecret` value points at from an operator's `ClusterSecretStore` - the primary secrets path (#46) |
 | `sops-secret.example.yaml`, `.sops.yaml` | the SOPS alternative, see below - **illustrative only**, not wired into `kustomization.yaml` |
@@ -128,6 +128,4 @@ by `charts/memory-manager/README.md`'s own "Validate before installing" and the 
 
 ## Not included
 
-- Publishing the chart to `oci://ghcr.io/scramb/charts` - #52; `helmrepository.yaml` documents the
-  URL it will live at.
 - Cloudflare Tunnel as an `HTTPRoute`/`Ingress` alternative - [`docs/guides/cloudflare-tunnel.md`](../../docs/guides/cloudflare-tunnel.md) (#47).

@@ -149,5 +149,5 @@ Goal: complete docs, security review done, importers, first signed release.
 ### WP-15 — Release · Branch: `wp/15-release`
 
 - [ ] #51 Security review against OWASP Top 10 for LLM apps, findings fixed or documented
-- [ ] #52 Release pipeline: GHCR push, cosign signing, SBOM, chart-releaser, release-please
+- [x] #52 Release pipeline: GHCR push, cosign signing, SBOM, chart-releaser, release-please
 - [ ] #53 README comparison with mem0, Basic Memory, Zep; tag v0.1.0

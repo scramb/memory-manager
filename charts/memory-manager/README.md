@@ -3,8 +3,14 @@
 Helm packaging of the same server `deploy/` ships as a generic Kustomize base (`deploy/README.md`):
 the `Deployment`/`Service`, a `HTTPRoute`/`Ingress`, an optional CloudNativePG `Cluster` and an
 optional NetworkPolicy, restricted Pod Security by default, single writer (`replicaCount` fixed at
-0 or 1). For operators who prefer Helm over Flux+Kustomize; chart publishing (a chart repository,
-`helm repo add`) is separate, later work (#52) - for now, install straight from a checkout:
+0 or 1). For operators who prefer Helm over Flux+Kustomize. Every tagged release publishes this
+chart as a signed OCI artifact (`docs/releasing.md`):
+
+```sh
+helm install memory-manager oci://ghcr.io/scramb/charts/memory-manager --version X.Y.Z -f my-values.yaml
+```
+
+or, straight from a checkout:
 
 ```sh
 helm install memory-manager ./charts/memory-manager -f my-values.yaml
@@ -75,7 +81,6 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
 
 ## Not included
 
-- A chart repository / `helm repo add` (chart-releaser) - #52.
 - A Flux `HelmRelease` example with SOPS secrets - #46 (`deploy/flux/`).
 - Backups for the CNPG `Cluster` - it is a derived index (`memory-manager reindex --full` rebuilds
   it from the vault), not a primary store; add a CNPG `Backup`/`ScheduledBackup` and object-store
