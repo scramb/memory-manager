@@ -469,29 +469,37 @@ class Repo:
         return {"GIT_SSH_COMMAND": ssh_command}
 
     def _ssh_key_file(self, configured: Path) -> Path:
-        """`configured`, or a private 0600 copy of it.
+        """`configured`, or a private 0600 copy of it with a trailing newline.
 
         A Kubernetes Secret volume mounts its keys root-owned/0440 or 0644
         under `fsGroup` (there is no per-key `defaultMode` granular enough
         to land exactly on 0600 for one key among others in the same
         volume) - `ssh` refuses a key file that is group- or
         other-readable at all ("UNPROTECTED PRIVATE KEY FILE"), regardless
-        of who can actually read it through that mode. When `configured`
-        is not already safe for `ssh` to use as-is, it is copied once, the
-        first time this is called, into a fresh `mkstemp` file (private to
-        this process's uid, mode 0600 by construction) and every later
-        call reuses that same copy rather than copying again.
+        of who can actually read it through that mode. A secret store can
+        just as easily have dropped the key's own final `\n` (#77 - e.g. a
+        shell `$(cat key)` substitution strips it on the way into the
+        store); `ssh`/`libcrypto` then fails to load an otherwise-valid key
+        with "error in libcrypto", permissions notwithstanding. When
+        `configured` is not already safe to use as-is on both counts, it
+        is copied once, the first time this is called, into a fresh
+        `mkstemp` file (private to this process's uid, mode 0600 by
+        construction, newline-terminated) and every later call reuses that
+        same copy rather than copying again.
         """
         if self._resolved_ssh_key_file is not None:
             return self._resolved_ssh_key_file
-        if _is_private_key_file(configured):
+        content = configured.read_bytes()
+        if _is_private_key_file(configured) and content.endswith(b"\n"):
             self._resolved_ssh_key_file = configured
             return configured
+        if not content.endswith(b"\n"):
+            content += b"\n"
 
         fd, tmp_name = tempfile.mkstemp(prefix="memory-manager-ssh-key-")
         try:
             with os.fdopen(fd, "wb") as handle:
-                handle.write(configured.read_bytes())
+                handle.write(content)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(tmp_name)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,8 @@ from memory_manager.config import VaultConfig
 from memory_manager.vault.git import Git, GitError, PushRejected
 from memory_manager.vault.paths import PathRejected
 from memory_manager.vault.repo import Repo, author_for
+
+_SSH_KEYGEN_EXECUTABLE = shutil.which("ssh-keygen") or "ssh-keygen"
 
 
 def _log(remote: Path) -> list[tuple[str, ...]]:
@@ -253,6 +256,39 @@ class TestSshEnv:
         assert resolved.read_text() == "fake key\n"
         mode = os.stat(resolved).st_mode & 0o777
         assert mode == 0o600
+
+    def test_key_file_without_a_trailing_newline_is_normalized(
+        self, vault_config: VaultConfig, tmp_path: Path
+    ) -> None:
+        """A secret store can drop a key's final `\\n` on the way in (#77 - e.g. a
+        shell `$(cat key)` substitution strips it) - `ssh`/`libcrypto` then fails to
+        load an otherwise-valid key ("error in libcrypto"), even at a correct 0600.
+        `_ssh_key_file()` must append the missing newline when copying the key."""
+        key_file = tmp_path / "id_ed25519"
+        subprocess.run(  # noqa: S603 - fixed executable, argument list, no shell
+            [_SSH_KEYGEN_EXECUTABLE, "-t", "ed25519", "-N", "", "-f", str(key_file)],
+            check=True,
+            capture_output=True,
+        )
+        original = key_file.read_bytes()
+        assert original.endswith(b"\n")
+        key_file.write_bytes(original[:-1])
+        key_file.chmod(0o600)
+        config = replace(vault_config, ssh_key_file=key_file)
+
+        repo = Repo(config)
+        resolved = repo._ssh_key_file(key_file)
+
+        assert resolved != key_file
+        assert resolved.read_bytes() == original
+        mode = os.stat(resolved).st_mode & 0o777
+        assert mode == 0o600
+
+        subprocess.run(  # noqa: S603 - fixed executable, argument list, no shell
+            [_SSH_KEYGEN_EXECUTABLE, "-y", "-f", str(resolved)],
+            check=True,
+            capture_output=True,
+        )
 
     def test_copied_key_file_is_reused_on_later_calls(
         self, vault_config: VaultConfig, tmp_path: Path
