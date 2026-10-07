@@ -155,4 +155,4 @@ Goal: complete docs, security review done, importers, first signed release.
 - [x] #80 claude.ai connects through CIMD without a scope in its metadata
 - [x] #82 CIMD fetch falls back across resolved addresses and logs failures
 - [x] #85 Access logs never contain OAuth codes or other secrets
-- [ ] #89 uv.lock's package version follows releases automatically
+- [x] #89 uv.lock's package version follows releases automatically
