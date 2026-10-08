@@ -40,9 +40,20 @@ allowed_suffixes=(
 
 # Exact, whole-token exceptions that happen to have the same dotted shape
 # as a hostname but are neither one nor a file reference: the SPDX
-# license identifier every file starts with, and the conventional
-# placeholder for "some released semver tag" in rollout docs.
-allowed_tokens=(AGPL-3.0-only X.Y.Z)
+# license identifier every file starts with, the conventional placeholder
+# for "some released semver tag" in rollout docs, and - deploy/entra/,
+# #256 - the fixed Microsoft Entra app role names (ADR-0006 §3) and
+# Microsoft Graph application permission/directory role names (ADR-0006
+# §9, addendum 2026-10-08) that README documents by their real, public
+# Microsoft-defined names. None of these is an operator's own
+# infrastructure; all are identical in every deployment of this module.
+allowed_tokens=(
+  AGPL-3.0-only X.Y.Z
+  Memory.User Memory.Curator Memory.Admin
+  User.Read.All GroupMember.Read.All
+  Application.ReadWrite.OwnedBy Application.ReadWrite.All
+  Application.Read.All Directory.Read.All
+)
 
 is_allowed_host() {
   local host="$1" suffix token

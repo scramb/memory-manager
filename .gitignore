@@ -10,3 +10,18 @@ dist/
 *.egg-info/
 .venv/
 .claude/worktrees/
+
+# OpenTofu/Terraform (deploy/entra, #256) - provider plugin cache and local
+# state/plan artefacts, never committed. .terraform.lock.hcl is *not* ignored
+# here: "tofu init" asks for it to be tracked so provider selection stays
+# reproducible.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
