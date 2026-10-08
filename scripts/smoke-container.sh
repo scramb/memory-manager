@@ -22,6 +22,8 @@ else
   exit 1
 fi
 
+PYTHON_EXTRAS_CHECK='import redis, opentelemetry.sdk, opentelemetry.exporter.otlp'
+
 NAME="mm-smoke-$$"
 WORKDIR=$(mktemp -d)
 BODY_FILE="${WORKDIR}/healthz-body.json"
@@ -49,6 +51,14 @@ chmod 0777 "${WORKDIR}/data"
 "$ENGINE" run --rm --entrypoint git \
   --volume "${WORKDIR}/data:/data" \
   "$IMAGE" init --quiet --bare --initial-branch=main /data/remote.git
+
+# Image-content check (#253): the valkey and otel extras are installed in
+# the image's venv, not just declared as optional in pyproject.toml.
+if ! "$ENGINE" run --rm --entrypoint python "$IMAGE" -c "$PYTHON_EXTRAS_CHECK" >/dev/null; then
+  echo "FAIL: image is missing the valkey/otel extras (import redis/opentelemetry failed)" >&2
+  exit 1
+fi
+echo "OK: valkey and otel extras are importable in the image"
 
 echo "starting ${ENGINE} container from ${IMAGE}..."
 "$ENGINE" run --detach --name "$NAME" \

@@ -35,7 +35,8 @@ See [`docs/PLAN.md`](./docs/PLAN.md) for the full goal, scope and architecture, 
   documents (CIMD), per-client and per-IP limits, and an audit log for every write.
 - Static scoped bearer tokens as a lighter-weight alternative to OAuth.
 - Vault import/export for migration and backup.
-- Container images signed (cosign) with an SBOM published alongside each release.
+- Container images signed (cosign) with an SBOM published alongside each release; the image
+  bundles the Valkey client and the OTel SDK/exporter, both inert until configured.
 - Deployment via Helm chart, Kustomize base, or a Flux example.
 
 ## Quickstart

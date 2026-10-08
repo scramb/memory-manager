@@ -18,8 +18,12 @@ COPY src/ src/
 # --no-editable: the runtime image ships the venv only, not /app/src - an
 # editable install's .pth file points at this build's absolute path, which
 # would not exist in the runtime stage.
+# --extra valkey/--extra otel: the published image ships both optional
+# extras (shared-state Valkey client, OTel SDK/exporter) so one image serves
+# every deployment shape; both stay inert until their own env var is set
+# (VALKEY_URL, OTEL_EXPORTER_OTLP_ENDPOINT - #253, ADR-0009 addendum).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --no-editable --extra valkey --extra otel
 
 # --- runtime ----------------------------------------------------------------
 FROM python:3.12-slim AS runtime
