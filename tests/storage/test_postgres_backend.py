@@ -25,10 +25,13 @@ import asyncpg
 import pytest
 import pytest_asyncio
 from storage.contract import (
+    AuditEntry,
     ChangesSinceContract,
     ListContract,
+    PromoteContract,
     ReadWriteEditContract,
     SupersedeArchiveContract,
+    audit_recorder,
     note_bytes,
     poll_changes_since,
 )
@@ -48,8 +51,16 @@ from memory_manager.vault.ulid import new_ulid
 _CREATED = datetime(2026, 1, 1, tzinfo=UTC)
 
 
+@pytest.fixture
+def audit_log() -> list[AuditEntry]:
+    """Every `AuditHook` call the `backend` fixture below fires, in order."""
+    return []
+
+
 @pytest_asyncio.fixture
-async def backend(test_database_url: str) -> AsyncIterator[StorageBackend]:
+async def backend(
+    test_database_url: str, audit_log: list[AuditEntry]
+) -> AsyncIterator[StorageBackend]:
     """A `PostgresBackend` over a freshly migrated, empty test database."""
     conn = await asyncpg.connect(test_database_url)
     try:
@@ -57,8 +68,10 @@ async def backend(test_database_url: str) -> AsyncIterator[StorageBackend]:
     finally:
         await conn.close()
     pool = await asyncpg.create_pool(test_database_url)
+    pg_backend = PostgresBackend(pool)
+    pg_backend.add_audit_hook(audit_recorder(audit_log))
     try:
-        yield PostgresBackend(pool)
+        yield pg_backend
     finally:
         await pool.close()
 
@@ -98,6 +111,10 @@ class TestReadWriteEdit(ReadWriteEditContract):
 
 
 class TestSupersedeArchive(SupersedeArchiveContract):
+    pass
+
+
+class TestPromote(PromoteContract):
     pass
 
 

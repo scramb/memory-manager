@@ -48,7 +48,7 @@ __all__ = [
     "WriteResult",
 ]
 
-Op = Literal["write", "edit", "archive", "supersede"]
+Op = Literal["write", "edit", "archive", "supersede", "promote"]
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,11 @@ class WriteRequest:
     `archive` needs neither. `supersede` keeps `path` pointing at the old
     note (`if_version` is its current version) and uses `new_path`/`content`
     for the new note that replaces it - the two end up in one commit (#19).
-    `message` overrides the default commit message (`"<op> <path>"`).
+    `promote` (#226) also keeps `path` pointing at the original (`if_version`
+    is its current version) and uses `target_namespace`/`keep_original`
+    instead of `new_path`/`content` - the copy's path and bytes are derived
+    from the original, not supplied by the caller. `message` overrides the
+    default commit message (`"<op> <path>"`).
     """
 
     op: Op
@@ -73,6 +77,15 @@ class WriteRequest:
     new_str: str | None = None
     new_path: str | None = None
     message: str | None = None
+    #: `promote` only (#226): the namespace the copy at `path` is written
+    #: into, as `<target_namespace>/<type>/<slug>.md` with `path`'s own
+    #: `type`/`slug` carried over unchanged.
+    target_namespace: str | None = None
+    #: `promote` only (#226): leave the original at `path` untouched instead
+    #: of archiving it once the copy exists. Defaults to archiving
+    #: (ADR-0008 "`memory_promote`"), the same default the MCP tool (#227)
+    #: exposes.
+    keep_original: bool = False
     #: The caller's identity for the audit log (#39): an OAuth access token's
     #: subject, a static token's name, or `"stdio"` for a local session with
     #: no token at all (`memory_manager.mcp.server.current_actor`'s default,
@@ -86,9 +99,13 @@ class WriteRequest:
 class WriteResult:
     """What a successful write produced: where, at what version, in which commit.
 
-    `related` is set only by `supersede`: the old note's new path mapped to
-    its new version, for a caller that needs to report both notes' state
-    from one result.
+    `related` is set only by `supersede` and `promote`: the old note's
+    resulting path mapped to its new version, for a caller that needs to
+    report both notes' state from one result. For `supersede` that path is
+    always the original `path` itself (its content/`valid_to` changed, it
+    never moves); for `promote` it is the original's archive path
+    (`keep_original=False`, the default) or the original `path` unchanged
+    (`keep_original=True`).
     """
 
     path: str
@@ -407,6 +424,33 @@ class StorageBackend(Protocol):
         The old note gets `valid_to` set and stays in place; the new note's
         `supersedes` gains the old note's `id`. Raises `NotFound` if `path`
         does not exist.
+        """
+        ...
+
+    async def promote(
+        self,
+        path: str,
+        target_namespace: str,
+        *,
+        if_version: str,
+        keep_original: bool = False,
+        client: str,
+        actor: str = "stdio",
+        message: str | None = None,
+    ) -> WriteResult:
+        """Copy the note at `path` into `target_namespace` as a new note that supersedes it.
+
+        The copy gets a new `id` at `<target_namespace>/<type>/<slug>.md`
+        (`path`'s own `type`/`slug`); its `supersedes` gains the original's
+        `id`; every other field is byte-identical to the original
+        (ADR-0008 "`memory_promote`"). By default (`keep_original=False`)
+        the original is archived in the same write; `keep_original=True`
+        leaves it untouched. `related` in the result carries the
+        original's resulting path (its archive path, or `path` itself when
+        `keep_original=True`) mapped to its version. Raises `NotFound` if
+        `path` does not exist, `InvalidNote` if `path` is archived, the
+        target path already exists, or (when archiving) the original's
+        archive target already exists.
         """
         ...
 

@@ -838,6 +838,172 @@ class PostgresBackend:
             related={path: old_new_version},
         )
 
+    async def promote(
+        self,
+        path: str,
+        target_namespace: str,
+        *,
+        if_version: str,
+        keep_original: bool = False,
+        client: str,
+        actor: str = "stdio",
+        message: str | None = None,
+    ) -> WriteResult:
+        """Copy the note at `path` into `target_namespace`, in one transaction.
+
+        The copy is inserted through the same `ON CONFLICT (path) DO
+        NOTHING` `write`/`supersede` use for a new path - losing that race
+        is reported as `InvalidNote`, the same wording a non-racing caller
+        gets from `rules.prepare_promote_content`'s own existence check.
+        Unless `keep_original`, the original is moved to its archive path
+        through the same conditional `UPDATE` a plain `archive` uses, under
+        the same `current_revision` guard, so a concurrent `edit` of the
+        original races and is reported exactly like `archive` would
+        (`VersionConflict`, never `WriteFailed`). `keep_original=True`
+        leaves the original's row untouched entirely - no second `UPDATE`,
+        no second revision. Audited exactly once, success or rejection
+        alike, same as `_write_or_edit` above.
+        """
+        request = WriteRequest(
+            op="promote",
+            path=path,
+            client=client,
+            if_version=if_version,
+            target_namespace=target_namespace,
+            keep_original=keep_original,
+            message=message,
+            actor=actor,
+        )
+        try:
+            result = await self._promote_inner(request)
+        except Exception as exc:
+            await self._run_audit_hooks(request, None, exc)
+            raise
+        await self._run_audit_hooks(request, result, None)
+        return result
+
+    async def _promote_inner(self, request: WriteRequest) -> WriteResult:
+        path = request.path
+        client = request.client
+        actor = request.actor
+        message = request.message
+        # Overwritten below once `rules.prepare_promote_paths` resolves it from
+        # `target_namespace` - this placeholder is only ever seen by the
+        # `UniqueViolationError` handler below, and only if that somehow fired
+        # before the real one is known, which none of the lookups between here
+        # and there can cause (they only ever raise `PostgresError`, not a
+        # unique violation).
+        target_path = path
+        try:
+            async with self._content_connection() as conn:
+                source_row = await conn.fetchrow(_SELECT_CURRENT, path)
+                source_current = bytes(source_row["content"]) if source_row is not None else None
+                source_version = source_row["version"] if source_row is not None else None
+
+                rules.check_version(request, source_version, source_current)
+
+                source_note_path, target_note_path, target_path, current = (
+                    rules.prepare_promote_paths(path, request.target_namespace, source_current)
+                )
+                if source_row is None:  # pragma: no cover - prepare_promote_paths already raised
+                    raise NotFound(path)
+                source_version = source_row["version"]
+
+                target_row = await conn.fetchrow(_SELECT_CURRENT, target_path)
+
+                archive_rel = source_note_path.archive_path().relative
+                archive_exists = False
+                if not request.keep_original:
+                    archive_row = await conn.fetchrow(_SELECT_CURRENT, archive_rel)
+                    archive_exists = archive_row is not None
+
+                now = self._clock().astimezone(UTC).replace(microsecond=0)
+                new_bytes, archived_bytes = rules.prepare_promote_content(
+                    path,
+                    target_path,
+                    current,
+                    target_note_path=target_note_path,
+                    target_exists=target_row is not None,
+                    archive_exists=archive_exists,
+                    keep_original=request.keep_original,
+                    now=now,
+                )
+                final_message = message or f"promote {path} to {target_path}"
+
+                new_version = version(new_bytes)
+                new_note_id = parse(new_bytes).id
+                inserted = await conn.fetchrow(
+                    _INSERT_NEW,
+                    new_note_id,
+                    target_note_path.namespace,
+                    target_path,
+                    new_bytes,
+                    new_version,
+                )
+                if inserted is None:
+                    raise InvalidNote(target_path, "already exists, promote needs an unused path")
+                new_revision = int(inserted["current_revision"])
+                await conn.execute(
+                    _INSERT_REVISION,
+                    str(inserted["id"]),
+                    new_revision,
+                    target_path,
+                    new_bytes,
+                    new_version,
+                    actor,
+                    client,
+                    final_message,
+                )
+                if self._index_hook is not None:
+                    await self._index_hook(conn, target_path, new_bytes)
+
+                if archived_bytes is None:
+                    related = {path: source_version}
+                    index_commit_ids: tuple[str, ...] = (new_note_id,)
+                else:
+                    archived_version = version(archived_bytes)
+                    updated = await conn.fetchrow(
+                        _UPDATE_ARCHIVE,
+                        archive_rel,
+                        archived_bytes,
+                        archived_version,
+                        source_row["id"],
+                        source_row["current_revision"],
+                    )
+                    if updated is None:
+                        raise VersionConflict(path, *await self._reread_for_conflict(conn, path))
+                    source_note_id = str(updated["id"])
+                    source_revision = int(updated["current_revision"])
+                    await conn.execute(
+                        _INSERT_REVISION,
+                        source_note_id,
+                        source_revision,
+                        archive_rel,
+                        archived_bytes,
+                        archived_version,
+                        actor,
+                        client,
+                        final_message,
+                    )
+                    if self._index_hook is not None:
+                        await self._index_hook(conn, archive_rel, archived_bytes)
+                    related = {archive_rel: archived_version}
+                    index_commit_ids = (new_note_id, source_note_id)
+        except asyncpg.UniqueViolationError as exc:
+            raise InvalidNote(target_path, str(exc)) from exc
+        except asyncpg.PostgresError as exc:
+            raise WriteFailed(str(exc)) from exc
+
+        if self._index_commit_hook is not None:
+            await self._index_commit_hook(index_commit_ids)
+
+        return WriteResult(
+            path=target_path,
+            version=new_version,
+            commit=f"{inserted['id']}@{new_revision}",
+            related=related,
+        )
+
     async def changes_since(self, cursor: str | None) -> StorageChanges:
         """Notes added, modified or deleted since `cursor` (ADR-0007 §2).
 

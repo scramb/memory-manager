@@ -320,6 +320,8 @@ class WriteQueue:
             result, changed_paths = await self._do_archive(request, current)
         elif request.op == "supersede":
             result, changed_paths = await self._do_supersede(request, current)
+        elif request.op == "promote":
+            result, changed_paths = await self._do_promote(request, current)
         else:
             result, changed_paths = await self._do_write_or_edit(request, current)
 
@@ -425,6 +427,63 @@ class WriteQueue:
             related={request.path: version(old_final_bytes)},
         )
         return result, (request.path, new_path)
+
+    async def _do_promote(
+        self, request: WriteRequest, current: bytes | None
+    ) -> tuple[WriteResult, tuple[str, ...]]:
+        source_note_path, target_note_path, target_path, current_bytes = (
+            rules.prepare_promote_paths(request.path, request.target_namespace, current)
+        )
+
+        try:
+            target_current = await asyncio.to_thread(self._repo.read_file, target_path)
+        except PathRejected as exc:
+            raise InvalidNote(target_path, str(exc)) from exc
+
+        archive_rel = source_note_path.archive_path().relative
+        archive_exists = False
+        if not request.keep_original:
+            try:
+                already_archived = await asyncio.to_thread(self._repo.read_file, archive_rel)
+            except PathRejected as exc:
+                raise InvalidNote(request.path, str(exc)) from exc
+            archive_exists = already_archived is not None
+
+        now = self._clock().astimezone(UTC).replace(microsecond=0)
+        new_bytes, archived_bytes = rules.prepare_promote_content(
+            request.path,
+            target_path,
+            current_bytes,
+            target_note_path=target_note_path,
+            target_exists=target_current is not None,
+            archive_exists=archive_exists,
+            keep_original=request.keep_original,
+            now=now,
+        )
+
+        message = request.message or f"promote {request.path} to {target_path}"
+        author = author_for(request.client)
+        archive_move = (
+            (request.path, archive_rel, archived_bytes) if archived_bytes is not None else None
+        )
+        try:
+            commit_sha = await asyncio.to_thread(
+                self._repo.promote_files, target_path, new_bytes, archive_move, author, message
+            )
+        except GitError as exc:
+            raise WriteFailed(str(exc)) from exc
+
+        if archived_bytes is None:
+            related = {request.path: version(current_bytes)}
+            changed_paths: tuple[str, ...] = (request.path, target_path)
+        else:
+            related = {archive_rel: version(archived_bytes)}
+            changed_paths = (request.path, archive_rel, target_path)
+
+        result = WriteResult(
+            path=target_path, version=version(new_bytes), commit=commit_sha, related=related
+        )
+        return result, changed_paths
 
     async def _push(
         self, request: WriteRequest, changed_paths: tuple[str, ...], base: str | None

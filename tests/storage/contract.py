@@ -11,6 +11,11 @@ that subset (#96, the Postgres backend, only exercises
 
 - `ReadWriteEditContract`: `read`/`write`/`edit`, `if_version` enforcement.
 - `SupersedeArchiveContract`: `supersede`/`archive`.
+- `PromoteContract`: `promote` (#226), including the audit hook it fires -
+  needs an `audit_log` fixture in addition to `backend` (see
+  `audit_recorder`), one every concrete test module below wires onto its
+  own backend's audit-hook seam (`queue.WriteQueue.add_audit_hook` for the
+  Git backend, `storage.postgres.PostgresBackend.add_audit_hook` for Postgres).
 - `ListContract`: `list`, with and without archived notes.
 - `ChangesSinceContract`: `changes_since`.
 
@@ -37,6 +42,7 @@ from pathlib import Path
 import pytest
 
 from memory_manager.storage.base import (
+    AuditHook,
     BlocklistRejected,
     EditMismatch,
     InvalidNote,
@@ -45,9 +51,28 @@ from memory_manager.storage.base import (
     StorageBackend,
     StorageChanges,
     VersionConflict,
+    WriteRequest,
+    WriteResult,
 )
 from memory_manager.vault.note import Note, parse, serialize, version
 from memory_manager.vault.ulid import new_ulid
+
+#: One `AuditHook` call, recorded verbatim - `audit_recorder` below is what
+#: every concrete backend test module uses to collect these onto its own
+#: `audit_log` fixture (`PromoteContract` needs it; see that class).
+AuditEntry = tuple[WriteRequest, WriteResult | None, Exception | None]
+
+
+def audit_recorder(log: list[AuditEntry]) -> AuditHook:
+    """An `AuditHook` that appends every call it receives to `log`, verbatim."""
+
+    async def hook(
+        request: WriteRequest, result: WriteResult | None, error: Exception | None
+    ) -> None:
+        log.append((request, result, error))
+
+    return hook
+
 
 _CREATED = datetime(2026, 1, 1, tzinfo=UTC)
 #: A well-known AWS *example* access key id (never a real credential, see
@@ -317,6 +342,133 @@ class SupersedeArchiveContract:
         # archive is still intact (CLAUDE.md: never overwrite silently).
         assert await backend.read("personal/fact/a.md") is not None
         assert await backend.read("_archive/personal/fact/a.md") is not None
+
+
+class PromoteContract:
+    """`promote` (#226): copy into another namespace, archive the original by default.
+
+    Every test here needs an `audit_log` fixture in addition to `backend` -
+    a concrete test module wires `audit_recorder(audit_log)` onto its own
+    backend's audit-hook seam before yielding `backend` (see this module's
+    docstring).
+    """
+
+    async def test_promote_copies_and_archives_the_original_by_default(
+        self, backend: StorageBackend, audit_log: list[AuditEntry]
+    ) -> None:
+        original_content = note_bytes()
+        original_id = parse(original_content).id
+        written = await backend.write(
+            "personal/fact/old.md", original_content, if_version="new", client="claude-code"
+        )
+        audit_log.clear()
+
+        result = await backend.promote(
+            "personal/fact/old.md", "shared", if_version=written.version, client="claude-code"
+        )
+
+        assert result.path == "shared/fact/old.md"
+        promoted = await backend.read("shared/fact/old.md")
+        assert promoted is not None
+        promoted_note = parse(promoted.content)
+        assert promoted_note.id != original_id
+        assert promoted_note.supersedes == (original_id,)
+        assert promoted_note.title == parse(original_content).title
+        assert promoted.version == result.version
+
+        assert await backend.read("personal/fact/old.md") is None
+        archived = await backend.read("_archive/personal/fact/old.md")
+        assert archived is not None
+        assert result.related == {"_archive/personal/fact/old.md": archived.version}
+
+        entries = [entry for entry in audit_log if entry[0].op == "promote"]
+        assert len(entries) == 1
+        request, hook_result, error = entries[0]
+        assert error is None
+        assert hook_result == result
+        assert request.path == "personal/fact/old.md"
+        assert hook_result is not None
+        assert hook_result.path == "shared/fact/old.md"
+
+    async def test_promote_keep_original_leaves_the_source_live(
+        self, backend: StorageBackend, audit_log: list[AuditEntry]
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/old.md", note_bytes(), if_version="new", client="claude-code"
+        )
+
+        result = await backend.promote(
+            "personal/fact/old.md",
+            "shared",
+            if_version=written.version,
+            keep_original=True,
+            client="claude-code",
+        )
+
+        original = await backend.read("personal/fact/old.md")
+        assert original is not None
+        assert original.version == written.version
+        assert await backend.read("_archive/personal/fact/old.md") is None
+        assert result.related == {"personal/fact/old.md": written.version}
+
+    async def test_stale_if_version_on_promote_is_rejected_and_nothing_written(
+        self, backend: StorageBackend, audit_log: list[AuditEntry]
+    ) -> None:
+        await backend.write(
+            "personal/fact/old.md", note_bytes(), if_version="new", client="claude-code"
+        )
+
+        with pytest.raises(VersionConflict):
+            await backend.promote(
+                "personal/fact/old.md", "shared", if_version="0" * 64, client="claude-code"
+            )
+
+        assert await backend.read("shared/fact/old.md") is None
+        assert await backend.read("personal/fact/old.md") is not None
+        assert await backend.read("_archive/personal/fact/old.md") is None
+
+    async def test_promote_onto_existing_target_raises_invalid_note(
+        self, backend: StorageBackend, audit_log: list[AuditEntry]
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/old.md", note_bytes(), if_version="new", client="claude-code"
+        )
+        await backend.write(
+            "shared/fact/old.md",
+            note_bytes(title="Already there"),
+            if_version="new",
+            client="claude-code",
+        )
+
+        with pytest.raises(InvalidNote):
+            await backend.promote(
+                "personal/fact/old.md", "shared", if_version=written.version, client="claude-code"
+            )
+
+        # Nothing was overwritten: the original is still live, unarchived
+        # (CLAUDE.md: never overwrite silently).
+        assert await backend.read("personal/fact/old.md") is not None
+        assert await backend.read("_archive/personal/fact/old.md") is None
+
+    async def test_promote_archived_source_raises_invalid_note(
+        self, backend: StorageBackend, audit_log: list[AuditEntry]
+    ) -> None:
+        written = await backend.write(
+            "personal/fact/old.md", note_bytes(), if_version="new", client="claude-code"
+        )
+        await backend.archive(
+            "personal/fact/old.md", if_version=written.version, client="claude-code"
+        )
+        archived = await backend.read("_archive/personal/fact/old.md")
+        assert archived is not None
+
+        with pytest.raises(InvalidNote):
+            await backend.promote(
+                "_archive/personal/fact/old.md",
+                "shared",
+                if_version=archived.version,
+                client="claude-code",
+            )
 
 
 class ListContract:
