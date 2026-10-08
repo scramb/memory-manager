@@ -57,6 +57,12 @@ _DEFAULT_WEBHOOK_PER_MINUTE = 30.0
 _DEFAULT_WEBHOOK_BURST = 10.0
 _DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
 
+# Write quota defaults (#242, ADR-0009 §2). All six default to 0, which `quotas.
+# QuotaChecker` reads as "off" - a deployment opts in per scope and per window
+# explicitly, unlike `RATE_LIMIT_*` above, which is always on.
+_DEFAULT_QUOTA_WRITES_PER_MINUTE = 0.0
+_DEFAULT_QUOTA_WRITES_PER_DAY = 0.0
+
 # Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
 # `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
 # value instead, so `SIGKILL` from an orchestrator is never what actually ends
@@ -403,6 +409,23 @@ class ServerConfig:
     ones already in flight still get the full grace period to finish.
     Kubernetes `preStop`/`terminationGracePeriodSeconds` (WP-29) sit outside
     this value entirely, on top of it.
+
+    `quota_user_per_minute`/`quota_user_per_day`, `quota_namespace_per_minute`/
+    `quota_namespace_per_day` and `quota_token_per_minute`/`quota_token_per_day`
+    (`QUOTA_WRITES_PER_MINUTE_USER`/`QUOTA_WRITES_PER_DAY_USER`/
+    `QUOTA_WRITES_PER_MINUTE_NAMESPACE`/`QUOTA_WRITES_PER_DAY_NAMESPACE`/
+    `QUOTA_WRITES_PER_MINUTE_TOKEN`/`QUOTA_WRITES_PER_DAY_TOKEN`, #242) feed
+    `quotas.QuotaChecker`, built by `http.py`'s `create_app` on the same
+    `auth.shared_state.SharedState` the `RATE_LIMIT_*` limiters above share -
+    held across replicas the same way (ADR-0009 §2). Unlike those, every one
+    of these six defaults to `0`, which means "off": a deployment opts a scope
+    and a window in explicitly, there is no quota at all otherwise, same
+    behaviour this server always had. `user` and `token` are independent
+    fixed windows from `namespace`'s, each enforced on its own, never summed;
+    see `quotas.QuotaChecker`'s own docstring for which identity each scope
+    keys on and why `user` only ever applies once a `db.rls.Principal` exists
+    (`"postgres"` mode, ADR-0008 addendum) while `namespace`/`token` apply to
+    both storage backends.
     """
 
     host: str = _DEFAULT_HOST
@@ -427,6 +450,12 @@ class ServerConfig:
     webhook_burst: float = _DEFAULT_WEBHOOK_BURST
     forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
+    quota_user_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_user_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_namespace_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_namespace_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_token_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_token_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -458,12 +487,12 @@ class ServerConfig:
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
-        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS` entries of
-        `environ`.
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`
+        entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
-        variable if `PORT` is not a valid port number, or any size/rate
-        limit is not a positive number.
+        variable if `PORT` is not a valid port number, any size/rate limit is
+        not a positive number, or any `QUOTA_WRITES_*` variable is negative.
         """
         host = environ.get("HOST", _DEFAULT_HOST)
         port = _parse_port(environ.get("PORT"))
@@ -501,6 +530,24 @@ class ServerConfig:
         shutdown_grace_seconds = _parse_positive_int(
             environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
         )
+        quota_user_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_USER", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_user_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_USER", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
+        quota_namespace_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_NAMESPACE", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_namespace_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_NAMESPACE", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
+        quota_token_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_TOKEN", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_token_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_TOKEN", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
 
         return cls(
             host=host,
@@ -525,6 +572,12 @@ class ServerConfig:
             webhook_burst=webhook_burst,
             forwarded_allow_ips=forwarded_allow_ips,
             shutdown_grace_seconds=shutdown_grace_seconds,
+            quota_user_per_minute=quota_user_per_minute,
+            quota_user_per_day=quota_user_per_day,
+            quota_namespace_per_minute=quota_namespace_per_minute,
+            quota_namespace_per_day=quota_namespace_per_day,
+            quota_token_per_minute=quota_token_per_minute,
+            quota_token_per_day=quota_token_per_day,
         )
 
 
@@ -563,6 +616,22 @@ def _parse_positive_float(environ: dict[str, str], name: str, default: float) ->
         raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
     if value <= 0:
         raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _parse_nonnegative_float(environ: dict[str, str], name: str, default: float) -> float:
+    """Like `_parse_positive_float`, but `0` is valid - the "off" value every
+    `QUOTA_WRITES_*` variable (#242) uses, unlike a `RATE_LIMIT_*` pair, which
+    is always enforced."""
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value < 0:
+        raise ServerConfigError(f"{name} must be zero or positive, got {value}")
     return value
 
 

@@ -43,6 +43,14 @@ whatever a static/OAuth token's own `namespaces` claim (ADR-0004) still
 restricts (`_effective_readable`/`_effective_writable`). `"git"` mode
 (`Services.app_role is None`) never runs any of this - every tool call below
 is then exactly what it always was.
+
+`quota_checker` (`memory_manager.quotas.QuotaChecker`, #242), given only by
+`http.py`, additionally caps how many writes the calling user, namespace and
+token may make per minute/day, held across replicas on the same shared state
+`mcp/authz.py`'s rate limiters use - every write tool calls it, right after
+its own namespace-permission check and before it ever reaches
+`Services.storage`; `None` (stdio, or an HTTP server with no quota
+configured) skips this entirely, same as always before #242.
 """
 
 from __future__ import annotations
@@ -77,6 +85,7 @@ from memory_manager.mcp.authz import (
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.observability import instrument_tool
+from memory_manager.quotas import QuotaChecker
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
 from memory_manager.storage import InvalidNote, NotFound, StorageBackend, WriteError
@@ -457,6 +466,18 @@ def _to_stored_namespace(value: str, resolved: namespaces.Resolution | None) -> 
     return resolved.to_stored(value)
 
 
+def _namespace_of(path: str) -> str | None:
+    """`path`'s namespace segment, for `quotas.QuotaChecker.check_write` - `None` if
+    `path` does not even parse, the same best-effort fallback `_require_writable`'s own
+    `PathRejected` catch uses: a `path` this malformed is about to fail its own
+    `parse_note_path`/`storage.write` call anyway, with a sharper error than a
+    skipped quota check would ever report."""
+    try:
+        return parse_note_path(path, allow_archive=True).namespace
+    except PathRejected:
+        return None
+
+
 def _require_writable(path: str, resolved: namespaces.Resolution | None) -> None:
     """Raise `ToolError` if `path`'s namespace is not writable for the calling principal.
 
@@ -564,6 +585,7 @@ def build_server(
     auth: AuthSettings | None = None,
     token_verifier: TokenVerifier | None = None,
     auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
+    quota_checker: QuotaChecker | None = None,
 ) -> MCPServer:
     """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
 
@@ -581,6 +603,15 @@ def build_server(
     `streamable_http_app()` - nothing in this module reads any of the three
     directly; every tool below gets the per-request token through
     `mcp/authz.py`'s `get_access_token()` instead.
+
+    `quota_checker` (`quotas.QuotaChecker`, #242) is `None` for stdio and for
+    an HTTP server built without one - no write quota is enforced then, the
+    same "off unless configured" default `ServerConfig`'s `quota_*` fields
+    have. Given, every write tool below calls `quota_checker.check_write`
+    with the namespace it is about to write to, right after its own
+    `_require_writable`/`_require_archive_access` check and before it ever
+    reaches `services.storage` - a `QuotaExceeded` (a `ToolError`) then stops
+    the call exactly like a scope or namespace-permission failure would.
     """
     mcp = MCPServer(
         name="memory-manager",
@@ -760,6 +791,14 @@ def build_server(
             return stored_path_or_error
         stored_path = stored_path_or_error
         _require_writable(stored_path, resolved)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="write",
+                path=stored_path,
+                namespace=_namespace_of(stored_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
         try:
             prepared = await _prepare_write_content(
                 services.storage, stored_path, content, if_version
@@ -805,6 +844,14 @@ def build_server(
             return stored_path_or_error
         stored_path = stored_path_or_error
         _require_writable(stored_path, resolved)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="edit",
+                path=stored_path,
+                namespace=_namespace_of(stored_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
         try:
             result = await services.storage.edit(
                 stored_path,
@@ -855,6 +902,17 @@ def build_server(
         stored_new_path = stored_new_path_or_error
         _require_writable(resolved_old, resolved)
         _require_writable(stored_new_path, resolved)
+        if quota_checker is not None:
+            # Quotas against the namespace actually receiving new content
+            # (`new_path`) - `old` only ever has its `valid_to` set in place,
+            # never a new revision of its own content.
+            await quota_checker.check_write(
+                op="supersede",
+                path=stored_new_path,
+                namespace=_namespace_of(stored_new_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             prepared = await _prepare_write_content(
@@ -915,6 +973,14 @@ def build_server(
         if resolved_path is None:
             return _error_result(NotFound(path))
         await _require_archive_access(resolved_path, resolved_ns, services)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="archive",
+                path=resolved_path,
+                namespace=_namespace_of(resolved_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             result = await services.storage.archive(
