@@ -1,6 +1,6 @@
 # ADR-0013 — Autonomous agents: own identity, own namespace, guarded writes
 
-Status: Proposed · Date: 2026-10-07
+Status: Accepted · Date: 2026-10-08
 Relates to: auth, mcp, storage, F-02 Client Integrations (M15, WP-52 … WP-55); [ADR-0008](./0008-namespace-permissions.md), [ADR-0012](./0012-personal-tokens.md)
 
 ## Context
@@ -40,15 +40,15 @@ Con: the approval mode the owner asked for does not exist; operators have to cho
 Pro: zero server work.
 Con: the guard lives in the component the attacker is talking to; a misconfiguration silently opens the owner's memory.
 
-## Recommendation
+## Decision
 
-**A.** The deciding reason is that the write guard must sit on the server, outside the reach of the agent's prompt. The runtime guards in C are documented as an additional layer, not as the protection.
+**A**, accepted by the owner on 2026-10-08. Integration tier 2 (native memory plugins) is not part of v1 ([ADR-0014](./0014-agent-integration-tier.md)). The deciding reason is that the write guard must sit on the server, outside the reach of the agent's prompt. The runtime guards in C are documented as an additional layer, not as the protection.
 
 Checked against the guardrails:
 - Few dependencies: none new.
 - OSS first: yes.
 - Container: unchanged.
-- Technology pool: within ADR-0001. A native OpenClaw memory plugin (integration tier 2) would be TypeScript, outside the pool, and needs a separate owner decision (F-02 O17).
+- Technology pool: within ADR-0001. A native OpenClaw memory plugin (integration tier 2) would be TypeScript, outside the pool, and is not part of v1 (ADR-0014).
 
 ## Consequences
 

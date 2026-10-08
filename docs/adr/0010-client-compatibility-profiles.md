@@ -1,6 +1,6 @@
 # ADR-0010 — Client compatibility: one strict tool surface, profiles for delivery, explicit selection
 
-Status: Proposed · Date: 2026-10-07
+Status: Accepted · Date: 2026-10-08
 Relates to: mcp, cli, F-02 Client Integrations (WP-38, WP-40); [ADR-0009](./0009-stateless-replicas.md)
 
 ## Context
@@ -30,9 +30,9 @@ Pro: one contract and one test matrix; works on any replica; the override stays 
 ### C — No profiles; lint only
 Pro: least code · Con: clients that drop `instructions` get no usage rules, and the per-client limits that the linter checks have no home.
 
-## Recommendation
+## Decision
 
-**B.** The tool contract stays single and additive. Profiles live in `src/memory_manager/compat/` as data: limits, a delivery mode and a result budget. They do not live as code paths in the tool handlers.
+**B**, accepted by the owner on 2026-10-08. The tool contract stays single and additive. Profiles live in `src/memory_manager/compat/` as data: limits, a delivery mode and a result budget. They do not live as code paths in the tool handlers.
 
 Additive changes that come with this decision:
 - Every tool gets MCP annotations: `readOnlyHint` (index, search, read), `destructiveHint: false`, and `idempotentHint` where true.

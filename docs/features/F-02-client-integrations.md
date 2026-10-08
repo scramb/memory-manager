@@ -9,7 +9,7 @@ A memory-manager user can use the same memory from every common AI client: claud
 
 **Done when:**
 - The owner-approved support matrix (`docs/clients/README.md`) is implemented. Every *Full* or *Partial* client has a profile that passes the conformance suite.
-- E2E tests are green: Open WebUI, Hermes, OpenClaw, plus the headless CLI clients Codex CLI, Gemini CLI and Claude Code.
+- E2E tests are green for Open WebUI, Hermes and OpenClaw (scripted stub model, no API keys). The headless CLI clients (Claude Code, Codex CLI, Gemini CLI) are verified manually with the harness (O21) and recorded in the checklist.
 - The manual checklist `docs/release/client-checklist.md` is ticked for the release.
 - `v1.0.0-rc.1` is tagged with a signed image and chart.
 
@@ -30,8 +30,11 @@ The prompt's milestones M1–M5 map to project-wide numbers: M1 → **M12**, M2 
 - Automatic fact extraction from conversations. The Open WebUI `outlet` and the agent integrations act only on explicit user requests (PLAN "Explicitly not").
 - An OpenAPI facade, unless research shows a supported client needs one. Open WebUI has native MCP since v0.6.31.
 - Accepting IdP-issued tokens directly (resource-server mode, [ADR-0006](../adr/0006-enterprise-auth-entra.md) §8). It is needed for Open WebUI token forwarding (ADR-0011 option B) and stays a follow-up.
-- Trusted identity headers from Open WebUI, unless the owner chooses ADR-0011 option C.
+- Trusted identity headers from Open WebUI (ADR-0011 option C). They may follow later through their own ADR with a threat model, never as the default.
 - Brand logos in README or docs.
+- Native memory plugins for agent runtimes (tier 2) — after 1.0 ([ADR-0014](../adr/0014-agent-integration-tier.md)).
+- A docs website generator; docs stay Markdown on GitHub (O20).
+- Model API keys in CI; CLI clients are checked manually (O21).
 
 ## Existing users
 
@@ -69,6 +72,7 @@ Blocked items carry `⛔ blocked by WP-NN` in `docs/TASKS.md`. They become issue
 | `src/memory_manager/mcp/server.py` | extended: tool annotations; description core rules; profile-aware `instructions` | ADR-0010 |
 | `docs/memory-guide.md` + `src/memory_manager/guide/` | new: single source of the usage rules; generator for instructions, the `memory_guide` prompt, a short form and client instruction files | — (implementation detail, see Design) |
 | `src/memory_manager/auth/`, migrations | extended: token `kind`, `created_by`, `last_used_at`; owner-bounded rights; later agent policy and `pending_writes` | [ADR-0012](../adr/0012-personal-tokens.md), [ADR-0013](../adr/0013-agent-identity.md) |
+| `src/memory_manager/auth/` + `cli.py` | extended: operator-registered confidential OAuth clients (`oauth-client create|list|revoke`) | [ADR-0015](../adr/0015-preregistered-oauth-clients.md) |
 | `/account` | extended: token section whenever the embedded AS runs; agent approvals | ADR-0012, ADR-0013 |
 | `src/memory_manager/clients/` + `cli.py` | new: `connect <client>` (config merge with backup, diff, idempotence), `doctor --client`, `instructions generate`, `agent …` | — |
 | `src/memory_manager/importers/` | extended: `import openwebui`, `import hermes`, `import openclaw` | — |
@@ -112,8 +116,8 @@ M12 settles the first two with the linter, the profiles and the conformance suit
 |---|---|---|---|
 | M12 — Shared client foundation | compatibility profiles + linter, usage rules from one source, personal tokens (CLI), conformance suite per profile, `connect`/`doctor --client` for Claude Code, client docs skeleton | `make check` and `uv run pytest tests/conformance` green with profiles `claude-ai` and `claude-code`; the CI job `compat-lint` and `instructions generate --check` run; `memory-manager connect claude-code --dry-run` then `connect` then `doctor --client claude-code` succeed against a local server | WP-35 … WP-41 |
 | M13 — Open WebUI, released on its own | native MCP with per-user OAuth, filter, import of built-in memories, Compose + Helm example, docs; a 0.x release | `uv run pytest tests/e2e/clients/test_openwebui.py` green against the pinned version and the two previous minors (users A and B isolated, filter within budget, same results as the conformance suite); release with a CHANGELOG entry; admin setup per docs in < 15 min (timed by the owner) | WP-42 … WP-46 |
-| **Gate** — support matrix | owner approves *Full / Partial / Not possible* per client | `docs/clients/README.md` with status "approved" (#159) | WP-35 |
-| M14 — IDE and CLI clients | profiles, `integrations/`, `connect`/`doctor` for Codex, Gemini CLI / Code Assist, Cursor, Copilot, Antigravity; headless CLI runs in CI; org rollout docs | conformance suite green for every approved profile; `tests/e2e/clients/test_headless_cli.py` green for Codex CLI, Gemini CLI and Claude Code | WP-47 … WP-51 |
+| **Gate** — support matrix | owner approved *Full / Partial / Not possible* per client on 2026-10-08 | matrix below; copied to `docs/clients/README.md` by #129 (#159) | WP-35 |
+| M14 — IDE and CLI clients | profiles, `integrations/`, `connect`/`doctor` for Codex, Gemini CLI / Code Assist, Cursor, Copilot, Antigravity; local headless harness; org rollout docs | conformance suite green for every approved profile; checklist entries filled for Claude Code, Codex CLI and Gemini CLI (headless harness) and for the GUI clients | WP-47 … WP-51 |
 | M15 — Autonomous agent runtimes | agent identity and write guard, Hermes and OpenClaw at the approved tier, importers | conformance + E2E for both runtimes with pinned versions; the injection test proves that a third party's "remember …" never reaches the owner's namespace | WP-52 … WP-55 |
 | M16 — Web clients | ChatGPT and Gemini Enterprise per the approved matrix; manual client checklist | checklist in `docs/release/client-checklist.md` filled for every GUI/web client, with result and version | WP-56 … WP-58 |
 | M17 — v1.0.0-rc | stable API + compatibility policy, upgrade guide, security review, docs website, release | `v1.0.0-rc.1` tag with signed image and chart; no open High/Critical findings | WP-59 … WP-62 |
@@ -141,8 +145,8 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 - **WP-46** `wp/46-openwebui-release`: Helm values example next to the official chart with NetworkPolicy, `docs/clients/openwebui.md`, `integrations/openwebui/README.md` with version matrix, CI matrix over the pinned and two previous minors, enterprise variant via the facade ⛔ WP-22, release. Issues: #154, #155, #156, #157, #158.
 
 **M14 — IDE and CLI clients** (blocked by the support-matrix gate)
-- **WP-47** `wp/47-headless-cli`: headless E2E harness in CI against a test instance; Claude Code `-p` and Codex CLI `exec`; profile, `integrations/codex/` (`config.toml`, `AGENTS.md`), `connect`/`doctor codex`. Issues: #161, #162, #163, #164.
-- **WP-48** `wp/48-gemini-cli`: profile (OpenAPI schema subset), `integrations/gemini/` (`settings.json`, `GEMINI.md`), `connect`/`doctor gemini`, headless `gemini -p` in CI; Code Assist notes. Issues: #165, #166, #167, #168.
+- **WP-47** `wp/47-headless-cli`: local headless harness (self-tested in CI with a fake CLI, real CLIs run manually per O21); Claude Code `-p` and Codex CLI `exec`; profile, `integrations/codex/` (`config.toml`, `AGENTS.md`), `connect`/`doctor codex`. Issues: #161, #162, #163, #164.
+- **WP-48** `wp/48-gemini-cli`: profile (OpenAPI schema subset), `integrations/gemini/` (`settings.json`, `GEMINI.md`), `connect`/`doctor gemini`, headless `gemini -p` via the harness (manual); Code Assist notes. Issues: #165, #166, #167, #168.
 - **WP-49** `wp/49-cursor`: profile, `integrations/cursor/` (`mcp.json` global/project, rules file), `connect`/`doctor cursor`, Teams rollout docs. Issues: #169, #170, #171.
 - **WP-50** `wp/50-copilot`: profile, `integrations/copilot/` (VS Code `mcp.json`, JetBrains, coding-agent config, `copilot-instructions.md`), `connect`/`doctor copilot`, Business/Enterprise MCP policy docs. Issues: #172, #173, #174.
 - **WP-51** `wp/51-antigravity`: profile, `integrations/antigravity/`, `connect`/`doctor antigravity`, manual checklist entry. Issues: #175.
@@ -151,7 +155,7 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 - **WP-52** `wp/52-agent-identity`: agent tokens, namespace kind `agent`, delegation grants, write policies incl. `pending_writes` + approval CLI, `MM-Agent-Channel` in the audit; approval on `/account` ⛔ WP-25; quotas ⛔ WP-27; injection test. Issues: #176, #177, #178, #179, #180, #181, #182, #183.
 - **WP-53** `wp/53-hermes`: tier 1 (MCP with tool filter and `trust: untrusted`), skill with the usage rules, `connect`/`doctor hermes`, `import hermes` (`MEMORY.md`/`USER.md`), Compose example, E2E with a pinned version. Issues: #184, #185, #186.
 - **WP-54** `wp/54-openclaw`: tier 1 (MCP with `toolFilter`, per-requester OAuth), skill, `connect`/`doctor openclaw`, `import openclaw`, Compose example, E2E with a pinned version. Issues: #187, #188, #189.
-- **WP-55** `wp/55-agent-native`: tier 2 only if approved (O17): Hermes `MemoryProvider` (Python) and/or OpenClaw memory-slot plugin (TypeScript, outside the pool); `source` marking for runtime-derived writes, off by default. Issues: #190, #191, #192.
+- **WP-55** `wp/55-agent-native`: decision recorded as [ADR-0014](../adr/0014-agent-integration-tier.md) (tier 1 only in v1, #190); the Hermes provider (#191) and the OpenClaw plugin (#192) are closed as not planned and revisited after 1.0.
 
 **M16 — Web clients** (blocked by the support-matrix gate)
 - **WP-56** `wp/56-chatgpt`: profile (annotations drive write approval), `docs/clients/chatgpt.md`, `connect chatgpt` instructions, Enterprise/Business rollout docs, checklist entry. Issues: #194, #195.
@@ -161,12 +165,12 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 **M17 — v1.0.0-rc**
 - **WP-59** `wp/59-stable-api`: `docs/compatibility.md` (SemVer, deprecation policy); tool contract, config format, note format and CLI marked stable; upgrade guide from the last 0.x; migration tests. Issues: #199, #200, #201, #202.
 - **WP-60** `wp/60-security-rc`: threat model update (Open WebUI identity, personal tokens, agents with third-party input) ⛔ WP-33; review; no open High/Critical findings. Issues: #203, #204.
-- **WP-61** `wp/61-docs-site`: docs website (MkDocs Material ⛔ O20) with quickstart, client pages, support matrix, operations, enterprise; README lists clients as text only. Issues: #205, #206, #207.
+- **WP-61** `wp/61-docs-site`: Markdown docs on GitHub (O20): `docs/README.md` as index with quickstart, client pages, support matrix, operations, enterprise; README lists clients as text only. Issues: #205, #206, #207.
 - **WP-62** `wp/62-release-rc`: all features done in TASKS or deferred with a reason; release notes; signed image, chart, tag `v1.0.0-rc.1` ⛔ WP-34. Issues: #208, #209.
 
-## Draft support matrix (for the O19 gate)
+## Support matrix (approved 2026-10-08)
 
-Desk research of 2026-10-07 in [`docs/research/clients/`](../research/clients/). Not yet approved. Each level is re-verified with a tested version when the client's work package starts.
+Approved by the owner on 2026-10-08 (O19), based on the desk research of 2026-10-07 in [`docs/research/clients/`](../research/clients/). Each level is re-verified with a tested version when the client's work package starts; a client that turns out weaker is downgraded in `docs/clients/README.md` and reported, never promised.
 
 | Client | MCP transport | Auth that fits our server | Server `instructions` used | Proposed level | Main caveat |
 |---|---|---|---|---|---|
@@ -186,19 +190,21 @@ Desk research of 2026-10-07 in [`docs/research/clients/`](../research/clients/).
 | Gemini Enterprise | Streamable HTTP, admin data store (preview) | OAuth with pre-registered client only | unverified | Partial ⛔ O18 | no DCR; ≤ 100 actions |
 | Gemini app (consumer) | custom MCP apps, US only | DCR, reported failing | unverified | Not possible (reliably) | revisit at M16 |
 
-## Open decisions
+## Decisions
 
-| # | Question | Options | Blocks | Who decides |
-|---|---|---|---|---|
-| O13 | Open WebUI identity | A per-user OAuth + personal token for the filter (recommended) · B forward SSO token · C trusted headers ([ADR-0011](../adr/0011-openwebui-identity.md)) | M13 (WP-42 … WP-46) | owner |
-| O14 | Client compatibility and profile selection | one strict surface + explicit selection (recommended) · per-client surfaces · lint only ([ADR-0010](../adr/0010-client-compatibility-profiles.md)) | #130, #131, #132, #133 | owner |
-| O15 | Personal tokens and `/account` outside enterprise mode | extend static tokens + `/account` token section (recommended) · refresh tokens · CLI only ([ADR-0012](../adr/0012-personal-tokens.md)) | #134, #135 | owner |
-| O16 | Agent identity and write guard | agent namespace kind + approval queue (recommended) · scopes only · runtime guards only ([ADR-0013](../adr/0013-agent-identity.md)) | M15 | owner |
-| O17 | Native agent integration (tier 2) | tier 1 only in v1 (recommended) · Hermes provider (Python) · OpenClaw plugin (TypeScript, outside the pool) | WP-55 (#190 → ADR-0014) | owner |
-| O18 | Pre-registered confidential OAuth clients in the AS (Gemini Enterprise has no DCR) | add static client registration · route via Entra · mark *Not possible* | WP-57 (#196 → ADR-0015) | owner, after the support matrix |
-| O19 | Support matrix | per client *Full / Partial / Not possible* | M14, M15, M16 (#159) | owner |
-| O20 | Docs website tooling | MkDocs Material (Python docs tooling) · plain Markdown on GitHub | WP-61 (#205) | owner |
-| O21 | Model API keys and cost for headless CLI E2E in CI | repository secrets with spend cap, nightly only · local model where the CLI allows it · manual only | #161 and the headless CLI tests | owner |
+All open decisions were taken by the owner on 2026-10-08.
+
+| # | Question | Decision | Record |
+|---|---|---|---|
+| O13 | Open WebUI identity | per-user OAuth for tools, personal token for the filter; trusted headers possibly later via own ADR; Python for `integrations/openwebui/` confirmed | [ADR-0011](../adr/0011-openwebui-identity.md) |
+| O14 | Client compatibility and profile selection | one strict tool surface, profiles change delivery only, explicit selection | [ADR-0010](../adr/0010-client-compatibility-profiles.md) |
+| O15 | Personal tokens | extend static tokens; `/account` token section whenever the embedded AS runs | [ADR-0012](../adr/0012-personal-tokens.md) |
+| O16 | Agent identity and write guard | agent namespace kind, server-side policy, approval queue, explicit delegation | [ADR-0013](../adr/0013-agent-identity.md) |
+| O17 | Native agent integration (tier 2) | tier 1 (MCP) only in v1; #191, #192 closed as not planned | [ADR-0014](../adr/0014-agent-integration-tier.md) |
+| O18 | Clients without DCR/CIMD (Gemini Enterprise) | operator-registered confidential OAuth clients in our AS | [ADR-0015](../adr/0015-preregistered-oauth-clients.md) |
+| O19 | Support matrix | draft approved as is | this file, `docs/clients/README.md` (#129) |
+| O20 | Docs website tooling | plain Markdown on GitHub, no site generator | PLAN technology decisions |
+| O21 | Model API keys for CLI E2E in CI | none; CLI clients are verified manually with the local harness and the checklist; agent runtimes and Open WebUI run in CI against the scripted stub model | PLAN technology decisions |
 
 ## Spikes
 

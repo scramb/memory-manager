@@ -1,6 +1,6 @@
 # ADR-0011 — Open WebUI identity: per-user OAuth for tools, personal tokens for the filter, no trusted headers in v1
 
-Status: Proposed · Date: 2026-10-07
+Status: Accepted · Date: 2026-10-08
 Relates to: auth, integrations/openwebui, F-02 Client Integrations (M13, WP-42 … WP-46); [ADR-0004](./0004-auth-model.md), [ADR-0006](./0006-enterprise-auth-entra.md), [ADR-0008](./0008-namespace-permissions.md)
 
 ## Context
@@ -40,9 +40,9 @@ Con: Open WebUI becomes a fully trusted impersonator of every user. The HS256 se
 ### D — One service token
 Rejected: it violates the per-user identity requirement.
 
-## Recommendation
+## Decision
 
-**A for M13.** The deciding reason is that it adds no trust path: every request carries a token our AS or our CLI issued to that user, revocable and audited. B stays the follow-up once resource-server mode exists (ADR-0006 §8). C is built only if the owner wants zero-touch onboarding, behind its own ADR with a threat model, never as the default.
+**A**, accepted by the owner on 2026-10-08, who also confirmed Python for `integrations/openwebui/` (the filter and tool run inside Open WebUI, which only executes Python). Option C (trusted headers) stays a possible later addition for zero-touch onboarding, but only through its own ADR with a threat model and never as the default. The deciding reason is that it adds no trust path: every request carries a token our AS or our CLI issued to that user, revocable and audited. B stays the follow-up once resource-server mode exists (ADR-0006 §8).
 
 If the WP-42 spike shows that Open WebUI's DCR request cannot be served without weakening the AS (for example, it needs an open redirect pattern), this ADR goes back to the owner before any workaround.
 
@@ -50,7 +50,7 @@ Checked against the guardrails:
 - Few dependencies: none new.
 - OSS first: yes.
 - Container: unchanged.
-- Technology pool: the filter is Python because Open WebUI only runs Python functions. That extends the ADR-0001 deviation to `integrations/openwebui/`, and the owner confirms it with this ADR.
+- Technology pool: the filter is Python because Open WebUI only runs Python functions. That extends the ADR-0001 deviation to `integrations/openwebui/`, confirmed by the owner on 2026-10-08.
 
 ## Consequences
 

@@ -5,7 +5,7 @@
 > lives exclusively in `docs/TASKS.md`.
 > Source of truth for tasks: GitHub issues in `scramb/memory-manager`; `docs/TASKS.md` is the readable mirror.
 
-Last updated: 2026-10-07 (F-02 planned) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
+Last updated: 2026-10-08 (F-02 decisions) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
 
 ## Goal
 
@@ -101,7 +101,13 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | Enterprise auth | embedded AS as facade, login delegated to Entra ID, own short-lived tokens bound to `oid`; Graph delta sync for deprovisioning | clients against Entra directly, APIM gateway | Entra has no DCR/CIMD and lacks `code_challenge_methods_supported`, so claude.ai cannot use it directly | [ADR-0006](./adr/0006-enterprise-auth-entra.md) |
 | Storage backend | `StorageBackend` interface: Git (default) or Postgres with append-only revisions (enterprise) | scaled Git, Postgres only | horizontal writes and GDPR erasure without breaking single-user/team mode | [ADR-0007](./adr/0007-storage-backend.md) |
 | Namespaces + permissions | registry with aliases (`me`, groups, projects, `org`) in the existing path format; RLS derives access from membership tables, app checks independently | type-prefixed IDs in paths, app-computed namespace list | no tool contract break; two independent access computations | [ADR-0008](./adr/0008-namespace-permissions.md) |
-| Client compatibility | one strict tool surface for all clients, profiles change only how usage rules are delivered, selected by `?profile=`/header/`clientInfo` | per-client tool surfaces | one contract and test matrix that works on any stateless replica (Proposed) | [ADR-0010](./adr/0010-client-compatibility-profiles.md) |
+| Client compatibility | one strict tool surface for all clients, profiles change only how usage rules are delivered, selected by `?profile=`/header/`clientInfo` | per-client tool surfaces | one contract and test matrix that works on any stateless replica | [ADR-0010](./adr/0010-client-compatibility-profiles.md) |
+| Open WebUI identity | per-user OAuth for tools, personal token for the filter; Python allowed in `integrations/openwebui/` | SSO token forwarding, trusted headers | no new trust path | [ADR-0011](./adr/0011-openwebui-identity.md) |
+| Personal tokens | owner-bound static tokens with `kind`, self-service on `/account` | refresh tokens, CLI only | users get revocable credentials without an operator | [ADR-0012](./adr/0012-personal-tokens.md) |
+| Agent runtimes | own agent identity and namespace, server-side write policy with approval queue; MCP integration only in v1 | runtime guards, native plugins | the write guard sits outside the agent's prompt | [ADR-0013](./adr/0013-agent-identity.md), [ADR-0014](./adr/0014-agent-integration-tier.md) |
+| Clients without DCR/CIMD | operator-registered confidential OAuth clients | Entra routing, unsupported | per-user identity for Gemini Enterprise without resource-server mode | [ADR-0015](./adr/0015-preregistered-oauth-clients.md) |
+| Documentation | plain Markdown on GitHub, `docs/README.md` as index | MkDocs Material | no extra tooling | — (owner 2026-10-08) |
+| Client E2E in CI | Open WebUI and agent runtimes against a scripted stub model; CLI clients checked manually with a local harness | model API keys in CI | no secrets or spend in CI | — (owner 2026-10-08) |
 | Scaling | stateless Streamable HTTP, no sticky sessions; shared state in Valkey if configured, else Postgres | stateful sessions, Valkey mandatory | any replica serves any request; no extra service for small setups | [ADR-0009](./adr/0009-stateless-replicas.md) |
 | Load test | k6 in a container, p95 thresholds as CI gate | Locust | single binary with built-in thresholds; JS scripts count as test tooling | — (owner 2026-10-07) |
 | Deployment | repo ships its own generic deployment like bring--mcp: Kustomize base in `deploy/` + `deploy/README.md`, Helm chart, Flux example; no operator-specific values (hosts, secrets, cluster names) in this public repo — those live in the operator's own overlay | Helm only; owner-specific manifests in the repo | same pattern as bring--mcp, safe for a public repo ([reference](./research/bring-mcp-reference.md)) | — (owner 2026-10-06) |
@@ -156,15 +162,15 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O10 | Storage backend for enterprise mode | — decided: `StorageBackend` with Postgres SoT; CLAUDE.md rules adapted (ADR-0007) | — | owner ✔ 2026-10-07 |
 | O11 | Namespace and permission model | — decided: aliases + RLS from membership tables; `memory_promote`, `namespace_kind`, `/account` incl. admin area; break-glass default 2 admins (ADR-0008) | — | owner ✔ 2026-10-07 |
 | O12 | Sessions and shared state across replicas | — decided: stateless; Valkey optional with Postgres fallback (ADR-0009) | — | owner ✔ 2026-10-07 |
-| O13 | Open WebUI identity | A per-user OAuth for tools + personal token for the filter (recommended) · B forward SSO token · C trusted headers ([ADR-0011](./adr/0011-openwebui-identity.md), Proposed) | M13 | owner |
-| O14 | Client compatibility and profile selection | one strict tool surface, profiles for delivery, explicit selection (recommended) · per-client surfaces · lint only ([ADR-0010](./adr/0010-client-compatibility-profiles.md), Proposed) | #130–#133 | owner |
-| O15 | Personal tokens and `/account` outside enterprise mode | extend static tokens + `/account` token section (recommended) · refresh tokens · CLI only ([ADR-0012](./adr/0012-personal-tokens.md), Proposed) | #134, #135 | owner |
-| O16 | Agent identity and write guard | agent namespace kind + approval queue (recommended) · scopes only · runtime guards only ([ADR-0013](./adr/0013-agent-identity.md), Proposed) | M15 | owner |
-| O17 | Native agent memory integration (tier 2) | tier 1 (MCP) only in v1 (recommended) · Hermes provider (Python) · OpenClaw plugin (TypeScript, outside the pool) | WP-55 | owner |
-| O18 | Pre-registered confidential OAuth clients (Gemini Enterprise has no DCR) | static client registration · route via Entra · *Not possible* | WP-57 | owner, after O19 |
-| O19 | Client support matrix (*Full / Partial / Not possible*) | draft in [F-02](./features/F-02-client-integrations.md), approved in `docs/clients/README.md` (#159) | M14–M16 | owner |
-| O20 | Docs website tooling | MkDocs Material · plain Markdown on GitHub | WP-61 | owner |
-| O21 | Model API keys and cost for headless CLI E2E in CI | secrets with spend cap, nightly · local model where possible · manual only | WP-47, WP-48 | owner |
+| O13 | Open WebUI identity | — decided: per-user OAuth for tools, personal token for the filter; trusted headers only later via own ADR (ADR-0011) | — | owner ✔ 2026-10-08 |
+| O14 | Client compatibility and profile selection | — decided: one strict tool surface, profiles for delivery, explicit selection (ADR-0010) | — | owner ✔ 2026-10-08 |
+| O15 | Personal tokens and `/account` outside enterprise mode | — decided: extend static tokens, `/account` token section whenever the AS runs (ADR-0012) | — | owner ✔ 2026-10-08 |
+| O16 | Agent identity and write guard | — decided: agent namespace kind, server-side policy, approval queue (ADR-0013) | — | owner ✔ 2026-10-08 |
+| O17 | Native agent memory integration (tier 2) | — decided: tier 1 (MCP) only in v1 (ADR-0014) | — | owner ✔ 2026-10-08 |
+| O18 | Clients without DCR/CIMD (Gemini Enterprise) | — decided: operator-registered confidential OAuth clients (ADR-0015) | — | owner ✔ 2026-10-08 |
+| O19 | Client support matrix | — decided: draft approved as is ([F-02](./features/F-02-client-integrations.md)) | — | owner ✔ 2026-10-08 |
+| O20 | Docs website tooling | — decided: plain Markdown on GitHub, no site generator | — | owner ✔ 2026-10-08 |
+| O21 | Model API keys for CLI E2E in CI | — decided: none; CLI clients verified manually, agents and Open WebUI against a stub model in CI | — | owner ✔ 2026-10-08 |
 
 ## Risks
 

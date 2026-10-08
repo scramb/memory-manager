@@ -1,6 +1,6 @@
 # ADR-0012 — Personal tokens: owner-bound static tokens that users create themselves
 
-Status: Proposed · Date: 2026-10-07
+Status: Accepted · Date: 2026-10-08
 Relates to: auth, cli, `/account`, F-02 Client Integrations (WP-39); [ADR-0004](./0004-auth-model.md), [ADR-0006](./0006-enterprise-auth-entra.md) §7, [ADR-0008](./0008-namespace-permissions.md)
 
 ## Context
@@ -37,9 +37,9 @@ Con: refresh rotation breaks clients that store one value; expiry and listing do
 Pro: smallest change.
 Con: in a multi-user deployment every user needs an operator to get a token, and operators then handle other people's secrets.
 
-## Recommendation
+## Decision
 
-**A.** It is the smallest change that gives users their own revocable credentials without an operator in the loop. The self-service page depends on `/account`, which F-01 builds in WP-25. Until then the CLI path works and is sufficient for M12's acceptance.
+**A**, accepted by the owner on 2026-10-08, including the `/account` token section whenever the embedded AS runs. It is the smallest change that gives users their own revocable credentials without an operator in the loop. The self-service page depends on `/account`, which F-01 builds in WP-25. Until then the CLI path works and is sufficient for M12's acceptance.
 
 Checked against the guardrails:
 - Few dependencies: none new.
