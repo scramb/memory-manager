@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.4](https://github.com/scramb/memory-manager/compare/v0.1.3...v0.1.4) (2026-10-08)
+
+
+### Features
+
+* **auth:** share rate limits and login state across replicas, drain on SIGTERM ([#113](https://github.com/scramb/memory-manager/issues/113)) ([9d2237e](https://github.com/scramb/memory-manager/commit/9d2237e8007452edb8a3cb1d37452eb0e93cb63b)), closes [#103](https://github.com/scramb/memory-manager/issues/103) [#104](https://github.com/scramb/memory-manager/issues/104) [#105](https://github.com/scramb/memory-manager/issues/105)
+* **index:** enforce namespaces with RLS and an application-side matrix ([#121](https://github.com/scramb/memory-manager/issues/121)) ([52483ad](https://github.com/scramb/memory-manager/commit/52483addb350082c20341eac0b621c8cae1dae59)), closes [#100](https://github.com/scramb/memory-manager/issues/100) [#101](https://github.com/scramb/memory-manager/issues/101) [#102](https://github.com/scramb/memory-manager/issues/102) [#115](https://github.com/scramb/memory-manager/issues/115) [#116](https://github.com/scramb/memory-manager/issues/116) [#118](https://github.com/scramb/memory-manager/issues/118) [#119](https://github.com/scramb/memory-manager/issues/119)
+* **vault:** add the Postgres storage backend for enterprise mode ([#114](https://github.com/scramb/memory-manager/issues/114)) ([25e8bf7](https://github.com/scramb/memory-manager/commit/25e8bf70e48449f98ac0081de661cd01ac56ea97)), closes [#96](https://github.com/scramb/memory-manager/issues/96) [#97](https://github.com/scramb/memory-manager/issues/97) [#98](https://github.com/scramb/memory-manager/issues/98) [#99](https://github.com/scramb/memory-manager/issues/99) [#112](https://github.com/scramb/memory-manager/issues/112)
+
+
+### Documentation
+
+* accept enterprise ADRs and plan F-01 Enterprise Scale ([#110](https://github.com/scramb/memory-manager/issues/110)) ([62cf611](https://github.com/scramb/memory-manager/commit/62cf6117fdc83420a6bd86fc1382095ede4b0bef)), closes [#93](https://github.com/scramb/memory-manager/issues/93)
+* keep RLS variant R2 ([#140](https://github.com/scramb/memory-manager/issues/140)) ([f2b6e05](https://github.com/scramb/memory-manager/commit/f2b6e0551e5bf64d10ad4915aa469fcba9d3d172)), closes [#109](https://github.com/scramb/memory-manager/issues/109)
+* record the state after 0.1.3 in TASKS and the handoff ([#90](https://github.com/scramb/memory-manager/issues/90)) ([30cc66a](https://github.com/scramb/memory-manager/commit/30cc66a5c185ababc10b31036f89d8ad1cf2bb9e)), closes [#89](https://github.com/scramb/memory-manager/issues/89)
+
 ## [0.1.3](https://github.com/scramb/memory-manager/compare/v0.1.2...v0.1.3) (2026-10-07)
 
 
