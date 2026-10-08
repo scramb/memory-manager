@@ -173,7 +173,7 @@ F-01 (M8–M11) is built before F-02 (M12–M17) starts (O32).
 | O19 | Client support matrix | — decided: draft approved as is ([F-02](./features/F-02-client-integrations.md)) | — | owner ✔ 2026-10-08 |
 | O20 | Docs website tooling | — decided: plain Markdown on GitHub, no site generator | — | owner ✔ 2026-10-08 |
 | O21 | Model API keys for CLI E2E in CI | — decided: none for now; CLI clients verified manually, agents and Open WebUI against a stub model in CI. Possible later: a CI token with a spend limit for the headless CLI checks | — | owner ✔ 2026-10-08 |
-| O22 | Vector index and partitioning in Postgres mode | measure first: the spike #125 opens WP-23 and proposes ADR-0016 (`halfvec` vs `vector`, HNSW parameters, partitioning by namespace kind incl. `agent`) | the `chunks` schema in WP-23, WP-32 | owner, after #125 |
+| O22 | Vector index and partitioning in Postgres mode | measured by the spike #125, proposed as [ADR-0016](./adr/0016-vector-index.md) (`halfvec`, a B-tree on namespace, partitioning by namespace kind incl. `agent`) | the `chunks` schema in WP-23, WP-32 | owner, after #125 |
 | O23 | Embedding dimension in Postgres mode | — decided: the existing `EMBEDDING_DIMENSIONS` is pinned at the first migration (default 1024) and immutable afterwards; another dimension means a reindex | — | owner ✔ 2026-10-08 |
 | O24 | Where the target-size load test runs | — decided: an operator Kubernetes cluster; the public report names only a generic hardware profile | — | owner ✔ 2026-10-08 |
 | O25 | Browser session for `/account` | — decided: opaque cookie session with hashed row in Postgres and CSRF token, page in every embedded-AS login mode (ADR-0008 addendum) | — | owner ✔ 2026-10-08 |

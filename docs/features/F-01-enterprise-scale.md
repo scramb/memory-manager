@@ -86,7 +86,7 @@ Work packages of M8–M11 (cut into issues on 2026-10-08, ahead of the code at t
 
 | Question | Options | Blocks |
 |---|---|---|
-| Vector index and partitioning (PLAN O22) | measured by the spike #125 at the start of WP-23: `halfvec` vs `vector` (recall on the golden set, size, latency), HNSW parameters, partitioning of `chunks` by namespace kind incl. `agent` (ADR-0013); the result is proposed as ADR-0016 | the `chunks` schema in WP-23 and everything that builds on it; WP-32 |
+| Vector index and partitioning (PLAN O22) | measured by the spike #125 at the start of WP-23: `halfvec` vs `vector` (recall on the golden set, size, latency), HNSW parameters, partitioning of `chunks` by namespace kind incl. `agent` (ADR-0013); proposed as [ADR-0016](../adr/0016-vector-index.md), owner decision pending | the `chunks` schema in WP-23 and everything that builds on it; WP-32 |
 | R2 cost under load | — decided 2026-10-08 by the owner: keep R2 ([baseline](../benchmarks/baseline.md): ~1.6 ms vs ~0.1 ms per access-function call, targets met at 100k); re-evaluate only if WP-32 misses the budget at target size | — |
 
 Decided by the owner on 2026-10-08 while cutting M8–M11 (PLAN O23–O37):

@@ -224,7 +224,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 
 ### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: open
 
-- [ ] #125 Vector-index spike → `docs/research/vector-index.md` + ADR-0016 (Proposed)
+- [x] #125 Vector-index spike → `docs/research/vector-index.md` + ADR-0016 (Proposed)
 - [x] #217 `memory-manager worker` with health/ready/metrics port; singleton jobs; OAuth cleanup moved from api
 - [x] #218 `jobs` outbox: enqueue in write tx, `SKIP LOCKED`, `LISTEN/NOTIFY` + poll ⛔ blocked by #217
 - [x] #219 Asynchronous embeddings via `jobs` in Postgres mode ⛔ blocked by #218
