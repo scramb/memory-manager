@@ -116,6 +116,8 @@ Remote setup for both clients (OAuth, verified 2026-10-07): [`docs/guides/remote
 - Policy, scope and how to report a vulnerability: [`SECURITY.md`](./SECURITY.md)
 - Review against the OWASP Top 10 for LLM Applications, threat model and findings:
   [`docs/security-review.md`](./docs/security-review.md)
+- Exporting the audit log to a SIEM (stdout and/or OTLP, `AUDIT_EXPORT`):
+  [`docs/guides/audit-export.md`](./docs/guides/audit-export.md)
 
 ## Comparison
 

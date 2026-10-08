@@ -92,6 +92,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from memory_manager import __commit__, __version__
 from memory_manager.app import Services
+from memory_manager.audit import AuditWriter
 from memory_manager.auth import store
 from memory_manager.auth.cimd import ClientMetadataFetcher
 from memory_manager.auth.login import (
@@ -128,6 +129,8 @@ from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
 from memory_manager.observability.metrics import metrics_endpoint
+from memory_manager.quotas import QuotaChecker, StorageQuotaChecker
+from memory_manager.storage.postgres import PostgresBackend
 
 __all__ = ["GracefulShutdownServer", "ServicesFactory", "build_authenticator", "create_app"]
 
@@ -349,6 +352,42 @@ def create_app(
                     # would be this module's own wiring bug, not a client-facing one.
                     raise RuntimeError("EntraAuthenticator was configured without a database pool")
                 authenticator.bind_pool(services.pool)
+            # Built once `services.pool` is known (`None` for "git" without a
+            # database, #242) - against the same `shared_state` handle every
+            # `RateLimiter` below shares (ADR-0009 §2), so held across replicas the
+            # same way. `audit` is `None` without a pool: no `audit_log` table
+            # exists to record a rejection into then, the same reason `app.py`
+            # only ever wires an `AuditWriter` onto a backend that has one.
+            quota_checker = QuotaChecker(
+                state=shared_state,
+                audit=AuditWriter(services.pool) if services.pool is not None else None,
+                user_per_minute=config.quota_user_per_minute,
+                user_per_day=config.quota_user_per_day,
+                namespace_per_minute=config.quota_namespace_per_minute,
+                namespace_per_day=config.quota_namespace_per_day,
+                token_per_minute=config.quota_token_per_minute,
+                token_per_day=config.quota_token_per_day,
+            )
+
+            # `StorageQuotaChecker` (#243) only ever applies to the Postgres
+            # backend - `vault_notes` stays empty for "git" (ADR-0007 §2), so a
+            # note-count/byte-size budget against it would be meaningless.
+            # `services.pool is not None` alone (as `quota_checker` above uses)
+            # is not enough here: that also holds for "git" with `DATABASE_URL`
+            # configured, where `services.storage` is a `storage.git.GitBackend`,
+            # not a `PostgresBackend`.
+            storage_quota_checker = (
+                StorageQuotaChecker(
+                    storage=services.storage,
+                    audit=AuditWriter(services.pool) if services.pool is not None else None,
+                    max_notes_personal=config.quota_max_notes_personal,
+                    max_bytes_personal=config.quota_max_bytes_personal,
+                    max_notes_shared=config.quota_max_notes_shared,
+                    max_bytes_shared=config.quota_max_bytes_shared,
+                )
+                if isinstance(services.storage, PostgresBackend)
+                else None
+            )
 
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
@@ -372,6 +411,8 @@ def create_app(
                 auth=auth,
                 token_verifier=token_verifier,
                 auth_server_provider=oauth_provider,
+                quota_checker=quota_checker,
+                storage_quota_checker=storage_quota_checker,
             )
             mcp_app = mcp.streamable_http_app(
                 streamable_http_path=config.mcp_path,

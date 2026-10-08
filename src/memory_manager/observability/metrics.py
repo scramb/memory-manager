@@ -24,6 +24,9 @@ What each metric answers:
 - `mm_index_notes`: the Postgres index's current note count. Defined here
   so the metric name exists; nothing in this work package's blast radius
   sets it (the indexer is out of scope, #45).
+- `mm_quota_hits_total` (`scope`, `outcome`): every `quotas.QuotaChecker`
+  write-quota check, labeled by scope (`user`/`namespace`/`token`) and
+  `outcome` (`"allowed"`/`"rejected"`) - via `record_quota_hit`.
 - `mm_build_info` (`version`, `commit`): set once at import, same values
   `/healthz` already reports (ADR-0002 §13).
 
@@ -54,12 +57,14 @@ __all__ = [
     "METRICS_ENABLED_ENV",
     "QUEUE_DEPTH",
     "QUEUE_WRITES_TOTAL",
+    "QUOTA_HITS_TOTAL",
     "SEARCH_DURATION_SECONDS",
     "TOOL_CALLS_TOTAL",
     "TOOL_DURATION_SECONDS",
     "metrics_enabled",
     "metrics_endpoint",
     "record_queue_write",
+    "record_quota_hit",
     "track_git_operation",
     "track_search",
     "track_tool_call",
@@ -86,6 +91,7 @@ SEARCH_DURATION_SECONDS = Histogram(
     "mm_search_duration_seconds", "hybrid_search duration in seconds.", ["mode"]
 )
 INDEX_NOTES = Gauge("mm_index_notes", "Notes currently held in the Postgres index.")
+QUOTA_HITS_TOTAL = Counter("mm_quota_hits_total", "Write quota checks.", ["scope", "outcome"])
 
 _BUILD_INFO = Info("mm_build", "The version and commit this process was built from.")
 _BUILD_INFO.info({"version": __version__, "commit": __commit__})
@@ -153,6 +159,11 @@ def track_tool_call(tool: str) -> Callable[[_ToolFunc], _ToolFunc]:
 def record_queue_write(op: str, outcome: str) -> None:
     """`mm_queue_writes_total`'s one call site: after every write job the consumer runs."""
     QUEUE_WRITES_TOTAL.labels(op=op, outcome=outcome).inc()
+
+
+def record_quota_hit(*, scope: str, outcome: str) -> None:
+    """`mm_quota_hits_total`'s one call site: `quotas.QuotaChecker`'s own write check."""
+    QUOTA_HITS_TOTAL.labels(scope=scope, outcome=outcome).inc()
 
 
 def _git_op_name(args: Sequence[str]) -> str:

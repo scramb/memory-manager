@@ -43,6 +43,23 @@ whatever a static/OAuth token's own `namespaces` claim (ADR-0004) still
 restricts (`_effective_readable`/`_effective_writable`). `"git"` mode
 (`Services.app_role is None`) never runs any of this - every tool call below
 is then exactly what it always was.
+
+`quota_checker` (`memory_manager.quotas.QuotaChecker`, #242), given only by
+`http.py`, additionally caps how many writes the calling user, namespace and
+token may make per minute/day, held across replicas on the same shared state
+`mcp/authz.py`'s rate limiters use - every write tool calls it, right after
+its own namespace-permission check and before it ever reaches
+`Services.storage`; `None` (stdio, or an HTTP server with no quota
+configured) skips this entirely, same as always before #242.
+
+`storage_quota_checker` (`memory_manager.quotas.StorageQuotaChecker`, #243),
+also given only by `http.py` and only once `Services.storage` is a
+`storage.postgres.PostgresBackend`, additionally caps how many notes and how
+many bytes a namespace may hold in total - `memory_write`/`memory_edit`/
+`memory_supersede` each call it with the namespace and byte size the write
+they are about to submit would actually produce; `memory_archive` never does
+(it only ever frees a note-count slot). `None` skips this entirely, same
+"off unless configured" default as `quota_checker`.
 """
 
 from __future__ import annotations
@@ -77,6 +94,7 @@ from memory_manager.mcp.authz import (
 from memory_manager.mcp.errors import error_to_dict
 from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.observability import instrument_tool
+from memory_manager.quotas import NamespaceKind, QuotaChecker, StorageQuotaChecker
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
 from memory_manager.storage import InvalidNote, NotFound, StorageBackend, WriteError
@@ -457,6 +475,39 @@ def _to_stored_namespace(value: str, resolved: namespaces.Resolution | None) -> 
     return resolved.to_stored(value)
 
 
+def _namespace_of(path: str) -> str | None:
+    """`path`'s namespace segment, for `quotas.QuotaChecker.check_write` - `None` if
+    `path` does not even parse, the same best-effort fallback `_require_writable`'s own
+    `PathRejected` catch uses: a `path` this malformed is about to fail its own
+    `parse_note_path`/`storage.write` call anyway, with a sharper error than a
+    skipped quota check would ever report."""
+    try:
+        return parse_note_path(path, allow_archive=True).namespace
+    except PathRejected:
+        return None
+
+
+def _storage_namespace_kind(
+    resolved: namespaces.Resolution | None, namespace: str | None
+) -> NamespaceKind | None:
+    """`namespace`'s kind for `quotas.StorageQuotaChecker.check_write` (#243): `"personal"`
+    for the caller's own namespace, `"shared"` for every other kind (group/project/org).
+
+    `None` in `"git"` mode (`resolved is None` - `storage_quota_checker` is
+    never given one then either, see `build_server`'s own docstring) or for
+    a `namespace` this resolution holds no row for at all - not reachable
+    for a path that already passed `_require_writable`, but the same
+    best-effort fallback `_namespace_of` uses for a path that does not even
+    parse.
+    """
+    if resolved is None or namespace is None:
+        return None
+    kind = resolved.kind_of(namespace)
+    if kind is None:
+        return None
+    return "personal" if kind == "personal" else "shared"
+
+
 def _require_writable(path: str, resolved: namespaces.Resolution | None) -> None:
     """Raise `ToolError` if `path`'s namespace is not writable for the calling principal.
 
@@ -564,6 +615,8 @@ def build_server(
     auth: AuthSettings | None = None,
     token_verifier: TokenVerifier | None = None,
     auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
+    quota_checker: QuotaChecker | None = None,
+    storage_quota_checker: StorageQuotaChecker | None = None,
 ) -> MCPServer:
     """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
 
@@ -581,6 +634,27 @@ def build_server(
     `streamable_http_app()` - nothing in this module reads any of the three
     directly; every tool below gets the per-request token through
     `mcp/authz.py`'s `get_access_token()` instead.
+
+    `quota_checker` (`quotas.QuotaChecker`, #242) is `None` for stdio and for
+    an HTTP server built without one - no write quota is enforced then, the
+    same "off unless configured" default `ServerConfig`'s `quota_*` fields
+    have. Given, every write tool below calls `quota_checker.check_write`
+    with the namespace it is about to write to, right after its own
+    `_require_writable`/`_require_archive_access` check and before it ever
+    reaches `services.storage` - a `QuotaExceeded` (a `ToolError`) then stops
+    the call exactly like a scope or namespace-permission failure would.
+
+    `storage_quota_checker` (`quotas.StorageQuotaChecker`, #243) is `None`
+    for stdio, for `"git"` mode and for an HTTP server built without one -
+    `None` is also the only possibility unless `services.storage` is a
+    `storage.postgres.PostgresBackend` (`http.py` only ever builds one
+    then). Given, `memory_write`/`memory_edit`/`memory_supersede` each call
+    it with the namespace and byte size the write they are about to submit
+    would actually produce, right after that content is computed and before
+    it reaches `services.storage` - never `memory_archive`, which only ever
+    frees a note-count slot (module docstring, `quotas.StorageQuotaChecker`'s
+    own). A `StorageQuotaExceeded` (also a `ToolError`) stops the call the
+    same way `QuotaExceeded` does.
     """
     mcp = MCPServer(
         name="memory-manager",
@@ -760,12 +834,38 @@ def build_server(
             return stored_path_or_error
         stored_path = stored_path_or_error
         _require_writable(stored_path, resolved)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="write",
+                path=stored_path,
+                namespace=_namespace_of(stored_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
         try:
             prepared = await _prepare_write_content(
                 services.storage, stored_path, content, if_version
             )
         except NoteFormatError as exc:
             return _error_result(exc)
+
+        write_namespace = _namespace_of(stored_path)
+        write_namespace_kind = _storage_namespace_kind(resolved, write_namespace)
+        if (
+            storage_quota_checker is not None
+            and write_namespace is not None
+            and write_namespace_kind is not None
+        ):
+            await storage_quota_checker.check_write(
+                op="write",
+                path=stored_path,
+                namespace=write_namespace,
+                namespace_kind=write_namespace_kind,
+                is_new_note=(if_version == _NEW_VERSION),
+                final_size=len(prepared.content),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             result = await services.storage.write(
@@ -805,6 +905,44 @@ def build_server(
             return stored_path_or_error
         stored_path = stored_path_or_error
         _require_writable(stored_path, resolved)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="edit",
+                path=stored_path,
+                namespace=_namespace_of(stored_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
+        edit_namespace = _namespace_of(stored_path)
+        edit_namespace_kind = _storage_namespace_kind(resolved, edit_namespace)
+        if (
+            storage_quota_checker is not None
+            and edit_namespace is not None
+            and edit_namespace_kind is not None
+        ):
+            current_for_quota = await services.storage.read(stored_path)
+            if current_for_quota is not None:
+                # An estimate, not the exact canonical bytes `services.storage.edit`
+                # will end up committing (module docstring: #243 is a soft limit) -
+                # good enough to decide whether this edit would push the namespace
+                # over its byte budget, without duplicating `storage.rules`' own
+                # validation here just to measure a length.
+                predicted_size = max(
+                    0,
+                    len(current_for_quota.content)
+                    - len(old_str.encode("utf-8"))
+                    + len(new_str.encode("utf-8")),
+                )
+                await storage_quota_checker.check_write(
+                    op="edit",
+                    path=stored_path,
+                    namespace=edit_namespace,
+                    namespace_kind=edit_namespace_kind,
+                    is_new_note=False,
+                    final_size=predicted_size,
+                    actor=current_actor(),
+                    client=current_client(),
+                )
         try:
             result = await services.storage.edit(
                 stored_path,
@@ -855,6 +993,17 @@ def build_server(
         stored_new_path = stored_new_path_or_error
         _require_writable(resolved_old, resolved)
         _require_writable(stored_new_path, resolved)
+        if quota_checker is not None:
+            # Quotas against the namespace actually receiving new content
+            # (`new_path`) - `old` only ever has its `valid_to` set in place,
+            # never a new revision of its own content.
+            await quota_checker.check_write(
+                op="supersede",
+                path=stored_new_path,
+                namespace=_namespace_of(stored_new_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             prepared = await _prepare_write_content(
@@ -862,6 +1011,27 @@ def build_server(
             )
         except NoteFormatError as exc:
             return _error_result(exc)
+
+        supersede_namespace = _namespace_of(stored_new_path)
+        supersede_namespace_kind = _storage_namespace_kind(resolved, supersede_namespace)
+        if (
+            storage_quota_checker is not None
+            and supersede_namespace is not None
+            and supersede_namespace_kind is not None
+        ):
+            # Same reasoning as the rate-quota check above: only `new_path`'s
+            # namespace is checked - `supersede` always inserts exactly one new
+            # note there, never changes how many notes `old`'s own namespace holds.
+            await storage_quota_checker.check_write(
+                op="supersede",
+                path=stored_new_path,
+                namespace=supersede_namespace,
+                namespace_kind=supersede_namespace_kind,
+                is_new_note=True,
+                final_size=len(prepared.content),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             result = await services.storage.supersede(
@@ -915,6 +1085,14 @@ def build_server(
         if resolved_path is None:
             return _error_result(NotFound(path))
         await _require_archive_access(resolved_path, resolved_ns, services)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="archive",
+                path=resolved_path,
+                namespace=_namespace_of(resolved_path),
+                actor=current_actor(),
+                client=current_client(),
+            )
 
         try:
             result = await services.storage.archive(

@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 __all__ = [
+    "AuditConfigError",
     "EmbeddingConfig",
     "EmbeddingConfigError",
     "ServerConfig",
@@ -22,6 +23,8 @@ __all__ = [
     "StorageConfigError",
     "VaultConfig",
     "VaultConfigError",
+    "audit_export_targets_from_env",
+    "blocklist_file_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
     "storage_backend_from_env",
@@ -54,6 +57,19 @@ _DEFAULT_OAUTH_BURST = 10.0
 _DEFAULT_WEBHOOK_PER_MINUTE = 30.0
 _DEFAULT_WEBHOOK_BURST = 10.0
 _DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
+
+# Write quota defaults (#242, ADR-0009 §2). All six default to 0, which `quotas.
+# QuotaChecker` reads as "off" - a deployment opts in per scope and per window
+# explicitly, unlike `RATE_LIMIT_*` above, which is always on.
+_DEFAULT_QUOTA_WRITES_PER_MINUTE = 0.0
+_DEFAULT_QUOTA_WRITES_PER_DAY = 0.0
+
+# Storage quota defaults (#243): a namespace's note-count/byte-size budget,
+# Postgres mode only. All four default to 0, same "off unless a deployment
+# opts in" meaning as the `QUOTA_WRITES_*` defaults above - see `quotas.
+# StorageQuotaChecker`'s own docstring for what "personal"/"shared" mean.
+_DEFAULT_QUOTA_MAX_NOTES = 0
+_DEFAULT_QUOTA_MAX_BYTES = 0
 
 # Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
 # `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
@@ -188,6 +204,21 @@ def database_app_role_from_env(environ: dict[str, str]) -> str | None:
     return role
 
 
+def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
+    """The configured operator blocklist file (`BLOCKLIST_FILE`), or `None`.
+
+    `None` - the default, nothing set - means no blocklist at all:
+    `vault.blocklist.check` is then a no-op, same "off unless a deployment
+    opts in" behaviour the `QUOTA_*` variables above have. Unlike those,
+    there is nothing to validate here beyond "is a value set" - whether the
+    file at that path actually exists and compiles is `vault.blocklist.
+    load_rules`'s job, called eagerly at startup (`app.open_storage`/
+    `open_services`) so a malformed file refuses startup there, not here.
+    """
+    value = environ.get("BLOCKLIST_FILE")
+    return Path(value) if value else None
+
+
 class EmbeddingConfigError(ValueError):
     """A required `EMBEDDING_*` environment variable is missing or invalid."""
 
@@ -257,6 +288,49 @@ class EmbeddingConfig:
 
 class ServerConfigError(ValueError):
     """An HTTP server environment variable is missing or invalid."""
+
+
+class AuditConfigError(ServerConfigError):
+    """`AUDIT_EXPORT` names an unknown target, or `otlp` without the `otel` extra.
+
+    A subclass of `ServerConfigError` (not a sibling `ValueError`), so every
+    caller that already catches `ServerConfigError` to report a startup
+    config problem with exit code 2 (`cli.py`'s `_serve`) keeps doing so
+    unchanged for this error too - the same reasoning `StorageConfigError`
+    gives above for `VaultConfigError`.
+    """
+
+
+#: `AUDIT_EXPORT` targets this build can export to (#245) - `AuditWriter`
+#: (`audit.py`) picks the matching `observability.audit_export.AuditExporter`
+#: for whichever of these are named; any other value is a config error.
+_AUDIT_EXPORT_TARGETS = frozenset({"stdout", "otlp"})
+_DEFAULT_AUDIT_EXPORT = "off"
+
+
+def audit_export_targets_from_env(environ: dict[str, str]) -> frozenset[str]:
+    """The `AUDIT_EXPORT` targets to export every audit record to (#245).
+
+    `AUDIT_EXPORT` is a comma-separated list drawn from `_AUDIT_EXPORT_TARGETS`
+    (`"stdout"`, `"otlp"`), or `"off"` (the default): the empty `frozenset`
+    means "export nothing", same as unset. Raises `AuditConfigError` naming
+    the offending value if any entry is not one of these - whether `otlp`
+    additionally needs the `otel` extra installed is not checked here (that
+    happens only once `observability.audit_export.AuditExporter.from_env`
+    actually tries to build the OTLP exporter, so a `"git"`/no-`otlp`
+    deployment never needs the extra installed at all to pass this check).
+    """
+    raw = environ.get("AUDIT_EXPORT", _DEFAULT_AUDIT_EXPORT).strip()
+    if not raw or raw == _DEFAULT_AUDIT_EXPORT:
+        return frozenset()
+    targets = frozenset(entry.strip() for entry in raw.split(",") if entry.strip())
+    unknown = targets - _AUDIT_EXPORT_TARGETS
+    if unknown:
+        raise AuditConfigError(
+            f"AUDIT_EXPORT must be 'off' or a comma-separated list drawn from "
+            f"{sorted(_AUDIT_EXPORT_TARGETS)}, got {raw!r}"
+        )
+    return targets
 
 
 @dataclass(frozen=True)
@@ -358,6 +432,36 @@ class ServerConfig:
     ones already in flight still get the full grace period to finish.
     Kubernetes `preStop`/`terminationGracePeriodSeconds` (WP-29) sit outside
     this value entirely, on top of it.
+
+    `quota_user_per_minute`/`quota_user_per_day`, `quota_namespace_per_minute`/
+    `quota_namespace_per_day` and `quota_token_per_minute`/`quota_token_per_day`
+    (`QUOTA_WRITES_PER_MINUTE_USER`/`QUOTA_WRITES_PER_DAY_USER`/
+    `QUOTA_WRITES_PER_MINUTE_NAMESPACE`/`QUOTA_WRITES_PER_DAY_NAMESPACE`/
+    `QUOTA_WRITES_PER_MINUTE_TOKEN`/`QUOTA_WRITES_PER_DAY_TOKEN`, #242) feed
+    `quotas.QuotaChecker`, built by `http.py`'s `create_app` on the same
+    `auth.shared_state.SharedState` the `RATE_LIMIT_*` limiters above share -
+    held across replicas the same way (ADR-0009 §2). Unlike those, every one
+    of these six defaults to `0`, which means "off": a deployment opts a scope
+    and a window in explicitly, there is no quota at all otherwise, same
+    behaviour this server always had. `user` and `token` are independent
+    fixed windows from `namespace`'s, each enforced on its own, never summed;
+    see `quotas.QuotaChecker`'s own docstring for which identity each scope
+    keys on and why `user` only ever applies once a `db.rls.Principal` exists
+    (`"postgres"` mode, ADR-0008 addendum) while `namespace`/`token` apply to
+    both storage backends.
+
+    `quota_max_notes_personal`/`quota_max_bytes_personal`/
+    `quota_max_notes_shared`/`quota_max_bytes_shared` (`QUOTA_MAX_NOTES_PERSONAL`/
+    `QUOTA_MAX_BYTES_PERSONAL`/`QUOTA_MAX_NOTES_SHARED`/`QUOTA_MAX_BYTES_SHARED`,
+    #243) feed `quotas.StorageQuotaChecker`, built by `http.py`'s `create_app`
+    only once `services.storage` is a `storage.postgres.PostgresBackend`
+    ("postgres" mode - the Git backend's `vault_notes` always stays empty, so
+    a note-count/byte-size budget against it would be meaningless). Each of
+    the four defaults to `0`, same "off unless a deployment opts in"
+    behaviour the six `QUOTA_WRITES_*` fields above have; "personal" is the
+    caller's own namespace, "shared" every group/project/org namespace - see
+    `quotas.StorageQuotaChecker`'s own docstring for exactly what counts
+    toward each and why archived notes count toward size but not count.
     """
 
     host: str = _DEFAULT_HOST
@@ -382,6 +486,16 @@ class ServerConfig:
     webhook_burst: float = _DEFAULT_WEBHOOK_BURST
     forwarded_allow_ips: str = _DEFAULT_FORWARDED_ALLOW_IPS
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
+    quota_user_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_user_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_namespace_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_namespace_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_token_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
+    quota_token_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_max_notes_personal: int = _DEFAULT_QUOTA_MAX_NOTES
+    quota_max_bytes_personal: int = _DEFAULT_QUOTA_MAX_BYTES
+    quota_max_notes_shared: int = _DEFAULT_QUOTA_MAX_NOTES
+    quota_max_bytes_shared: int = _DEFAULT_QUOTA_MAX_BYTES
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -413,12 +527,13 @@ class ServerConfig:
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
-        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS` entries of
-        `environ`.
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`/
+        `QUOTA_MAX_*` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
-        variable if `PORT` is not a valid port number, or any size/rate
-        limit is not a positive number.
+        variable if `PORT` is not a valid port number, any size/rate limit is
+        not a positive number, or any `QUOTA_WRITES_*`/`QUOTA_MAX_*` variable
+        is negative.
         """
         host = environ.get("HOST", _DEFAULT_HOST)
         port = _parse_port(environ.get("PORT"))
@@ -456,6 +571,36 @@ class ServerConfig:
         shutdown_grace_seconds = _parse_positive_int(
             environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
         )
+        quota_user_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_USER", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_user_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_USER", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
+        quota_namespace_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_NAMESPACE", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_namespace_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_NAMESPACE", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
+        quota_token_per_minute = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_MINUTE_TOKEN", _DEFAULT_QUOTA_WRITES_PER_MINUTE
+        )
+        quota_token_per_day = _parse_nonnegative_float(
+            environ, "QUOTA_WRITES_PER_DAY_TOKEN", _DEFAULT_QUOTA_WRITES_PER_DAY
+        )
+        quota_max_notes_personal = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_NOTES_PERSONAL", _DEFAULT_QUOTA_MAX_NOTES
+        )
+        quota_max_bytes_personal = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_BYTES_PERSONAL", _DEFAULT_QUOTA_MAX_BYTES
+        )
+        quota_max_notes_shared = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_NOTES_SHARED", _DEFAULT_QUOTA_MAX_NOTES
+        )
+        quota_max_bytes_shared = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_BYTES_SHARED", _DEFAULT_QUOTA_MAX_BYTES
+        )
 
         return cls(
             host=host,
@@ -480,6 +625,16 @@ class ServerConfig:
             webhook_burst=webhook_burst,
             forwarded_allow_ips=forwarded_allow_ips,
             shutdown_grace_seconds=shutdown_grace_seconds,
+            quota_user_per_minute=quota_user_per_minute,
+            quota_user_per_day=quota_user_per_day,
+            quota_namespace_per_minute=quota_namespace_per_minute,
+            quota_namespace_per_day=quota_namespace_per_day,
+            quota_token_per_minute=quota_token_per_minute,
+            quota_token_per_day=quota_token_per_day,
+            quota_max_notes_personal=quota_max_notes_personal,
+            quota_max_bytes_personal=quota_max_bytes_personal,
+            quota_max_notes_shared=quota_max_notes_shared,
+            quota_max_bytes_shared=quota_max_bytes_shared,
         )
 
 
@@ -518,6 +673,37 @@ def _parse_positive_float(environ: dict[str, str], name: str, default: float) ->
         raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
     if value <= 0:
         raise ServerConfigError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _parse_nonnegative_float(environ: dict[str, str], name: str, default: float) -> float:
+    """Like `_parse_positive_float`, but `0` is valid - the "off" value every
+    `QUOTA_WRITES_*` variable (#242) uses, unlike a `RATE_LIMIT_*` pair, which
+    is always enforced."""
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value < 0:
+        raise ServerConfigError(f"{name} must be zero or positive, got {value}")
+    return value
+
+
+def _parse_nonnegative_int(environ: dict[str, str], name: str, default: int) -> int:
+    """Like `_parse_nonnegative_float`, but for an integer count/byte-size budget -
+    the "off" value every `QUOTA_MAX_*` variable (#243) uses."""
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise ServerConfigError(f"{name} must be zero or positive, got {value}")
     return value
 
 

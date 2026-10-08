@@ -86,6 +86,7 @@ from memory_manager.migrate_git import (
 )
 from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
+from memory_manager.vault.blocklist import BlocklistConfigError
 from memory_manager.vault.validate import NOTE_TYPES
 
 __all__ = ["main"]
@@ -573,7 +574,7 @@ async def _run_import_markdown(
     try:
         async with open_storage(os.environ) as storage:
             report = await run_import(items, storage, apply=apply)
-    except VaultConfigError as exc:
+    except (VaultConfigError, BlocklistConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -597,7 +598,7 @@ async def _run_import_claude(file: Path, *, namespace: str, type_: str, apply: b
         async with open_storage(os.environ) as storage:
             kept_items, duplicates = await dedupe_against_vault(items, storage)
             report = await run_import(kept_items, storage, apply=apply)
-    except VaultConfigError as exc:
+    except (VaultConfigError, BlocklistConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -626,7 +627,7 @@ async def _run_import_chatgpt(
         async with open_storage(os.environ) as storage:
             kept_items, duplicates = await dedupe_against_vault(items, storage)
             report = await run_import(kept_items, storage, apply=apply)
-    except VaultConfigError as exc:
+    except (VaultConfigError, BlocklistConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -1061,7 +1062,7 @@ def _serve(*, stdio: bool, http: bool) -> int:
         if stdio:
             return asyncio.run(_serve_stdio())
         return asyncio.run(_serve_http())
-    except (VaultConfigError, EmbeddingConfigError, ServerConfigError) as exc:
+    except (VaultConfigError, EmbeddingConfigError, ServerConfigError, BlocklistConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 

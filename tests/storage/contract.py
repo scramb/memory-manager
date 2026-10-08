@@ -32,10 +32,12 @@ import asyncio
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from memory_manager.storage.base import (
+    BlocklistRejected,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -225,6 +227,25 @@ class ReadWriteEditContract:
             await backend.write(
                 "personal/fact/a.md", content, if_version="new", client="claude-code"
             )
+
+        assert await backend.read("personal/fact/a.md") is None
+
+    async def test_blocklist_hit_is_rejected_without_writing(
+        self, backend: StorageBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        blocklist_file = tmp_path / "blocklist.toml"
+        blocklist_file.write_text(
+            '[[category]]\nname = "example-confidential"\nkeywords = ["topsecret"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BLOCKLIST_FILE", str(blocklist_file))
+        content = note_bytes(body="the plan is topsecret for now\n")
+
+        with pytest.raises(BlocklistRejected) as excinfo:
+            await backend.write(
+                "personal/fact/a.md", content, if_version="new", client="claude-code"
+            )
+        assert excinfo.value.category == "example-confidential"
 
         assert await backend.read("personal/fact/a.md") is None
 

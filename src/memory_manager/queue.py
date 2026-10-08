@@ -59,6 +59,7 @@ from memory_manager.observability.metrics import QUEUE_DEPTH, record_queue_write
 from memory_manager.storage import rules
 from memory_manager.storage.base import (
     AuditHook,
+    BlocklistRejected,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -79,6 +80,7 @@ from memory_manager.vault.sync import ChangeSet
 
 __all__ = [
     "AuditHook",
+    "BlocklistRejected",
     "EditMismatch",
     "InvalidNote",
     "NotFound",
