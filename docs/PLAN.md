@@ -107,7 +107,7 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | Agent runtimes | own agent identity and namespace, server-side write policy with approval queue; MCP integration only in v1 | runtime guards, native plugins | the write guard sits outside the agent's prompt | [ADR-0013](./adr/0013-agent-identity.md), [ADR-0014](./adr/0014-agent-integration-tier.md) |
 | Clients without DCR/CIMD | operator-registered confidential OAuth clients | Entra routing, unsupported | per-user identity for Gemini Enterprise without resource-server mode | [ADR-0015](./adr/0015-preregistered-oauth-clients.md) |
 | Documentation | plain Markdown on GitHub, `docs/README.md` as index | MkDocs Material | no extra tooling | — (owner 2026-10-08) |
-| Client E2E in CI | Open WebUI and agent runtimes against a scripted stub model; CLI clients checked manually with a local harness | model API keys in CI | no secrets or spend in CI | — (owner 2026-10-08) |
+| Client E2E in CI | Open WebUI and agent runtimes against a scripted stub model; CLI clients checked manually with a local harness | model API keys in CI (for now) | no secrets or spend in CI; a CI token with a spend limit may follow, then the harness (#161) runs the CLI checks in CI | — (owner 2026-10-08) |
 | Scaling | stateless Streamable HTTP, no sticky sessions; shared state in Valkey if configured, else Postgres | stateful sessions, Valkey mandatory | any replica serves any request; no extra service for small setups | [ADR-0009](./adr/0009-stateless-replicas.md) |
 | Load test | k6 in a container, p95 thresholds as CI gate | Locust | single binary with built-in thresholds; JS scripts count as test tooling | — (owner 2026-10-07) |
 | Deployment | repo ships its own generic deployment like bring--mcp: Kustomize base in `deploy/` + `deploy/README.md`, Helm chart, Flux example; no operator-specific values (hosts, secrets, cluster names) in this public repo — those live in the operator's own overlay | Helm only; owner-specific manifests in the repo | same pattern as bring--mcp, safe for a public repo ([reference](./research/bring-mcp-reference.md)) | — (owner 2026-10-06) |
@@ -170,7 +170,7 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O18 | Clients without DCR/CIMD (Gemini Enterprise) | — decided: operator-registered confidential OAuth clients (ADR-0015) | — | owner ✔ 2026-10-08 |
 | O19 | Client support matrix | — decided: draft approved as is ([F-02](./features/F-02-client-integrations.md)) | — | owner ✔ 2026-10-08 |
 | O20 | Docs website tooling | — decided: plain Markdown on GitHub, no site generator | — | owner ✔ 2026-10-08 |
-| O21 | Model API keys for CLI E2E in CI | — decided: none; CLI clients verified manually, agents and Open WebUI against a stub model in CI | — | owner ✔ 2026-10-08 |
+| O21 | Model API keys for CLI E2E in CI | — decided: none for now; CLI clients verified manually, agents and Open WebUI against a stub model in CI. Possible later: a CI token with a spend limit for the headless CLI checks | — | owner ✔ 2026-10-08 |
 
 ## Risks
 

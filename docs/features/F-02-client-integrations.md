@@ -34,7 +34,7 @@ The prompt's milestones M1–M5 map to project-wide numbers: M1 → **M12**, M2 
 - Brand logos in README or docs.
 - Native memory plugins for agent runtimes (tier 2) — after 1.0 ([ADR-0014](../adr/0014-agent-integration-tier.md)).
 - A docs website generator; docs stay Markdown on GitHub (O20).
-- Model API keys in CI; CLI clients are checked manually (O21).
+- Model API keys in CI for now; CLI clients are checked manually (O21). A CI token with a spend limit may be added later.
 
 ## Existing users
 
@@ -204,7 +204,7 @@ All open decisions were taken by the owner on 2026-10-08.
 | O18 | Clients without DCR/CIMD (Gemini Enterprise) | operator-registered confidential OAuth clients in our AS | [ADR-0015](../adr/0015-preregistered-oauth-clients.md) |
 | O19 | Support matrix | draft approved as is | this file, `docs/clients/README.md` (#129) |
 | O20 | Docs website tooling | plain Markdown on GitHub, no site generator | PLAN technology decisions |
-| O21 | Model API keys for CLI E2E in CI | none; CLI clients are verified manually with the local harness and the checklist; agent runtimes and Open WebUI run in CI against the scripted stub model | PLAN technology decisions |
+| O21 | Model API keys for CLI E2E in CI | none for now; CLI clients are verified manually with the local harness and the checklist; agent runtimes and Open WebUI run in CI against the scripted stub model. Possibly later: a CI token with a spend limit, then the harness runs the CLI checks in CI as well | PLAN technology decisions |
 
 ## Spikes
 
