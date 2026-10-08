@@ -1,0 +1,323 @@
+---
+# Source: memory-manager/templates/service.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: v1
+kind: Service
+metadata:
+  name: t-memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/version: "0.1.4"
+    helm.sh/chart: memory-manager-0.1.4
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: memory-manager
+    app.kubernetes.io/instance: t
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Source: memory-manager/templates/deployment.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# One replica, `strategy: Recreate`: memory-manager is a single writer to
+# the vault's git remote (ADR-0003/the write queue) and the in-process
+# OAuth login rate limiter (ADR-0004) is per-process state - two replicas
+# would mean two independent writers/limiters, not one scaled service
+# (replicaCount is fixed at 1 by values.schema.json). `Recreate` guarantees
+# the old pod is gone before the new one starts, so there is never a
+# moment with two running at once during a rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: t-memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/version: "0.1.4"
+    helm.sh/chart: memory-manager-0.1.4
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: memory-manager
+      app.kubernetes.io/instance: t
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: memory-manager
+        app.kubernetes.io/instance: t
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: memory-manager
+          image: "ghcr.io/scramb/memory-manager:0.1.4"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Must match exactly what a client is told (ADR-0004).
+            - name: PUBLIC_URL
+              value: "https://memory.example.com"
+            # Assembled by CloudNativePG into the Secret
+            # "<cluster-name>-app" (templates/cnpg-cluster.yaml); "uri" is
+            # the full libpq connection string, including the generated
+            # password.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: t-memory-manager-db-app
+                  key: uri
+            # The vault's own git remote. VAULT_DIR defaults to
+            # /data/vault (the image's own ENV), which is exactly where
+            # the "vault-data" emptyDir below is mounted: Git is the
+            # source of truth, so this clone is rebuilt from VAULT_REMOTE
+            # on every pod start, never persisted on its own.
+            - name: VAULT_REMOTE
+              value: "git@git.example.com:memory-manager/vault.git"
+            - name: VAULT_BRANCH
+              value: "main"
+            - name: VAULT_SSH_KEY_FILE
+              value: /etc/memory-manager/ssh/id_ed25519
+            # Pins the remote's host key instead of trusting whoever
+            # answers on first contact - recommended for every production
+            # deployment (deploy/README.md's "SSH runtime notes").
+            - name: VAULT_SSH_KNOWN_HOSTS
+              value: /etc/memory-manager/ssh/known_hosts
+            - name: VAULT_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: t-memory-manager-secrets
+                  key: VAULT_WEBHOOK_SECRET
+            # Login at /authorize (ADR-0004 L2) - upstream OIDC in
+            # production; setting login's own mode to "password" (plus an
+            # ADMIN_PASSWORD_HASH secret key) is the quickstart alternative.
+            - name: LOGIN_MODE
+              value: "oidc"
+            - name: OIDC_ISSUER
+              value: "https://idp.example.com"
+            - name: OIDC_CLIENT_ID
+              value: "memory-manager"
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: t-memory-manager-secrets
+                  key: OIDC_CLIENT_SECRET
+            # Deny-by-default allowlist (ADR-0004 addendum).
+            - name: OIDC_ALLOWED_EMAILS
+              value: "you@example.com"
+            # Subjects with no entry in LOGIN_NAMESPACE_MAP fall back to
+            # this; adjust to your own vault layout.
+            - name: LOGIN_NAMESPACES
+              value: "personal"
+            - name: OAUTH_CLIENT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: t-memory-manager-secrets
+                  key: OAUTH_CLIENT_SECRET_KEY
+            - name: LOG_FORMAT
+              value: "json"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          # 503 while the vault clone or the database is unreachable.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            # VAULT_DIR (/data/vault, the image's default) and the vault
+            # webhook both live here; emptyDir on purpose - Git is the
+            # source of truth, this clone is rebuilt on every start, never
+            # a thing to persist or back up on its own.
+            - name: vault-data
+              mountPath: /data
+            # Read-only; the Kubernetes Secret volume may mount these
+            # keys group-/other-readable under fsGroup - the server itself
+            # copies an unsafe key to a private 0600 temp file before ever
+            # handing it to `ssh` (vault/repo.py's `_ssh_key_file()`).
+            - name: ssh
+              mountPath: /etc/memory-manager/ssh
+              readOnly: true
+            # HOME=/tmp (the image's own ENV) and the read-only root
+            # filesystem both need this writable.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: vault-data
+          emptyDir: {}
+        - name: ssh
+          secret:
+            secretName: t-memory-manager-secrets
+            items:
+              - key: SSH_PRIVATE_KEY
+                path: id_ed25519
+              - key: SSH_KNOWN_HOSTS
+                path: known_hosts
+        - name: tmp
+          emptyDir: {}
+---
+# Source: memory-manager/templates/ingress.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Classic Ingress, for clusters without Gateway API - off by default; the
+# HTTPRoute template (deploy/httproute.yaml's own equivalent, enabled by
+# default) is the default path. Enable at most one of the two for a given
+# install.
+---
+# Source: memory-manager/templates/networkpolicy.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default (deploy/README.md: "the namespace itself, and any
+# network policy restricting who may reach the pod" is an operator's own
+# cluster topology, not this project's to decide) - documented here for
+# anyone who wants it anyway. Ingress is scoped to configurable
+# namespace/pod selectors on the MCP port; egress defaults to
+# allow-all-with-DNS, because the vault's git remote, the OIDC issuer and
+# an embedding provider are all operator-specific hostnames whose IPs this
+# chart cannot know - set the egress block's "allowAll" to false and list
+# its own "rules" (raw NetworkPolicyEgressRule entries) to lock it down to
+# your own resolved ranges.
+---
+# Source: memory-manager/templates/secret.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Chart-managed Secret, built straight from the secrets block's own
+# "values" in plain `values.yaml`/`--set` - the quick-install path, off
+# by default. A production install should set the secrets block's own
+# "existingSecret" to a Secret created out-of-band (External Secrets
+# Operator, SOPS, `kubectl create secret`, ...) instead: a Helm values
+# file (even one never committed) is
+# a worse place for credentials than a Secret resource that at least gets
+# etcd-level encryption-at-rest and RBAC on its own. Same key names either
+# way (deploy/secrets.yaml's own table).
+---
+# Source: memory-manager/templates/serviceaccount.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default (deploy/deployment.yaml's own pod sets
+# automountServiceAccountToken: false and needs no identity of its own);
+# an operator who wires up IRSA/Workload Identity or a PSP-adjacent policy
+# bound to a ServiceAccount turns this on in their own values.
+---
+# Source: memory-manager/templates/servicemonitor.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default, needs the Prometheus Operator's CRDs installed.
+# observability/metrics.py's own /metrics - no auth of its own, scraped
+# only from inside the cluster; restrict further with networkPolicy if
+# the Prometheus Operator is not in the same namespace.
+---
+# Source: memory-manager/templates/cnpg-cluster.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Postgres 16 + pgvector (PLAN: a derived, fully rebuildable search index -
+# `memory-manager reindex --full` repopulates it from the vault, so losing
+# this Cluster loses only the index, never a note). Requires the
+# CloudNativePG operator already installed in the cluster - this chart
+# only renders the Cluster custom resource, not the operator itself.
+#
+# The cnpg block's `imageName` value must be a CNPG operand image (the
+# stock `pgvector/pgvector` image compose.yaml runs locally is NOT one -
+# CNPG's instance manager requires its own image layout); the default,
+# `ghcr.io/cloudnative-pg/postgresql:16-standard-trixie`, already ships the
+# vector extension compiled in. `postInitApplicationSQL` creates it once,
+# as the bootstrap (superuser) role, right after `initdb` - the app's own
+# database role is never a superuser, and `CREATE EXTENSION` needs one
+# unless the extension is already there, at which point memory-manager's
+# own migration 0001 (`CREATE EXTENSION IF NOT EXISTS vector`) runs as a
+# no-op requiring no such privilege (verified directly in
+# `tests/db/test_migrations.py`,
+# `TestMigrate::test_succeeds_for_a_non_superuser_role_once_vector_already_exists`).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: t-memory-manager-db
+  labels:
+    app.kubernetes.io/name: memory-manager
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/version: "0.1.4"
+    helm.sh/chart: memory-manager-0.1.4
+    app.kubernetes.io/managed-by: Helm
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16-standard-trixie
+  bootstrap:
+    initdb:
+      database: memory_manager
+      owner: memory_manager
+      postInitApplicationSQL:
+        - "CREATE EXTENSION IF NOT EXISTS vector;"
+  storage:
+    size: 5Gi
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+---
+# Source: memory-manager/templates/httproute.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The whole host goes to the app: the MCP endpoint (/mcp), the embedded
+# authorization server's own routes and metadata (/.well-known/*,
+# /authorize, /token, /register, /revoke), the vault webhook
+# (/hooks/vault) and /healthz, /readyz. The app itself decides who gets
+# in - every MCP request needs a bearer token it issued or verified.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: t-memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+    app.kubernetes.io/instance: t
+    app.kubernetes.io/version: "0.1.4"
+    helm.sh/chart: memory-manager-0.1.4
+    app.kubernetes.io/managed-by: Helm
+spec:
+  parentRefs:
+    - name: gateway-name
+      namespace: gateway-namespace
+  hostnames:
+    - memory.example.com
+  rules:
+    - backendRefs:
+        - name: t-memory-manager
+          port: 8080

@@ -6,12 +6,23 @@
 # never by editing this one in place. `charts/memory-manager/README.md`
 # documents every key in a table; this file is the inline reference.
 
-# Fixed at 1 (also enforced by values.schema.json: maximum 1) -
-# memory-manager is a single writer to the vault's git remote and the
-# in-process OAuth login rate limiter is per-process state
-# (deploy/deployment.yaml's own comment); two replicas would mean two
-# independent writers/limiters, not one scaled service. 0 is allowed, to
-# scale the deployment down deliberately.
+# Source of truth for notes (ADR-0007). "git" (default) keeps Postgres as
+# a derived, fully rebuildable search index; "postgres" (enterprise) makes
+# Postgres itself the source of truth, with append-only revisions. Only
+# "postgres" may run more than one replica or an autoscaler (ADR-0009 §6) -
+# enforced by both values.schema.json's own "if"/"then" and
+# memory-manager's own "validate" helper, since --skip-schema-validation
+# exists.
+storage:
+  backend: git
+
+# Fixed at 0 or 1 while storage's own backend is "git" (also enforced by
+# values.schema.json) - memory-manager is a single writer to the vault's
+# git remote and the in-process OAuth login rate limiter is per-process
+# state (deploy/deployment.yaml's own comment); two replicas would mean
+# two independent writers/limiters, not one scaled service. 0 is always
+# allowed, to scale the deployment down deliberately. A "postgres"
+# backend lifts the maximum (ADR-0007, ADR-0009 §6).
 replicaCount: 1
 
 image:

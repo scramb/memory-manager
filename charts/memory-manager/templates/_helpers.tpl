@@ -85,3 +85,23 @@ deployment.yaml rely on exactly this).
 {{- define "memory-manager.cnpgClusterName" -}}
 {{- printf "%s-db" (include "memory-manager.fullname" .) }}
 {{- end }}
+
+{{/*
+Fails fast when storage's own backend is "git" and combined with more
+than one replica or any autoscaler (ADR-0007, ADR-0009 §6: only a
+"postgres" backend may scale) - a template-side guard alongside
+values.schema.json's own "if"/"then", since `helm template
+--skip-schema-validation` exists. Included by templates/deployment.yaml;
+renders no output of its own.
+*/}}
+{{- define "memory-manager.validate" -}}
+{{- if eq .Values.storage.backend "git" }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail (printf "storage.backend \"git\" allows at most 1 replica, got %d - only storage.backend \"postgres\" may scale (ADR-0007, ADR-0009 §6)" (int .Values.replicaCount)) }}
+{{- end }}
+{{- $autoscaling := .Values.autoscaling }}
+{{- if and $autoscaling (or $autoscaling.enabled (and $autoscaling.keda $autoscaling.keda.enabled)) }}
+{{- fail "storage.backend \"git\" does not allow an autoscaler (HPA or KEDA) - only storage.backend \"postgres\" may scale (ADR-0007, ADR-0009 §6)" }}
+{{- end }}
+{{- end }}
+{{- end }}

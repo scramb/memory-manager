@@ -4,11 +4,22 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "storage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["git", "postgres"],
+          "description": "Source of truth for notes (ADR-0007). \"git\" (default) caps replicaCount at 1 and refuses an autoscaler; \"postgres\" (enterprise) lifts both (ADR-0009 §6)."
+        }
+      },
+      "required": ["backend"]
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 1,
-      "description": "Fixed at 0 or 1 - memory-manager is a single writer to the vault's git remote, never a scaled service."
+      "description": "0 or 1 while storage.backend is \"git\" - memory-manager is then a single writer to the vault's git remote, never a scaled service. storage.backend \"postgres\" lifts the maximum."
     },
     "image": {
       "type": "object",
@@ -165,5 +176,20 @@
       }
     }
   },
-  "required": ["image", "service", "publicUrl", "vault"]
+  "required": ["image", "service", "publicUrl", "vault", "storage"],
+  "if": {
+    "properties": {
+      "storage": {
+        "properties": { "backend": { "const": "git" } }
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "replicaCount": {
+        "maximum": 1,
+        "description": "storage.backend \"git\" allows at most 1 replica (ADR-0007, ADR-0009 §6)."
+      }
+    }
+  }
 }

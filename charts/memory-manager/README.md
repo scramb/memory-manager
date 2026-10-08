@@ -2,8 +2,9 @@
 
 Helm packaging of the same server `deploy/` ships as a generic Kustomize base (`deploy/README.md`):
 the `Deployment`/`Service`, a `HTTPRoute`/`Ingress`, an optional CloudNativePG `Cluster` and an
-optional NetworkPolicy, restricted Pod Security by default, single writer (`replicaCount` fixed at
-0 or 1). For operators who prefer Helm over Flux+Kustomize. Every tagged release publishes this
+optional NetworkPolicy, restricted Pod Security by default, single writer while `storage` → `backend`
+is `git` (`replicaCount` 0 or 1 - `postgres` lifts the maximum, ADR-0007/ADR-0009 §6). For operators
+who prefer Helm over Flux+Kustomize. Every tagged release publishes this
 chart as a signed OCI artifact (`docs/releasing.md`):
 
 ```sh
@@ -42,7 +43,8 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 
 | Key | Default | Description |
 |---|---|---|
-| `replicaCount` | `1` | Fixed at 0 or 1 (`values.schema.json`) - single writer to the vault's git remote and per-process OAuth login rate limiter, never a scaled service |
+| `storage` → `backend` | `git` | `git` (default, ADR-0007) or `postgres` (enterprise) - only `postgres` may run more than one replica or an autoscaler (ADR-0009 §6), enforced by `values.schema.json` and the chart's own `validate` helper |
+| `replicaCount` | `1` | 0 or 1 while `storage` → `backend` is `git` (`values.schema.json`) - single writer to the vault's git remote and per-process OAuth login rate limiter, never a scaled service; `postgres` lifts the maximum |
 | `image` → `repository` | `ghcr.io/scramb/memory-manager` | |
 | `image` → `tag` | `""` | Defaults to the chart's own `appVersion`; never `latest` |
 | `image` → `pullPolicy` | `IfNotPresent` | |
