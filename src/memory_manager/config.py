@@ -18,15 +18,19 @@ __all__ = [
     "AuditConfigError",
     "EmbeddingConfig",
     "EmbeddingConfigError",
+    "EmbeddingDimensionPinError",
     "ServerConfig",
     "ServerConfigError",
     "StorageConfigError",
     "VaultConfig",
     "VaultConfigError",
+    "WorkerConfig",
+    "WorkerConfigError",
     "audit_export_targets_from_env",
     "blocklist_file_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
+    "rate_limit_sweep_floor_seconds",
     "storage_backend_from_env",
 ]
 
@@ -42,6 +46,17 @@ _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8080
 _DEFAULT_MCP_PATH = "/mcp"
 _FALSY_BOOL_ENV = frozenset({"0", "false", "no", "off", ""})
+
+# `memory-manager worker`'s own minimal Starlette app (#217, ADR-0009 §4) - a
+# different default port than `_DEFAULT_PORT` (the `api` process's), so an
+# operator running both on one host (or one `podman`/compose network) never
+# has to pick one before the other binds.
+_DEFAULT_WORKER_HOST = "127.0.0.1"
+_DEFAULT_WORKER_PORT = 8090
+
+# `WorkerConfig.jobs_poll_seconds` (#218): docs/research/enterprise.md
+# §"Queue" names 1-5s polling as the `jobs` outbox's NOTIFY fallback.
+_DEFAULT_JOBS_POLL_SECONDS = 5.0
 
 # Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
 # "burst" is the token bucket's capacity - how many calls a key can make
@@ -70,6 +85,12 @@ _DEFAULT_QUOTA_WRITES_PER_DAY = 0.0
 # StorageQuotaChecker`'s own docstring for what "personal"/"shared" mean.
 _DEFAULT_QUOTA_MAX_NOTES = 0
 _DEFAULT_QUOTA_MAX_BYTES = 0
+# The fixed brute-force window `auth.login_password`'s own `_WINDOW_SECONDS`
+# uses (ADR-0004: "5 failures / 10 min") - duplicated here rather than
+# imported, since that name is private to its own module.
+# `rate_limit_sweep_floor_seconds` below folds it into the sweep's threshold,
+# so a running brute-force window is never swept away mid-window either.
+_LOGIN_BRUTE_FORCE_WINDOW_SECONDS = 10 * 60.0
 
 # Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
 # `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
@@ -221,6 +242,18 @@ def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
 
 class EmbeddingConfigError(ValueError):
     """A required `EMBEDDING_*` environment variable is missing or invalid."""
+
+
+class EmbeddingDimensionPinError(EmbeddingConfigError):
+    """`EMBEDDING_DIMENSIONS` (or a provider's actual response) disagrees with the
+    dimension a Postgres-mode backend was first migrated with (PLAN O23,
+    ADR-0016, #220: pinned at first `migrate(..., backend="postgres")`, immutable
+    afterwards). Raised by `db.migrate.migrate` at startup and by
+    `index.indexer.Indexer` the first time a provider's own response disagrees -
+    a subclass of `EmbeddingConfigError` so every caller that already catches
+    that broadly (`cli.py`'s command dispatch) reports this the same way,
+    with exit code 2, rather than an unhandled traceback.
+    """
 
 
 @dataclass(frozen=True)
@@ -638,15 +671,118 @@ class ServerConfig:
         )
 
 
-def _parse_port(raw: str | None) -> int:
+def rate_limit_sweep_floor_seconds(config: ServerConfig) -> float:
+    """The longest fixed window any `auth.ratelimit.RateLimiter`/the login
+    brute-force check could have opened against `config`'s `RATE_LIMIT_*`
+    settings - the floor `PostgresSharedState.sweep_expired_windows`'s
+    `older_than_seconds` must never go under (that function's own docstring),
+    so a window still being counted against is never swept away mid-window.
+
+    One home for this formula, imported by both `http.py`'s own periodic
+    cleanup sweep and `worker.py`'s equivalent job for the `"postgres"`
+    backend (#217) - both read the same `RATE_LIMIT_*` environment into their
+    own `ServerConfig` and must agree on this floor, which a second,
+    independently maintained copy of the formula could only risk drifting
+    out of.
+
+    `RateLimiter.__init__`'s own `window_seconds = burst * 60 / per_minute`
+    formula, recomputed here rather than read off a built `RateLimiter`
+    (which keeps that value private) - the four `(burst, per_minute)` pairs
+    `http.py`'s `create_app` builds its limiters from, plus the one fixed
+    window `auth.login_password` uses, are the only windows either process
+    ever opens on a `SharedState` backend.
+    """
+    pairs = (
+        (config.mcp_burst, config.mcp_per_minute),
+        (config.write_burst, config.write_per_minute),
+        (config.oauth_burst, config.oauth_per_minute),
+        (config.webhook_burst, config.webhook_per_minute),
+    )
+    windows = [burst * 60.0 / per_minute for burst, per_minute in pairs]
+    windows.append(_LOGIN_BRUTE_FORCE_WINDOW_SECONDS)
+    return max(windows)
+
+
+class WorkerConfigError(ValueError):
+    """A `memory-manager worker` environment variable is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    """Configuration for `memory-manager worker` (#217, ADR-0009 §4: "worker:
+    embedding queue, Graph delta sync, retention, OAuth cleanup, with its own
+    HPA").
+
+    `host`/`port` (`WORKER_HOST`/`WORKER_PORT`, default `127.0.0.1:8090`) is
+    where the worker's own minimal Starlette app binds - `/healthz`,
+    `/readyz`, `/metrics`, the same three paths `ServerConfig`'s `api`
+    process serves, but on a different default port: a deployment running
+    both processes on one host must be able to tell the two apart.
+
+    `shutdown_grace_seconds` reads the same `SHUTDOWN_GRACE_SECONDS`
+    variable and default (20s) `ServerConfig` does (ADR-0009 §1/§5) - one
+    knob, not two, since both processes drain the same way on `SIGTERM`:
+    stop scheduling new work, let whatever is already running finish within
+    this many seconds, then exit.
+
+    `jobs_poll_seconds` (`JOBS_POLL_SECONDS`, default 5s) is the `jobs`
+    outbox consumer's poll fallback (#218, `worker.consume_jobs`,
+    docs/research/enterprise.md §"Queue": "1-5 s polling as fallback") -
+    `LISTEN/NOTIFY` is only ever a wake-up hint, so this is the ceiling on
+    how long a claimable job can wait for a notification that never
+    arrives, not how often the worker normally wakes up.
+    """
+
+    host: str = _DEFAULT_WORKER_HOST
+    port: int = _DEFAULT_WORKER_PORT
+    shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
+    jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS
+
+    @classmethod
+    def from_env(cls, environ: dict[str, str]) -> WorkerConfig:
+        """Build a `WorkerConfig` from `WORKER_HOST`/`WORKER_PORT`/
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS` entries of `environ`.
+
+        Raises `WorkerConfigError` with a message naming the offending
+        variable if `WORKER_PORT` is not a valid port number, or either
+        `SHUTDOWN_GRACE_SECONDS` or `JOBS_POLL_SECONDS` is not a positive
+        number.
+        """
+        host = environ.get("WORKER_HOST", _DEFAULT_WORKER_HOST)
+        try:
+            port = _parse_port(
+                environ.get("WORKER_PORT"), name="WORKER_PORT", default=_DEFAULT_WORKER_PORT
+            )
+            shutdown_grace_seconds = _parse_positive_int(
+                environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
+            )
+            jobs_poll_seconds = _parse_positive_float(
+                environ, "JOBS_POLL_SECONDS", _DEFAULT_JOBS_POLL_SECONDS
+            )
+        except ServerConfigError as exc:
+            # `_parse_port`/`_parse_positive_int`/`_parse_positive_float` raise
+            # `ServerConfigError` (shared with `ServerConfig`, which reuses all three) -
+            # re-raised as this module's own `WorkerConfigError` so a caller catching
+            # errors for `memory-manager worker` never has to also know about
+            # `ServerConfig`'s.
+            raise WorkerConfigError(str(exc)) from exc
+        return cls(
+            host=host,
+            port=port,
+            shutdown_grace_seconds=shutdown_grace_seconds,
+            jobs_poll_seconds=jobs_poll_seconds,
+        )
+
+
+def _parse_port(raw: str | None, *, name: str = "PORT", default: int = _DEFAULT_PORT) -> int:
     if raw is None:
-        return _DEFAULT_PORT
+        return default
     try:
         port = int(raw)
     except ValueError as exc:
-        raise ServerConfigError(f"PORT must be an integer, got {raw!r}") from exc
+        raise ServerConfigError(f"{name} must be an integer, got {raw!r}") from exc
     if not 1 <= port <= 65535:
-        raise ServerConfigError(f"PORT must be between 1 and 65535, got {port}")
+        raise ServerConfigError(f"{name} must be between 1 and 65535, got {port}")
     return port
 
 

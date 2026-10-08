@@ -9,7 +9,9 @@ module is the two pieces of Python the SQL alone cannot provide:
 
 - `grant_app_role`: an idempotent, owner-run grant of exactly the
   privileges a request-serving role needs (table DML, the `chunks_id_seq`
-  sequence, `EXECUTE` on all four functions) - and nothing on `namespaces`
+  sequence, `EXECUTE` on every function it finds, `mm_namespace_kind`
+  (ADR-0016, #220, Postgres-mode-only) included when present) - and nothing
+  on `namespaces`
   or the membership tables, which the `SECURITY DEFINER` functions read
   with the owner's own privileges regardless of the caller.
 - `request_identity`: the per-transaction role switch and identity
@@ -75,16 +77,31 @@ _Connectable = asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 # is append-only: no `update`/`delete` grant.
 _FULL_DML_TABLES = ("vault_notes", "notes", "chunks", "links")
 _APPEND_ONLY_TABLES = ("vault_revisions",)
+# `jobs` (migration 0011_jobs.sql, #218): a request transaction only ever
+# enqueues - `claim`/`complete`/`fail`/`fail_or_retry` run as the owner, never
+# under this role (`jobs.py`'s own module docstring) - so, unlike
+# `_APPEND_ONLY_TABLES` above, the app role gets no `SELECT` here at all; it
+# can insert a row but never read one back.
+_INSERT_ONLY_TABLES = ("jobs",)
+# `schema_migrations`: `index.indexer.Indexer._uses_vector_layout` reads it
+# on `index_on_connection`'s own, possibly role-switched connection (ADR-0016,
+# #220) - never written under this role, so `select` alone is enough.
+_SELECT_ONLY_TABLES = ("schema_migrations",)
 # `(name, argument signature)`: `grant_app_role`'s loop below formats the
 # signature straight into the `GRANT EXECUTE` statement, so
 # `mm_principal_namespaces` (0009_namespace_resolution.sql) - the one
 # function here that is not zero-arg - carries its own `(text[])` alongside
-# the other three's `()`.
+# the other three's `()`. `mm_namespace_kind` (ADR-0016,
+# `migrations/postgres/0012_vector_layout.sql`, #220) only exists on a
+# database `db.migrate.migrate` migrated with `backend="postgres"` - the
+# loop below checks each function exists before granting on it, so a
+# `backend="git"` database (every pre-existing caller/test) is unaffected.
 _FUNCTIONS = (
     ("mm_readable_ns", "()"),
     ("mm_writable_ns", "()"),
     ("mm_ensure_personal_ns", "()"),
     ("mm_principal_namespaces", "(text[])"),
+    ("mm_namespace_kind", "(text)"),
 )
 
 
@@ -137,6 +154,10 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
             await conn.execute(f'grant select, insert, update, delete on "{table}" to "{role}"')
         for table in _APPEND_ONLY_TABLES:
             await conn.execute(f'grant select, insert on "{table}" to "{role}"')
+        for table in _INSERT_ONLY_TABLES:
+            await conn.execute(f'grant insert on "{table}" to "{role}"')
+        for table in _SELECT_ONLY_TABLES:
+            await conn.execute(f'grant select on "{table}" to "{role}"')
         # `chunks.id` is a plain `bigserial`, not an identity column: its
         # sequence needs its own `USAGE` grant for `insert` to work. The
         # other tables' primary keys are either client-supplied text
@@ -145,6 +166,15 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
         # sequence grant on top of table `INSERT`.
         await conn.execute(f'grant usage on sequence "chunks_id_seq" to "{role}"')
         for function, signature in _FUNCTIONS:
+            # `to_regprocedure` returns `NULL` instead of raising for a function
+            # that does not exist - `mm_namespace_kind` on a `backend="git"`
+            # database (module docstring above) - so this grant is simply
+            # skipped there rather than failing the whole call.
+            exists = await conn.fetchval(
+                "select to_regprocedure('public.' || $1 || $2) is not null", function, signature
+            )
+            if not exists:
+                continue
             await conn.execute(f'grant execute on function "{function}"{signature} to "{role}"')
 
 

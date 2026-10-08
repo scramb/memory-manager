@@ -16,6 +16,16 @@ gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
+`worker` runs `worker.py`'s periodic singleton jobs, plus the `jobs` outbox
+consumer (#218, `worker.consume_jobs`), as a separate process (#217,
+ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still runs
+its own equivalent sweep inside every `serve --http` process instead
+(ADR-0009 §6, `http.py`'s `_cleanup_loop`); connects to Postgres as the
+owner, like `reindex`/`token ...` already do (ADR-0008 addendum), never
+switching to `DATABASE_APP_ROLE`. The embedding queue (#219) runs here too:
+`EMBEDDING_*` is read exactly like `reindex`'s own does, to build the one
+`index.indexer.Indexer` this process claims `"embed_note"` jobs through.
+
 `serve --http` with `DATABASE_URL` set turns bearer-token auth on for
 `/mcp` (`http.py`); without it (no token to ever verify a request against)
 it instead refuses to bind to a non-loopback host unless
@@ -58,6 +68,8 @@ from memory_manager.config import (
     ServerConfigError,
     StorageConfigError,
     VaultConfigError,
+    WorkerConfig,
+    WorkerConfigError,
     storage_backend_from_env,
 )
 from memory_manager.db.migrate import migrate
@@ -88,6 +100,12 @@ from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.blocklist import BlocklistConfigError
 from memory_manager.vault.validate import NOTE_TYPES
+from memory_manager.worker import (
+    build_job_handlers,
+    build_jobs,
+    create_worker_app,
+    enqueue_pending_embeddings,
+)
 
 __all__ = ["main"]
 
@@ -174,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(stdio=args.stdio, http=args.http)
 
+    if args.command == "worker":
+        return _run_worker_command()
+
     if args.command == "hash-password":
         return _run_hash_password()
 
@@ -209,7 +230,21 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    return asyncio.run(_reindex(database_url, vault_dir, embedding_config, full=args.full))
+    try:
+        return asyncio.run(
+            _reindex(
+                database_url,
+                vault_dir,
+                embedding_config,
+                full=args.full,
+                backend=storage_backend,
+            )
+        )
+    except EmbeddingConfigError as exc:
+        # `EmbeddingDimensionPinError` (ADR-0016, #220): `migrate()` refuses a
+        # dimension pin mismatch only once connected, inside `_reindex` itself.
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -403,6 +438,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="serve over Streamable HTTP, binding to $HOST:$PORT (default 127.0.0.1:8080)",
     )
 
+    subparsers.add_parser(
+        "worker",
+        help="run periodic singleton jobs (#217) - requires STORAGE_BACKEND=postgres",
+    )
+
     token_parser = subparsers.add_parser(
         "token", help="manage static bearer tokens for the HTTP transport (ADR-0004)"
     )
@@ -539,7 +579,7 @@ def _run_export_command(
 async def _run_export_postgres_command(
     out_path: Path, *, include_archive: bool, namespaces: list[str] | None
 ) -> int:
-    pool = await _open_migrated_pool()
+    pool = await _open_migrated_pool(backend="postgres")
     if pool is None:
         return 2
     try:
@@ -702,7 +742,7 @@ async def _run_migrate_git_to_postgres_apply(vault: str | None, raw_maps: list[s
         print("dry run found problems - nothing was imported", file=sys.stderr)
         return 1
 
-    pool = await _open_migrated_pool()
+    pool = await _open_migrated_pool(backend="postgres")
     if pool is None:
         return 2
     try:
@@ -773,8 +813,17 @@ def _print_migrate_import_report(report: MigrateImportReport) -> None:
         print("one or more namespaces already held notes - nothing was overwritten")
 
 
-async def _open_migrated_pool() -> asyncpg.Pool | None:
-    """A connection pool to `DATABASE_URL`, migrated first. `None` if it is unset."""
+async def _open_migrated_pool(
+    *, backend: str = "git", embedding_dimensions: int | None = None
+) -> asyncpg.Pool | None:
+    """A connection pool to `DATABASE_URL`, migrated first. `None` if it is unset.
+
+    `backend`/`embedding_dimensions` are threaded straight into
+    `db.migrate.migrate` - `token create|list|revoke` never pass either
+    (tokens are backend-agnostic, `backend`'s default is enough), while
+    `export`'s and `migrate git-to-postgres`'s own Postgres-only callers
+    pass `backend="postgres"` explicitly (ADR-0016, #220).
+    """
     try:
         database_url = _require_env("DATABASE_URL")
     except _MissingEnvironment as exc:
@@ -783,7 +832,7 @@ async def _open_migrated_pool() -> asyncpg.Pool | None:
 
     migration_conn = await asyncpg.connect(database_url)
     try:
-        await migrate(migration_conn)
+        await migrate(migration_conn, backend=backend, embedding_dimensions=embedding_dimensions)
     finally:
         await migration_conn.close()
 
@@ -880,19 +929,28 @@ async def _run_token_revoke(name: str) -> int:
 
 
 async def _reindex(
-    database_url: str, vault_dir: Path | None, embedding_config: EmbeddingConfig, *, full: bool
+    database_url: str,
+    vault_dir: Path | None,
+    embedding_config: EmbeddingConfig,
+    *,
+    full: bool,
+    backend: str,
 ) -> int:
     """Reindex `database_url` from `vault_dir` (`"git"`) or `vault_notes` (`"postgres"`).
 
     `vault_dir` is `None` for the `postgres` backend (ADR-0007 §2, WP-18):
     there is no vault to walk, `vault_notes` is `Indexer`'s source instead
-    (`VaultNotesSource`).
+    (`VaultNotesSource`). `backend` is the caller's own already-computed
+    `storage_backend_from_env` value, threaded into `migrate()` (ADR-0016,
+    #220) rather than re-derived here from `vault_dir is None`.
     """
     # A plain connection for the migration, not one from the pool below:
     # `migrate` takes an `asyncpg.Connection`, not a pool's connection proxy.
     migration_conn = await asyncpg.connect(database_url)
     try:
-        await migrate(migration_conn)
+        await migrate(
+            migration_conn, backend=backend, embedding_dimensions=embedding_config.dimensions
+        )
     finally:
         await migration_conn.close()
 
@@ -962,7 +1020,11 @@ async def _eval(
     try:
         migration_conn = await asyncpg.connect(eval_db_url)
         try:
-            await migrate(migration_conn)
+            # `backend="git"` (named explicitly): `eval` always indexes from
+            # `vault_dir` (the research baseline this schema measures,
+            # docs/research/vector-index.md §4) - never the Postgres-mode,
+            # ADR-0016 layout (#220).
+            await migrate(migration_conn, backend="git")
         finally:
             await migration_conn.close()
 
@@ -1148,6 +1210,99 @@ async def _serve_http() -> int:
     )
     server = GracefulShutdownServer(uvicorn_config)
     await server.serve()
+    return 0
+
+
+def _run_worker_command() -> int:
+    """`memory-manager worker` (#217) - logging first, same reasoning `_serve` gives for
+    `serve`, then every config/startup error this process can raise caught and reported
+    the same way `_serve` already does for `serve`'s own.
+    """
+    configure_logging_from_env(os.environ)
+    try:
+        return asyncio.run(_serve_worker())
+    except (EmbeddingConfigError, ServerConfigError, StorageConfigError, WorkerConfigError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+async def _serve_worker() -> int:
+    """Run `worker.py`'s job registry against `DATABASE_URL`, serving its own
+    `/healthz`/`/readyz`/`/metrics` on `WorkerConfig.port` until `SIGTERM`/`SIGINT`.
+
+    Refuses `STORAGE_BACKEND=git` (module docstring: that backend keeps running its
+    equivalent sweep inside every `serve --http` process instead, ADR-0009 §6) before
+    opening a single connection. Connects to Postgres as the owner
+    (`_open_migrated_pool`, the same connection shape `reindex`/`token ...` already
+    use) - never `DATABASE_APP_ROLE` (ADR-0008 addendum: a system identity, not a
+    request principal).
+
+    Also opens one dedicated connection (`jobs_listen_conn`, never from
+    `pool`) for the `jobs` outbox's `LISTEN` (#218, `worker.consume_jobs`'s
+    own docstring: a pool connection's `RESET ALL` on release would drop it)
+    - `DATABASE_URL` is read a second time here rather than threaded out of
+    `_open_migrated_pool`, which only ever returns the pool it already
+    opened from that same URL; by this point `_open_migrated_pool` having
+    returned a pool at all already proves the variable is set.
+
+    Builds one `index.indexer.Indexer` over `VaultNotesSource()` (#219), the
+    same `vault_notes`-backed source `app.py`'s `"postgres"` branch indexes
+    through on the request path - this process never touches a vault
+    working copy. Before `consume_jobs` starts claiming anything,
+    `worker.enqueue_pending_embeddings` runs this indexer's own startup
+    catch-up once, then `worker.build_job_handlers(indexer)` registers its
+    `"embed_note"` handler.
+    """
+    storage_backend = storage_backend_from_env(dict(os.environ))
+    if storage_backend != "postgres":
+        print(
+            f"worker: refusing STORAGE_BACKEND={storage_backend!r} - the worker only runs "
+            "singleton jobs for the postgres backend (ADR-0009 §4); the git backend keeps "
+            "running its cleanup sweep inside the api process itself (ADR-0009 §6)",
+            file=sys.stderr,
+        )
+        return 2
+
+    config = ServerConfig.from_env(dict(os.environ))
+    worker_config = WorkerConfig.from_env(dict(os.environ))
+    embedding_config = EmbeddingConfig.from_env(dict(os.environ))
+
+    pool = await _open_migrated_pool(
+        backend=storage_backend, embedding_dimensions=embedding_config.dimensions
+    )
+    if pool is None:
+        return 2
+
+    jobs_listen_conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    try:
+        provider = provider_from_config(embedding_config)
+        indexer = Indexer(pool, VaultNotesSource(), provider)
+        enqueued = await enqueue_pending_embeddings(indexer)
+        if enqueued:
+            _logger.info("worker startup: enqueued %d catch-up embedding job(s)", enqueued)
+
+        jobs = build_jobs(config)
+        job_handlers = build_job_handlers(indexer)
+        app = create_worker_app(
+            pool,
+            jobs,
+            shutdown_grace_seconds=worker_config.shutdown_grace_seconds,
+            jobs_listen_conn=jobs_listen_conn,
+            job_handlers=job_handlers,
+            jobs_poll_seconds=worker_config.jobs_poll_seconds,
+        )
+        uvicorn_config = uvicorn.Config(
+            app,
+            host=worker_config.host,
+            port=worker_config.port,
+            log_config=None,
+            timeout_graceful_shutdown=worker_config.shutdown_grace_seconds,
+        )
+        server = GracefulShutdownServer(uvicorn_config)
+        await server.serve()
+    finally:
+        await jobs_listen_conn.close()
+        await pool.close()
     return 0
 
 

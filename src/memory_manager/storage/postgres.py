@@ -18,7 +18,11 @@ back the whole write exactly like any other failure in that transaction
 unchanged); `index_commit_hook` runs only once that transaction has already
 committed, with the ids of every note the write just touched, and is never
 awaited by anything that could make a write wait on it (`Indexer.schedule_embeddings`
-only ever starts a background task). Without either hook (every other
+only ever starts a background task) - `app.py` no longer wires one (#219):
+`index_on_connection` itself now enqueues the note's embedding as a `jobs`
+row, on the same connection, inside the same transaction as `index_hook`
+runs in, for the separate `memory-manager worker` process to pick up once
+this transaction has committed. Without either hook (every other
 caller, most tests), indexing is simply skipped - the two parameters default
 to `None` and `PostgresBackend(pool)` keeps working unchanged.
 

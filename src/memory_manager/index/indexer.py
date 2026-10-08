@@ -26,22 +26,41 @@ all of them are in the index, so a forward reference is correct the first
 time a vault is rebuilt from scratch.
 
 Embedding a note's chunks (#27) happens best-effort right after it is
-upserted, via the optional `provider` constructor argument. A missing
-provider or a failed embedding call both leave `chunks.embedding` `NULL` -
-indexing itself never blocks on it. `embed_pending`, called at the end of
-`reindex`, is the catch-up pass: it re-embeds every chunk still missing an
-embedding or stamped with a model other than the provider's current one,
-so a provider outage or a model change both self-heal on the next reindex.
+upserted, via the optional `provider` constructor argument - for the
+`"git"` backend's batch paths (`index_paths`/`_index_one`), unchanged
+(#219's "not included"). A missing provider or a failed embedding call
+both leave `chunks.embedding` `NULL` - indexing itself never blocks on it.
+`embed_pending`, called at the end of `reindex` for a `_FileTreeSource`
+(the `"git"` backend), is the catch-up pass: it re-embeds every chunk
+still missing an embedding or stamped with a model other than the
+provider's current one, so a provider outage or a model change both
+self-heal on the next reindex. For a `_VaultNotesReader` source (the
+`"postgres"` backend), `reindex` skips that call: #219's worker-side
+catch-up (`enqueue_stale_embeddings`) takes over that job instead.
 
-`index_on_connection`/`schedule_embeddings` are the connection-path entry
-points `storage.postgres.PostgresBackend` wires in as its `IndexHook`/
-`IndexCommitHook` (ADR-0007 §4, #98): a write indexes the note it just
-wrote on the *same* connection, inside the *same* transaction as the write
-itself - no separate pool acquisition, no second transaction - and schedules
-its embeddings as a background task only after that transaction has
-committed, never awaited by the write. `aclose` drains those background
-tasks with a time limit on process shutdown, so none of them outlives the
-pool they were handed.
+`index_on_connection` is the connection-path entry point
+`storage.postgres.PostgresBackend` wires in as its `IndexHook` (ADR-0007
+§4, #98): a write indexes the note it just wrote on the *same* connection,
+inside the *same* transaction as the write itself - no separate pool
+acquisition, no second transaction - leaving the chunks it just wrote with
+`embedding` `NULL`, same as every other upsert. Embedding them is not this
+module's job to run inline any more (#219): on that same connection, still
+inside that same transaction, `index_on_connection` enqueues one
+`"embed_note"` job (`jobs.enqueue`, note id + `file_hash`) for the worker
+process to pick up once the write has committed - `jobs.enqueue`'s own
+`pg_notify` only ever fires on commit, so a rolled-back write never wakes a
+worker for a job that no longer exists either. `embed_note_job` is that
+job's handler (`worker.py`'s `build_job_handlers`): skips if the note's
+`file_hash` has already moved on (a newer write's own job will embed the
+current chunks instead), otherwise embeds whatever is still stale and lets
+`EmbeddingError` propagate so the worker retries with backoff, rather than
+swallowing it the way the batch path's `_embed_note` does.
+
+`schedule_embeddings`/`aclose` are this module's older, still-functional
+background-task mechanism for the same `IndexCommitHook` seam
+(`storage.base.IndexCommitHook`) - no longer wired by `app.py` (#219
+replaced it with the job above), kept only because other callers
+(`PostgresBackend(index_commit_hook=...)`) may still wire it in by hand.
 """
 
 from __future__ import annotations
@@ -58,8 +77,11 @@ from typing import Protocol
 import asyncpg
 import asyncpg.pool
 
+from memory_manager.config import EmbeddingDimensionPinError
+from memory_manager.db.migrate import POSTGRES_VECTOR_LAYOUT_VERSION
 from memory_manager.index.chunker import chunk_note
 from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
+from memory_manager.jobs import enqueue as enqueue_job
 from memory_manager.vault.links import (
     LinkRef,
     ResolvedLink,
@@ -202,6 +224,12 @@ class Indexer:
         # garbage-collects one mid-flight - `asyncio`'s own fire-and-forget
         # pitfall - and drained with a time limit by `aclose`.
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Whether `self._pool`'s database has the ADR-0016 `chunks` layout
+        # (`migrations/postgres/0012_vector_layout.sql`) - lazily resolved by
+        # `_uses_vector_layout` (a schema never changes shape again once a
+        # process is running) and cached here so every call after the first
+        # costs nothing. `None` means "not checked yet", not "no".
+        self._vector_layout: bool | None = None
 
     async def index_paths(self, paths: Iterable[str]) -> IndexStats:
         """Index or remove each of `paths`, skipping unchanged files.
@@ -242,23 +270,56 @@ class Indexer:
 
         With `full=True`, additionally removes rows for paths the source no
         longer has and recomputes links for every note, so a reference to a
-        note indexed later in the same run still resolves.
+        note indexed later in the same run still resolves. For a
+        `_VaultNotesReader` source (the `"postgres"` backend), `full=True`
+        also runs `ANALYZE chunks` once the rebuild is done (ADR-0007
+        addendum #117, #220's own checklist): a bulk `reindex --full` is
+        exactly the kind of mass rewrite that leaves `mm_frequent_lexemes`
+        (0008_frequent_lexemes.sql) without statistics until something
+        analyzes the table, and this is the one place in this module that
+        already knows the rebuild just finished - `search.py`'s
+        `hybrid_search` never has to wait for an unrelated autovacuum run
+        before its candidate-stage cap works for a freshly rebuilt index.
+        `ANALYZE chunks` on the partitioned parent (ADR-0016, #220)
+        recurses into every partition on its own.
+
+        The trailing `embed_pending` catch-up only runs for a
+        `_FileTreeSource` (the `"git"` backend, #219's "not included"). For
+        a `_VaultNotesReader` source, the worker process's own startup
+        catch-up (`enqueue_stale_embeddings`) is what re-embeds a chunk left
+        stale by a lost job, a provider outage or a model change - this
+        method leaves embedding alone entirely.
         """
         discovered = await self._source.discover_paths()
         stats = await self.index_paths(discovered)
         if not full:
-            await self.embed_pending()
+            if not isinstance(self._source, _VaultNotesReader):
+                await self.embed_pending()
             return stats
 
         extra_deleted = await self._delete_stale(discovered)
         await self._recompute_all_links()
-        await self.embed_pending()
+        if isinstance(self._source, _VaultNotesReader):
+            await self._analyze_chunks()
+        else:
+            await self.embed_pending()
         return IndexStats(
             indexed=stats.indexed,
             unchanged=stats.unchanged,
             deleted=stats.deleted + extra_deleted,
             failed=stats.failed,
         )
+
+    async def _analyze_chunks(self) -> None:
+        """`ANALYZE chunks` (ADR-0007 addendum #117, #220) - `reindex(full=True)`'s
+        own trailing step for a `_VaultNotesReader` source. Runs as the owner
+        (`self._pool.acquire()`, never a caller-supplied, possibly
+        role-switched connection): `ANALYZE` needs no row-level grant beyond
+        `SELECT`, but is a system-maintenance statement system jobs run, not
+        something a request-serving role should ever trigger.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute("analyze chunks")
 
     async def _delete_stale(self, keep_paths: Sequence[str]) -> int:
         async with self._pool.acquire() as conn:
@@ -312,6 +373,15 @@ class Indexer:
         aliases or path can now resolve, scoped to just this note - never a scan
         of every dangling link in the index (`_heal_dangling_links`'s job, for the
         batch paths that actually need it).
+
+        The chunks `_upsert_note_rows` just wrote are left with `embedding`
+        `NULL`, same as always - this method does not embed them itself any
+        more (#219). Instead, still on `conn` and still inside the caller's
+        own transaction, it enqueues one `"embed_note"` job (`jobs.enqueue`)
+        naming this note's id and the `file_hash` it was just written at, so
+        a worker picks the job up once - and only once - this transaction has
+        actually committed. A no-op without a configured provider: nothing
+        would ever claim the job.
         """
         note = parse(content)
         file_hash = version(content)
@@ -319,6 +389,8 @@ class Indexer:
         await self._heal_dangling_for_note(
             conn, note.id, note_path.namespace, note_path.slug, note.aliases
         )
+        if self._provider is not None:
+            await enqueue_job(conn, "embed_note", {"note_id": note.id, "version": file_hash})
 
     async def schedule_embeddings(self, note_ids: Sequence[str]) -> None:
         """Embed `note_ids`' chunks in the background, never awaited by the caller.
@@ -435,11 +507,29 @@ class Indexer:
             tags=note.tags,
         )
         if chunks:
-            await conn.executemany(
-                "insert into chunks (note_id, ord, heading_path, text, lang) "
-                "values ($1, $2, $3, $4, $5)",
-                [(note.id, c.ord, c.heading_path, c.text, c.lang) for c in chunks],
-            )
+            if await self._uses_vector_layout(conn):
+                # ADR-0016's `chunks` (`migrations/postgres/0012_vector_layout.sql`):
+                # `namespace`/`namespace_kind` are denormalised onto every row, the
+                # latter via `mm_namespace_kind` rather than a direct `select` on
+                # `namespaces` - `conn` may be running as the app role here
+                # (`index_on_connection`'s own connection-path writes), which holds
+                # no grant on that table (0005_rls.sql). `'org'` is the fallback for
+                # an alias with no registry row yet - never a failed write over it.
+                await conn.executemany(
+                    "insert into chunks "
+                    "(note_id, ord, heading_path, text, lang, namespace, namespace_kind) "
+                    "values ($1, $2, $3, $4, $5, $6, coalesce(mm_namespace_kind($6), 'org'))",
+                    [
+                        (note.id, c.ord, c.heading_path, c.text, c.lang, note_path.namespace)
+                        for c in chunks
+                    ],
+                )
+            else:
+                await conn.executemany(
+                    "insert into chunks (note_id, ord, heading_path, text, lang) "
+                    "values ($1, $2, $3, $4, $5)",
+                    [(note.id, c.ord, c.heading_path, c.text, c.lang) for c in chunks],
+                )
 
         await self._refresh_links(conn, note.id, note_path.namespace, note.body)
         return note_path
@@ -533,12 +623,79 @@ class Indexer:
 
         return total
 
+    async def embed_note_job(self, note_id: str, expected_version: str) -> None:
+        """Embed `note_id`'s still-stale chunks for one worker-claimed `"embed_note"`
+        job (#219, `worker.py`'s `build_job_handlers`).
+
+        A no-op without a configured provider - nothing to embed with. Also
+        a no-op if `note_id`'s current `notes.file_hash` no longer matches
+        `expected_version`: a newer write already replaced this note's
+        chunks (and `index_on_connection` already enqueued that write's own
+        job for them), so this stale job has nothing left to do, not even a
+        model-change catch-up - `enqueue_stale_embeddings` owns that case.
+        Unlike `_embed_note`'s own background path, an `EmbeddingError` from
+        `self._provider.embed` is not caught here: it propagates to the
+        caller (`worker._dispatch_job`), which retries the job with backoff
+        (`jobs.fail_or_retry`) rather than leaving it silently `NULL` forever.
+        """
+        if self._provider is None:
+            return
+
+        async with self._pool.acquire() as conn:
+            current_hash = await conn.fetchval("select file_hash from notes where id = $1", note_id)
+            if current_hash != expected_version:
+                return
+
+            rows = await conn.fetch(
+                "select id, text from chunks where note_id = $1 "
+                "and (embedding is null or model is distinct from $2) "
+                "order by ord",
+                note_id,
+                self._provider.model,
+            )
+        if not rows:
+            return
+
+        vectors = await self._provider.embed([row["text"] for row in rows])
+        await self._apply_embeddings(rows, vectors, self._provider.model)
+
+    async def enqueue_stale_embeddings(self) -> int:
+        """Enqueue one `"embed_note"` job per note with a chunk still missing an
+        embedding or stamped with a model other than the provider's current one.
+
+        The worker process's own startup catch-up (#219): a lost job, a
+        provider outage that left a chunk `NULL`, or a model change are all
+        caught up here, the same cases `embed_pending` used to catch at the
+        end of a `"postgres"`-mode `reindex` (`reindex`'s own docstring). A
+        no-op without a configured provider. Returns how many notes were
+        enqueued.
+        """
+        if self._provider is None:
+            return 0
+
+        async with self._pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "select distinct n.id as note_id, n.file_hash as file_hash "
+                "from notes n join chunks c on c.note_id = n.id "
+                "where c.embedding is null or c.model is distinct from $1",
+                self._provider.model,
+            )
+            for row in rows:
+                await enqueue_job(
+                    conn, "embed_note", {"note_id": row["note_id"], "version": row["file_hash"]}
+                )
+        return len(rows)
+
     async def _apply_embeddings(
         self, rows: Sequence[asyncpg.Record], vectors: Sequence[Sequence[float]], model: str
     ) -> None:
         if not vectors:
             return
         dimension = len(vectors[0])
+
+        if await self._uses_vector_layout():
+            await self._apply_embeddings_vector_layout(rows, vectors, model, dimension)
+            return
 
         async with self._pool.acquire() as conn:
             await conn.executemany(
@@ -551,6 +708,83 @@ class Indexer:
             )
 
         await self.ensure_vector_index(model, dimension)
+
+    async def _apply_embeddings_vector_layout(
+        self,
+        rows: Sequence[asyncpg.Record],
+        vectors: Sequence[Sequence[float]],
+        model: str,
+        dimension: int,
+    ) -> None:
+        """`_apply_embeddings`'s ADR-0016 counterpart (`migrations/postgres/
+        0012_vector_layout.sql`): `chunks.embedding` is a fixed `halfvec(1024)`,
+        with every `(namespace_kind)` partition's own index already created by
+        that migration - there is no runtime `ensure_vector_index` equivalent to
+        run here, unlike the per-`(model, dimension)` scheme the branch above
+        still uses for the Git backend.
+
+        Refuses, with `EmbeddingDimensionPinError`, a provider response whose
+        dimension disagrees with `embedding_dimension`'s pinned value (PLAN O23) -
+        before the mismatch ever reaches the strictly-typed `halfvec(1024)` column,
+        where it would otherwise surface as an opaque `asyncpg` data error instead
+        of a clear one naming the reindex path.
+        """
+        async with self._pool.acquire() as conn:
+            pinned = await conn.fetchval("select dimension from embedding_dimension")
+            if pinned is not None and dimension != pinned:
+                raise EmbeddingDimensionPinError(
+                    f"provider model {model!r} returned {dimension}-dim vectors, but this "
+                    f"Postgres backend is pinned to {pinned} (EMBEDDING_DIMENSIONS, set at "
+                    "first migrate, PLAN O23) - reindex into a new column/table to change it "
+                    "(ADR-0016; not done by this process)"
+                )
+
+            await conn.executemany(
+                "update chunks set embedding = $1::halfvec, model = $2, dimension = $3 "
+                "where id = $4",
+                [
+                    (_vector_literal(vector), model, dimension, row["id"])
+                    for row, vector in zip(rows, vectors, strict=True)
+                ],
+            )
+
+    async def _uses_vector_layout(self, conn: _Conn | None = None) -> bool:
+        """Whether the database has the ADR-0016 `chunks` layout.
+
+        Detected from `schema_migrations` rather than from which `_Source`
+        this `Indexer` was built with: a `VaultNotesSource()` instance
+        pointed at a `backend="git"`-migrated database (every existing test
+        that never asked for `backend="postgres"`) must keep writing the
+        flat, `vector`-typed `chunks` migration `0001_index_schema.sql`
+        gives it - ADR-0016 Consequences' "Git backend unchanged" holds
+        regardless of which `_Source` happens to be in play, only of which
+        migrations actually ran.
+
+        `conn`, when given (`_upsert_note_rows`'s own call, both from the
+        batch path's and `index_on_connection`'s already-open transaction),
+        is queried directly rather than through a second `self._pool.acquire()`
+        - acquiring a second connection while the caller's transaction still
+        holds the only one a `min_size=1, max_size=1` pool has (several
+        tests use exactly that shape for `index_on_connection`) would
+        deadlock the pool against itself. Querying `conn` instead needs
+        `schema_migrations` readable under whatever role that connection is
+        running as - `db.rls.grant_app_role` grants the app role plain
+        `select` on it for exactly this (#220). `self._pool.acquire()` is
+        used only when no `conn` is given (`_apply_embeddings`'s own call,
+        never inside an open caller transaction).
+        """
+        if self._vector_layout is None:
+            query = "select exists(select 1 from schema_migrations where version = $1)"
+            if conn is not None:
+                self._vector_layout = bool(
+                    await conn.fetchval(query, POSTGRES_VECTOR_LAYOUT_VERSION)
+                )
+            else:
+                async with self._pool.acquire() as pool_conn:
+                    self._vector_layout = bool(
+                        await pool_conn.fetchval(query, POSTGRES_VECTOR_LAYOUT_VERSION)
+                    )
+        return self._vector_layout
 
     async def ensure_vector_index(self, model: str, dimension: int) -> None:
         """Create the HNSW index for `(model, dimension)` if it doesn't exist yet.
