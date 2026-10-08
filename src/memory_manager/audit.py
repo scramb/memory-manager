@@ -22,15 +22,30 @@ A failed audit write is logged loudly but never raised: the vault write it
 describes has already happened (or already failed) by the time `record` is
 called, and losing the audit trail must not also lose - or retroactively
 undo - that outcome.
+
+Every record that reaches the DB also reaches `AuditExporter.export`
+(#245, `observability/audit_export.py`) - to stdout, an OTLP logs endpoint,
+both, or neither (`AUDIT_EXPORT`, off by default), for a SIEM. Exported
+unconditionally after the DB insert attempt, success or failure alike: a
+database outage must not also silence the SIEM copy, and a SIEM outage
+(`AuditExporter.export` never raises) must never fail or undo the DB row.
+`request_id` is read fresh for every record from `observability.logging.
+current_request_id` - `None` outside an HTTP request (stdio mode, the poll
+loop's own sync) - never threaded through by a caller.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
+
+from memory_manager.observability.audit_export import AuditExporter
+from memory_manager.observability.logging import current_request_id
 
 __all__ = ["AuditWriter"]
 
@@ -43,10 +58,20 @@ values ($1, $2, $3, $4, $5, $6, $7::jsonb)
 
 
 class AuditWriter:
-    """Inserts one row into `audit_log` per `record()` call, against `pool`."""
+    """Inserts one row into `audit_log` per `record()` call, against `pool`.
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    `exporter` defaults to `AuditExporter.from_env(os.environ)` - built once,
+    here, so a misconfigured `AUDIT_EXPORT` (`AuditConfigError`, e.g. `otlp`
+    without the `otel` extra) surfaces at startup, when this is constructed
+    (`memory_manager.app.open_services`), not only once the first write is
+    audited. Given explicitly only by `tests/test_audit_export.py`.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, *, exporter: AuditExporter | None = None) -> None:
         self._pool = pool
+        self._exporter = (
+            exporter if exporter is not None else AuditExporter.from_env(dict(os.environ))
+        )
 
     async def record(
         self,
@@ -64,8 +89,12 @@ class AuditWriter:
         `actor` is the token subject (OAuth `sub`), a static token's name,
         or `"stdio"` for a local session; `client` is the committer label
         (`memory_manager.mcp.server.current_client`); `outcome` is one of
-        `"ok"`/`"conflict"`/`"rejected"`/`"failed"`.
+        `"ok"`/`"conflict"`/`"rejected"`/`"failed"`. Exported to every
+        configured `AUDIT_EXPORT` target unconditionally afterwards, whether
+        the insert above succeeded or not (see module docstring).
         """
+        detail_value = detail if detail is not None else {}
+        at = datetime.now(UTC)
         try:
             await self._pool.execute(
                 _INSERT,
@@ -75,11 +104,40 @@ class AuditWriter:
                 path,
                 commit_sha,
                 outcome,
-                json.dumps(detail if detail is not None else {}),
+                json.dumps(detail_value),
             )
         except Exception:
             _logger.exception(
                 "audit log write failed: actor=%s client=%s op=%s path=%s outcome=%s",
+                actor,
+                client,
+                op,
+                path,
+                outcome,
+            )
+
+        try:
+            self._exporter.export(
+                {
+                    "at": at.isoformat(timespec="milliseconds"),
+                    "actor": actor,
+                    "client": client,
+                    "op": op,
+                    "path": path,
+                    "outcome": outcome,
+                    "detail": detail_value,
+                    "request_id": current_request_id(),
+                }
+            )
+        except Exception:
+            # Belt and suspenders: `AuditExporter.export` already swallows a
+            # failure on every target it knows about itself, but `exporter`
+            # here is a plain protocol - a caller-supplied stand-in (tests)
+            # could still raise, and a SIEM outage must never fail or undo
+            # the DB row just inserted above, same as a DB failure must not
+            # skip this export.
+            _logger.exception(
+                "audit export failed: actor=%s client=%s op=%s path=%s outcome=%s",
                 actor,
                 client,
                 op,

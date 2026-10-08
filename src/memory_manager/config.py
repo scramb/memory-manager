@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 __all__ = [
+    "AuditConfigError",
     "EmbeddingConfig",
     "EmbeddingConfigError",
     "ServerConfig",
@@ -22,6 +23,7 @@ __all__ = [
     "StorageConfigError",
     "VaultConfig",
     "VaultConfigError",
+    "audit_export_targets_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
     "storage_backend_from_env",
@@ -257,6 +259,49 @@ class EmbeddingConfig:
 
 class ServerConfigError(ValueError):
     """An HTTP server environment variable is missing or invalid."""
+
+
+class AuditConfigError(ServerConfigError):
+    """`AUDIT_EXPORT` names an unknown target, or `otlp` without the `otel` extra.
+
+    A subclass of `ServerConfigError` (not a sibling `ValueError`), so every
+    caller that already catches `ServerConfigError` to report a startup
+    config problem with exit code 2 (`cli.py`'s `_serve`) keeps doing so
+    unchanged for this error too - the same reasoning `StorageConfigError`
+    gives above for `VaultConfigError`.
+    """
+
+
+#: `AUDIT_EXPORT` targets this build can export to (#245) - `AuditWriter`
+#: (`audit.py`) picks the matching `observability.audit_export.AuditExporter`
+#: for whichever of these are named; any other value is a config error.
+_AUDIT_EXPORT_TARGETS = frozenset({"stdout", "otlp"})
+_DEFAULT_AUDIT_EXPORT = "off"
+
+
+def audit_export_targets_from_env(environ: dict[str, str]) -> frozenset[str]:
+    """The `AUDIT_EXPORT` targets to export every audit record to (#245).
+
+    `AUDIT_EXPORT` is a comma-separated list drawn from `_AUDIT_EXPORT_TARGETS`
+    (`"stdout"`, `"otlp"`), or `"off"` (the default): the empty `frozenset`
+    means "export nothing", same as unset. Raises `AuditConfigError` naming
+    the offending value if any entry is not one of these - whether `otlp`
+    additionally needs the `otel` extra installed is not checked here (that
+    happens only once `observability.audit_export.AuditExporter.from_env`
+    actually tries to build the OTLP exporter, so a `"git"`/no-`otlp`
+    deployment never needs the extra installed at all to pass this check).
+    """
+    raw = environ.get("AUDIT_EXPORT", _DEFAULT_AUDIT_EXPORT).strip()
+    if not raw or raw == _DEFAULT_AUDIT_EXPORT:
+        return frozenset()
+    targets = frozenset(entry.strip() for entry in raw.split(",") if entry.strip())
+    unknown = targets - _AUDIT_EXPORT_TARGETS
+    if unknown:
+        raise AuditConfigError(
+            f"AUDIT_EXPORT must be 'off' or a comma-separated list drawn from "
+            f"{sorted(_AUDIT_EXPORT_TARGETS)}, got {raw!r}"
+        )
+    return targets
 
 
 @dataclass(frozen=True)
