@@ -131,7 +131,8 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
   objects, off by default since the default `git`-backend `Cluster` is a derived index
   (`memory-manager reindex --full` rebuilds it from the vault), not a primary store.
 - The restore runbook and `erasure_log` replay procedure after a restore (WP-26, ADR-0007's own
-  30 d + 7 d horizon).
+  30 d + 7 d horizon) - see [`docs/guides/enterprise-operations.md`](../../docs/guides/enterprise-operations.md)
+  (the replay step itself still lands with #233).
 - A CNPG Pooler/PgBouncer, and backups in the kind E2E.
 - Valkey HA/Sentinel (not needed, ADR-0009).
 - Enforcement proof of the `NetworkPolicy` objects on a CNI (#255 - kind's default CNI does not

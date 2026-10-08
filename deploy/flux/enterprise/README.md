@@ -127,5 +127,5 @@ the second is the kind E2E (#258, not yet in this repository).
   Operator (see "Prerequisites" above).
 - The kind E2E that rolls this example out against a real cluster and checks `/readyz` across
   three `api` replicas (#258).
-- An operator guide walking through the enterprise profile end to end (#259).
+- An operator guide walking through the enterprise profile end to end - [`docs/guides/enterprise-operations.md`](../../../docs/guides/enterprise-operations.md) (#259).
 - Cloudflare Tunnel as an `HTTPRoute`/`Ingress` alternative - [`docs/guides/cloudflare-tunnel.md`](../../../docs/guides/cloudflare-tunnel.md) (`../README.md`'s own "Not included").
