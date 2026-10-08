@@ -277,7 +277,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 - [x] #246 `migrate git-to-postgres --dry-run` reports the namespace mapping and every note it would import
 - [x] #247 `migrate git-to-postgres` imports current notes byte-identically with Git history as revisions ⛔ blocked by #246
-- [ ] #248 The example vault migrates to Postgres with identical versions ⛔ blocked by #247
+- [x] #248 The example vault migrates to Postgres with identical versions ⛔ blocked by #247
 
 ---
 
