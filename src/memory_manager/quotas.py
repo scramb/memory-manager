@@ -71,7 +71,7 @@ or one byte under its cap can both pass the check and both land - the same
 "may overshoot by at most their number" soft-limit shape `QuotaChecker`'s
 own shared-state windows already have, just without a shared counter to
 make it precise even under concurrency. `check_write` is called only for
-`write`/`edit`/`supersede` (never `archive`, which only ever frees a slot -
+`write`/`edit`/`supersede`/`promote` (never `archive`, which only ever frees a slot -
 CLAUDE.md "archived notes count toward size, not toward count" is exactly
 why a count check only ever applies to a *new* note, never to editing an
 existing one or to archiving it in place).

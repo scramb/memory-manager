@@ -323,7 +323,10 @@ def prepare_promote_content(
     enables. Raises `InvalidNote` if `target_path` already exists, the
     original fails to parse, the copy fails ADR-0005 validation, or (when
     archiving) the original's archive target already exists;
-    `SecretRejected` if the copy's text looks like it contains a secret.
+    `SecretRejected` if the copy's text looks like it contains a secret;
+    `BlocklistRejected` if it matches an operator blocklist category, checked
+    right after the secret scan - the same check `prepare_write_or_edit`/
+    `prepare_supersede_content` already run (#244).
     """
     if target_exists:
         raise InvalidNote(target_path, "already exists, promote needs an unused path")
@@ -345,10 +348,15 @@ def prepare_promote_content(
 
     new_bytes = serialize(new_note)
 
+    new_decoded = new_bytes.decode("utf-8")
     try:
-        check(new_bytes.decode("utf-8"))
+        check(new_decoded)
     except SecretFound as exc:
         raise SecretRejected(target_path, str(exc)) from exc
+    try:
+        blocklist.check(new_decoded)
+    except blocklist.BlocklistFound as exc:
+        raise BlocklistRejected(target_path, exc.category) from exc
 
     if keep_original:
         return new_bytes, None

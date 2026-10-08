@@ -470,6 +470,39 @@ class PromoteContract:
                 client="claude-code",
             )
 
+    async def test_blocklist_hit_is_rejected_without_writing(
+        self,
+        backend: StorageBackend,
+        audit_log: list[AuditEntry],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        blocklist_file = tmp_path / "blocklist.toml"
+        blocklist_file.write_text(
+            '[[category]]\nname = "example-confidential"\nkeywords = ["topsecret"]\n',
+            encoding="utf-8",
+        )
+        written = await backend.write(
+            "personal/fact/old.md",
+            note_bytes(body="the plan is topsecret for now\n"),
+            if_version="new",
+            client="claude-code",
+        )
+        monkeypatch.setenv("BLOCKLIST_FILE", str(blocklist_file))
+
+        with pytest.raises(BlocklistRejected) as excinfo:
+            await backend.promote(
+                "personal/fact/old.md", "shared", if_version=written.version, client="claude-code"
+            )
+        assert excinfo.value.category == "example-confidential"
+
+        # Nothing was overwritten: the original is still live, unarchived,
+        # and no copy landed in the target namespace (CLAUDE.md: never
+        # overwrite silently).
+        assert await backend.read("shared/fact/old.md") is None
+        assert await backend.read("personal/fact/old.md") is not None
+        assert await backend.read("_archive/personal/fact/old.md") is None
+
 
 class ListContract:
     """`list`, with and without archived notes."""

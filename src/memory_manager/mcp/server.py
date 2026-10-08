@@ -541,6 +541,23 @@ def _namespace_of(path: str) -> str | None:
         return None
 
 
+def _promote_target_path(path: str, target_namespace: str) -> str | None:
+    """The target path `memory_promote` is about to write, for the quota checks below -
+    same construction `storage.rules.prepare_promote_paths` does, computed here only
+    for the audit-only `path` argument `QuotaChecker.check_write`/`StorageQuotaChecker.
+    check_write` take (neither keys its quota by it, see their own docstrings). `None`
+    if `path` does not even parse as a non-archived note path - the same best-effort
+    fallback `_namespace_of` uses, left to `storage.promote`'s own sharper error.
+    """
+    try:
+        source_note_path = parse_note_path(path, allow_archive=False)
+    except PathRejected:
+        return None
+    return NotePath(
+        namespace=target_namespace, type=source_note_path.type, slug=source_note_path.slug
+    ).relative
+
+
 def _storage_namespace_kind(
     resolved: namespaces.Resolution | None, namespace: str | None
 ) -> NamespaceKind | None:
@@ -739,20 +756,23 @@ def build_server(
     same "off unless configured" default `ServerConfig`'s `quota_*` fields
     have. Given, every write tool below calls `quota_checker.check_write`
     with the namespace it is about to write to, right after its own
-    `_require_writable`/`_require_archive_access` check and before it ever
-    reaches `services.storage` - a `QuotaExceeded` (a `ToolError`) then stops
-    the call exactly like a scope or namespace-permission failure would.
+    `_require_writable`/`_require_archive_access`/`_require_promote_access`
+    check and before it ever reaches `services.storage` - a `QuotaExceeded`
+    (a `ToolError`) then stops the call exactly like a scope or
+    namespace-permission failure would. `memory_promote` checks the *target*
+    namespace, the same way its own `storage_quota_checker` call below does.
 
     `storage_quota_checker` (`quotas.StorageQuotaChecker`, #243) is `None`
     for stdio, for `"git"` mode and for an HTTP server built without one -
     `None` is also the only possibility unless `services.storage` is a
     `storage.postgres.PostgresBackend` (`http.py` only ever builds one
-    then). Given, `memory_write`/`memory_edit`/`memory_supersede` each call
-    it with the namespace and byte size the write they are about to submit
-    would actually produce, right after that content is computed and before
-    it reaches `services.storage` - never `memory_archive`, which only ever
-    frees a note-count slot (module docstring, `quotas.StorageQuotaChecker`'s
-    own). A `StorageQuotaExceeded` (also a `ToolError`) stops the call the
+    then). Given, `memory_write`/`memory_edit`/`memory_supersede`/
+    `memory_promote` each call it with the namespace and byte size the write
+    they are about to submit would actually produce, right after that
+    content is computed and before it reaches `services.storage` - never
+    `memory_archive`, which only ever frees a note-count slot (module
+    docstring, `quotas.StorageQuotaChecker`'s own). A `StorageQuotaExceeded`
+    (also a `ToolError`) stops the call the
     same way `QuotaExceeded` does.
     """
     mcp = MCPServer(
@@ -1191,6 +1211,40 @@ def build_server(
             ) from exc
 
         _require_promote_access(stored_path, stored_target_namespace, resolved)
+
+        promote_target_path = _promote_target_path(stored_path, stored_target_namespace)
+        if quota_checker is not None:
+            await quota_checker.check_write(
+                op="promote",
+                path=promote_target_path if promote_target_path is not None else stored_path,
+                namespace=stored_target_namespace,
+                actor=current_actor(),
+                client=current_client(),
+            )
+
+        promote_namespace_kind = _storage_namespace_kind(resolved, stored_target_namespace)
+        if (
+            storage_quota_checker is not None
+            and promote_namespace_kind is not None
+            and promote_target_path is not None
+        ):
+            # An estimate, not the exact canonical bytes `services.storage.promote`
+            # will end up committing (module docstring: #243 is a soft limit) - the
+            # source note's own size is close enough: the copy only ever differs
+            # by a new `id` (same fixed length) and, when not already present, one
+            # more entry in `supersedes`.
+            current_for_quota = await services.storage.read(stored_path)
+            if current_for_quota is not None:
+                await storage_quota_checker.check_write(
+                    op="promote",
+                    path=promote_target_path,
+                    namespace=stored_target_namespace,
+                    namespace_kind=promote_namespace_kind,
+                    is_new_note=True,
+                    final_size=len(current_for_quota.content),
+                    actor=current_actor(),
+                    client=current_client(),
+                )
 
         try:
             result = await services.storage.promote(
