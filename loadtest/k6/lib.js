@@ -82,6 +82,12 @@ export function toolsCall(token, name, toolArguments) {
   });
   const response = http.post(BASE_URL, body, {
     headers: Object.assign({ Authorization: `Bearer ${token}` }, REQUEST_HEADERS),
+    // `tool` tags every metric this request produces (http_req_duration,
+    // http_req_failed, checks, ...) with the MCP tool name - `name` here is
+    // always one of memory_search/memory_read/memory_write/memory_edit, so
+    // write and edit (both under the `write` scenario) can be told apart in
+    // the export (#109, WP-21).
+    tags: { tool: name },
   });
 
   let payload = null;

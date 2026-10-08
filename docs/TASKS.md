@@ -206,7 +206,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #108 k6 scenarios measure search, read and write latency against one replica
 - [x] #123 Concurrent replica startup never fails on app-role grants
 - [x] #124 The k6 smoke runs under RLS with registered principals and stays green
-- [ ] #109 A 100k-note baseline records per-tool latency and the RLS function cost
+- [x] #109 A 100k-note baseline records per-tool latency and the RLS function cost
 
 ---
 

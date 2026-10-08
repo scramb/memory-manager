@@ -109,5 +109,12 @@ export const options = {
     'http_req_duration{scenario:write}': ['p(95)<200'],
     'checks{phase:measure}': ['rate>0.99'],
     'http_req_failed{phase:measure}': ['rate<0.01'],
+    // `write` (#108/#124) covers both memory_write and memory_edit - an
+    // empty condition list never fails (and never aborts), but still makes
+    // k6 instantiate the submetric so `lib.js`'s `tool` tag shows up in
+    // `--summary-export` (#109, WP-21: the baseline reports write and edit
+    // latency separately).
+    'http_req_duration{tool:memory_write}': [],
+    'http_req_duration{tool:memory_edit}': [],
   },
 };
