@@ -226,6 +226,60 @@ app.kubernetes.io/component: {{ .component }}
 {{- end }}
 
 {{/*
+Shared egress rules for the api and worker NetworkPolicies, storage's
+own backend "postgres" only (#255, templates/networkpolicy.yaml): DNS
+(always, same shape as the git-mode policy's own egress), the CNPG
+Cluster's own instance pods on 5432 (only while the database block's own
+cnpg sub-block is enabled - an external Postgres is an operator-specific
+host this chart cannot scope by podSelector, covered by the egress
+block's own "rules" below instead), Valkey on 6379 (only while valkey's
+own enabled flag is true, same reasoning), and finally 443 for
+Entra/Graph/an embedding provider - unrestricted destination by default
+(the egress block's own "allowAll", the same knob the git-mode policy's
+own egress uses) since those hostnames are operator-specific; set it to
+false and list its own "rules" instead to lock that down to your own
+resolved ranges. Takes the root context directly, not a dict, since it
+needs no per-component argument.
+*/}}
+{{- define "memory-manager.networkPolicyAppEgress" -}}
+- to:
+    - namespaceSelector: {}
+  ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+{{- if .Values.database.cnpg.enabled }}
+- to:
+    - podSelector:
+        matchLabels:
+          cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
+          cnpg.io/podRole: instance
+  ports:
+    - protocol: TCP
+      port: 5432
+{{- end }}
+{{- if .Values.valkey.enabled }}
+- to:
+    - podSelector:
+        matchLabels:
+          {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "valkey") | nindent 10 }}
+  ports:
+    - protocol: TCP
+      port: 6379
+{{- end }}
+{{- if .Values.networkPolicy.egress.allowAll }}
+- ports:
+    - protocol: TCP
+      port: 443
+{{- else }}
+{{- range .Values.networkPolicy.egress.rules }}
+- {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fails fast when shutdown's own terminationGracePeriodSeconds does not
 cover both the uvicorn drain (shutdown's own graceSeconds, ADR-0009
 §1/§5) and the preStop sleep on top of it (shutdown's own

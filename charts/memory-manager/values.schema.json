@@ -310,7 +310,9 @@
             "allowAll": { "type": "boolean" },
             "rules": { "type": "array" }
           }
-        }
+        },
+        "prometheus": { "type": "object", "additionalProperties": true },
+        "cnpgOperator": { "type": "object", "additionalProperties": true }
       }
     },
     "serviceMonitor": {

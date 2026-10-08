@@ -86,7 +86,7 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `valkey` → `externalUrl` | `""` | Points `api`/`worker` at an operator-managed Valkey/Redis elsewhere instead of the Deployment above; mutually exclusive with `valkey` → `enabled` |
 | `httpRoute` → `enabled` | `true` | Gateway API `HTTPRoute`, same shape as `deploy/httproute.yaml` |
 | `ingress` → `enabled` | `false` | Classic `Ingress`, for clusters without Gateway API |
-| `networkPolicy` → `enabled` | `false` | Off by default, documented; ingress scoped to configurable selectors, egress allow-all-with-DNS by default (remote IPs are operator-specific and unknown to this chart) |
+| `networkPolicy` → `enabled` | `false` | Off by default, documented; ingress scoped to configurable selectors, egress allow-all-with-DNS by default (remote IPs are operator-specific and unknown to this chart). `storage` → `backend` `postgres` renders one policy per component instead of the single `git`-mode one (#255) - `prometheus`/`cnpgOperator` name the extra ingress sources those need |
 | `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed |
 
 See `values.yaml` itself for the full, commented reference - this table is the summary.
@@ -100,8 +100,11 @@ bucket/endpoint - set your own). KEDA request-rate scaling stays off; turn `api`
 `enabled` on and `api` → `autoscaling` → `enabled` off in your own overlay to use it instead (KEDA
 itself must already be installed in the cluster). Valkey shared state (#254) stays off - the
 3-instance CNPG `Cluster` already covers the same state; turn `valkey` → `enabled` on in your own
-overlay instead for Valkey's sub-millisecond counters. It is a starting overlay, not a complete
-install - layer your own values on top for the pieces it does not cover yet (NetworkPolicies):
+overlay instead for Valkey's sub-millisecond counters. `networkPolicy` → `enabled` is on, with
+per-component policies for `api`, `worker` and the CNPG `Cluster`'s own instances (#255) - set
+`networkPolicy` → `ingress`/`prometheus`/`cnpgOperator` to your own gateway/monitoring/CNPG-operator
+namespace in a further overlay; they default to "matches everywhere" until you do. It is a starting
+overlay, not a complete install - layer your own values on top for the pieces it does not cover yet:
 
 ```sh
 helm template memory-manager charts/memory-manager \
@@ -127,5 +130,6 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
 - The restore runbook and `erasure_log` replay procedure after a restore (WP-26, ADR-0007's own
   30 d + 7 d horizon).
 - A CNPG Pooler/PgBouncer, and backups in the kind E2E.
-- Valkey HA/Sentinel (not needed, ADR-0009) and a `NetworkPolicy` scoped to the Valkey Deployment
-  (#255).
+- Valkey HA/Sentinel (not needed, ADR-0009).
+- Enforcement proof of the `NetworkPolicy` objects on a CNI (#255 - kind's default CNI does not
+  enforce them; this chart only renders, kubeconform-validated shapes) and service-mesh/mTLS.

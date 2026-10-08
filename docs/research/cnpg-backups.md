@@ -79,3 +79,30 @@ field (`robfig/cron`'s format) - this chart's default (`"0 0 2 * * *"`) is daily
   30 d + 7 d horizon ADR-0007 already documents).
 - PgBouncer/CNPG Pooler.
 - Backups in the kind E2E.
+
+## Instance pod labels and the operator's status port (#255)
+
+Retrieved: 2026-10-08 · Feeds: WP-29 (`templates/networkpolicy.yaml`) - the per-component
+`NetworkPolicy` objects storage's own backend `postgres` renders need to select the CNPG
+Cluster's own instance pods by label, and to scope the operator's own ingress to its status
+port rather than Postgres itself.
+
+Checked directly against the CloudNativePG source, `release-1.26` branch:
+
+- [`pkg/utils/labels_annotations.go`](https://github.com/cloudnative-pg/cloudnative-pg/blob/release-1.26/pkg/utils/labels_annotations.go)
+- [`pkg/specs/pods.go`](https://github.com/cloudnative-pg/cloudnative-pg/blob/release-1.26/pkg/specs/pods.go)
+- [`pkg/management/url/url.go`](https://github.com/cloudnative-pg/cloudnative-pg/blob/release-1.26/pkg/management/url/url.go)
+
+Every instance pod the operator creates for a `Cluster` carries `cnpg.io/cluster: <cluster
+name>` and `cnpg.io/podRole: instance` (`pkg/specs/pods.go`'s own pod-template labels, using
+the constants `utils.ClusterLabelName`/`utils.PodRoleLabelName`/`utils.PodRoleInstance`) - a
+job pod (`initdb`, `join`, ...) carries `cnpg.io/jobRole` instead, so `podRole: instance`
+excludes those. `cnpg.io/instanceRole` (`primary`/`replica`) and the deprecated `role` label
+carry the same value but are not needed here - the `NetworkPolicy` targets every instance
+alike, primary or replica, since replication traffic flows both ways during a failover.
+
+The instance manager's own HTTP API - the one the operator's reconciler calls for
+`pg/status`, `pg/backup`, etc., not Postgres' own `5432` - listens on `8000`
+(`pkg/management/url/url.go`'s own `StatusPort`). `PostgresMetricsPort` (`9187`, the
+Prometheus exporter) and `LocalPort` (`8010`, loopback-only) are both unrelated to the
+operator's own ingress and out of scope for #255's `NetworkPolicy` objects.

@@ -395,6 +395,16 @@ ingress:
 # to this chart, so the default egress when enabled is allow-all-with-DNS;
 # set this block's own "allowAll" to false and list your own "rules" (raw
 # NetworkPolicyEgressRule entries) to lock it down further.
+#
+# Storage's own backend "postgres" only (#255, templates/
+# networkpolicy.yaml): "ingress" above becomes the api Deployment's own
+# gateway/ingress-controller source instead (the "git" backend keeps
+# using it exactly as before); "prometheus" and "cnpgOperator" name the
+# two extra sources that mode's per-component policies also need -
+# Prometheus reaching api/worker's own metrics port, and the CNPG
+# operator reaching its instances' status port. Both default to "{}"
+# (matches every namespace/pod) until scoped to where those actually
+# run, same as "ingress" above.
 networkPolicy:
   enabled: false
   ingress:
@@ -403,6 +413,12 @@ networkPolicy:
   egress:
     allowAll: true
     rules: []
+  prometheus:
+    namespaceSelector: {}
+    podSelector: {}
+  cnpgOperator:
+    namespaceSelector: {}
+    podSelector: {}
 
 # Prometheus Operator ServiceMonitor (observability/metrics.py's own
 # /metrics) - off by default, needs the Prometheus Operator CRDs

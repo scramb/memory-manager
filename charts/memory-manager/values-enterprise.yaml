@@ -8,12 +8,12 @@
 # 2026-10-08, #251 - KEDA request-rate scaling stays off here; turn the
 # api block's own keda sub-block on and its autoscaling sub-block off in
 # your own overlay instead), a 3-instance CNPG Cluster with Barman Cloud
-# plugin backups (#252). Every hostname/secret-store path below is
-# still a placeholder (CLAUDE.md: a public repository carries no
+# plugin backups (#252), and per-component NetworkPolicies (#255) -
+# api/worker/Valkey/the CNPG Cluster's own instances each limited to the
+# flows they need. Every hostname/secret-store path below is still a
+# placeholder (CLAUDE.md: a public repository carries no
 # operator-specific values) - set your own in a further `-f` overlay,
 # never by editing this file in place.
-#
-# Extended by a later WP-29 task: NetworkPolicies (29g).
 storage:
   backend: postgres
 
@@ -58,3 +58,10 @@ worker:
 # for Valkey's sub-millisecond counters instead (#254).
 valkey:
   enabled: false
+
+# Per-component policies instead of the single git-mode one (#255,
+# templates/networkpolicy.yaml) - namespaceSelector/podSelector below
+# still default to "{}" (matches everywhere) until set to your own
+# gateway/Prometheus/CNPG-operator namespace in a further overlay.
+networkPolicy:
+  enabled: true
