@@ -14,6 +14,7 @@ Git backend.
 from __future__ import annotations
 
 from memory_manager.storage.base import (
+    BlocklistRejected,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -41,6 +42,7 @@ from memory_manager.storage.rules import (
 )
 
 __all__ = [
+    "BlocklistRejected",
     "EditMismatch",
     "InvalidNote",
     "NotFound",

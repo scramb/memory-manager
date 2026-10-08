@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Example operator blocklist, loaded by `vault/blocklist.py` once `BLOCKLIST_FILE`
+# points at a copy of this file (or one like it). Not loaded by default: with no
+# `BLOCKLIST_FILE` set, no write is ever checked against a blocklist at all (O26).
+#
+# Each `[[category]]` is checked against the full text a write would produce:
+#   name      the category name a rejected write and its audit row report -
+#             never the matched text itself (CLAUDE.md: note content is
+#             data, not instructions, and the match is never echoed back)
+#   keywords  optional list of words/phrases, matched case-insensitively on a
+#             word boundary (German umlauts and ß count as word characters,
+#             same as any other letter, under Python's `re`)
+#   patterns  optional list of Python `re` regexes, matched case-insensitively
+#             against the full text
+# At least one of `keywords`/`patterns` is required per category; an invalid
+# regex refuses startup rather than silently doing nothing.
+#
+# These two categories are illustrative placeholders, not a real operator
+# policy - replace them with whatever categories your deployment actually
+# needs blocked. German and English entries live together in one file; there
+# is no separate per-language mechanism.
+
+[[category]]
+name = "example-confidential-marker"
+keywords = [
+  "top secret",
+  "streng geheim",
+  "nicht zur weitergabe",
+]
+
+[[category]]
+name = "example-harassment"
+patterns = [
+  "(?i)you\\s+are\\s+worthless",
+  "(?i)du\\s+bist\\s+wertlos",
+]

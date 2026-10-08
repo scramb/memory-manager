@@ -29,6 +29,7 @@ from typing import Any, Literal, Protocol
 
 __all__ = [
     "AuditHook",
+    "BlocklistRejected",
     "EditMismatch",
     "IndexCommitHook",
     "IndexHook",
@@ -268,6 +269,26 @@ class SecretRejected(WriteError):
         return result
 
 
+class BlocklistRejected(WriteError):
+    """The note text a write would produce matches an operator blocklist category.
+
+    `category` is the name of the matched `[[category]]` from `BLOCKLIST_FILE`
+    (`vault.blocklist`) - never the text that matched it (CLAUDE.md: note
+    content is never echoed back into an error or the audit log, #244).
+    """
+
+    def __init__(self, path: str, category: str) -> None:
+        self.path = path
+        self.category = category
+        super().__init__(f"'{path}' rejected: blocklist category {category!r}")
+
+    def to_dict(self) -> dict[str, object]:
+        result = super().to_dict()
+        result["path"] = self.path
+        result["category"] = self.category
+        return result
+
+
 class WriteFailed(WriteError):
     """A git operation failed, or a push the remote kept rejecting.
 
@@ -321,6 +342,8 @@ class StorageBackend(Protocol):
     - `VersionConflict` - `if_version` did not match the current content.
     - `InvalidNote` - the resulting bytes violate ADR-0005 or the path rules.
     - `SecretRejected` - the resulting text looks like it contains a secret.
+    - `BlocklistRejected` - the resulting text matches an operator blocklist
+      category (`BLOCKLIST_FILE`, #244); never raised when none is configured.
     A backend may raise additional, implementation-specific subclasses of
     `WriteError` (the Git backend's `WriteConflict`/`WriteFailed` for a
     remote push race) that are not part of this shared contract.

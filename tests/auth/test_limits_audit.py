@@ -716,6 +716,46 @@ async def test_audit_row_recorded_for_a_secret_rejected_write_without_the_secret
     assert _FAKE_AWS_ACCESS_KEY_ID not in str(dict(row))
 
 
+async def test_audit_row_recorded_for_a_blocklist_rejected_write_without_the_match(
+    bare_remote: Path, tmp_path: Path, test_database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocklist_file = tmp_path / "blocklist.toml"
+    blocklist_file.write_text(
+        '[[category]]\nname = "example-confidential"\nkeywords = ["topsecret"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BLOCKLIST_FILE", str(blocklist_file))
+    # Not a real secret - a marker string whose absence from the audit row is
+    # what this test actually checks, standing in for a note's body text.
+    flagged_body = "the plan is topsecret for now"
+
+    config = ServerConfig(public_url=_PUBLIC_URL)
+    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
+        pool: asyncpg.Pool = app.state.services.pool
+        plaintext, _info = await create_token(
+            pool, "ci", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+        )
+        path = "personal/fact/flagged.md"
+        content = (
+            "---\ntitle: New note\ndescription: Written by a test.\ntype: fact\n"
+            f"---\n\n{flagged_body}\n"
+        )
+
+        async with _authed_mcp_client(app, config, plaintext) as client:
+            result = await client.call_tool(
+                "memory_write", {"path": path, "content": content, "if_version": "new"}
+            )
+            assert result.is_error is True
+
+        row = await pool.fetchrow("select * from audit_log order by id desc limit 1")
+
+    assert row is not None
+    assert row["outcome"] == "rejected"
+    detail = json.loads(row["detail"])
+    assert detail == {"error": "BlocklistRejected", "category": "example-confidential"}
+    assert flagged_body not in str(dict(row))
+
+
 async def test_audit_row_recorded_for_an_archive(
     bare_remote: Path, tmp_path: Path, test_database_url: str
 ) -> None:

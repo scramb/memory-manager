@@ -63,6 +63,7 @@ from memory_manager.audit import AuditWriter
 from memory_manager.config import (
     EmbeddingConfig,
     VaultConfig,
+    blocklist_file_from_env,
     database_app_role_from_env,
     storage_backend_from_env,
 )
@@ -72,6 +73,7 @@ from memory_manager.index.embeddings import EmbeddingProvider, provider_from_con
 from memory_manager.index.indexer import Indexer, VaultNotesSource
 from memory_manager.queue import (
     AuditHook,
+    BlocklistRejected,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -89,6 +91,7 @@ from memory_manager.queue import (
 from memory_manager.storage.base import StorageBackend
 from memory_manager.storage.git import GitBackend
 from memory_manager.storage.postgres import PostgresBackend
+from memory_manager.vault import blocklist
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
@@ -278,10 +281,15 @@ async def open_storage(environ: Mapping[str, str]) -> AsyncIterator[StorageBacke
     environment variables are missing or malformed, before anything is
     cloned. `STORAGE_BACKEND` is read first, and `VaultConfig` is only ever
     built for the `"git"` backend - a `"postgres"` call needs no `VAULT_*`
-    variable at all (ADR-0007 §2).
+    variable at all (ADR-0007 §2). Also loads `BLOCKLIST_FILE` eagerly
+    (`vault.blocklist.load_rules`), so a malformed file raises
+    `vault.blocklist.BlocklistConfigError` here too, before anything is
+    cloned, rather than surfacing as a confusing rejection on the first
+    write that happens to hit it (#244).
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
+    blocklist.load_rules(blocklist_file_from_env(dict(environ)))
     database_url = environ.get("DATABASE_URL")
     async with _open_backend(
         storage_backend_name, vault_config=vault_config, database_url=database_url
@@ -309,13 +317,16 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     here too (`database_app_role_from_env`, `None` for `"git"`, required and
     validated before anything else starts for `"postgres"`) and threaded
     through `_open_backend` into `PostgresBackend` and `Services.app_role`
-    alike.
+    alike. `BLOCKLIST_FILE` is loaded eagerly here too (`vault.blocklist.
+    load_rules`), same "fails before anything is started" contract as the
+    rest of this list (#244).
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
     vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
     embedding_config = EmbeddingConfig.from_env(dict(environ))
     app_role = database_app_role_from_env(dict(environ))
+    blocklist.load_rules(blocklist_file_from_env(dict(environ)))
 
     async with _open_backend(
         storage_backend_name,
@@ -469,7 +480,9 @@ def _audit_outcome(
 
     `outcome` is one of `"ok"`/`"conflict"`/`"rejected"`/`"failed"`.
     `detail` never carries `current_content`/`current_version`-adjacent note
-    text, only a version, an error class name, or a conflict file path.
+    text, only a version, an error class name, a conflict file path, or -
+    for `BlocklistRejected` - the matched category's name, never the text
+    that matched it (#244).
     """
     if error is None:
         if result is None:  # pragma: no cover - defensive, a write-queue invariant
@@ -483,6 +496,8 @@ def _audit_outcome(
             "conflict_path": error.conflict_path,
             "current_version": error.current_version,
         }
+    if isinstance(error, BlocklistRejected):
+        return "rejected", {"error": "BlocklistRejected", "category": error.category}
     if isinstance(error, (InvalidNote, EditMismatch, NotFound, SecretRejected)):
         return "rejected", {"error": type(error).__name__}
     if isinstance(error, WriteFailed):

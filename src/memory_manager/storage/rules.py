@@ -4,7 +4,8 @@
 Everything here is validation and content computation only - no disk, no
 git, no network - so both the Git backend (`storage/git.py`, through
 `queue.py`'s `_process`/`_do_*`) and a future Postgres backend enforce
-`if_version`, ADR-0005 and the secret scan identically. Each function that
+`if_version`, ADR-0005, the secret scan and the operator blocklist
+(`BLOCKLIST_FILE`, #244) identically. Each function that
 used to also do a filesystem lookup (does the archive target already
 exist? does `new_path` already exist?) now takes that lookup's result as a
 plain argument instead - `queue.py` performs the actual `repo.read_file`
@@ -19,6 +20,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from memory_manager.storage.base import (
+    BlocklistRejected,
     EditMismatch,
     InvalidNote,
     NotFound,
@@ -27,6 +29,7 @@ from memory_manager.storage.base import (
     VersionConflict,
     WriteRequest,
 )
+from memory_manager.vault import blocklist
 from memory_manager.vault.note import NoteFormatError, parse, serialize
 from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path
 from memory_manager.vault.secrets import SecretFound, check
@@ -114,7 +117,9 @@ def prepare_write_or_edit(
     """The canonical bytes to commit for a `write`/`edit`.
 
     Raises `InvalidNote` (bad path, structurally or semantically invalid
-    note, or the note's `id` changed), `EditMismatch`, or `SecretRejected`.
+    note, or the note's `id` changed), `EditMismatch`, `SecretRejected`, or
+    `BlocklistRejected` (an operator blocklist category, checked right
+    after the secret scan, #244).
     """
     new_bytes = new_content_for(op, path, content, old_str, new_str, current)
 
@@ -133,10 +138,15 @@ def prepare_write_or_edit(
         if current_note.id != parsed.id:
             raise InvalidNote(path, "id must not change")
 
+    decoded = new_bytes.decode("utf-8")
     try:
-        check(new_bytes.decode("utf-8"))
+        check(decoded)
     except SecretFound as exc:
         raise SecretRejected(path, str(exc)) from exc
+    try:
+        blocklist.check(decoded)
+    except blocklist.BlocklistFound as exc:
+        raise BlocklistRejected(path, exc.category) from exc
 
     canonical = serialize(parsed)
     return new_bytes if new_bytes == canonical else canonical
@@ -206,7 +216,8 @@ def prepare_supersede_content(
     Called after `prepare_supersede_paths` and the `new_path` existence
     lookup it enables. Raises `InvalidNote` if `new_path` already exists,
     either note fails to parse, or either fails ADR-0005 validation;
-    `SecretRejected` if the new note's text looks like it contains a secret.
+    `SecretRejected` if the new note's text looks like it contains a secret;
+    `BlocklistRejected` if it matches an operator blocklist category (#244).
     """
     if new_target_exists:
         raise InvalidNote(new_path, "already exists, supersede needs an unused path")
@@ -244,9 +255,14 @@ def prepare_supersede_content(
     new_final_bytes = serialize(new_note)
     old_final_bytes = serialize(old_note)
 
+    new_decoded = new_final_bytes.decode("utf-8")
     try:
-        check(new_final_bytes.decode("utf-8"))
+        check(new_decoded)
     except SecretFound as exc:
         raise SecretRejected(new_path, str(exc)) from exc
+    try:
+        blocklist.check(new_decoded)
+    except blocklist.BlocklistFound as exc:
+        raise BlocklistRejected(new_path, exc.category) from exc
 
     return new_final_bytes, old_final_bytes

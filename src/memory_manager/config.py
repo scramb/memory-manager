@@ -24,6 +24,7 @@ __all__ = [
     "VaultConfig",
     "VaultConfigError",
     "audit_export_targets_from_env",
+    "blocklist_file_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
     "storage_backend_from_env",
@@ -201,6 +202,21 @@ def database_app_role_from_env(environ: dict[str, str]) -> str | None:
             "before touching a row-level-security-protected content table"
         )
     return role
+
+
+def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
+    """The configured operator blocklist file (`BLOCKLIST_FILE`), or `None`.
+
+    `None` - the default, nothing set - means no blocklist at all:
+    `vault.blocklist.check` is then a no-op, same "off unless a deployment
+    opts in" behaviour the `QUOTA_*` variables above have. Unlike those,
+    there is nothing to validate here beyond "is a value set" - whether the
+    file at that path actually exists and compiles is `vault.blocklist.
+    load_rules`'s job, called eagerly at startup (`app.open_storage`/
+    `open_services`) so a malformed file refuses startup there, not here.
+    """
+    value = environ.get("BLOCKLIST_FILE")
+    return Path(value) if value else None
 
 
 class EmbeddingConfigError(ValueError):
