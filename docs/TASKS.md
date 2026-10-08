@@ -275,7 +275,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 ### WP-28 — Git-to-Postgres migration · F-01 · Branch: `wp/28-migrate-git` · PR: open
 
-- [ ] #246 `migrate git-to-postgres --dry-run` reports the namespace mapping and every note it would import
+- [x] #246 `migrate git-to-postgres --dry-run` reports the namespace mapping and every note it would import
 - [ ] #247 `migrate git-to-postgres` imports current notes byte-identically with Git history as revisions ⛔ blocked by #246
 - [ ] #248 The example vault migrates to Postgres with identical versions ⛔ blocked by #247
 
