@@ -212,10 +212,33 @@
           "additionalProperties": true,
           "properties": {
             "enabled": { "type": "boolean" },
-            "instances": { "type": "integer", "minimum": 1 },
+            "instances": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "More than 1 requires storage.backend \"postgres\" (ADR-0007, ADR-0009 §6)."
+            },
             "imageName": { "type": "string", "minLength": 1 },
             "storage": { "type": "object", "additionalProperties": true },
-            "resources": { "type": "object", "additionalProperties": true }
+            "resources": { "type": "object", "additionalProperties": true },
+            "backup": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "Barman Cloud plugin backups for the CNPG Cluster (#252) - renders an ObjectStore, a WAL-archiving plugin entry on the Cluster and a ScheduledBackup.",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "schedule": { "type": "string", "minLength": 1 },
+                "retentionPolicy": { "type": "string", "pattern": "^[1-9][0-9]*[dwm]$" },
+                "destinationPath": { "type": "string", "minLength": 1 },
+                "endpointURL": { "type": "string" },
+                "existingSecret": { "type": "string" },
+                "accessKeyIdKey": { "type": "string", "minLength": 1 },
+                "secretAccessKeyKey": { "type": "string", "minLength": 1 },
+                "compression": {
+                  "type": "string",
+                  "enum": ["", "bzip2", "gzip", "lz4", "snappy", "xz", "zstd"]
+                }
+              }
+            }
           }
         },
         "url": { "type": "string" },
@@ -292,6 +315,18 @@
       "replicaCount": {
         "maximum": 1,
         "description": "storage.backend \"git\" allows at most 1 replica (ADR-0007, ADR-0009 §6)."
+      },
+      "database": {
+        "properties": {
+          "cnpg": {
+            "properties": {
+              "instances": {
+                "maximum": 1,
+                "description": "storage.backend \"git\" allows at most 1 CNPG instance (ADR-0007, ADR-0009 §6)."
+              }
+            }
+          }
+        }
       }
     }
   }

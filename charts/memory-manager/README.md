@@ -55,7 +55,7 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `worker` → `autoscaling` → `enabled`/`minReplicas`/`maxReplicas`/`targetCPUUtilizationPercentage` | off, 2/6/70% | `storage` → `backend` `postgres` only - CPU `HorizontalPodAutoscaler` for `worker` (ADR-0009 addendum 2026-10-08) |
 | `shutdown` → `graceSeconds`/`preStopSleepSeconds`/`terminationGracePeriodSeconds` | 20/10/40 | `storage` → `backend` `postgres` only - graceful shutdown (ADR-0009 §5); the last value must be at least the first two added together |
 | `pdb` → `api` → `minAvailable` | `2` | `storage` → `backend` `postgres` only - PodDisruptionBudget for the api Deployment (ADR-0009 §5) |
-| `database` → `appRole` | `memory_manager_app` | api only, `storage` → `backend` `postgres` only - `DATABASE_APP_ROLE`, the non-owner role request transactions switch to (ADR-0008 addendum); the worker Deployment never gets it |
+| `database` → `appRole` | `memory_manager_app` | api only, `storage` → `backend` `postgres` only - `DATABASE_APP_ROLE`, the non-owner role request transactions switch to (ADR-0008 addendum); the worker Deployment never gets it. The CNPG `Cluster` below creates this role at bootstrap and grants it to the owner |
 | `image` → `repository` | `ghcr.io/scramb/memory-manager` | |
 | `image` → `tag` | `""` | Defaults to the chart's own `appVersion`; never `latest` |
 | `image` → `pullPolicy` | `IfNotPresent` | |
@@ -75,6 +75,10 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `secrets` → `existingSecret` | `""` | Defaults to `<release>-memory-manager-secrets` |
 | `secrets` → `create` | `false` | Chart-managed Secret from `secrets` → `values` - not for production |
 | `database` → `cnpg` → `enabled` | `true` | Renders a CloudNativePG `Cluster`; needs the CNPG operator installed already |
+| `database` → `cnpg` → `instances` | `1` | More than 1 needs `storage` → `backend` `postgres` (ADR-0007, ADR-0009 §6); `values-enterprise.yaml` sets 3 |
+| `database` → `cnpg` → `backup` → `enabled` | `false` | Barman Cloud plugin backups (#252, `docs/research/cnpg-backups.md`) - an `ObjectStore`, a WAL-archiving plugin entry on the `Cluster` and a `ScheduledBackup`; needs the plugin and cert-manager installed already |
+| `database` → `cnpg` → `backup` → `schedule`/`retentionPolicy` | daily, `30d` | `ScheduledBackup`'s own seconds-first cron schedule and the `ObjectStore`'s own retention window (ADR-0007's documented 30 d + 7 d erasure-replay horizon) |
+| `database` → `cnpg` → `backup` → `destinationPath`/`endpointURL`/`existingSecret`/`accessKeyIdKey`/`secretAccessKeyKey`/`compression` | placeholders | S3-compatible object store and credentials Secret (created out-of-band); defaults to `<cnpg cluster name>-backup-credentials` when `existingSecret` is empty |
 | `database` → `url`/`existingSecret` | `""` | Used instead, when the `cnpg` block above is disabled |
 | `httpRoute` → `enabled` | `true` | Gateway API `HTTPRoute`, same shape as `deploy/httproute.yaml` |
 | `ingress` → `enabled` | `false` | Classic `Ingress`, for clusters without Gateway API |
@@ -87,11 +91,12 @@ See `values.yaml` itself for the full, commented reference - this table is the s
 
 `values-enterprise.yaml` sets `storage` → `backend` to `postgres` and turns on the `api`/`worker`
 split above plus a CPU `HorizontalPodAutoscaler` for both Deployments, Entra login placeholders
-included. KEDA request-rate scaling stays off; turn `api` → `keda` → `enabled` on and `api` →
-`autoscaling` → `enabled` off in your own overlay to use it instead (KEDA itself must already be
-installed in the cluster). It is a starting overlay, not a complete install - layer your own values
-on top for the pieces it does not cover yet (CNPG backups and the app role migration, Valkey shared
-state, NetworkPolicies):
+included, a 3-instance CNPG `Cluster` with Barman Cloud plugin backups enabled (#252, placeholder
+bucket/endpoint - set your own). KEDA request-rate scaling stays off; turn `api` → `keda` →
+`enabled` on and `api` → `autoscaling` → `enabled` off in your own overlay to use it instead (KEDA
+itself must already be installed in the cluster). It is a starting overlay, not a complete install -
+layer your own values on top for the pieces it does not cover yet (Valkey shared state,
+NetworkPolicies):
 
 ```sh
 helm template memory-manager charts/memory-manager \
@@ -110,6 +115,10 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
 ## Not included
 
 - A Flux `HelmRelease` example with SOPS secrets - #46 (`deploy/flux/`).
-- Backups for the CNPG `Cluster` - it is a derived index (`memory-manager reindex --full` rebuilds
-  it from the vault), not a primary store; add a CNPG `Backup`/`ScheduledBackup` and object-store
-  configuration in your own values/overlay if you want point-in-time recovery anyway.
+- Installing the CNPG operator, the Barman Cloud plugin or cert-manager - `database` → `cnpg` →
+  `backup` (#252, `docs/research/cnpg-backups.md`) only renders the `ObjectStore`/`ScheduledBackup`
+  objects, off by default since the default `git`-backend `Cluster` is a derived index
+  (`memory-manager reindex --full` rebuilds it from the vault), not a primary store.
+- The restore runbook and `erasure_log` replay procedure after a restore (WP-26, ADR-0007's own
+  30 d + 7 d horizon).
+- A CNPG Pooler/PgBouncer, and backups in the kind E2E.

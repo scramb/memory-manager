@@ -284,6 +284,8 @@ spec:
       owner: memory_manager
       postInitApplicationSQL:
         - "CREATE EXTENSION IF NOT EXISTS vector;"
+        - "CREATE ROLE \"memory_manager_app\" NOLOGIN;"
+        - "GRANT \"memory_manager_app\" TO memory_manager;"
   storage:
     size: 5Gi
   resources:

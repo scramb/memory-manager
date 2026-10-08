@@ -64,3 +64,8 @@ networkPolicy:
 
 serviceMonitor:
   enabled: true
+
+database:
+  cnpg:
+    backup:
+      enabled: true

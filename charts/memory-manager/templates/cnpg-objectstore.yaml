@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Barman Cloud plugin ObjectStore (#252) - the object store the CNPG
+# Cluster's own WAL-archiving plugin entry (templates/cnpg-cluster.yaml)
+# and the ScheduledBackup below (templates/cnpg-scheduledbackup.yaml)
+# both reference by name. Needs the Barman Cloud plugin (and
+# cert-manager, its own prerequisite) already installed in the CNPG
+# operator's namespace - not this chart's job (#252's own "Not
+# included"). API verified against the current plugin docs, recorded in
+# docs/research/cnpg-backups.md.
+#
+# S3-compatible credentials only (`s3Credentials`) - every bucket/endpoint
+# value below is a placeholder (CLAUDE.md: a public repository carries no
+# operator-specific values); set your own destinationPath/endpointURL and
+# point existingSecret at a Secret you create out-of-band.
+{{- if and .Values.database.cnpg.enabled .Values.database.cnpg.backup.enabled }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ include "memory-manager.cnpgObjectStoreName" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+spec:
+  retentionPolicy: {{ .Values.database.cnpg.backup.retentionPolicy | quote }}
+  configuration:
+    destinationPath: {{ .Values.database.cnpg.backup.destinationPath | quote }}
+    {{- with .Values.database.cnpg.backup.endpointURL }}
+    endpointURL: {{ . | quote }}
+    {{- end }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ include "memory-manager.cnpgBackupSecretName" . }}
+        key: {{ .Values.database.cnpg.backup.accessKeyIdKey }}
+      secretAccessKey:
+        name: {{ include "memory-manager.cnpgBackupSecretName" . }}
+        key: {{ .Values.database.cnpg.backup.secretAccessKeyKey }}
+    {{- with .Values.database.cnpg.backup.compression }}
+    wal:
+      compression: {{ . }}
+    {{- end }}
+{{- end }}

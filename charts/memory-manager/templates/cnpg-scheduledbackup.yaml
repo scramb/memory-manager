@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Scheduled base backup through the Barman Cloud plugin (#252) -
+# `method: plugin` plus a plugin configuration name below is the
+# plugin-based replacement for the deprecated in-tree
+# `method: barmanObjectStore` (docs/research/cnpg-backups.md).
+# `backupOwnerReference: cluster` ties every Backup object this creates
+# to the Cluster's own lifecycle, so deleting the Cluster also
+# garbage-collects them.
+{{- if and .Values.database.cnpg.enabled .Values.database.cnpg.backup.enabled }}
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ printf "%s-schedule" (include "memory-manager.cnpgObjectStoreName" .) }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.database.cnpg.backup.schedule | quote }}
+  backupOwnerReference: cluster
+  cluster:
+    name: {{ include "memory-manager.cnpgClusterName" . }}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+{{- end }}

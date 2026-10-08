@@ -268,6 +268,10 @@ database:
     # Set to false and use this block's own "url"/"existingSecret" for an
     # external Postgres instead.
     enabled: true
+    # More than 1 requires storage's own backend to be "postgres"
+    # (ADR-0007, ADR-0009 §6) - values.schema.json's own "if"/"then" and the
+    # chart's own "validateCnpgInstances" helper both fail the render
+    # otherwise; values-enterprise.yaml sets 3.
     instances: 1
     # Must be a CNPG operand image, not a stock Postgres image - see
     # templates/cnpg-cluster.yaml's comment. This one ships the `vector`
@@ -282,6 +286,32 @@ database:
         memory: 256Mi
       limits:
         memory: 512Mi
+    # Barman Cloud plugin backups (#252, docs/research/cnpg-backups.md) -
+    # off by default. When enabled, renders an ObjectStore
+    # (templates/cnpg-objectstore.yaml), a WAL-archiving plugin entry on
+    # the Cluster (templates/cnpg-cluster.yaml) and a ScheduledBackup
+    # (templates/cnpg-scheduledbackup.yaml). Needs the Barman Cloud
+    # plugin and its own prerequisite, cert-manager, already installed in
+    # the CNPG operator's namespace - neither is this chart's job.
+    backup:
+      enabled: false
+      # Seconds-first cron (CNPG's own ScheduledBackup format, not the
+      # Kubernetes CronJob one) - daily at 02:00.
+      schedule: "0 0 2 * * *"
+      # ADR-0007's documented erasure-replay horizon assumes 30 d here
+      # (backup retention) + 7 d on top.
+      retentionPolicy: 30d
+      # Placeholders (CLAUDE.md) - set your own S3-compatible bucket.
+      destinationPath: s3://memory-manager-backups/
+      endpointURL: https://object-store.example.com
+      # A Secret you create out-of-band, carrying the two keys below.
+      # Defaults to "<cnpg cluster name>-backup-credentials" when empty.
+      existingSecret: ""
+      accessKeyIdKey: ACCESS_KEY_ID
+      secretAccessKeyKey: ACCESS_SECRET_KEY
+      # WAL compression; "" (default) stores WALs uncompressed. One of
+      # "", bzip2, gzip, lz4, snappy, xz, zstd.
+      compression: gzip
   # Used only when the cnpg block above is disabled.
   url: ""
   existingSecret:

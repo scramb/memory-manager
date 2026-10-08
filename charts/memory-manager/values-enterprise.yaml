@@ -7,13 +7,14 @@
 # for both Deployments (owner decision O27, ADR-0009 addendum
 # 2026-10-08, #251 - KEDA request-rate scaling stays off here; turn the
 # api block's own keda sub-block on and its autoscaling sub-block off in
-# your own overlay instead). Every hostname/secret-store path below is
+# your own overlay instead), a 3-instance CNPG Cluster with Barman Cloud
+# plugin backups (#252). Every hostname/secret-store path below is
 # still a placeholder (CLAUDE.md: a public repository carries no
 # operator-specific values) - set your own in a further `-f` overlay,
 # never by editing this file in place.
 #
-# Extended by later WP-29 tasks: CNPG backups and the app role migration
-# (29d), Valkey shared state (29f), NetworkPolicies (29g).
+# Extended by later WP-29 tasks: Valkey shared state (29f), NetworkPolicies
+# (29g).
 storage:
   backend: postgres
 
@@ -33,6 +34,15 @@ login:
 
 database:
   appRole: memory_manager_app
+  cnpg:
+    # 3 instances, only allowed once storage's own backend is "postgres"
+    # (ADR-0007, ADR-0009 §6) - the default profile's single instance.
+    instances: 3
+    backup:
+      # Placeholder bucket/endpoint (values.yaml) - set your own in a
+      # further overlay; scripts/check-deploy-placeholders.sh only
+      # checks for a real one creeping in here, not that these are set.
+      enabled: true
 
 api:
   autoscaling:
