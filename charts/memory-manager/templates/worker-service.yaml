@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# storage's own backend "postgres" only: the worker Deployment answers no
+# client-facing traffic (templates/service.yaml's own comment), so this
+# Service exists only so the ServiceMonitor (templates/servicemonitor.yaml,
+# #264) has something to select for the worker's own /metrics - no
+# separate "metrics-only port" knob, since the worker's single port
+# already serves /healthz, /readyz and /metrics (WP-23).
+{{- if eq .Values.storage.backend "postgres" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-worker
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "worker") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.worker.port }}
+      targetPort: http
+{{- end }}

@@ -104,9 +104,15 @@ def test_postgres_backend_worker_never_gets_database_app_role(
 
 
 def test_postgres_backend_service_targets_api_only(render: Callable[..., _ChartRender]) -> None:
+    # Two Services render in postgres mode since #264 added a worker one
+    # for the ServiceMonitor (templates/worker-service.yaml) - "by name"
+    # instead of result.find("Service"), which assumes exactly one.
     result = render(values_files=[ENTERPRISE_VALUES])
 
-    service = result.find("Service")
+    services = {
+        doc["metadata"]["name"]: doc for doc in result.documents() if doc["kind"] == "Service"
+    }
+    service = services["t-memory-manager"]
     assert service["spec"]["selector"]["app.kubernetes.io/component"] == "api"
 
 

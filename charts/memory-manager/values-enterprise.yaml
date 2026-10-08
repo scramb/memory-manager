@@ -64,3 +64,9 @@ valkey:
 # gateway/Prometheus/CNPG-operator namespace in a further overlay.
 networkPolicy:
   enabled: true
+
+# Two Prometheus scrape jobs instead of one (#264, templates/
+# servicemonitor.yaml) - api and worker each get their own component
+# label, since they are two independently-scaling Deployments here.
+serviceMonitor:
+  enabled: true

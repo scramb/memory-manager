@@ -90,7 +90,7 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `httpRoute` → `enabled` | `true` | Gateway API `HTTPRoute`, same shape as `deploy/httproute.yaml` |
 | `ingress` → `enabled` | `false` | Classic `Ingress`, for clusters without Gateway API |
 | `networkPolicy` → `enabled` | `false` | Off by default, documented; ingress scoped to configurable selectors, egress allow-all-with-DNS by default (remote IPs are operator-specific and unknown to this chart). `storage` → `backend` `postgres` renders one policy per component instead of the single `git`-mode one (#255) - `prometheus`/`cnpgOperator` name the extra ingress sources those need |
-| `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed |
+| `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed. `storage` → `backend` `postgres` scrapes `api` and `worker` as two jobs, each labeled `component` (#264) - `git` keeps the single, unchanged endpoint |
 
 See `values.yaml` itself for the full, commented reference - this table is the summary.
 
@@ -106,7 +106,8 @@ itself must already be installed in the cluster). Valkey shared state (#254) sta
 overlay instead for Valkey's sub-millisecond counters. `networkPolicy` → `enabled` is on, with
 per-component policies for `api`, `worker` and the CNPG `Cluster`'s own instances (#255) - set
 `networkPolicy` → `ingress`/`prometheus`/`cnpgOperator` to your own gateway/monitoring/CNPG-operator
-namespace in a further overlay; they default to "matches everywhere" until you do. It is a starting
+namespace in a further overlay; they default to "matches everywhere" until you do. `serviceMonitor` →
+`enabled` is on too, scraping `api` and `worker` as two separate jobs (#264). It is a starting
 overlay, not a complete install - layer your own values on top for the pieces it does not cover yet:
 
 ```sh

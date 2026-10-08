@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+#
+# storage's own backend "postgres" carries an explicit "api" component
+# label on this Service's own metadata (not just its selector below), so
+# the ServiceMonitor (templates/servicemonitor.yaml, #264) can filter its
+# own api endpoint to this Service and not the worker one
+# (templates/worker-service.yaml). Git mode keeps the plain, unqualified
+# labels it has always had.
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "memory-manager.fullname" . }}
   labels:
+    {{- if eq .Values.storage.backend "postgres" }}
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "api") | nindent 4 }}
+    {{- else }}
     {{- include "memory-manager.labels" . | nindent 4 }}
+    {{- end }}
 spec:
   type: {{ .Values.service.type }}
   selector:
