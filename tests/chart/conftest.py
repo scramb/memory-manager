@@ -16,6 +16,17 @@ to whichever file namespace-package rules give that top-level name -
 not necessarily the file in this directory. `ChartRender` therefore
 stays local to this file; `test_backend_guard.py` types the `render`
 fixture structurally instead of importing it.
+
+`bare_remote`/`human_commit`/`human_delete`/`human_rename`/`vault_config`
+are re-exported from `tests/git_fixtures.py`, same as `tests/conftest.py`,
+`tests/vault/conftest.py`, `tests/auth/conftest.py` and
+`tests/mcp/conftest.py` all do (see `tests/auth/conftest.py`'s own
+docstring): at runtime, every `conftest.py` under `tests/` ends up
+importable under the bare name `conftest` (no `__init__.py` anywhere
+under `tests/`), and whichever one Python's import system resolves first
+for a given run is the one a plain `from conftest import human_commit`
+elsewhere in the suite actually gets - so every `conftest.py` that could
+win that race must carry the same superset, this one included.
 """
 
 from __future__ import annotations
@@ -30,6 +41,16 @@ from typing import Any
 
 import pytest
 import yaml
+from git_fixtures import bare_remote, human_commit, human_delete, human_rename, vault_config
+
+__all__ = [
+    "bare_remote",
+    "human_commit",
+    "human_delete",
+    "human_rename",
+    "render",
+    "vault_config",
+]
 
 CHART_DIR = Path(__file__).resolve().parents[2] / "charts" / "memory-manager"
 
