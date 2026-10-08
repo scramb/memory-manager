@@ -26,8 +26,10 @@ too (#98), but differently from `"git"`: no startup reindex (there is no
 transaction, before `PostgresBackend` ever returns from it) and no
 sync/write-queue hooks (there is no queue) - instead, an `index.indexer.Indexer`
 built over `vault_notes` is handed to `PostgresBackend` itself as its
-`index_hook`/`index_commit_hook` (ADR-0007 §4), so `memory_search` can use
-`search.hybrid_search` exactly like `"git"` with `DATABASE_URL` does.
+`index_hook` (ADR-0007 §4), so `memory_search` can use `search.hybrid_search`
+exactly like `"git"` with `DATABASE_URL` does. Embeddings for what that hook
+just wrote are filled in later by the separate `memory-manager worker`
+process, not by this one (#219).
 
 `Services` is what the MCP tool layer (`mcp/server.py`) and the write tools
 (#18/#19) are built against; nothing outside this module touches
@@ -177,12 +179,17 @@ async def _open_backend(
 
     `embedding_config`, given only by `open_services` (ADR-0007 §4, WP-18/#98),
     additionally builds an `index.indexer.Indexer` over `vault_notes` and wires
-    it into the `PostgresBackend` as its `index_hook`/`index_commit_hook` -
-    every write indexes itself in the same transaction, and embeddings for it
-    are scheduled right after. `open_storage` (the import CLI's entry point)
-    never passes one, so a `"postgres"` call from there stays index-free, same
-    as it always was. Any `self._background_tasks` the indexer still has
-    pending are drained (`Indexer.aclose`) before the pool closes.
+    it into the `PostgresBackend` as its `index_hook` - every write indexes
+    itself in the same transaction. No `index_commit_hook` is wired any more
+    (#219): embedding a note's chunks is no longer this process's job at all -
+    `Indexer.index_on_connection` enqueues an `"embed_note"` job on the write's
+    own connection instead, and the separate `memory-manager worker` process
+    (`worker.py`) is what claims and runs it, never a background `asyncio`
+    task inside this one. `open_storage` (the import CLI's entry point) never
+    passes an `embedding_config`, so a `"postgres"` call from there stays
+    index-free, same as it always was. `Indexer.aclose` is still called before
+    the pool closes - a no-op today since nothing schedules a background
+    embedding task any more, but harmless to keep calling.
 
     `app_role` (ADR-0008 addendum, #116) is `"postgres"`-only too: given only
     by `open_services` (`database_app_role_from_env` requires it there before
@@ -233,7 +240,6 @@ async def _open_backend(
         storage = PostgresBackend(
             pool,
             index_hook=indexer.index_on_connection if indexer is not None else None,
-            index_commit_hook=indexer.schedule_embeddings if indexer is not None else None,
             app_role=app_role,
         )
         try:
@@ -312,8 +318,8 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     no comparable startup reindex (ADR-0007 §4, WP-18/#98: every write already
     indexes itself, so there is nothing to catch up on at startup) - only the
     audit hook is wired onto the backend in addition to what `_open_backend`
-    already wired in as `index_hook`/`index_commit_hook`, and `Services.pool`
-    is the backend's own pool. `app_role` (ADR-0008 addendum, #116) is read
+    already wired in as `index_hook`, and `Services.pool` is the backend's
+    own pool. `app_role` (ADR-0008 addendum, #116) is read
     here too (`database_app_role_from_env`, `None` for `"git"`, required and
     validated before anything else starts for `"postgres"`) and threaded
     through `_open_backend` into `PostgresBackend` and `Services.app_role`

@@ -26,22 +26,41 @@ all of them are in the index, so a forward reference is correct the first
 time a vault is rebuilt from scratch.
 
 Embedding a note's chunks (#27) happens best-effort right after it is
-upserted, via the optional `provider` constructor argument. A missing
-provider or a failed embedding call both leave `chunks.embedding` `NULL` -
-indexing itself never blocks on it. `embed_pending`, called at the end of
-`reindex`, is the catch-up pass: it re-embeds every chunk still missing an
-embedding or stamped with a model other than the provider's current one,
-so a provider outage or a model change both self-heal on the next reindex.
+upserted, via the optional `provider` constructor argument - for the
+`"git"` backend's batch paths (`index_paths`/`_index_one`), unchanged
+(#219's "not included"). A missing provider or a failed embedding call
+both leave `chunks.embedding` `NULL` - indexing itself never blocks on it.
+`embed_pending`, called at the end of `reindex` for a `_FileTreeSource`
+(the `"git"` backend), is the catch-up pass: it re-embeds every chunk
+still missing an embedding or stamped with a model other than the
+provider's current one, so a provider outage or a model change both
+self-heal on the next reindex. For a `_VaultNotesReader` source (the
+`"postgres"` backend), `reindex` skips that call: #219's worker-side
+catch-up (`enqueue_stale_embeddings`) takes over that job instead.
 
-`index_on_connection`/`schedule_embeddings` are the connection-path entry
-points `storage.postgres.PostgresBackend` wires in as its `IndexHook`/
-`IndexCommitHook` (ADR-0007 §4, #98): a write indexes the note it just
-wrote on the *same* connection, inside the *same* transaction as the write
-itself - no separate pool acquisition, no second transaction - and schedules
-its embeddings as a background task only after that transaction has
-committed, never awaited by the write. `aclose` drains those background
-tasks with a time limit on process shutdown, so none of them outlives the
-pool they were handed.
+`index_on_connection` is the connection-path entry point
+`storage.postgres.PostgresBackend` wires in as its `IndexHook` (ADR-0007
+§4, #98): a write indexes the note it just wrote on the *same* connection,
+inside the *same* transaction as the write itself - no separate pool
+acquisition, no second transaction - leaving the chunks it just wrote with
+`embedding` `NULL`, same as every other upsert. Embedding them is not this
+module's job to run inline any more (#219): on that same connection, still
+inside that same transaction, `index_on_connection` enqueues one
+`"embed_note"` job (`jobs.enqueue`, note id + `file_hash`) for the worker
+process to pick up once the write has committed - `jobs.enqueue`'s own
+`pg_notify` only ever fires on commit, so a rolled-back write never wakes a
+worker for a job that no longer exists either. `embed_note_job` is that
+job's handler (`worker.py`'s `build_job_handlers`): skips if the note's
+`file_hash` has already moved on (a newer write's own job will embed the
+current chunks instead), otherwise embeds whatever is still stale and lets
+`EmbeddingError` propagate so the worker retries with backoff, rather than
+swallowing it the way the batch path's `_embed_note` does.
+
+`schedule_embeddings`/`aclose` are this module's older, still-functional
+background-task mechanism for the same `IndexCommitHook` seam
+(`storage.base.IndexCommitHook`) - no longer wired by `app.py` (#219
+replaced it with the job above), kept only because other callers
+(`PostgresBackend(index_commit_hook=...)`) may still wire it in by hand.
 """
 
 from __future__ import annotations
@@ -60,6 +79,7 @@ import asyncpg.pool
 
 from memory_manager.index.chunker import chunk_note
 from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
+from memory_manager.jobs import enqueue as enqueue_job
 from memory_manager.vault.links import (
     LinkRef,
     ResolvedLink,
@@ -243,16 +263,25 @@ class Indexer:
         With `full=True`, additionally removes rows for paths the source no
         longer has and recomputes links for every note, so a reference to a
         note indexed later in the same run still resolves.
+
+        The trailing `embed_pending` catch-up only runs for a
+        `_FileTreeSource` (the `"git"` backend, #219's "not included"). For
+        a `_VaultNotesReader` source (the `"postgres"` backend), the worker
+        process's own startup catch-up (`enqueue_stale_embeddings`) is what
+        re-embeds a chunk left stale by a lost job, a provider outage or a
+        model change - this method leaves embedding alone entirely.
         """
         discovered = await self._source.discover_paths()
         stats = await self.index_paths(discovered)
         if not full:
-            await self.embed_pending()
+            if not isinstance(self._source, _VaultNotesReader):
+                await self.embed_pending()
             return stats
 
         extra_deleted = await self._delete_stale(discovered)
         await self._recompute_all_links()
-        await self.embed_pending()
+        if not isinstance(self._source, _VaultNotesReader):
+            await self.embed_pending()
         return IndexStats(
             indexed=stats.indexed,
             unchanged=stats.unchanged,
@@ -312,6 +341,15 @@ class Indexer:
         aliases or path can now resolve, scoped to just this note - never a scan
         of every dangling link in the index (`_heal_dangling_links`'s job, for the
         batch paths that actually need it).
+
+        The chunks `_upsert_note_rows` just wrote are left with `embedding`
+        `NULL`, same as always - this method does not embed them itself any
+        more (#219). Instead, still on `conn` and still inside the caller's
+        own transaction, it enqueues one `"embed_note"` job (`jobs.enqueue`)
+        naming this note's id and the `file_hash` it was just written at, so
+        a worker picks the job up once - and only once - this transaction has
+        actually committed. A no-op without a configured provider: nothing
+        would ever claim the job.
         """
         note = parse(content)
         file_hash = version(content)
@@ -319,6 +357,8 @@ class Indexer:
         await self._heal_dangling_for_note(
             conn, note.id, note_path.namespace, note_path.slug, note.aliases
         )
+        if self._provider is not None:
+            await enqueue_job(conn, "embed_note", {"note_id": note.id, "version": file_hash})
 
     async def schedule_embeddings(self, note_ids: Sequence[str]) -> None:
         """Embed `note_ids`' chunks in the background, never awaited by the caller.
@@ -532,6 +572,69 @@ class Indexer:
             total += len(rows)
 
         return total
+
+    async def embed_note_job(self, note_id: str, expected_version: str) -> None:
+        """Embed `note_id`'s still-stale chunks for one worker-claimed `"embed_note"`
+        job (#219, `worker.py`'s `build_job_handlers`).
+
+        A no-op without a configured provider - nothing to embed with. Also
+        a no-op if `note_id`'s current `notes.file_hash` no longer matches
+        `expected_version`: a newer write already replaced this note's
+        chunks (and `index_on_connection` already enqueued that write's own
+        job for them), so this stale job has nothing left to do, not even a
+        model-change catch-up - `enqueue_stale_embeddings` owns that case.
+        Unlike `_embed_note`'s own background path, an `EmbeddingError` from
+        `self._provider.embed` is not caught here: it propagates to the
+        caller (`worker._dispatch_job`), which retries the job with backoff
+        (`jobs.fail_or_retry`) rather than leaving it silently `NULL` forever.
+        """
+        if self._provider is None:
+            return
+
+        async with self._pool.acquire() as conn:
+            current_hash = await conn.fetchval("select file_hash from notes where id = $1", note_id)
+            if current_hash != expected_version:
+                return
+
+            rows = await conn.fetch(
+                "select id, text from chunks where note_id = $1 "
+                "and (embedding is null or model is distinct from $2) "
+                "order by ord",
+                note_id,
+                self._provider.model,
+            )
+        if not rows:
+            return
+
+        vectors = await self._provider.embed([row["text"] for row in rows])
+        await self._apply_embeddings(rows, vectors, self._provider.model)
+
+    async def enqueue_stale_embeddings(self) -> int:
+        """Enqueue one `"embed_note"` job per note with a chunk still missing an
+        embedding or stamped with a model other than the provider's current one.
+
+        The worker process's own startup catch-up (#219): a lost job, a
+        provider outage that left a chunk `NULL`, or a model change are all
+        caught up here, the same cases `embed_pending` used to catch at the
+        end of a `"postgres"`-mode `reindex` (`reindex`'s own docstring). A
+        no-op without a configured provider. Returns how many notes were
+        enqueued.
+        """
+        if self._provider is None:
+            return 0
+
+        async with self._pool.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "select distinct n.id as note_id, n.file_hash as file_hash "
+                "from notes n join chunks c on c.note_id = n.id "
+                "where c.embedding is null or c.model is distinct from $1",
+                self._provider.model,
+            )
+            for row in rows:
+                await enqueue_job(
+                    conn, "embed_note", {"note_id": row["note_id"], "version": row["file_hash"]}
+                )
+        return len(rows)
 
     async def _apply_embeddings(
         self, rows: Sequence[asyncpg.Record], vectors: Sequence[Sequence[float]], model: str

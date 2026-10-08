@@ -32,9 +32,15 @@ resolution for no benefit beyond skipping an occasional empty `DELETE`.
 The `jobs` outbox consumer (#218, `consume_jobs` below) is a second,
 unrelated loop shape this module runs, for a different problem: several
 worker replicas claiming disjoint rows from `jobs` concurrently, rather than
-one replica winning an exclusive lock. No job kind is registered against it
-yet - the embedding queue is #219's own follow-up, Graph delta sync and
-retention jobs ADR-0009 §4 also names are WP-24/WP-26's.
+one replica winning an exclusive lock. `build_job_handlers` registers one
+job kind against it today, `"embed_note"` (#219): a Postgres-mode write
+(`index.indexer.Indexer.index_on_connection`) commits its note, revision and
+full-text chunks and enqueues this job rather than embedding inline, so
+`memory_search` already finds a fresh note through full text before its
+embedding exists; `_embed_note_job` below is the handler, and
+`enqueue_pending_embeddings` is this process's startup catch-up for any
+chunk a lost job, a provider outage or a model change left stale. Graph
+delta sync and retention jobs ADR-0009 §4 also names are WP-24/WP-26's.
 
 This process always connects to Postgres as the owner, never switching to
 `DATABASE_APP_ROLE` (ADR-0008 addendum: "the worker is a system identity,
@@ -97,6 +103,7 @@ from memory_manager import __commit__, __version__, jobs
 from memory_manager.auth import store
 from memory_manager.auth.shared_state import PostgresSharedState
 from memory_manager.config import ServerConfig, rate_limit_sweep_floor_seconds
+from memory_manager.index.indexer import Indexer
 from memory_manager.observability.metrics import metrics_endpoint
 
 __all__ = [
@@ -106,6 +113,7 @@ __all__ = [
     "build_jobs",
     "consume_jobs",
     "create_worker_app",
+    "enqueue_pending_embeddings",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -264,19 +272,49 @@ _DEFAULT_JOBS_BATCH_SIZE = 10
 _DEFAULT_JOBS_POLL_SECONDS = 5.0
 
 
-def build_job_handlers(_config: ServerConfig) -> dict[str, JobHandler]:
-    """This worker's `jobs`-outbox handler registry: empty today.
+def build_job_handlers(indexer: Indexer) -> dict[str, JobHandler]:
+    """This worker's `jobs`-outbox handler registry: `"embed_note"` (#219) today.
 
     Mirrors `build_jobs` above for the other loop shape this module runs -
-    `_config` is accepted (unused for now) for the same reason `build_jobs`
-    takes `config`: a future handler (the embedding queue, #219) will need
-    its own config fields, and every caller of this function already builds
-    a `ServerConfig` to pass to `build_jobs` anyway. `create_worker_app`
-    derives `consume_jobs`'s own `kinds` from this registry's keys, so
-    registering a handler here is the only step #219 needs on this side -
-    no separate kind list to keep in sync.
+    `indexer` is the one `index.indexer.Indexer` `cli.py`'s `_serve_worker`
+    builds over `index.indexer.VaultNotesSource()` (the `"postgres"`
+    backend's `vault_notes`, same source `app.py`'s own `"postgres"` branch
+    indexes through on the request path; this worker never touches a vault
+    working copy at all). The handler itself does no more than decode the
+    job's `payload` (`index.indexer.Indexer.index_on_connection`'s own
+    `{"note_id": ..., "version": ...}` shape) and call
+    `indexer.embed_note_job` - an `EmbeddingError` it raises propagates
+    straight through to `_dispatch_job`, which retries the job with backoff
+    rather than swallowing it. `create_worker_app` derives `consume_jobs`'s
+    own `kinds` from this registry's keys, so registering a handler here is
+    the only step a future job kind needs on this side - no separate kind
+    list to keep in sync.
     """
-    return {}
+
+    async def embed_note(_pool: asyncpg.Pool, payload: Mapping[str, object]) -> None:
+        note_id = payload.get("note_id")
+        job_version = payload.get("version")
+        if not isinstance(note_id, str) or not isinstance(job_version, str):
+            raise ValueError(f"malformed 'embed_note' payload: {payload!r}")
+        await indexer.embed_note_job(note_id, job_version)
+
+    return {"embed_note": embed_note}
+
+
+async def enqueue_pending_embeddings(indexer: Indexer) -> int:
+    """This worker's own startup catch-up (#219, module docstring): enqueue one
+    `"embed_note"` job for every note with a chunk still missing an embedding
+    or stamped with a model other than the provider's current one.
+
+    `index.indexer.Indexer.enqueue_stale_embeddings` does the actual query
+    and enqueueing; `cli.py`'s `_serve_worker` calls this once, before
+    `consume_jobs` starts claiming anything, so a chunk left stale by a job
+    lost before this worker ever ran, a provider outage, or an
+    `EMBEDDING_MODEL` change all converge without needing a manual
+    `memory-manager reindex`. A no-op without a configured provider. Returns
+    how many notes were enqueued.
+    """
+    return await indexer.enqueue_stale_embeddings()
 
 
 async def _dispatch_job(
@@ -395,11 +433,11 @@ def create_worker_app(
     (`consume_jobs`'s own docstring: never a pool connection) - the outbox
     loop is then simply not started, exactly as if this parameter did not
     exist. `cli.py`'s `_serve_worker` is the one production caller that
-    passes one; `job_handlers` defaults to `build_job_handlers`'s own empty
-    registry (#219 not landed yet) if omitted. `consume_jobs`'s own `kinds`
-    is derived from `job_handlers`' keys - registering a handler is the only
-    step adding a job kind needs on this side, no separate list to keep in
-    sync.
+    passes one; `job_handlers` defaults to an empty registry if omitted
+    (every existing test of this function bar the `"embed_note"` ones).
+    `consume_jobs`'s own `kinds` is derived from `job_handlers`' keys -
+    registering a handler is the only step adding a job kind needs on this
+    side, no separate list to keep in sync.
 
     `cli.py`'s `_serve_worker` serves the result with `http.py`'s own
     `GracefulShutdownServer` (`handle_exit` flips `app.state.draining = True`

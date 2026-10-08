@@ -22,7 +22,9 @@ ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still runs
 its own equivalent sweep inside every `serve --http` process instead
 (ADR-0009 §6, `http.py`'s `_cleanup_loop`); connects to Postgres as the
 owner, like `reindex`/`token ...` already do (ADR-0008 addendum), never
-switching to `DATABASE_APP_ROLE`.
+switching to `DATABASE_APP_ROLE`. The embedding queue (#219) runs here too:
+`EMBEDDING_*` is read exactly like `reindex`'s own does, to build the one
+`index.indexer.Indexer` this process claims `"embed_note"` jobs through.
 
 `serve --http` with `DATABASE_URL` set turns bearer-token auth on for
 `/mcp` (`http.py`); without it (no token to ever verify a request against)
@@ -98,7 +100,12 @@ from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.blocklist import BlocklistConfigError
 from memory_manager.vault.validate import NOTE_TYPES
-from memory_manager.worker import build_job_handlers, build_jobs, create_worker_app
+from memory_manager.worker import (
+    build_job_handlers,
+    build_jobs,
+    create_worker_app,
+    enqueue_pending_embeddings,
+)
 
 __all__ = ["main"]
 
@@ -1178,7 +1185,7 @@ def _run_worker_command() -> int:
     configure_logging_from_env(os.environ)
     try:
         return asyncio.run(_serve_worker())
-    except (ServerConfigError, StorageConfigError, WorkerConfigError) as exc:
+    except (EmbeddingConfigError, ServerConfigError, StorageConfigError, WorkerConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -1201,6 +1208,14 @@ async def _serve_worker() -> int:
     `_open_migrated_pool`, which only ever returns the pool it already
     opened from that same URL; by this point `_open_migrated_pool` having
     returned a pool at all already proves the variable is set.
+
+    Builds one `index.indexer.Indexer` over `VaultNotesSource()` (#219), the
+    same `vault_notes`-backed source `app.py`'s `"postgres"` branch indexes
+    through on the request path - this process never touches a vault
+    working copy. Before `consume_jobs` starts claiming anything,
+    `worker.enqueue_pending_embeddings` runs this indexer's own startup
+    catch-up once, then `worker.build_job_handlers(indexer)` registers its
+    `"embed_note"` handler.
     """
     storage_backend = storage_backend_from_env(dict(os.environ))
     if storage_backend != "postgres":
@@ -1214,6 +1229,7 @@ async def _serve_worker() -> int:
 
     config = ServerConfig.from_env(dict(os.environ))
     worker_config = WorkerConfig.from_env(dict(os.environ))
+    embedding_config = EmbeddingConfig.from_env(dict(os.environ))
 
     pool = await _open_migrated_pool()
     if pool is None:
@@ -1221,8 +1237,14 @@ async def _serve_worker() -> int:
 
     jobs_listen_conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     try:
+        provider = provider_from_config(embedding_config)
+        indexer = Indexer(pool, VaultNotesSource(), provider)
+        enqueued = await enqueue_pending_embeddings(indexer)
+        if enqueued:
+            _logger.info("worker startup: enqueued %d catch-up embedding job(s)", enqueued)
+
         jobs = build_jobs(config)
-        job_handlers = build_job_handlers(config)
+        job_handlers = build_job_handlers(indexer)
         app = create_worker_app(
             pool,
             jobs,
