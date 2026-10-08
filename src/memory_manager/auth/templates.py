@@ -34,7 +34,12 @@ Options: DENY` (no clickjacking the password form into a frame) and a strict
 external anything; `style-src 'unsafe-inline'` only because the pages below
 use a single inline `<style>` block rather than pulling in a stylesheet
 dependency; `form-action 'self'` - the password form may only ever submit
-back to this origin).
+back to this origin; `frame-ancestors 'none'` - the CSP-level equivalent of
+`X-Frame-Options: DENY`, added for `/account` (#229, ADR-0008 addendum
+2026-10-08's explicit "`frame-ancestors 'none'`" requirement on every
+account response) and kept here, applied to every page this module renders,
+rather than only the account shell - strictly stronger than `DENY` alone,
+never a behaviour change for an existing login page).
 """
 
 from __future__ import annotations
@@ -58,7 +63,9 @@ __all__ = [
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+    ),
 }
 
 #: Hosts that are never reachable from outside the machine the browser runs on -
