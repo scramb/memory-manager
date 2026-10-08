@@ -31,6 +31,7 @@ win that race must carry the same superset, this one included.
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import subprocess
@@ -48,6 +49,7 @@ __all__ = [
     "human_commit",
     "human_delete",
     "human_rename",
+    "normalise_version_derived",
     "render",
     "vault_config",
 ]
@@ -115,3 +117,39 @@ def render() -> Callable[..., ChartRender]:
         return ChartRender(proc.returncode, proc.stdout, proc.stderr)
 
     return _render
+
+
+@pytest.fixture
+def normalise_version_derived() -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """`normalise_version_derived(doc)` - a deep copy of one rendered
+    object with every value a release-please `Chart.yaml` version/
+    `appVersion` bump changes replaced by a fixed placeholder: the
+    `app.kubernetes.io/version` and `helm.sh/chart` labels every object
+    carries (`_helpers.tpl`'s "memory-manager.labels"), and the app
+    container's image tag when it falls back to `.Chart.AppVersion`
+    (`image.tag: ""` in `values.yaml`, container name "memory-manager" -
+    Valkey's own pinned tag in `templates/valkey.yaml` is untouched, since
+    it does not move with the chart version).
+
+    Lets a golden-render comparison survive a version bump without
+    re-recording the fixture, while still comparing everything else
+    byte-for-byte.
+    """
+
+    def _normalise(doc: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(doc)
+        labels = result.get("metadata", {}).get("labels")
+        if labels:
+            if "app.kubernetes.io/version" in labels:
+                labels["app.kubernetes.io/version"] = "<chart-app-version>"
+            if "helm.sh/chart" in labels:
+                labels["helm.sh/chart"] = "<chart-name-version>"
+        if result.get("kind") == "Deployment":
+            for container in result["spec"]["template"]["spec"]["containers"]:
+                image = container.get("image", "")
+                if container.get("name") == "memory-manager" and ":" in image:
+                    repository, _, _tag = image.rpartition(":")
+                    container["image"] = f"{repository}:<chart-app-version>"
+        return result
+
+    return _normalise
