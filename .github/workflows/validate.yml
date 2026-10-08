@@ -27,8 +27,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       KUBECONFORM_VERSION: v0.6.7
+      TOFU_VERSION: v1.13.1
     steps:
       - uses: actions/checkout@v7
+      - name: Validate the Entra app-registration module (deploy/entra, #256)
+        run: |
+          curl -sL "https://github.com/opentofu/opentofu/releases/download/${TOFU_VERSION}/tofu_${TOFU_VERSION#v}_linux_amd64.zip" -o /tmp/tofu.zip
+          unzip -o /tmp/tofu.zip tofu -d /tmp
+          sudo install -m 0755 /tmp/tofu /usr/local/bin/tofu
+          tofu -chdir=deploy/entra fmt -check
+          tofu -chdir=deploy/entra init -backend=false
+          tofu -chdir=deploy/entra validate
+          # Local provider plugin cache, gitignored - clean it up so the
+          # placeholder check below (which walks the whole deploy/ tree, not
+          # just what Git tracks) doesn't trip over third-party CHANGELOGs.
+          rm -rf deploy/entra/.terraform
       - name: Install kubeconform
         run: |
           curl -sL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
@@ -43,6 +56,12 @@ jobs:
       - name: Render and validate the Flux example (incl. CRD schemas)
         run: |
           kubectl kustomize deploy/flux \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Render and validate the Flux enterprise example (incl. CRD schemas, #257)
+        run: |
+          kubectl kustomize deploy/flux/enterprise \
             | kubeconform -strict -summary \
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'

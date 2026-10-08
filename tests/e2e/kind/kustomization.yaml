@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# kind E2E overlay (#258, WP-30) on top of ../../../deploy/flux/enterprise/:
+# swaps the two ExternalSecret objects that example ships for a plain Secret
+# this directory provides instead (no External Secrets Operator installed in
+# the kind cluster - scripts/e2e-kind.sh's own "Not included" list), points
+# the HelmRepository at the throwaway local registry scripts/e2e-kind.sh
+# builds (see __LOCAL_REGISTRY__ below), and patches the HelmRelease's own
+# values to the shape this E2E actually exercises (mock IdP authority, the
+# e2e-tagged images, backups off, no HTTPRoute - see helmrelease-patch.yaml's
+# own comment for why each one).
+#
+# Every "__LOCAL_REGISTRY__" placeholder below is substituted by
+# scripts/e2e-kind.sh (sed, after `kubectl kustomize` renders this directory)
+# with the registry container's own IP:port on the kind network - resolved
+# only at run time, so this overlay carries no run-specific value in Git
+# (docs/research/kind-e2e.md's own "Local registry" section explains why a
+# pod cannot resolve that registry by name at all).
+resources:
+  - ../../../deploy/flux/enterprise
+  - secret.yaml
+  - mock-idp.yaml
+
+patches:
+  - patch: |-
+      $patch: delete
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: memory-manager-secrets
+        namespace: memory-manager
+    target:
+      group: external-secrets.io
+      version: v1
+      kind: ExternalSecret
+      name: memory-manager-secrets
+  - patch: |-
+      $patch: delete
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: memory-manager-backup-credentials
+        namespace: memory-manager
+    target:
+      group: external-secrets.io
+      version: v1
+      kind: ExternalSecret
+      name: memory-manager-backup-credentials
+  - path: helmrepository-patch.yaml
+  - path: helmrelease-patch.yaml

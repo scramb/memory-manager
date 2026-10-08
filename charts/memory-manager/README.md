@@ -41,6 +41,7 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `OIDC_CLIENT_SECRET` | the upstream OIDC provider's client secret, when `login` → `mode` is `oidc` | issued by the provider when the client is registered there |
 | `OAUTH_CLIENT_SECRET_KEY` | encrypts each DCR client's `client_secret` at rest (ADR-0004) | the one-liner in `src/memory_manager/auth/store.py`'s own `ValueError` message (generates a Fernet key) |
 | `ADMIN_PASSWORD_HASH` | the quickstart login alternative, when `login` → `mode` is `password` | `memory-manager hash-password` (reads the password from stdin) |
+| `ENTRA_CLIENT_SECRET` | the Entra app registration's client secret, when `login` → `mode` is `entra` (ADR-0006) | `deploy/entra`'s own OpenTofu module (`client_secret` output), or issued by Entra when the app is registered manually |
 
 ## Values
 
@@ -66,8 +67,10 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `probes` → `liveness`/`readiness` | see `values.yaml` | `/healthz`, `/readyz` |
 | `publicUrl` | `https://memory.example.com` | Must equal the `HTTPRoute`/`Ingress` hostname exactly (ADR-0004) |
 | `vault` → `remote`/`branch` | placeholder / `main` | The vault's own git remote |
-| `login` → `mode` | `oidc` | `oidc` or `password` (quickstart alternative) |
-| `login` → `oidc` → `issuer`/`clientId`/`allowedEmails` | placeholders | Deny-by-default allowlist (ADR-0004 addendum) |
+| `login` → `mode` | `oidc` | `oidc`, `entra` (ADR-0006, enterprise) or `password` (quickstart alternative) |
+| `login` → `oidc` → `issuer`/`clientId`/`allowedEmails` | placeholders | Deny-by-default allowlist (ADR-0004 addendum); unused once `login` → `mode` is `entra` |
+| `login` → `entra` → `tenantId`/`clientId` | placeholders | Required once `login` → `mode` is `entra` (chart's own `validateEntra` helper); `deploy/entra`'s OpenTofu module creates the app registration these come from (#256) |
+| `login` → `entra` → `allowedTenants`/`authority`/`graphUrl`/`allowInsecureAuthority`/`groupsTtlSeconds`/`accessTokenMinutes`/`maxSessionSeconds` | empty/false/null | Optional overrides for the `EntraAuthenticator`'s own `from_env` builder (`src/memory_manager/auth/login_entra.py`); empty/false/null keeps that authenticator's own defaults |
 | `login` → `namespaces` | `personal` | Fallback for a subject with no namespace mapping |
 | `embedding` → `provider` | `none` | `none`, `ollama` or `openai` - every embedding API is optional |
 | `metrics` → `enabled` | `true` | `/metrics`; restrict with `networkPolicy` or a `serviceMonitor`-only scrape path |
@@ -128,7 +131,8 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
   objects, off by default since the default `git`-backend `Cluster` is a derived index
   (`memory-manager reindex --full` rebuilds it from the vault), not a primary store.
 - The restore runbook and `erasure_log` replay procedure after a restore (WP-26, ADR-0007's own
-  30 d + 7 d horizon).
+  30 d + 7 d horizon) - see [`docs/guides/enterprise-operations.md`](../../docs/guides/enterprise-operations.md)
+  (the replay step itself still lands with #233).
 - A CNPG Pooler/PgBouncer, and backups in the kind E2E.
 - Valkey HA/Sentinel (not needed, ADR-0009).
 - Enforcement proof of the `NetworkPolicy` objects on a CNI (#255 - kind's default CNI does not

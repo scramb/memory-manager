@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Identical to ../helmrepository.yaml - duplicated rather than
+# referenced by relative path, for the same reason namespace.yaml here
+# is (`kustomize build`'s own root-only load restriction, see that
+# file's comment). Same OCI source for the chart on GHCR
+# (`oci://ghcr.io/scramb/charts/memory-manager`, published by
+# `.github/workflows/release.yml` on every tag, `docs/releasing.md`);
+# helmrelease.yaml's own `chart` -> `spec` -> `chart` field names the
+# chart within it. Anonymous pull - GHCR serves public packages without
+# a `secretRef`.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+spec:
+  type: oci
+  url: oci://ghcr.io/scramb/charts
+  interval: 1h

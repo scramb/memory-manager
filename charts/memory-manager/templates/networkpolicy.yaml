@@ -169,6 +169,18 @@ spec:
 # 443 only while backups are enabled (the Barman Cloud plugin's own
 # object-store upload, #252) - using the same egress block's own
 # allowAll/rules knob as the app Deployments' own egress.
+#
+# The peer selector below (both ingress "from" and egress "to") matches
+# cnpg.io/cluster alone, not cnpg.io/podRole: instance too - a NEW
+# replica's own pg_basebackup/join step runs as a Job (CNPG's own job
+# builder, package "pkg/specs", functions JoinReplicaInstance and
+# CreatePrimaryJob, CNPG release 1_26), labelled cnpg.io/cluster plus
+# cnpg.io/jobRole, never cnpg.io/podRole: instance - requiring that label
+# here would let the primary accept a *running* replica's connection but
+# reject every joining replica's own pg_basebackup against it (confirmed
+# locally: with the narrower selector, a kind cluster with NetworkPolicy on
+# never got past 2/3 ready CNPG instances - the kind E2E, #258, now runs
+# with this policy enabled precisely to keep catching this).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -194,7 +206,6 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
-              cnpg.io/podRole: instance
       ports:
         - protocol: TCP
           port: 5432
@@ -218,7 +229,6 @@ spec:
         - podSelector:
             matchLabels:
               cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
-              cnpg.io/podRole: instance
       ports:
         - protocol: TCP
           port: 5432

@@ -189,12 +189,48 @@ def test_postgres_backend_cnpg_policy_accepts_app_pods_and_peers_only(
     assert postgres_ingress["ports"] == [{"protocol": "TCP", "port": 5432}]
     sources = postgres_ingress["from"]
     assert len(sources) == 3
-    assert {"cnpg.io/cluster": "t-memory-manager-db", "cnpg.io/podRole": "instance"} in [
+    # cnpg.io/cluster alone, not cnpg.io/podRole: instance too - see
+    # test_postgres_backend_cnpg_policy_peers_match_cluster_label_only below
+    # for why the peer selector has to stay this broad.
+    assert {"cnpg.io/cluster": "t-memory-manager-db"} in [
         peer["podSelector"]["matchLabels"] for peer in sources
     ]
 
     operator_ingress = cnpg_policy["spec"]["ingress"][1]
     assert operator_ingress["ports"] == [{"protocol": "TCP", "port": 8000}]
+
+
+def test_postgres_backend_cnpg_policy_peers_match_cluster_label_only(
+    render: Callable[..., _ChartRender],
+) -> None:
+    """A joining replica's own pg_basebackup step runs as a Job, not an
+    "instance" pod (CNPG `pkg/specs/jobs.go`'s own `JoinReplicaInstance`/
+    `CreatePrimaryJob`, release-1.26) - labelled cnpg.io/cluster and
+    cnpg.io/jobRole, never cnpg.io/podRole: instance. Both the ingress "from"
+    and the egress "to" peer selector must therefore match cnpg.io/cluster
+    alone: requiring cnpg.io/podRole: instance too would let the primary
+    accept a connection from an already-running replica but reject the very
+    Job that is still joining - confirmed locally (the kind E2E, #258, ran
+    with networkPolicy.enabled and never got a CNPG Cluster past 2/3 ready
+    instances until this test's own assertion held)."""
+    result = render(values_files=[ENTERPRISE_VALUES])
+
+    cnpg_policy = _network_policies_by_name(result)["t-memory-manager-db"]
+    peer_selector = {"cnpg.io/cluster": "t-memory-manager-db"}
+
+    postgres_ingress = cnpg_policy["spec"]["ingress"][0]
+    ingress_peers = [peer["podSelector"]["matchLabels"] for peer in postgres_ingress["from"]]
+    assert peer_selector in ingress_peers
+    assert not any("cnpg.io/podRole" in peer for peer in ingress_peers)
+
+    peer_egress_rules = [
+        rule
+        for rule in cnpg_policy["spec"]["egress"]
+        if rule.get("ports") == [{"protocol": "TCP", "port": 5432}]
+    ]
+    assert len(peer_egress_rules) == 1
+    egress_peers = [peer["podSelector"]["matchLabels"] for peer in peer_egress_rules[0]["to"]]
+    assert egress_peers == [peer_selector]
 
 
 def test_postgres_backend_cnpg_policy_egress_https_only_with_backup_enabled(

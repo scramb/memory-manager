@@ -1,0 +1,53 @@
+name: e2e-kind
+# A kind E2E (#258, WP-30): rolls out charts/memory-manager's enterprise
+# profile (deploy/flux/enterprise/, through tests/e2e/kind/'s own overlay)
+# against a real kind cluster and asserts GET /readyz is 200 on 3 api pods -
+# scripts/e2e-kind.sh does the actual work; this workflow only decides when
+# to run it. Path-filtered (owner decision 8, 2026-10-08): only the inputs
+# that can actually change what this test exercises re-run it on every push,
+# plus workflow_dispatch for an on-demand run.
+on:
+  pull_request:
+    paths:
+      - charts/**
+      - deploy/**
+      - Dockerfile
+      - tests/mock_idp/**
+      - tests/e2e/kind/**
+      - scripts/e2e-kind.sh
+      - .github/workflows/e2e-kind.yml
+  push:
+    branches: [main]
+    paths:
+      - charts/**
+      - deploy/**
+      - Dockerfile
+      - tests/mock_idp/**
+      - tests/e2e/kind/**
+      - scripts/e2e-kind.sh
+      - .github/workflows/e2e-kind.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-kind:
+    runs-on: ubuntu-latest
+    # Generous but bounded, so a stuck run fails the job instead of burning
+    # the whole workflow quota: scripts/e2e-kind.sh's own three step waits
+    # (CNPG, HelmRelease, /readyz) are 900s each - the HelmRelease retries
+    # its own 5m install action up to 3 times on a timeout
+    # (helmrelease.yaml's own install.remediation.retries), so a slow first
+    # attempt can still leave room for one retry to actually succeed.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run the kind E2E (docker on this runner)
+        env:
+          CONTAINER_ENGINE: docker
+        run: scripts/e2e-kind.sh

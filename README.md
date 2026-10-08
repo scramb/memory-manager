@@ -108,6 +108,8 @@ Remote setup for both clients (OAuth, verified 2026-10-07): [`docs/guides/remote
   [`docs/guides/cloudflare-tunnel.md`](./docs/guides/cloudflare-tunnel.md)
 - Migrating an existing Git vault into the enterprise `postgres` storage backend:
   [`docs/guides/migrate-git-to-postgres.md`](./docs/guides/migrate-git-to-postgres.md)
+- Running the enterprise profile end to end (Entra, Flux rollout, scaling, backups and
+  restore): [`docs/guides/enterprise-operations.md`](./docs/guides/enterprise-operations.md)
 - Cutting and verifying a release (image and chart signatures, SBOM):
   [`docs/releasing.md`](./docs/releasing.md)
 

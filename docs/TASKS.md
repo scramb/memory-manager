@@ -298,10 +298,10 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 
 ### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: open
 
-- [ ] #256 An OpenTofu module under deploy/entra creates the Entra app registration for the auth facade ⛔ blocked by #216
-- [ ] #257 A Flux enterprise example deploys the chart with the enterprise profile ⛔ blocked by #255, #216
-- [ ] #258 A kind E2E workflow rolls out the Flux enterprise example and gets /readyz 200 from three api replicas ⛔ blocked by #257, #216, #219
-- [ ] #259 An operator guide explains how to run the enterprise profile end to end ⛔ blocked by #256, #257, #258
+- [x] #256 An OpenTofu module under deploy/entra creates the Entra app registration for the auth facade ⛔ blocked by #216
+- [x] #257 A Flux enterprise example deploys the chart with the enterprise profile ⛔ blocked by #255, #216
+- [x] #258 A kind E2E workflow rolls out the Flux enterprise example and gets /readyz 200 from three api replicas ⛔ blocked by #257, #216, #219
+- [x] #259 An operator guide explains how to run the enterprise profile end to end ⛔ blocked by #256, #257, #258
 
 ### WP-31 — Observability · F-01 · Branch: `wp/31-observability` · PR: open
 
