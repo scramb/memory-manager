@@ -320,7 +320,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 
 ### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: open
 
-- [ ] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
+- [x] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
 - [ ] #267 Loader writes chunks with synthetic vectors and builds the ADR-0016 HNSW index ⛔ blocked by #266, #221
 - [ ] #268 Embedding stub answers query embeddings deterministically for load tests ⛔ blocked by #266
 - [ ] #269 Local load test runs 3 replicas with a replica kill on Postgres or Valkey shared state ⛔ blocked by #267, #268
