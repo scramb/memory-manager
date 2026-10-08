@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# CPU-based autoscaling/v2 HorizontalPodAutoscaler for the api and worker
+# Deployments (owner decision O27, ADR-0009 addendum 2026-10-08, #251) -
+# storage's own backend "postgres" only, since only that backend renders
+# the Deployments these target (templates/api-deployment.yaml,
+# templates/worker-deployment.yaml). The api one is skipped while the
+# api block's own keda sub-block is enabled: a KEDA ScaledObject
+# (templates/keda-scaledobject.yaml) creates its own HPA instead, and the
+# chart's own "validateApiAutoscaling" helper, included by
+# api-deployment.yaml, already fails the render if both are
+# enabled at once. Both Deployments omit their own replicas field while
+# their own autoscaler is enabled, so a Helm upgrade never fights it over
+# the desired replica count.
+{{- if eq .Values.storage.backend "postgres" }}
+{{- if and .Values.api.autoscaling.enabled (not .Values.api.keda.enabled) }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-api
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "api") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "memory-manager.fullname" . }}-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.worker.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-worker
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "worker") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "memory-manager.fullname" . }}-worker
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

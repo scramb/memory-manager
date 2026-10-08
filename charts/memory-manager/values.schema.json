@@ -4,11 +4,121 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
+    "storage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["git", "postgres"],
+          "description": "Source of truth for notes (ADR-0007). \"git\" (default) caps replicaCount at 1 and refuses an autoscaler; \"postgres\" (enterprise) lifts both (ADR-0009 §6)."
+        }
+      },
+      "required": ["backend"]
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 1,
-      "description": "Fixed at 0 or 1 - memory-manager is a single writer to the vault's git remote, never a scaled service."
+      "description": "0 or 1 while storage.backend is \"git\" - memory-manager is then a single writer to the vault's git remote, never a scaled service. storage.backend \"postgres\" lifts the maximum."
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "storage.backend \"postgres\" only (ADR-0009 §4) - renders a separate api Deployment instead of the Deployment above.",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "resources": { "type": "object", "additionalProperties": true },
+        "topologySpreadConstraints": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxSkew": { "type": "integer", "minimum": 1 },
+            "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+          }
+        },
+        "autoscaling": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "CPU HorizontalPodAutoscaler for the api Deployment (ADR-0009 addendum 2026-10-08) - mutually exclusive with api.keda.enabled.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 0 },
+            "maxReplicas": { "type": "integer", "minimum": 0 },
+            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        },
+        "keda": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Optional KEDA ScaledObject for the api Deployment instead of the CPU HPA above (ADR-0009 addendum 2026-10-08) - mutually exclusive with api.autoscaling.enabled.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicaCount": { "type": "integer", "minimum": 0 },
+            "maxReplicaCount": { "type": "integer", "minimum": 0 },
+            "prometheus": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "serverAddress": { "type": "string" },
+                "query": { "type": "string" },
+                "threshold": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "storage.backend \"postgres\" only (ADR-0009 §4) - the embedding queue, Graph delta sync, retention and OAuth cleanup.",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "resources": { "type": "object", "additionalProperties": true },
+        "topologySpreadConstraints": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxSkew": { "type": "integer", "minimum": 1 },
+            "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+          }
+        },
+        "autoscaling": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "CPU HorizontalPodAutoscaler for the worker Deployment (ADR-0009 addendum 2026-10-08).",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 0 },
+            "maxReplicas": { "type": "integer", "minimum": 0 },
+            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Graceful shutdown (ADR-0009 §5), storage.backend \"postgres\" only - terminationGracePeriodSeconds must be at least graceSeconds + preStopSleepSeconds (enforced by the chart's own validateShutdown helper).",
+      "properties": {
+        "graceSeconds": { "type": "integer", "minimum": 0 },
+        "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "pdb": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "api": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": { "minAvailable": { "type": "integer", "minimum": 0 } }
+        }
+      }
     },
     "image": {
       "type": "object",
@@ -62,7 +172,7 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "mode": { "type": "string", "enum": ["oidc", "password"] },
+        "mode": { "type": "string", "enum": ["oidc", "entra", "password"] },
         "oidc": { "type": "object", "additionalProperties": true },
         "namespaces": { "type": "string" }
       }
@@ -102,10 +212,33 @@
           "additionalProperties": true,
           "properties": {
             "enabled": { "type": "boolean" },
-            "instances": { "type": "integer", "minimum": 1 },
+            "instances": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "More than 1 requires storage.backend \"postgres\" (ADR-0007, ADR-0009 §6)."
+            },
             "imageName": { "type": "string", "minLength": 1 },
             "storage": { "type": "object", "additionalProperties": true },
-            "resources": { "type": "object", "additionalProperties": true }
+            "resources": { "type": "object", "additionalProperties": true },
+            "backup": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "Barman Cloud plugin backups for the CNPG Cluster (#252) - renders an ObjectStore, a WAL-archiving plugin entry on the Cluster and a ScheduledBackup.",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "schedule": { "type": "string", "minLength": 1 },
+                "retentionPolicy": { "type": "string", "pattern": "^[1-9][0-9]*[dwm]$" },
+                "destinationPath": { "type": "string", "minLength": 1 },
+                "endpointURL": { "type": "string" },
+                "existingSecret": { "type": "string" },
+                "accessKeyIdKey": { "type": "string", "minLength": 1 },
+                "secretAccessKeyKey": { "type": "string", "minLength": 1 },
+                "compression": {
+                  "type": "string",
+                  "enum": ["", "bzip2", "gzip", "lz4", "snappy", "xz", "zstd"]
+                }
+              }
+            }
           }
         },
         "url": { "type": "string" },
@@ -116,7 +249,32 @@
             "name": { "type": "string" },
             "key": { "type": "string" }
           }
+        },
+        "appRole": {
+          "type": "string",
+          "description": "api only (storage.backend \"postgres\") - DATABASE_APP_ROLE, the non-owner role request transactions switch to (ADR-0008 addendum)."
         }
+      }
+    },
+    "valkey": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional single-primary Valkey for shared rate-limit/login state (ADR-0009 §2, #254) - mutually exclusive with externalUrl below, checked by the chart's own validateValkey template helper (values.schema.json cannot express mutual exclusion between two independently optional fields as an \"if\"/\"then\").",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1 },
+            "pullPolicy": { "type": "string" }
+          }
+        },
+        "resources": { "type": "object", "additionalProperties": true },
+        "existingSecret": { "type": "string" },
+        "passwordKey": { "type": "string" },
+        "externalUrl": { "type": "string" }
       }
     },
     "httpRoute": {
@@ -152,7 +310,9 @@
             "allowAll": { "type": "boolean" },
             "rules": { "type": "array" }
           }
-        }
+        },
+        "prometheus": { "type": "object", "additionalProperties": true },
+        "cnpgOperator": { "type": "object", "additionalProperties": true }
       }
     },
     "serviceMonitor": {
@@ -165,5 +325,32 @@
       }
     }
   },
-  "required": ["image", "service", "publicUrl", "vault"]
+  "required": ["image", "service", "publicUrl", "vault", "storage"],
+  "if": {
+    "properties": {
+      "storage": {
+        "properties": { "backend": { "const": "git" } }
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "replicaCount": {
+        "maximum": 1,
+        "description": "storage.backend \"git\" allows at most 1 replica (ADR-0007, ADR-0009 §6)."
+      },
+      "database": {
+        "properties": {
+          "cnpg": {
+            "properties": {
+              "instances": {
+                "maximum": 1,
+                "description": "storage.backend \"git\" allows at most 1 CNPG instance (ADR-0007, ADR-0009 §6)."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }

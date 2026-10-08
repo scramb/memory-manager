@@ -3,14 +3,20 @@
 # Off by default (deploy/README.md: "the namespace itself, and any
 # network policy restricting who may reach the pod" is an operator's own
 # cluster topology, not this project's to decide) - documented here for
-# anyone who wants it anyway. Ingress is scoped to configurable
-# namespace/pod selectors on the MCP port; egress defaults to
-# allow-all-with-DNS, because the vault's git remote, the OIDC issuer and
-# an embedding provider are all operator-specific hostnames whose IPs this
-# chart cannot know - set the egress block's "allowAll" to false and list
-# its own "rules" (raw NetworkPolicyEgressRule entries) to lock it down to
-# your own resolved ranges.
+# anyone who wants it anyway. Storage's own backend "git" (below) keeps
+# the single policy this chart has always rendered; backend "postgres"
+# (#255) renders one policy per component instead, since api, worker, an
+# optional Valkey and the CNPG Cluster's own instance pods each need a
+# different set of sources/destinations.
 {{- if .Values.networkPolicy.enabled }}
+{{- if eq .Values.storage.backend "git" }}
+# Ingress is scoped to configurable namespace/pod selectors on the MCP
+# port; egress defaults to allow-all-with-DNS, because the vault's git
+# remote, the OIDC issuer and an embedding provider are all
+# operator-specific hostnames whose IPs this chart cannot know - set the
+# egress block's "allowAll" to false and list its own "rules" (raw
+# NetworkPolicyEgressRule entries) to lock it down to your own resolved
+# ranges.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -50,4 +56,183 @@ spec:
     - {{- toYaml . | nindent 6 }}
     {{- end }}
     {{- end }}
+{{- else if eq .Values.storage.backend "postgres" }}
+# The api Deployment accepts the gateway/ingress-controller source the
+# ingress block's own namespaceSelector/podSelector already names, plus
+# Prometheus on the same "http" port (/metrics, templates/
+# api-deployment.yaml). The worker Deployment answers no client-facing
+# traffic (templates/service.yaml's own comment), so it only accepts
+# Prometheus. Both get the shared egress helper below (DNS, the CNPG
+# Cluster's own instances, Valkey if enabled, 443).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-api
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "api") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingress.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.ingress.podSelector | nindent 12 }}
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.prometheus.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.prometheus.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: http
+  egress:
+    {{- include "memory-manager.networkPolicyAppEgress" . | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-worker
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.prometheus.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.prometheus.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: http
+  egress:
+    {{- include "memory-manager.networkPolicyAppEgress" . | nindent 4 }}
+{{- if .Values.valkey.enabled }}
+---
+# Only api and worker ever need to reach Valkey (ADR-0009 §2); it
+# initiates no outbound connection of its own beyond DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "memory-manager.valkeyName" . }}
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "valkey") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "valkey") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "api") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: valkey
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- if .Values.database.cnpg.enabled }}
+---
+# The CNPG operator labels every instance pod cnpg.io/cluster and
+# cnpg.io/podRole=instance itself - verified directly against the
+# operator's own source, docs/research/cnpg-backups.md records the
+# sources. Instances accept api/worker plus each other (streaming
+# replication) on 5432, and the operator's own namespace on its
+# instance manager's status port 8000 (not Postgres itself - the port
+# the operator's reconciler talks to, same source); the cnpgOperator
+# block's own namespace/pod selectors default to "{}" (matches
+# everywhere) until an operator scopes them to where the CNPG operator
+# actually runs. Egress covers DNS, replication to its own peers, and
+# 443 only while backups are enabled (the Barman Cloud plugin's own
+# object-store upload, #252) - using the same egress block's own
+# allowAll/rules knob as the app Deployments' own egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "memory-manager.cnpgClusterName" . }}
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "cnpg") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
+      cnpg.io/podRole: instance
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "api") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
+              cnpg.io/podRole: instance
+      ports:
+        - protocol: TCP
+          port: 5432
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.cnpgOperator.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.networkPolicy.cnpgOperator.podSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
+              cnpg.io/podRole: instance
+      ports:
+        - protocol: TCP
+          port: 5432
+    {{- if .Values.database.cnpg.backup.enabled }}
+    {{- if .Values.networkPolicy.egress.allowAll }}
+    - ports:
+        - protocol: TCP
+          port: 443
+    {{- else }}
+    {{- range .Values.networkPolicy.egress.rules }}
+    - {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

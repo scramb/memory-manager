@@ -6,13 +6,167 @@
 # never by editing this one in place. `charts/memory-manager/README.md`
 # documents every key in a table; this file is the inline reference.
 
-# Fixed at 1 (also enforced by values.schema.json: maximum 1) -
-# memory-manager is a single writer to the vault's git remote and the
-# in-process OAuth login rate limiter is per-process state
-# (deploy/deployment.yaml's own comment); two replicas would mean two
-# independent writers/limiters, not one scaled service. 0 is allowed, to
-# scale the deployment down deliberately.
+# Source of truth for notes (ADR-0007). "git" (default) keeps Postgres as
+# a derived, fully rebuildable search index; "postgres" (enterprise) makes
+# Postgres itself the source of truth, with append-only revisions. Only
+# "postgres" may run more than one replica or an autoscaler (ADR-0009 §6) -
+# enforced by both values.schema.json's own "if"/"then" and
+# memory-manager's own "validate" helper, since --skip-schema-validation
+# exists.
+storage:
+  backend: git
+
+# Fixed at 0 or 1 while storage's own backend is "git" (also enforced by
+# values.schema.json) - memory-manager is a single writer to the vault's
+# git remote and the in-process OAuth login rate limiter is per-process
+# state (deploy/deployment.yaml's own comment); two replicas would mean
+# two independent writers/limiters, not one scaled service. 0 is always
+# allowed, to scale the deployment down deliberately. A "postgres"
+# backend lifts the maximum (ADR-0007, ADR-0009 §6).
 replicaCount: 1
+
+# The separate api and worker Deployments storage's own backend
+# "postgres" renders instead of the Deployment above (ADR-0009 §4, #250) - each has
+# its own replica count and resources; topologySpreadConstraints spreads
+# each component's pods across zones and nodes ("ScheduleAnyway" never
+# blocks scheduling when a cluster has only one zone or node).
+api:
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+  # CPU-based autoscaling/v2 HorizontalPodAutoscaler for the api
+  # Deployment (templates/hpa.yaml), storage's own backend "postgres"
+  # only (owner decision O27, ADR-0009 addendum 2026-10-08: always a CPU
+  # HPA for the enterprise profile). Mutually exclusive with the keda
+  # sub-block's own enabled flag below - a KEDA ScaledObject creates its
+  # own HPA, so the chart's own "validate" helper fails the render if
+  # both are true at once. While either this or the keda sub-block below
+  # is enabled, replicaCount above is ignored: the Deployment omits its
+  # own replicas field so Helm upgrades never fight the autoscaler over
+  # the desired count.
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  # Optional request-rate scaling instead of the CPU HPA above, api only
+  # (owner decision O27, ADR-0009 addendum 2026-10-08: CPU HPA always,
+  # RPS scaling optional through KEDA) - renders a KEDA ScaledObject
+  # (templates/keda-scaledobject.yaml) with a "cpu" trigger (reusing the
+  # targetCPUUtilizationPercentage above) and a "prometheus" trigger on
+  # the query below, instead of the HPA. KEDA (https://keda.sh) must
+  # already be installed in the cluster; this chart does not install it.
+  # minReplicaCount should stay at least the api PDB's own minAvailable
+  # (below) plus one, so KEDA never scales below what the PDB allows to
+  # be evicted at once.
+  keda:
+    enabled: false
+    minReplicaCount: 3
+    maxReplicaCount: 10
+    prometheus:
+      # Placeholder; point this at your own Prometheus (or
+      # Prometheus-compatible) query endpoint.
+      serverAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
+      # mm_tool_calls_total (observability/metrics.py) summed across
+      # every tool and outcome, as requests/second over a 2-minute
+      # window - overridable for a different request-rate signal.
+      query: sum(rate(mm_tool_calls_total[2m]))
+      threshold: "50"
+
+worker:
+  replicaCount: 2
+  # WORKER_PORT (default 8090, matching the worker's own default -
+  # WP-23); the pod always sets WORKER_HOST=0.0.0.0 so probes can reach
+  # it from the kubelet.
+  port: 8090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+  # CPU-based HorizontalPodAutoscaler for the worker Deployment
+  # (templates/hpa.yaml), storage's own backend "postgres" only - same
+  # owner decision as the api block's own autoscaling sub-block above.
+  # No KEDA option here: queue-length scaling of the worker is out of
+  # scope (#251's own "Not included").
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# Graceful shutdown (ADR-0009 §5), storage's own backend "postgres" only
+# - the git-mode Deployment's single replica has no in-flight traffic to
+# drain across a rollout the way api/worker do. terminationGracePeriodSeconds
+# must be at least graceSeconds + preStopSleepSeconds (the chart's own
+# "validateShutdown" helper fails the render otherwise).
+shutdown:
+  # SHUTDOWN_GRACE_SECONDS - uvicorn's timeout_graceful_shutdown.
+  graceSeconds: 20
+  # Kubernetes preStop hook: sleep this long before SIGTERM, so the load
+  # balancer has time to stop routing here before uvicorn starts
+  # draining.
+  preStopSleepSeconds: 10
+  terminationGracePeriodSeconds: 40
+
+# PodDisruptionBudget for the api Deployment (ADR-0009 §5), storage's own
+# backend "postgres" only - the worker Deployment runs best-effort
+# background jobs and needs no PDB of its own.
+pdb:
+  api:
+    minAvailable: 2
+
+# Optional single-primary Valkey for shared rate-limit/login state
+# (ADR-0009 §2, #254) - storage's own backend "postgres" already covers
+# the same state without it (docs/research/enterprise.md §5: roughly
+# 50-100x the expected load), so this is only for setups that want
+# Valkey's sub-millisecond counters anyway. Off by default: VALKEY_URL
+# stays unset, and api/worker fall back to Postgres (storage's own
+# backend "postgres") or in-process state (storage's own backend "git") -
+# memory_manager/config.py's own "valkey_url".
+valkey:
+  enabled: false
+  image:
+    repository: docker.io/valkey/valkey
+    # Pinned, not a floating major tag (CLAUDE.md) - 9.1.2 is the
+    # current latest stable release, re-verified 2026-10-08
+    # (docs/research/enterprise.md records the source and the version
+    # history).
+    tag: "9.1.2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  # Optional auth for the Deployment this chart renders below (ADR-0009
+  # §2: this Valkey holds only state that may be lost, so auth is extra
+  # hardening, not a prerequisite) - a Secret carrying the password
+  # under passwordKey; the chart passes it to valkey-server's own
+  # --requirepass and to api/worker's own VALKEY_URL.
+  existingSecret: ""
+  passwordKey: password
+  # Points api/worker at an operator-managed Valkey/Redis elsewhere
+  # instead of the Deployment above - a complete VALKEY_URL (redis://,
+  # rediss:// or unix://, credentials included if needed - config.py's
+  # own "_parse_valkey_url" checks only the scheme). Mutually exclusive
+  # with enabled above (the chart's own "validateValkey" helper fails
+  # the render otherwise).
+  externalUrl: ""
 
 image:
   repository: ghcr.io/scramb/memory-manager
@@ -153,6 +307,10 @@ database:
     # Set to false and use this block's own "url"/"existingSecret" for an
     # external Postgres instead.
     enabled: true
+    # More than 1 requires storage's own backend to be "postgres"
+    # (ADR-0007, ADR-0009 §6) - values.schema.json's own "if"/"then" and the
+    # chart's own "validateCnpgInstances" helper both fail the render
+    # otherwise; values-enterprise.yaml sets 3.
     instances: 1
     # Must be a CNPG operand image, not a stock Postgres image - see
     # templates/cnpg-cluster.yaml's comment. This one ships the `vector`
@@ -167,11 +325,45 @@ database:
         memory: 256Mi
       limits:
         memory: 512Mi
+    # Barman Cloud plugin backups (#252, docs/research/cnpg-backups.md) -
+    # off by default. When enabled, renders an ObjectStore
+    # (templates/cnpg-objectstore.yaml), a WAL-archiving plugin entry on
+    # the Cluster (templates/cnpg-cluster.yaml) and a ScheduledBackup
+    # (templates/cnpg-scheduledbackup.yaml). Needs the Barman Cloud
+    # plugin and its own prerequisite, cert-manager, already installed in
+    # the CNPG operator's namespace - neither is this chart's job.
+    backup:
+      enabled: false
+      # Seconds-first cron (CNPG's own ScheduledBackup format, not the
+      # Kubernetes CronJob one) - daily at 02:00.
+      schedule: "0 0 2 * * *"
+      # ADR-0007's documented erasure-replay horizon assumes 30 d here
+      # (backup retention) + 7 d on top.
+      retentionPolicy: 30d
+      # Placeholders (CLAUDE.md) - set your own S3-compatible bucket.
+      destinationPath: s3://memory-manager-backups/
+      endpointURL: https://object-store.example.com
+      # A Secret you create out-of-band, carrying the two keys below.
+      # Defaults to "<cnpg cluster name>-backup-credentials" when empty.
+      existingSecret: ""
+      accessKeyIdKey: ACCESS_KEY_ID
+      secretAccessKeyKey: ACCESS_SECRET_KEY
+      # WAL compression; "" (default) stores WALs uncompressed. One of
+      # "", bzip2, gzip, lz4, snappy, xz, zstd.
+      compression: gzip
   # Used only when the cnpg block above is disabled.
   url: ""
   existingSecret:
     name: ""
     key: uri
+  # DATABASE_APP_ROLE (api only, storage's own backend "postgres") - the
+  # non-owner, non-BYPASSRLS role every request transaction switches to
+  # before touching a FORCE ROW LEVEL SECURITY content table (ADR-0008
+  # addendum "system identity under FORCE RLS"). The operator creates
+  # this role and grants it to the owner role already in DATABASE_URL;
+  # the worker Deployment connects as the owner instead and never gets
+  # this variable (ADR-0008 addendum: system jobs keep bypassing RLS).
+  appRole: memory_manager_app
 
 # Gateway API HTTPRoute (deploy/httproute.yaml) - the whole host goes to
 # the app, which decides who gets in on its own. Mutually exclusive with
@@ -203,6 +395,16 @@ ingress:
 # to this chart, so the default egress when enabled is allow-all-with-DNS;
 # set this block's own "allowAll" to false and list your own "rules" (raw
 # NetworkPolicyEgressRule entries) to lock it down further.
+#
+# Storage's own backend "postgres" only (#255, templates/
+# networkpolicy.yaml): "ingress" above becomes the api Deployment's own
+# gateway/ingress-controller source instead (the "git" backend keeps
+# using it exactly as before); "prometheus" and "cnpgOperator" name the
+# two extra sources that mode's per-component policies also need -
+# Prometheus reaching api/worker's own metrics port, and the CNPG
+# operator reaching its instances' status port. Both default to "{}"
+# (matches every namespace/pod) until scoped to where those actually
+# run, same as "ingress" above.
 networkPolicy:
   enabled: false
   ingress:
@@ -211,6 +413,12 @@ networkPolicy:
   egress:
     allowAll: true
     rules: []
+  prometheus:
+    namespaceSelector: {}
+    podSelector: {}
+  cnpgOperator:
+    namespaceSelector: {}
+    podSelector: {}
 
 # Prometheus Operator ServiceMonitor (observability/metrics.py's own
 # /metrics) - off by default, needs the Prometheus Operator CRDs

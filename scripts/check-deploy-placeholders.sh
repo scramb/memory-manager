@@ -31,6 +31,10 @@ allowed_suffixes=(
   github.com ghcr.io docker.io
   kubernetes.io k8s.io fluxcd.io cnpg.io external-secrets.io
   monitoring.coreos.com githubusercontent.com
+  # Fixed, public CNPG-I plugin identifier (barman-cloud.cloudnative-pg.io,
+  # #252) - the plugin project's own name, not an operator's infrastructure,
+  # same category as cnpg.io above.
+  cloudnative-pg.io
   py sh yaml yml md json toml lock txt cfg ini
 )
 

@@ -60,8 +60,21 @@ jobs:
             | kubeconform -strict -summary \
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Render and validate the Helm chart (enterprise profile, #250)
+        run: |
+          helm template t charts/memory-manager -f charts/memory-manager/values-enterprise.yaml \
+            | kubeconform -strict -summary \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
       - name: No operator-specific hostnames or IPs
         run: scripts/check-deploy-placeholders.sh
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - name: Chart tests (storage.backend <-> scaling guard, api/worker split, #249/#250)
+        env:
+          MM_REQUIRE_HELM: "1"
+        run: uv run pytest tests/chart
 
   python:
     runs-on: ubuntu-latest

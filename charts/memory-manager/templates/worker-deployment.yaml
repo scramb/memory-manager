@@ -1,0 +1,205 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# storage's own backend "postgres" only (ADR-0007, ADR-0009 §4/#250): the
+# embedding queue, Graph delta sync, retention and OAuth cleanup run
+# here instead of inside the api process, so they scale and restart
+# independently of client-facing traffic. Runs `memory-manager worker`
+# (WP-23), which refuses to start without STORAGE_BACKEND=postgres and
+# serves its own /healthz, /readyz and /metrics on WORKER_HOST/
+# WORKER_PORT. It connects to Postgres as the owner role - it needs
+# DATABASE_URL but must NOT get DATABASE_APP_ROLE (ADR-0008 addendum
+# "system identity under FORCE RLS": system jobs keep bypassing RLS as
+# the owner; only request transactions switch role).
+{{- if eq .Values.storage.backend "postgres" }}
+{{- include "memory-manager.validateShutdown" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-worker
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "worker") | nindent 4 }}
+spec:
+  {{- /* Omitted while the HPA manages this Deployment
+  (templates/hpa.yaml, #251), so a Helm upgrade never resets the replica
+  count the autoscaler set. */}}
+  {{- if not .Values.worker.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "memory-manager.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # >= graceSeconds + preStopSleepSeconds (ADR-0009 §5, enforced by
+      # the validateShutdown helper included above).
+      terminationGracePeriodSeconds: {{ .Values.shutdown.terminationGracePeriodSeconds }}
+      {{- if .Values.worker.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .Values.worker.topologySpreadConstraints.maxSkew }}
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ .Values.worker.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 14 }}
+        - maxSkew: {{ .Values.worker.topologySpreadConstraints.maxSkew }}
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.worker.topologySpreadConstraints.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "worker") | nindent 14 }}
+      {{- end }}
+      containers:
+        - name: memory-manager-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Overrides the image's own `CMD ["memory-manager", "serve",
+          # "--http"]` (Dockerfile) with the worker entry point (WP-23).
+          command: ["memory-manager", "worker"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.worker.port }}
+          env:
+            - name: STORAGE_BACKEND
+              value: {{ .Values.storage.backend | quote }}
+            {{- if .Values.database.cnpg.enabled }}
+            # Assembled by CloudNativePG into the Secret
+            # "<cluster-name>-app" (templates/cnpg-cluster.yaml); "uri" is
+            # the full libpq connection string, including the generated
+            # password - the owner credential, same as the api
+            # Deployment's own DATABASE_URL. Unlike api, there is no
+            # DATABASE_APP_ROLE here: the worker runs system jobs that
+            # keep connecting as the owner (ADR-0008 addendum).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.cnpgClusterName" . }}-app
+                  key: uri
+            {{- else if .Values.database.existingSecret.name }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret.name }}
+                  key: {{ .Values.database.existingSecret.key | default "uri" }}
+            {{- else }}
+            - name: DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            {{- end }}
+            # The worker's own health/metrics port (WP-23); 127.0.0.1 is
+            # its default outside a pod, 0.0.0.0 so the kubelet can reach
+            # the probes below.
+            - name: WORKER_HOST
+              value: "0.0.0.0"
+            - name: WORKER_PORT
+              value: {{ .Values.worker.port | quote }}
+            - name: SHUTDOWN_GRACE_SECONDS
+              value: {{ .Values.shutdown.graceSeconds | quote }}
+            - name: OAUTH_CLIENT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: OAUTH_CLIENT_SECRET_KEY
+            {{- /* Shared rate-limit/login state in Valkey instead of
+            Postgres (ADR-0009 §2, #254) - same wiring as the api
+            Deployment's own env above. */}}
+            {{- if or .Values.valkey.enabled .Values.valkey.externalUrl }}
+            {{- if and .Values.valkey.enabled .Values.valkey.existingSecret }}
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.valkey.existingSecret }}
+                  key: {{ .Values.valkey.passwordKey | default "password" }}
+            {{- end }}
+            - name: VALKEY_URL
+              value: {{ (ternary (include "memory-manager.valkeyUrl" .) .Values.valkey.externalUrl .Values.valkey.enabled) | quote }}
+            {{- end }}
+            {{- if ne .Values.embedding.provider "none" }}
+            - name: EMBEDDING_PROVIDER
+              value: {{ .Values.embedding.provider | quote }}
+            - name: EMBEDDING_URL
+              value: {{ .Values.embedding.url | quote }}
+            {{- if .Values.embedding.model }}
+            - name: EMBEDDING_MODEL
+              value: {{ .Values.embedding.model | quote }}
+            {{- end }}
+            {{- if .Values.embedding.dimensions }}
+            - name: EMBEDDING_DIMENSIONS
+              value: {{ .Values.embedding.dimensions | quote }}
+            {{- end }}
+            {{- if .Values.embedding.apiKeySecretKey }}
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: {{ .Values.embedding.apiKeySecretKey }}
+            {{- end }}
+            {{- end }}
+            {{- if not .Values.metrics.enabled }}
+            - name: METRICS_ENABLED
+              value: "false"
+            {{- end }}
+            - name: LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+          lifecycle:
+            # Same drain window as the api Deployment (ADR-0009 §5).
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep {{ .Values.shutdown.preStopSleepSeconds }}"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            # HOME=/tmp (the image's own ENV) and the read-only root
+            # filesystem both need this writable.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

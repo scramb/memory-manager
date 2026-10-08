@@ -9,6 +9,13 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "memory-manager.selectorLabels" . | nindent 4 }}
+    {{- if eq .Values.storage.backend "postgres" }}
+    # Only the api Deployment serves client-facing traffic in postgres
+    # mode (ADR-0009 §4/#250) - the worker Deployment shares the same
+    # base selector, so without this it would get traffic it cannot
+    # answer. Unchanged in git mode, where only one Deployment exists.
+    app.kubernetes.io/component: api
+    {{- end }}
   ports:
     - name: http
       port: {{ .Values.service.port }}

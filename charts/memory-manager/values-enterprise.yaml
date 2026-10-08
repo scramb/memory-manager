@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Enterprise profile (ADR-0007 storage backend, ADR-0008 namespaces,
+# ADR-0009 stateless replicas): storage's own backend set to "postgres"
+# instead of the default single-writer "git" Deployment, 3 api replicas
+# behind a PDB, 2 worker replicas, Entra login, a CPU HorizontalPodAutoscaler
+# for both Deployments (owner decision O27, ADR-0009 addendum
+# 2026-10-08, #251 - KEDA request-rate scaling stays off here; turn the
+# api block's own keda sub-block on and its autoscaling sub-block off in
+# your own overlay instead), a 3-instance CNPG Cluster with Barman Cloud
+# plugin backups (#252), and per-component NetworkPolicies (#255) -
+# api/worker/Valkey/the CNPG Cluster's own instances each limited to the
+# flows they need. Every hostname/secret-store path below is still a
+# placeholder (CLAUDE.md: a public repository carries no
+# operator-specific values) - set your own in a further `-f` overlay,
+# never by editing this file in place.
+storage:
+  backend: postgres
+
+# Entra login (ADR-0006) - WP-22 defines the Entra-specific env/secret
+# keys this mode actually needs; the oidc block below is unused once
+# that lands and stays only as a placeholder until then (#250's own "Not
+# included": "Entra env keys beyond placeholders").
+login:
+  mode: entra
+  oidc:
+    # Placeholder only - a real tenant's issuer is Microsoft's own fixed
+    # identity-platform hostname followed by that tenant's own id; set
+    # your own tenant's issuer here.
+    issuer: https://login.example.com/00000000-0000-0000-0000-000000000000
+    clientId: memory-manager
+    allowedEmails: you@example.com
+
+database:
+  appRole: memory_manager_app
+  cnpg:
+    # 3 instances, only allowed once storage's own backend is "postgres"
+    # (ADR-0007, ADR-0009 §6) - the default profile's single instance.
+    instances: 3
+    backup:
+      # Placeholder bucket/endpoint (values.yaml) - set your own in a
+      # further overlay; scripts/check-deploy-placeholders.sh only
+      # checks for a real one creeping in here, not that these are set.
+      enabled: true
+
+api:
+  autoscaling:
+    enabled: true
+
+worker:
+  autoscaling:
+    enabled: true
+
+# Off here: the 3-instance CNPG Cluster above already covers the same
+# rate-limit/login state at far more than the expected load (ADR-0009
+# §2, docs/research/enterprise.md §5) - Postgres is the fallback, not a
+# missing piece. Turn valkey's own enabled flag on in your own overlay
+# for Valkey's sub-millisecond counters instead (#254).
+valkey:
+  enabled: false
+
+# Per-component policies instead of the single git-mode one (#255,
+# templates/networkpolicy.yaml) - namespaceSelector/podSelector below
+# still default to "{}" (matches everywhere) until set to your own
+# gateway/Prometheus/CNPG-operator namespace in a further overlay.
+networkPolicy:
+  enabled: true

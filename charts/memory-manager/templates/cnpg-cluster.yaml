@@ -18,7 +18,29 @@
 # no-op requiring no such privilege (verified directly in
 # `tests/db/test_migrations.py`,
 # `TestMigrate::test_succeeds_for_a_non_superuser_role_once_vector_already_exists`).
+#
+# The same bootstrap also creates the database block's own appRole as a
+# NOLOGIN role and grants it to the owner (#252) - the non-owner,
+# non-BYPASSRLS role request transactions switch to under FORCE ROW
+# LEVEL SECURITY (ADR-0008 addendum). `src/memory_manager/db/rls.py`'s
+# `check_app_role` fails startup fast if the owner is somehow not a
+# member of it; `postInitApplicationSQL` only ever runs once, at cluster
+# creation, so this grant - like the extension above - is not meant to
+# be idempotent against a later edit of that value.
+#
+# The cnpg block's own instances value above 1 requires storage's own
+# backend to be "postgres" (ADR-0007, ADR-0009 §6) - the
+# "validateCnpgInstances" helper below fails the render otherwise,
+# alongside values.schema.json's own "if"/"then".
+#
+# The cnpg block's own backup sub-block, once enabled (#252), adds a
+# Barman Cloud plugin entry (a WAL-archiving plugins list entry below)
+# pointing at the ObjectStore templates/cnpg-objectstore.yaml renders -
+# see docs/research/cnpg-backups.md for the plugin's current API and
+# prerequisites (CNPG >= 1.26, cert-manager, the plugin installed in the
+# operator's own namespace - none of this chart's job).
 {{- if .Values.database.cnpg.enabled }}
+{{- include "memory-manager.validateCnpgInstances" . }}
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -34,6 +56,15 @@ spec:
       owner: memory_manager
       postInitApplicationSQL:
         - "CREATE EXTENSION IF NOT EXISTS vector;"
+        - {{ printf "CREATE ROLE \"%s\" NOLOGIN;" .Values.database.appRole | quote }}
+        - {{ printf "GRANT \"%s\" TO memory_manager;" .Values.database.appRole | quote }}
+  {{- if .Values.database.cnpg.backup.enabled }}
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ include "memory-manager.cnpgObjectStoreName" . }}
+  {{- end }}
   storage:
     {{- with .Values.database.cnpg.storage.storageClassName }}
     storageClass: {{ . }}

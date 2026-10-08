@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# storage's own backend "postgres" only (ADR-0009 §5/#250): only the api
+# Deployment serves client-facing traffic, so it is the only one that
+# needs a PodDisruptionBudget - the worker Deployment runs best-effort
+# background jobs and tolerates a voluntary disruption taking out more
+# than one replica at once.
+{{- if eq .Values.storage.backend "postgres" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-api
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "api") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.api.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "api") | nindent 6 }}
+{{- end }}
