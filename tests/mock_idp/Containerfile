@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Builds a standalone image for tests/mock_idp (#212), run with:
+#   podman build -f tests/mock_idp/Containerfile \
+#     --ignorefile tests/mock_idp/.containerignore -t mock-idp:dev .
+# The root .dockerignore excludes "tests" wholesale (it is written for the
+# production Dockerfile, which never needs test code) - this image needs
+# exactly the opposite, so it gets its own ignore file via --ignorefile
+# rather than this image punching a hole in the root one. Needed for the
+# kind E2E (WP-30, owner decision 8), which runs this mock in-cluster
+# alongside memory-manager - not used by `uv run pytest`, which runs the app
+# in-process or as a plain subprocess instead (see
+# tests/mock_idp_fixtures.py). Same two-stage shape as the root Dockerfile
+# (builder venv via uv, copied into a minimal non-root runtime image), but
+# does not need git/openssh-client since this image carries no vault.
+
+# --- builder --------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /usr/local/bin/uv
+
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ src/
+
+# Starlette/uvicorn/httpx already come in via the `mcp` dependency (CLAUDE.md
+# "few dependencies" - no new one for this mock). --no-editable: the runtime
+# stage ships the venv only, not /app/src.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
+
+# --- runtime ----------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+LABEL org.opencontainers.image.title="memory-manager-mock-idp" \
+      org.opencontainers.image.description="Test-only mock of Entra ID and Microsoft Graph" \
+      org.opencontainers.image.source="https://github.com/scramb/memory-manager" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
+RUN groupadd --gid 10001 mock-idp \
+    && useradd --uid 10001 --gid mock-idp --no-create-home \
+       --shell /usr/sbin/nologin mock-idp
+
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+# Only the mock package itself - no vault, no production code (Blast-Radius:
+# "Nothing under src/" for this issue, and this image does not need it either).
+COPY tests/mock_idp/ tests/mock_idp/
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    HOME=/tmp \
+    PYTHONPATH=/app
+
+USER 10001:10001
+EXPOSE 8080
+
+# Issuer URL comes from MOCK_IDP_ISSUER_BASE (see tests/mock_idp/__main__.py),
+# set per-deployment by the kind E2E overlay (WP-30) to the in-cluster
+# service name - not baked in here (CLAUDE.md: no operator-specific values
+# in images/manifests).
+CMD ["python", "-m", "tests.mock_idp", "--host", "0.0.0.0", "--port", "8080"]
