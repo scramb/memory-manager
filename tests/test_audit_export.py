@@ -29,6 +29,13 @@ from memory_manager.config import AuditConfigError, audit_export_targets_from_en
 from memory_manager.db.migrate import migrate
 from memory_manager.observability.audit_export import AuditExporter
 
+try:
+    import opentelemetry.sdk  # noqa: F401
+except ImportError:
+    _OTEL_INSTALLED = False
+else:
+    _OTEL_INSTALLED = True
+
 # --- config.audit_export_targets_from_env -----------------------------------
 
 
@@ -122,6 +129,12 @@ class TestAuditExporterStdout:
 
 
 class TestAuditExporterOtlp:
+    # Skips every test in this class, cleanly, the moment the `otel` extra is
+    # missing (`tests/test_tracing.py`'s own module-level `pytestmark`, here
+    # scoped to just this class instead of the whole file) - the stdout and
+    # config tests above have no such dependency and must keep running.
+    pytestmark = pytest.mark.skipif(not _OTEL_INSTALLED, reason="the 'otel' extra is not installed")
+
     def test_exports_one_log_record_with_the_expected_attributes(self) -> None:
         from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
