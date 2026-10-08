@@ -31,6 +31,9 @@ __all__ = [
     "AuditHook",
     "BlocklistRejected",
     "EditMismatch",
+    "ErasureResult",
+    "ErasureTargetKind",
+    "ErasureUnsupported",
     "IndexCommitHook",
     "IndexHook",
     "InvalidNote",
@@ -318,6 +321,46 @@ class WriteFailed(WriteError):
     """
 
 
+class ErasureUnsupported(Exception):
+    """Raised by `GitBackend.erase` (ADR-0007 §3): erasure only exists for the
+    Postgres backend (CLAUDE.md "erasure exists only with the postgres
+    backend, outside MCP"). Git is designed to keep history forever - there
+    is no provable way to hard-delete from every clone and remote - so the
+    Git backend refuses the call outright rather than pretending to comply.
+    Not a `WriteError`: `erase` is a separate, non-MCP operation (#231), not
+    part of the write contract every `WriteError` subclass above describes.
+    """
+
+
+#: The three things `storage.erasure` can hard-delete (ADR-0007 §3 addendum
+#: 2026-10-08, #231): a single note (by its ULID `id`), every note in a
+#: namespace (by its alias), or a user and their personal namespace (by
+#: `users.oid`) - `PostgresBackend.erase`'s own dispatch key.
+ErasureTargetKind = Literal["note", "namespace", "user"]
+
+
+@dataclass(frozen=True)
+class ErasureResult:
+    """What one `storage.erasure.erase_note`/`erase_namespace`/`erase_user` call did.
+
+    `target_ids` is the one id `erase` was called with, except for
+    `erase_user` with no personal namespace of its own yet - still exactly
+    one id (`target_kind="user"`'s `users.oid`), never more: this is *not*
+    the set of notes touched, only what identified the erasure itself.
+    `row_counts` is a plain count per table touched (e.g. `{"vault_notes":
+    3, "vault_revisions": 7, ...}`), the same shape persisted in
+    `erasure_log.row_counts` and mirrored into the `audit_log` row's
+    `detail` - counts only, never a path, a slug or any other content.
+    `erasure_log_id` is that row's own id, for a caller that wants to look
+    it up again.
+    """
+
+    target_kind: ErasureTargetKind
+    target_ids: tuple[str, ...]
+    row_counts: dict[str, int]
+    erasure_log_id: int
+
+
 @dataclass(frozen=True)
 class StoredNote:
     """One note as a backend reads or lists it: where, what, at what version."""
@@ -467,6 +510,31 @@ class StorageBackend(Protocol):
 
         Raises `NotFound` if `path` does not exist, `InvalidNote` if the
         archive target already exists. Never hard-deletes (CLAUDE.md).
+        """
+        ...
+
+    async def erase(
+        self,
+        target_kind: ErasureTargetKind,
+        target_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> ErasureResult:
+        """Hard-delete `target_kind`'s `target_id`, in one transaction (ADR-0007 §3, #231).
+
+        A separate, non-MCP, admin-only operation - never reachable from a
+        write (`CLAUDE.md`: "no MCP tool hard-deletes notes"). `target_id`
+        is a note's ULID `id` for `"note"`, a namespace alias for
+        `"namespace"`, or a `users.oid` for `"user"`. `actor`/`reason` are
+        recorded on the `erasure_log` row this call writes, in the same
+        transaction as the deletes themselves - a failure partway through
+        rolls back the deletes and leaves no `erasure_log`/`audit_log` row
+        behind either.
+
+        `GitBackend.erase` always raises `ErasureUnsupported`: Git is the
+        source of truth there, and nothing about it can be provably
+        erased from every clone and remote (ADR-0007 §3).
         """
         ...
 

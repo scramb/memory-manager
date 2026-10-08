@@ -286,6 +286,7 @@ class TestMigrateBackendPostgres:
             "0013_vault_notes_namespace_idx",
             "0014_entra_delta_cursor",
             "0016_account_sessions",
+            "0018_erasure_log",
         ]
         tables = {
             row["table_name"]
@@ -300,18 +301,26 @@ class TestMigrateBackendPostgres:
             "chunks_project",
             "chunks_org",
             "embedding_dimension",
+            "erasure_log",
         } <= tables
 
     async def test_backend_git_default_never_applies_it(self, conn: asyncpg.Connection) -> None:
         applied = await migrate(conn)
 
         assert "0012_vector_layout" not in applied
+        assert "0018_erasure_log" not in applied
 
         exists = await conn.fetchval(
             "select exists(select 1 from information_schema.tables "
             "where table_schema = 'public' and table_name = 'embedding_dimension')"
         )
         assert exists is False
+
+        erasure_log_exists = await conn.fetchval(
+            "select exists(select 1 from information_schema.tables "
+            "where table_schema = 'public' and table_name = 'erasure_log')"
+        )
+        assert erasure_log_exists is False
 
     async def test_an_unknown_backend_is_refused(self, conn: asyncpg.Connection) -> None:
         with pytest.raises(ValueError, match="backend"):

@@ -115,9 +115,11 @@ from datetime import UTC, datetime
 import asyncpg
 
 from memory_manager.db import rls
-from memory_manager.storage import rules
+from memory_manager.storage import erasure, rules
 from memory_manager.storage.base import (
     AuditHook,
+    ErasureResult,
+    ErasureTargetKind,
     IndexCommitHook,
     IndexHook,
     InvalidNote,
@@ -1040,3 +1042,30 @@ class PostgresBackend:
         changed = tuple(sorted(path for path in touched if path in existing))
         deleted = tuple(sorted(path for path in touched if path not in existing))
         return StorageChanges(cursor=str(new_xmin), changed=changed, deleted=deleted)
+
+    async def erase(
+        self,
+        target_kind: ErasureTargetKind,
+        target_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> ErasureResult:
+        """Hard-delete `target_kind`'s `target_id` (ADR-0007 §3, #231).
+
+        Deliberately bypasses `_content_connection`/`app_role`: erasure
+        always runs as the owner (ADR-0008 addendum #100, "system
+        identity"), acquiring a plain connection straight from `self._pool`
+        regardless of whether this instance was built with an `app_role` at
+        all - never through `db.rls.request_connection`, which would switch
+        to a role the app role (`storage/erasure.py`'s own module docstring:
+        no grant at all on the tables erasure touches) could never carry
+        this out as anyway.
+        """
+        erase_fn = {
+            "note": erasure.erase_note,
+            "namespace": erasure.erase_namespace,
+            "user": erasure.erase_user,
+        }[target_kind]
+        async with self._pool.acquire() as conn:
+            return await erase_fn(conn, target_id, actor=actor, reason=reason)

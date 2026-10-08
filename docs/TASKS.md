@@ -254,8 +254,8 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 ### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
 
+- [x] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
 - [ ] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
-- [ ] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
 - [ ] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
 - [ ] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229
 - [ ] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222

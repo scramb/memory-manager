@@ -25,7 +25,15 @@ import asyncio
 from pathlib import Path
 
 from memory_manager.queue import WriteQueue
-from memory_manager.storage.base import StorageChanges, StoredNote, WriteRequest, WriteResult
+from memory_manager.storage.base import (
+    ErasureResult,
+    ErasureTargetKind,
+    ErasureUnsupported,
+    StorageChanges,
+    StoredNote,
+    WriteRequest,
+    WriteResult,
+)
 from memory_manager.vault.note import version
 from memory_manager.vault.paths import PathRejected, iter_md_files, parse_note_path
 from memory_manager.vault.repo import Repo
@@ -195,6 +203,21 @@ class GitBackend:
                 message=message,
                 actor=actor,
             )
+        )
+
+    async def erase(
+        self,
+        target_kind: ErasureTargetKind,
+        target_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> ErasureResult:
+        """Always raises `ErasureUnsupported` (ADR-0007 §3, CLAUDE.md:
+        "erasure exists only with the postgres backend")."""
+        raise ErasureUnsupported(
+            "erasure is not supported by the git backend - git is the source of truth there "
+            "and nothing can be provably hard-deleted from every clone and remote (ADR-0007 §3)"
         )
 
     async def changes_since(self, cursor: str | None) -> StorageChanges:
