@@ -339,6 +339,7 @@ Licences:
   - `valkey` (valkey-py) 6.1.1: MIT.
   - `valkey-glide` 2.5.3: Apache-2.0 ([L6]).
   - All three are AGPL-compatible.
+- **Re-verified 2026-10-08** (WP-29f, #254): `valkey/valkey:9.1.2` is still the latest stable tag on Docker Hub (`9.2.0-rc1` exists but is a release candidate); amd64/`9.1.2` and amd64/`9.1.2-trixie` share the same digest, so the chart's `charts/memory-manager/values.yaml` pins `docker.io/valkey/valkey:9.1.2` rather than the floating `:8`/`:9` tags the Makefile's own `valkey-up` and `.github/workflows/validate.yml`'s own `valkey` service use for local/CI convenience. The image creates a `valkey:valkey` user at uid/gid 999 but keeps `USER root` as its default (`docker-entrypoint.sh`, `valkey-io/valkey-container`), so the chart's Deployment sets `runAsUser`/`runAsGroup: 999` itself rather than relying on the image default.
 
 **Is Postgres-only realistic at ~200 concurrent users / few hundred RPS?** Yes. Measured headroom is roughly 50–100× (fixed window), and per-key contention is negligible because each token has its own row.
 

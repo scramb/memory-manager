@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Optional single-primary Valkey for shared state (ADR-0009 §2:
+# rate-limit counters, the login brute-force window, pending OIDC/Entra
+# login state) - off by default, since storage's own backend "postgres"
+# already covers the same state at far more than the expected load
+# (docs/research/enterprise.md §5) and a small enterprise setup needs no
+# extra service. No persistence (--save "" --appendonly no, matching the
+# Makefile's own valkey-up target): losing this data only resets
+# counters and aborts logins in progress, never anything durable. One
+# replica is enough - Valkey HA/Sentinel is explicitly out of scope
+# (#254's own "Not included").
+#
+# Mutually exclusive with valkey's own externalUrl (an operator-managed
+# Valkey/Redis elsewhere) - the validateValkey helper below fails the
+# render if both are set.
+{{- if .Values.valkey.enabled }}
+{{- include "memory-manager.validateValkey" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memory-manager.valkeyName" . }}
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "valkey") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "valkey") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "valkey") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      # The official image's own docker-entrypoint.sh chown's its data
+      # directory to uid/gid 999 ("valkey") only when started as root;
+      # running as that uid directly instead (restricted Pod Security
+      # Standard, matching the rest of this chart) needs the data
+      # volume below already group-writable, which fsGroup arranges.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: "{{ .Values.valkey.image.repository }}:{{ .Values.valkey.image.tag }}"
+          imagePullPolicy: {{ .Values.valkey.image.pullPolicy }}
+          {{- if .Values.valkey.existingSecret }}
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.valkey.existingSecret }}
+                  key: {{ .Values.valkey.passwordKey | default "password" }}
+          {{- end }}
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            {{- if .Values.valkey.existingSecret }}
+            - --requirepass
+            - "$(VALKEY_PASSWORD)"
+            {{- end }}
+          ports:
+            - name: valkey
+              containerPort: 6379
+          # Plain TCP checks, not `valkey-cli ping` - the latter would
+          # need its own auth handling once existingSecret sets a
+          # password above.
+          livenessProbe:
+            tcpSocket:
+              port: valkey
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: valkey
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # The image's own WORKDIR; writable even with
+            # readOnlyRootFilesystem since this is a separate emptyDir -
+            # no persistence is kept here on purpose (comment above).
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memory-manager.valkeyName" . }}
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "valkey") | nindent 4 }}
+spec:
+  selector:
+    {{- include "memory-manager.componentSelectorLabels" (dict "context" . "component" "valkey") | nindent 4 }}
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+{{- end }}

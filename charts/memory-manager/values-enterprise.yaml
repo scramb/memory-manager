@@ -13,8 +13,7 @@
 # operator-specific values) - set your own in a further `-f` overlay,
 # never by editing this file in place.
 #
-# Extended by later WP-29 tasks: Valkey shared state (29f), NetworkPolicies
-# (29g).
+# Extended by a later WP-29 task: NetworkPolicies (29g).
 storage:
   backend: postgres
 
@@ -51,3 +50,11 @@ api:
 worker:
   autoscaling:
     enabled: true
+
+# Off here: the 3-instance CNPG Cluster above already covers the same
+# rate-limit/login state at far more than the expected load (ADR-0009
+# §2, docs/research/enterprise.md §5) - Postgres is the fallback, not a
+# missing piece. Turn valkey's own enabled flag on in your own overlay
+# for Valkey's sub-millisecond counters instead (#254).
+valkey:
+  enabled: false

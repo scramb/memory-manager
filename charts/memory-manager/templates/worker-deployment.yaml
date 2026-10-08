@@ -117,6 +117,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "memory-manager.secretName" . }}
                   key: OAUTH_CLIENT_SECRET_KEY
+            {{- /* Shared rate-limit/login state in Valkey instead of
+            Postgres (ADR-0009 §2, #254) - same wiring as the api
+            Deployment's own env above. */}}
+            {{- if or .Values.valkey.enabled .Values.valkey.externalUrl }}
+            {{- if and .Values.valkey.enabled .Values.valkey.existingSecret }}
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.valkey.existingSecret }}
+                  key: {{ .Values.valkey.passwordKey | default "password" }}
+            {{- end }}
+            - name: VALKEY_URL
+              value: {{ (ternary (include "memory-manager.valkeyUrl" .) .Values.valkey.externalUrl .Values.valkey.enabled) | quote }}
+            {{- end }}
             {{- if ne .Values.embedding.provider "none" }}
             - name: EMBEDDING_PROVIDER
               value: {{ .Values.embedding.provider | quote }}

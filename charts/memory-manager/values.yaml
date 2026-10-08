@@ -129,6 +129,45 @@ pdb:
   api:
     minAvailable: 2
 
+# Optional single-primary Valkey for shared rate-limit/login state
+# (ADR-0009 §2, #254) - storage's own backend "postgres" already covers
+# the same state without it (docs/research/enterprise.md §5: roughly
+# 50-100x the expected load), so this is only for setups that want
+# Valkey's sub-millisecond counters anyway. Off by default: VALKEY_URL
+# stays unset, and api/worker fall back to Postgres (storage's own
+# backend "postgres") or in-process state (storage's own backend "git") -
+# memory_manager/config.py's own "valkey_url".
+valkey:
+  enabled: false
+  image:
+    repository: docker.io/valkey/valkey
+    # Pinned, not a floating major tag (CLAUDE.md) - 9.1.2 is the
+    # current latest stable release, re-verified 2026-10-08
+    # (docs/research/enterprise.md records the source and the version
+    # history).
+    tag: "9.1.2"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  # Optional auth for the Deployment this chart renders below (ADR-0009
+  # §2: this Valkey holds only state that may be lost, so auth is extra
+  # hardening, not a prerequisite) - a Secret carrying the password
+  # under passwordKey; the chart passes it to valkey-server's own
+  # --requirepass and to api/worker's own VALKEY_URL.
+  existingSecret: ""
+  passwordKey: password
+  # Points api/worker at an operator-managed Valkey/Redis elsewhere
+  # instead of the Deployment above - a complete VALKEY_URL (redis://,
+  # rediss:// or unix://, credentials included if needed - config.py's
+  # own "_parse_valkey_url" checks only the scheme). Mutually exclusive
+  # with enabled above (the chart's own "validateValkey" helper fails
+  # the render otherwise).
+  externalUrl: ""
+
 image:
   repository: ghcr.io/scramb/memory-manager
   pullPolicy: IfNotPresent

@@ -256,6 +256,27 @@
         }
       }
     },
+    "valkey": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional single-primary Valkey for shared rate-limit/login state (ADR-0009 §2, #254) - mutually exclusive with externalUrl below, checked by the chart's own validateValkey template helper (values.schema.json cannot express mutual exclusion between two independently optional fields as an \"if\"/\"then\").",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1 },
+            "pullPolicy": { "type": "string" }
+          }
+        },
+        "resources": { "type": "object", "additionalProperties": true },
+        "existingSecret": { "type": "string" },
+        "passwordKey": { "type": "string" },
+        "externalUrl": { "type": "string" }
+      }
+    },
     "httpRoute": {
       "type": "object",
       "additionalProperties": true,

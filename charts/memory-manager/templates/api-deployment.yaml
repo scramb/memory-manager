@@ -146,6 +146,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "memory-manager.secretName" . }}
                   key: OAUTH_CLIENT_SECRET_KEY
+            {{- /* Shared rate-limit/login state in Valkey instead of
+            Postgres (ADR-0009 §2, #254) - the chart's own Deployment
+            (templates/valkey.yaml) when valkey's own enabled flag is
+            true, or an operator-managed instance via externalUrl.
+            Unset falls back to Postgres (this Deployment's own
+            STORAGE_BACKEND) or in-process state. */}}
+            {{- if or .Values.valkey.enabled .Values.valkey.externalUrl }}
+            {{- if and .Values.valkey.enabled .Values.valkey.existingSecret }}
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.valkey.existingSecret }}
+                  key: {{ .Values.valkey.passwordKey | default "password" }}
+            {{- end }}
+            - name: VALKEY_URL
+              value: {{ (ternary (include "memory-manager.valkeyUrl" .) .Values.valkey.externalUrl .Values.valkey.enabled) | quote }}
+            {{- end }}
             {{- if ne .Values.embedding.provider "none" }}
             - name: EMBEDDING_PROVIDER
               value: {{ .Values.embedding.provider | quote }}

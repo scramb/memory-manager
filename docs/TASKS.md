@@ -292,7 +292,7 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 - [x] #251 The api and worker Deployments scale on CPU, with optional RPS scaling through a KEDA ScaledObject ⛔ blocked by #250
 - [x] #252 The CNPG cluster of the enterprise profile runs three instances with Barman Cloud plugin backups ⛔ blocked by #250
 - [x] #253 The container image ships the valkey and otel extras
-- [ ] #254 The chart can deploy an optional Valkey without persistence for shared state ⛔ blocked by #250, #253
+- [x] #254 The chart can deploy an optional Valkey without persistence for shared state ⛔ blocked by #250, #253
 - [ ] #255 NetworkPolicies limit api, worker, Valkey and Postgres traffic to the needed flows ⛔ blocked by #251, #252, #254
 
 ### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: open

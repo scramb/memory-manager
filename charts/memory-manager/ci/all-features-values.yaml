@@ -69,3 +69,8 @@ database:
   cnpg:
     backup:
       enabled: true
+
+valkey:
+  enabled: true
+  existingSecret: memory-manager-valkey-secret
+  passwordKey: password

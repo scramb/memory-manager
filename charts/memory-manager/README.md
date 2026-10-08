@@ -80,6 +80,10 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `database` → `cnpg` → `backup` → `schedule`/`retentionPolicy` | daily, `30d` | `ScheduledBackup`'s own seconds-first cron schedule and the `ObjectStore`'s own retention window (ADR-0007's documented 30 d + 7 d erasure-replay horizon) |
 | `database` → `cnpg` → `backup` → `destinationPath`/`endpointURL`/`existingSecret`/`accessKeyIdKey`/`secretAccessKeyKey`/`compression` | placeholders | S3-compatible object store and credentials Secret (created out-of-band); defaults to `<cnpg cluster name>-backup-credentials` when `existingSecret` is empty |
 | `database` → `url`/`existingSecret` | `""` | Used instead, when the `cnpg` block above is disabled |
+| `valkey` → `enabled` | `false` | Optional single-primary Valkey for shared rate-limit/login state (ADR-0009 §2, #254) - no persistence; `storage` → `backend` `postgres` already covers the same state without it |
+| `valkey` → `image` → `repository`/`tag`/`pullPolicy` | `docker.io/valkey/valkey`, `9.1.2` | Pinned, not a floating major tag |
+| `valkey` → `existingSecret`/`passwordKey` | `""` / `password` | Optional auth for the Deployment above - `--requirepass` and `api`/`worker`'s own `VALKEY_URL` both read it |
+| `valkey` → `externalUrl` | `""` | Points `api`/`worker` at an operator-managed Valkey/Redis elsewhere instead of the Deployment above; mutually exclusive with `valkey` → `enabled` |
 | `httpRoute` → `enabled` | `true` | Gateway API `HTTPRoute`, same shape as `deploy/httproute.yaml` |
 | `ingress` → `enabled` | `false` | Classic `Ingress`, for clusters without Gateway API |
 | `networkPolicy` → `enabled` | `false` | Off by default, documented; ingress scoped to configurable selectors, egress allow-all-with-DNS by default (remote IPs are operator-specific and unknown to this chart) |
@@ -94,9 +98,10 @@ split above plus a CPU `HorizontalPodAutoscaler` for both Deployments, Entra log
 included, a 3-instance CNPG `Cluster` with Barman Cloud plugin backups enabled (#252, placeholder
 bucket/endpoint - set your own). KEDA request-rate scaling stays off; turn `api` → `keda` →
 `enabled` on and `api` → `autoscaling` → `enabled` off in your own overlay to use it instead (KEDA
-itself must already be installed in the cluster). It is a starting overlay, not a complete install -
-layer your own values on top for the pieces it does not cover yet (Valkey shared state,
-NetworkPolicies):
+itself must already be installed in the cluster). Valkey shared state (#254) stays off - the
+3-instance CNPG `Cluster` already covers the same state; turn `valkey` → `enabled` on in your own
+overlay instead for Valkey's sub-millisecond counters. It is a starting overlay, not a complete
+install - layer your own values on top for the pieces it does not cover yet (NetworkPolicies):
 
 ```sh
 helm template memory-manager charts/memory-manager \
@@ -122,3 +127,5 @@ helm template memory-manager charts/memory-manager -f my-values.yaml | kubeconfo
 - The restore runbook and `erasure_log` replay procedure after a restore (WP-26, ADR-0007's own
   30 d + 7 d horizon).
 - A CNPG Pooler/PgBouncer, and backups in the kind E2E.
+- Valkey HA/Sentinel (not needed, ADR-0009) and a `NetworkPolicy` scoped to the Valkey Deployment
+  (#255).

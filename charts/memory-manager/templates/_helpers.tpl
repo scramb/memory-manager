@@ -121,6 +121,46 @@ Included by templates/cnpg-cluster.yaml; renders no output of its own.
 {{- end }}
 
 {{/*
+The Valkey Deployment/Service name this chart renders when valkey's own
+enabled flag is true (templates/valkey.yaml) - "<fullname>-valkey",
+matching the api/worker suffix convention above.
+*/}}
+{{- define "memory-manager.valkeyName" -}}
+{{- printf "%s-valkey" (include "memory-manager.fullname" .) }}
+{{- end }}
+
+{{/*
+VALKEY_URL for the chart's own Valkey Deployment (never for valkey's own
+externalUrl, which is already a complete URL a caller supplies as-is) -
+redis:// to the in-cluster Service's own DNS name on Valkey's
+default port, with $(VALKEY_PASSWORD) spliced in when valkey's own
+existingSecret is set. Kubernetes expands a $(VAR_NAME) reference
+against env vars defined earlier in the same container ("dependent
+environment variables") - templates/api-deployment.yaml and
+templates/worker-deployment.yaml both define VALKEY_PASSWORD right
+before the env entry that calls this helper, whenever existingSecret is
+set.
+*/}}
+{{- define "memory-manager.valkeyUrl" -}}
+{{- if .Values.valkey.existingSecret }}
+{{- printf "redis://:$(VALKEY_PASSWORD)@%s:6379/0" (include "memory-manager.valkeyName" .) }}
+{{- else }}
+{{- printf "redis://%s:6379/0" (include "memory-manager.valkeyName" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fails fast when valkey's own enabled flag and externalUrl are both set
+(#254): two different ways to point api/worker at Valkey, never both.
+Included by templates/valkey.yaml; renders no output of its own.
+*/}}
+{{- define "memory-manager.validateValkey" -}}
+{{- if and .Values.valkey.enabled .Values.valkey.externalUrl }}
+{{- fail "valkey.enabled and valkey.externalUrl are mutually exclusive - pick one way to point api/worker at Valkey (#254)" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Fails fast when storage's own backend is "git" and combined with more
 than one replica or any autoscaler (ADR-0007, ADR-0009 §6: only a
 "postgres" backend may scale) - a template-side guard alongside
