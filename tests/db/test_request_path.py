@@ -22,8 +22,10 @@ switch.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -52,9 +54,19 @@ class RequestPathDb:
     pool: asyncpg.Pool
 
 
-@pytest_asyncio.fixture
-async def request_path_db(admin_database_url: str) -> AsyncIterator[RequestPathDb]:
-    """A non-superuser owner, migrated, with one app role granted (#116)."""
+@asynccontextmanager
+async def _request_path_db(
+    admin_database_url: str, *, pre_grant: bool
+) -> AsyncIterator[RequestPathDb]:
+    """A non-superuser owner, migrated, with one app role created.
+
+    `pre_grant=True` is `request_path_db` below's own shape: the app role
+    already holds `grant_app_role`'s grant (#116), the way a replica that
+    already passed startup sees it. `pre_grant=False` is `ungranted_app_role_db`'s
+    shape instead - the role exists and the owner is a member of it (what
+    `check_app_role` needs to pass), but nothing has granted it yet - the
+    state several replicas starting at once race over (#123).
+    """
     db_name = f"mm_test_reqpath_{secrets.token_hex(8)}"
     owner_role = f"mm_test_owner_{secrets.token_hex(8)}"
     owner_password = secrets.token_urlsafe(16)
@@ -90,7 +102,8 @@ async def request_path_db(admin_database_url: str) -> AsyncIterator[RequestPathD
         )
         owner_conn = await asyncpg.connect(owner_url)
         await migrate(owner_conn)
-        await rls.grant_app_role(owner_conn, app_role)
+        if pre_grant:
+            await rls.grant_app_role(owner_conn, app_role)
 
         pool = await asyncpg.create_pool(owner_url)
         yield RequestPathDb(owner_url=owner_url, app_role=app_role, pool=pool)
@@ -108,6 +121,22 @@ async def request_path_db(admin_database_url: str) -> AsyncIterator[RequestPathD
         await admin_conn.execute(f'drop role if exists "{app_role}"')
         await admin_conn.execute(f'drop role if exists "{owner_role}"')
         await admin_conn.close()
+
+
+@pytest_asyncio.fixture
+async def request_path_db(admin_database_url: str) -> AsyncIterator[RequestPathDb]:
+    """A non-superuser owner, migrated, with one app role granted (#116)."""
+    async with _request_path_db(admin_database_url, pre_grant=True) as db:
+        yield db
+
+
+@pytest_asyncio.fixture
+async def ungranted_app_role_db(admin_database_url: str) -> AsyncIterator[RequestPathDb]:
+    """Same shape as `request_path_db`, but nothing has granted the app role
+    yet - the state several replicas starting at once race `grant_app_role`
+    over (#123)."""
+    async with _request_path_db(admin_database_url, pre_grant=False) as db:
+        yield db
 
 
 async def _seed_personal_namespace(owner_url: str, *, oid: str, alias: str) -> None:
@@ -491,3 +520,32 @@ class TestHnswIndexIsCreatedAsTheOwner:
         assert len(rows) == 1
         assert rows[0]["owner"] == owner_name
         assert rows[0]["owner"] != request_path_db.app_role
+
+
+class TestConcurrentReplicaStartupNeverFailsOnAppRoleGrants:
+    async def test_several_concurrent_grant_app_role_calls_on_a_fresh_role_all_succeed(
+        self, ungranted_app_role_db: RequestPathDb
+    ) -> None:
+        """Several API replicas starting at the same time each run `migrate()`
+        then `grant_app_role` on their own connection (`app.py`'s
+        `_open_backend`, ADR-0009). Without something serializing the
+        `GRANT`s, Postgres can answer concurrent `GRANT`s on the same object
+        with "tuple concurrently updated" (#123) - this must never surface
+        to any of them, however many start at once.
+
+        One round is not guaranteed to hit the race (it is a timing window
+        in Postgres' own catalog update, not a deterministic conflict), so
+        this repeats a fresh round of concurrent connections several times;
+        a single raised exception across all rounds fails the test.
+        """
+        owner_url = ungranted_app_role_db.owner_url
+        app_role = ungranted_app_role_db.app_role
+
+        for _ in range(20):
+            connections = [await asyncpg.connect(owner_url) for _ in range(8)]
+            try:
+                await asyncio.gather(
+                    *(rls.grant_app_role(connection, app_role) for connection in connections)
+                )
+            finally:
+                await asyncio.gather(*(connection.close() for connection in connections))

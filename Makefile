@@ -1,7 +1,11 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down
+.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
+
+LOADTEST_NOTES ?= 10000
+LOADTEST_PORT ?= 18080
+K6_IMAGE ?= docker.io/grafana/k6:2.3.0
 
 fmt:
 	uv run ruff format .
@@ -65,6 +69,13 @@ image:
 
 smoke: image
 	scripts/smoke-container.sh memory-manager:dev
+
+# Loads a synthetic LOADTEST_NOTES-note vault into the Postgres backend and
+# runs k6's search/read/write scenarios against one memory-manager replica
+# on LOADTEST_PORT (#108, WP-21) - see scripts/loadtest-smoke.sh.
+loadtest-smoke: db-up
+	LOADTEST_NOTES=$(LOADTEST_NOTES) LOADTEST_PORT=$(LOADTEST_PORT) K6_IMAGE=$(K6_IMAGE) \
+		scripts/loadtest-smoke.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
 # vault-init one-shot seeding a local vault remote. See README.md.

@@ -71,6 +71,7 @@ import hmac
 import json
 import logging
 import math
+import zlib
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import FrameType
@@ -153,10 +154,31 @@ _WRITE_TOOL_NAMES = frozenset({"memory_write", "memory_edit", "memory_supersede"
 
 ServicesFactory = Callable[[], AbstractAsyncContextManager[Services]]
 
-#: How often the embedded OAuth authorization server's stale state (expired
-#: pending authorizations/codes, long-expired tokens, abandoned DCR clients)
-#: is swept (`auth.store.cleanup`). Only runs at all while the server is (#36).
-_OAUTH_CLEANUP_INTERVAL_SECONDS = 60 * 60
+#: How often the periodic cleanup sweep runs (#36, #106): the embedded OAuth
+#: authorization server's stale state (`auth.store.cleanup` - expired pending
+#: authorizations/codes, long-expired tokens, abandoned DCR clients), and, once a
+#: `PostgresSharedState` backs rate limiting, that backend's own stale
+#: `rate_limits` rows (`PostgresSharedState.sweep_expired_windows`). Not
+#: configurable - out of scope for #106 - and does not need to be: the advisory
+#: lock below makes it a singleton regardless of how many replicas run it, so a
+#: shorter interval would only cost extra skipped lock attempts, never duplicate
+#: work.
+_CLEANUP_INTERVAL_SECONDS = 60 * 60
+
+#: Fixed advisory lock key for the periodic cleanup sweep (#106, ADR-0009 §4:
+#: "singleton jobs take a Postgres advisory lock") - distinct from
+#: `db/migrate.py`'s own `_LOCK_KEY` (schema migrations), so the two never
+#: block each other over unrelated work. Any replica running this sweep takes
+#: the same key, so of however many call it on the same interval, only one
+#: actually runs it; the others see the lock held and skip this round.
+_CLEANUP_LOCK_KEY = zlib.crc32(b"memory_manager:periodic_cleanup")
+
+#: The fixed brute-force window `auth.login_password`'s own `_WINDOW_SECONDS`
+#: uses (ADR-0004: "5 failures / 10 min") - duplicated here rather than
+#: imported, since that name is private to its own module.
+#: `_max_rate_limit_window_seconds` below folds it into the sweep's threshold,
+#: so a running brute-force window is never swept away mid-window either.
+_LOGIN_BRUTE_FORCE_WINDOW_SECONDS = 10 * 60.0
 
 
 class _OAuthProviderCell:
@@ -355,9 +377,25 @@ def create_app(
             app.state.mcp_app = mcp_app
             app.state.oauth_authorization_server_enabled = oauth_provider is not None
 
+            # Runs whenever there is anything to sweep: an OAuth authorization
+            # server (`auth.store.cleanup`) or a `PostgresSharedState` backend
+            # (`PostgresSharedState.sweep_expired_windows`) - either on its own is
+            # enough to start the loop, not just the OAuth-only condition this
+            # replaced (#106).
             cleanup_task = (
-                asyncio.create_task(_oauth_cleanup_loop(services.pool))
-                if oauth_provider is not None and services.pool is not None
+                asyncio.create_task(
+                    _cleanup_loop(
+                        services.pool,
+                        oauth_provider=oauth_provider,
+                        shared_state_backend=shared_state.backend,
+                        rate_limit_window_floor_seconds=_max_rate_limit_window_seconds(config),
+                    )
+                )
+                if services.pool is not None
+                and (
+                    oauth_provider is not None
+                    or isinstance(shared_state.backend, PostgresSharedState)
+                )
                 else None
             )
             try:
@@ -441,18 +479,28 @@ def create_app(
             webhook_path=WEBHOOK_PATH,
             max_request_bytes=config.max_request_bytes,
             mcp_limiter=RateLimiter(
-                state=shared_state, per_minute=config.mcp_per_minute, burst=config.mcp_burst
+                state=shared_state,
+                per_minute=config.mcp_per_minute,
+                burst=config.mcp_burst,
+                name="mcp",
             ),
             write_limiter=RateLimiter(
-                state=shared_state, per_minute=config.write_per_minute, burst=config.write_burst
+                state=shared_state,
+                per_minute=config.write_per_minute,
+                burst=config.write_burst,
+                name="write",
             ),
             oauth_limiter=RateLimiter(
-                state=shared_state, per_minute=config.oauth_per_minute, burst=config.oauth_burst
+                state=shared_state,
+                per_minute=config.oauth_per_minute,
+                burst=config.oauth_burst,
+                name="oauth",
             ),
             webhook_limiter=RateLimiter(
                 state=shared_state,
                 per_minute=config.webhook_per_minute,
                 burst=config.webhook_burst,
+                name="webhook",
             ),
         ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
@@ -599,26 +647,93 @@ def _require_provider(cell: _OAuthProviderCell) -> MemoryManagerOAuthProvider:
     return cell.provider
 
 
-async def _oauth_cleanup_loop(pool: asyncpg.Pool) -> None:
-    """Sweep `auth.store`'s stale OAuth state every `_OAUTH_CLEANUP_INTERVAL_SECONDS`.
+def _max_rate_limit_window_seconds(config: ServerConfig) -> float:
+    """The longest fixed window any `RateLimiter`/the login brute-force check
+    builds from `config` - the floor `PostgresSharedState.sweep_expired_windows`'s
+    `older_than_seconds` must never go under (its own docstring), so a window a
+    replica is still counting a key against is never swept away mid-window.
 
-    Runs for the lifetime of the app (cancelled by `create_app`'s `lifespan` on shutdown);
-    a failed sweep is logged and retried next interval, never allowed to crash the server.
+    `RateLimiter.__init__`'s own `window_seconds = burst * 60 / per_minute` formula,
+    recomputed here rather than read off a built `RateLimiter` (which keeps that
+    value private) - the four `(burst, per_minute)` pairs `create_app` builds its
+    limiters from, plus the one fixed window `auth.login_password` uses, are the
+    only windows this server ever opens on a `SharedState` backend.
+    """
+    pairs = (
+        (config.mcp_burst, config.mcp_per_minute),
+        (config.write_burst, config.write_per_minute),
+        (config.oauth_burst, config.oauth_per_minute),
+        (config.webhook_burst, config.webhook_per_minute),
+    )
+    windows = [burst * 60.0 / per_minute for burst, per_minute in pairs]
+    windows.append(_LOGIN_BRUTE_FORCE_WINDOW_SECONDS)
+    return max(windows)
+
+
+async def _run_cleanup_iteration(
+    pool: asyncpg.Pool,
+    *,
+    oauth_provider: MemoryManagerOAuthProvider | None,
+    shared_state_backend: SharedState,
+    rate_limit_window_floor_seconds: float,
+) -> None:
+    """One cleanup sweep, behind `_CLEANUP_LOCK_KEY`'s advisory lock (#106, ADR-0009
+    §4: "singleton jobs take a Postgres advisory lock"): `auth.store.cleanup` when an
+    OAuth authorization server is configured, and
+    `PostgresSharedState.sweep_expired_windows` when that is the shared-state backend
+    currently in use.
+
+    Takes its own connection from `pool` and holds `pg_try_advisory_xact_lock` - the
+    non-blocking counterpart to `db/migrate.py`'s `pg_advisory_xact_lock` (every
+    caller of `migrate()` needs its result; nothing waits on this sweep, so a
+    replica that loses the race skips this round outright instead of queuing up
+    behind the lock) - for exactly as long as both sweeps below take, inside one
+    transaction: the lock is released the moment that transaction ends.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        acquired = await conn.fetchval("select pg_try_advisory_xact_lock($1)", _CLEANUP_LOCK_KEY)
+        if not acquired:
+            _logger.debug("cleanup sweep: advisory lock held elsewhere, skipping this round")
+            return
+        if oauth_provider is not None:
+            stats = await store.cleanup(pool)
+            _logger.info(
+                "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d",
+                stats.pending,
+                stats.codes,
+                stats.tokens,
+                stats.clients,
+            )
+        if isinstance(shared_state_backend, PostgresSharedState):
+            swept = await shared_state_backend.sweep_expired_windows(
+                older_than_seconds=rate_limit_window_floor_seconds
+            )
+            _logger.info("rate limit sweep: removed %d expired rate-limit window(s)", swept)
+
+
+async def _cleanup_loop(
+    pool: asyncpg.Pool,
+    *,
+    oauth_provider: MemoryManagerOAuthProvider | None,
+    shared_state_backend: SharedState,
+    rate_limit_window_floor_seconds: float,
+) -> None:
+    """Run `_run_cleanup_iteration` every `_CLEANUP_INTERVAL_SECONDS`, for the
+    lifetime of the app (cancelled by `create_app`'s `lifespan` on shutdown) -
+    a failed sweep is logged and retried next interval, never allowed to crash
+    the server.
     """
     while True:
-        await asyncio.sleep(_OAUTH_CLEANUP_INTERVAL_SECONDS)
+        await asyncio.sleep(_CLEANUP_INTERVAL_SECONDS)
         try:
-            stats = await store.cleanup(pool)
+            await _run_cleanup_iteration(
+                pool,
+                oauth_provider=oauth_provider,
+                shared_state_backend=shared_state_backend,
+                rate_limit_window_floor_seconds=rate_limit_window_floor_seconds,
+            )
         except Exception:
-            _logger.exception("oauth cleanup run failed")
-            continue
-        _logger.info(
-            "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d",
-            stats.pending,
-            stats.codes,
-            stats.tokens,
-            stats.clients,
-        )
+            _logger.exception("cleanup sweep failed")
 
 
 class _McpMount:

@@ -58,7 +58,9 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "RUF"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests"]
+# "loadtest" is standalone load-test tooling (#107), not part of the
+# installed package, but still typed and checked like everything else.
+files = ["src", "tests", "loadtest"]
 # `tests/conftest.py` and `tests/vault/conftest.py` are both non-package
 # modules (no `__init__.py`); without this, mypy reports a duplicate
 # module name instead of resolving each by its path.
@@ -79,3 +81,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Repo root on sys.path so tests/loadtest/test_generate.py can import the
+# top-level "loadtest" package (#107), which is not under src/.
+pythonpath = ["."]
