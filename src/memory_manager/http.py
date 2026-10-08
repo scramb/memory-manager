@@ -124,7 +124,12 @@ from memory_manager.auth.shared_state import (
     build_valkey_shared_state,
 )
 from memory_manager.auth.verifier import StaticTokenVerifier
-from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
+from memory_manager.config import (
+    ServerConfig,
+    ServerConfigError,
+    canonical_resource_url,
+    rate_limit_sweep_floor_seconds,
+)
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
@@ -177,13 +182,6 @@ _CLEANUP_INTERVAL_SECONDS = 60 * 60
 #: the same key, so of however many call it on the same interval, only one
 #: actually runs it; the others see the lock held and skip this round.
 _CLEANUP_LOCK_KEY = zlib.crc32(b"memory_manager:periodic_cleanup")
-
-#: The fixed brute-force window `auth.login_password`'s own `_WINDOW_SECONDS`
-#: uses (ADR-0004: "5 failures / 10 min") - duplicated here rather than
-#: imported, since that name is private to its own module.
-#: `_max_rate_limit_window_seconds` below folds it into the sweep's threshold,
-#: so a running brute-force window is never swept away mid-window either.
-_LOGIN_BRUTE_FORCE_WINDOW_SECONDS = 10 * 60.0
 
 
 class _OAuthProviderCell:
@@ -433,17 +431,27 @@ def create_app(
             # server (`auth.store.cleanup`) or a `PostgresSharedState` backend
             # (`PostgresSharedState.sweep_expired_windows`) - either on its own is
             # enough to start the loop, not just the OAuth-only condition this
-            # replaced (#106).
+            # replaced (#106). Additionally gated on `services.vault_root is not
+            # None` - true only for the `"git"` backend (#217, ADR-0009 §4): a
+            # `"postgres"`-backend deployment runs this same sweep as one of
+            # `worker.py`'s own singleton jobs instead (under its own, differently
+            # derived lock key - `worker._lock_key`, not this module's
+            # `_CLEANUP_LOCK_KEY`), so every `api` replica scheduling it here too
+            # would just be redundant, duplicate work against the same tables. The
+            # `"git"` backend is unchanged (ADR-0009 §6): single process, no
+            # `worker` deployment, so this loop stays the only place the sweep
+            # ever runs for it.
             cleanup_task = (
                 asyncio.create_task(
                     _cleanup_loop(
                         services.pool,
                         oauth_provider=oauth_provider,
                         shared_state_backend=shared_state.backend,
-                        rate_limit_window_floor_seconds=_max_rate_limit_window_seconds(config),
+                        rate_limit_window_floor_seconds=rate_limit_sweep_floor_seconds(config),
                     )
                 )
                 if services.pool is not None
+                and services.vault_root is not None
                 and (
                     oauth_provider is not None
                     or isinstance(shared_state.backend, PostgresSharedState)
@@ -755,29 +763,6 @@ def _require_provider(cell: _OAuthProviderCell) -> MemoryManagerOAuthProvider:
     if cell.provider is None:  # pragma: no cover - defensive
         raise RuntimeError("the /login route was mounted without an OAuth provider configured")
     return cell.provider
-
-
-def _max_rate_limit_window_seconds(config: ServerConfig) -> float:
-    """The longest fixed window any `RateLimiter`/the login brute-force check
-    builds from `config` - the floor `PostgresSharedState.sweep_expired_windows`'s
-    `older_than_seconds` must never go under (its own docstring), so a window a
-    replica is still counting a key against is never swept away mid-window.
-
-    `RateLimiter.__init__`'s own `window_seconds = burst * 60 / per_minute` formula,
-    recomputed here rather than read off a built `RateLimiter` (which keeps that
-    value private) - the four `(burst, per_minute)` pairs `create_app` builds its
-    limiters from, plus the one fixed window `auth.login_password` uses, are the
-    only windows this server ever opens on a `SharedState` backend.
-    """
-    pairs = (
-        (config.mcp_burst, config.mcp_per_minute),
-        (config.write_burst, config.write_per_minute),
-        (config.oauth_burst, config.oauth_per_minute),
-        (config.webhook_burst, config.webhook_per_minute),
-    )
-    windows = [burst * 60.0 / per_minute for burst, per_minute in pairs]
-    windows.append(_LOGIN_BRUTE_FORCE_WINDOW_SECONDS)
-    return max(windows)
 
 
 async def _run_cleanup_iteration(
