@@ -255,11 +255,13 @@ class TestDryRun:
 
 
 class TestCli:
-    def test_requires_dry_run_flag(self) -> None:
-        assert cli.main(["migrate", "git-to-postgres", "--vault", "."]) == 2
-
-    def test_requires_vault(self) -> None:
+    def test_dry_run_requires_vault(self) -> None:
         assert cli.main(["migrate", "git-to-postgres", "--dry-run"]) == 2
+
+    def test_apply_requires_vault(self) -> None:
+        # No `--dry-run` (#247 lifted the requirement to pass it): this must
+        # still fail on the missing `--vault`, before ever touching a database.
+        assert cli.main(["migrate", "git-to-postgres"]) == 2
 
     def test_rejects_malformed_map(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

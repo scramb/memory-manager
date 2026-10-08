@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Dry run for `memory-manager migrate git-to-postgres` (#246, ADR-0007 §6).
+"""`memory-manager migrate git-to-postgres` (#246 dry run, #247 the real import, ADR-0007 §6).
 
-This module only ever reads: the vault's working tree and its `git log`
-history. It never opens a database connection and never writes anything -
-writing the imported notes and revisions into Postgres is #247 (the issue's
-"Not included").
+`dry_run` only ever reads: the vault's working tree and its `git log`
+history. It never opens a database connection and never writes anything.
+`import_vault` (#247) is the write path: it re-runs `dry_run` itself first
+and refuses to write anything if that reports a problem, then imports each
+mapped namespace - current notes and their Git history as revisions - into
+Postgres in one transaction per namespace, connected as the owner role
+(ADR-0008 addendum #100, "system identity"): both `vault_notes_owner_access`
+and `vault_revisions_owner_access` (`migrations/0005_rls.sql`) grant that
+role unconditional read/write, so this module needs no `app_role`/principal
+of its own and can set an explicit `author_oid` per revision, something no
+MCP tool's write path is ever allowed to do.
 
 `parse_map_entries` turns the repeatable `--map <git-ns>=<kind>:<key>[:<alias>]`
 flags (owner decision 2026-10-08, no map-file format) into `MapEntry` objects,
@@ -30,32 +37,49 @@ archived notes and to collect anything that would block the import, and it
 walks the whole Git history (`vault.git.Git`, `git log --reverse -M
 --name-status`) to count revisions per note, keyed by the note's frontmatter
 `id` rather than its path - the one key that survives a rename or an
-archive move across commits.
+archive move across commits. `import_vault` walks that same history a second
+time, this time keeping every revision's content, commit author, author time
+and subject (`_revisions_by_id`, shared with `dry_run`), and writes them
+oldest first, followed by one current `vault_notes` row per note whose
+`version` is `vault.note.version` of the HEAD bytes - byte-identical to what
+is on disk, per ADR-0007 §6. A namespace whose stored alias already has rows
+in `vault_notes` is refused, reported, and left untouched; every other
+namespace's own transaction rolls back whole on any failure, so a crash
+during one note's import never leaves that namespace half-imported.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
+import asyncpg
+import asyncpg.pool
+
+from memory_manager.audit import AuditWriter
 from memory_manager.vault.git import Git
 from memory_manager.vault.note import NoteFormatError
 from memory_manager.vault.note import parse as parse_note_structural
-from memory_manager.vault.paths import PathRejected, iter_md_files, parse_note_path
+from memory_manager.vault.note import version as note_version
+from memory_manager.vault.paths import NotePath, PathRejected, iter_md_files, parse_note_path
 from memory_manager.vault.secrets import SecretFound
 from memory_manager.vault.secrets import check as check_secrets
 from memory_manager.vault.validate import NoteInvalid, validate_bytes
 
 __all__ = [
     "DryRunReport",
+    "ImportReport",
     "MapEntry",
     "MapError",
     "MigrationError",
+    "NamespaceImportResult",
     "NamespaceReport",
     "discover_namespaces",
     "dry_run",
+    "import_vault",
     "parse_map_entries",
 ]
 
@@ -72,6 +96,19 @@ _INTERNAL_ALIAS_PREFIX = "u-"
 _ARCHIVE_SEGMENT = "_archive"
 _CONFLICT_SUFFIX = ".conflict.md"
 _GIT_DIR = ".git"
+
+#: `vault_revisions.client` for every revision `import_vault` writes (#247) -
+#: distinguishes an imported revision from one a real MCP client wrote. Also
+#: `audit_log.client` for this module's own audit rows (same identity).
+_IMPORT_CLIENT = "migrate-git"
+
+#: `audit_log.actor` for every row `import_vault` writes - CLAUDE.md "audit
+#: log for every write" and ADR-0008 addendum's "system identity" (#100):
+#: this is not any end user's `oid`, it is the migration itself.
+_IMPORT_ACTOR = "migrate"
+
+#: `audit_log.op` for every row `import_vault` writes.
+_IMPORT_OP = "migrate_import"
 
 
 class MapError(ValueError):
@@ -300,8 +337,28 @@ def _effective_path(change_line: str) -> str | None:
     return parts[1] if len(parts) > 1 else None
 
 
-def _read_id_at(git: Git, sha: str, path: str) -> str | None:
-    """The frontmatter `id` of `path` as it read at commit `sha`, `None` if unreadable.
+@dataclass(frozen=True)
+class _HistoricalRevision:
+    """One commit that changed the note identified by `note_id`, oldest first.
+
+    `path` is the path this revision's content lived at, in the original Git
+    namespace (not yet rewritten to the import's target alias - `import_vault`
+    does that per namespace, since the same history is shared across every
+    namespace `dry_run`/`import_vault` process in one call). `content` is the
+    raw bytes read at that commit, never re-validated against today's rules
+    (`_read_note_at`'s own docstring).
+    """
+
+    sha: str
+    author: str
+    created_at: datetime
+    message: str
+    path: str
+    content: bytes
+
+
+def _read_note_at(git: Git, sha: str, path: str) -> tuple[str, bytes] | None:
+    """`(id, content)` of `path` as it read at commit `sha`, `None` if unreadable.
 
     Only a structural parse (`vault.note.parse`) - a historical revision is
     never re-validated against today's semantic rules, only used to key it
@@ -310,35 +367,54 @@ def _read_id_at(git: Git, sha: str, path: str) -> str | None:
     result = git.run("show", f"{sha}:{path}", check=False)
     if result.returncode != 0:
         return None
+    content = result.stdout
     try:
-        return parse_note_structural(result.stdout).id
+        note_id = parse_note_structural(content).id
     except NoteFormatError:
         return None
+    return note_id, content
 
 
-def _revisions_by_id(vault_root: Path) -> dict[str, int]:
-    """Every note id's revision count across the whole history of `vault_root`.
+def _revisions_by_id(vault_root: Path) -> dict[str, list[_HistoricalRevision]]:
+    """Every note id's revisions, oldest first, across the whole history of `vault_root`.
 
-    One `git log --reverse -M --name-status` walk, oldest commit first. `-M`
-    turns an archive move or a plain rename into a single `R`-status line
-    instead of a `D`+`A` pair, but the `id`-keyed counting below is correct
-    either way: a `D` carries no content and is never counted, so a rename
-    git does not think similar enough to flag only ever contributes the one
-    `A` side.
+    One `git log --reverse -M --name-status` walk, oldest commit first, with
+    the commit's author name, author time and subject carried on the same
+    header line (`%x01`-separated, right after the `%x00`-prefixed sha
+    `dry_run`'s own commit-block split already relies on). `-M` turns an
+    archive move or a plain rename into a single `R`-status line instead of a
+    `D`+`A` pair, but the `id`-keyed grouping below is correct either way: a
+    `D` carries no content and is never counted, so a rename git does not
+    think similar enough to flag only ever contributes the one `A` side.
     """
     git = Git(cwd=vault_root)
-    result = git.run("log", "--reverse", "-M", "--name-status", "--format=%x00%H", check=False)
+    result = git.run(
+        "log",
+        "--reverse",
+        "-M",
+        "--name-status",
+        "--format=%x00%H%x01%an%x01%aI%x01%s",
+        check=False,
+    )
     if result.returncode != 0:
         return {}
 
-    counts: dict[str, int] = {}
+    revisions: dict[str, list[_HistoricalRevision]] = {}
     text = result.stdout.decode("utf-8", errors="replace")
     for commit_block in text.split("\x00"):
         if not commit_block:
             continue
-        sha, _, body = commit_block.partition("\n")
+        header, _, body = commit_block.partition("\n")
+        fields = header.split("\x01")
+        if len(fields) != 4:
+            continue
+        sha, author, author_time, subject = fields
         sha = sha.strip()
         if not sha:
+            continue
+        try:
+            created_at = datetime.fromisoformat(author_time)
+        except ValueError:
             continue
         for change_line in body.splitlines():
             if not change_line:
@@ -350,11 +426,37 @@ def _revisions_by_id(vault_root: Path) -> dict[str, int]:
                 parse_note_path(path, allow_archive=True)
             except PathRejected:
                 continue
-            note_id = _read_id_at(git, sha, path)
-            if note_id is None:
+            found = _read_note_at(git, sha, path)
+            if found is None:
                 continue
-            counts[note_id] = counts.get(note_id, 0) + 1
-    return counts
+            note_id, content = found
+            revisions.setdefault(note_id, []).append(
+                _HistoricalRevision(
+                    sha=sha,
+                    author=author,
+                    created_at=created_at,
+                    message=subject,
+                    path=path,
+                    content=content,
+                )
+            )
+    return revisions
+
+
+def _require_git_vault(vault_root: Path) -> Path:
+    """`vault_root`, resolved, if it is a directory with a `.git` - shared by
+    `dry_run`/`import_vault`.
+
+    Raises `MigrationError` otherwise.
+    """
+    vault_root = vault_root.resolve()
+    if not vault_root.is_dir():
+        raise MigrationError(f"vault root '{vault_root}' is not a directory")
+    if not (vault_root / _GIT_DIR).exists():
+        raise MigrationError(
+            f"vault root '{vault_root}' is not a git working copy - no '.git' found"
+        )
+    return vault_root
 
 
 def dry_run(vault_root: Path, map_entries: Mapping[str, MapEntry]) -> DryRunReport:
@@ -366,13 +468,7 @@ def dry_run(vault_root: Path, map_entries: Mapping[str, MapEntry]) -> DryRunRepo
     collected into the returned report (`DryRunReport.ok`), not raised:
     the caller sees every problem at once, the same way `doctor` does.
     """
-    vault_root = vault_root.resolve()
-    if not vault_root.is_dir():
-        raise MigrationError(f"vault root '{vault_root}' is not a directory")
-    if not (vault_root / _GIT_DIR).exists():
-        raise MigrationError(
-            f"vault root '{vault_root}' is not a git working copy - no '.git' found"
-        )
+    vault_root = _require_git_vault(vault_root)
 
     namespaces = discover_namespaces(vault_root)
     unknown_mappings = tuple(sorted(git_ns for git_ns in map_entries if git_ns not in namespaces))
@@ -425,13 +521,13 @@ def dry_run(vault_root: Path, map_entries: Mapping[str, MapEntry]) -> DryRunRepo
         id_namespace[note.id] = namespace
 
     revisions_by_namespace: dict[str, int] = {}
-    for note_id, count in _revisions_by_id(vault_root).items():
+    for note_id, note_revisions in _revisions_by_id(vault_root).items():
         owning_namespace = id_namespace.get(note_id)
         if owning_namespace is None:
             continue
-        revisions_by_namespace[owning_namespace] = (
-            revisions_by_namespace.get(owning_namespace, 0) + count
-        )
+        revisions_by_namespace[owning_namespace] = revisions_by_namespace.get(
+            owning_namespace, 0
+        ) + len(note_revisions)
 
     reports = tuple(
         NamespaceReport(
@@ -446,3 +542,309 @@ def dry_run(vault_root: Path, map_entries: Mapping[str, MapEntry]) -> DryRunRepo
     )
 
     return DryRunReport(namespaces=reports, unknown_mappings=unknown_mappings)
+
+
+@dataclass(frozen=True)
+class _CurrentNote:
+    """One note `import_vault` found in `vault_root`'s current working tree."""
+
+    note_id: str
+    git_namespace: str
+    note_path: NotePath
+    content: bytes
+
+
+def _catalog_current_notes(vault_root: Path) -> dict[str, _CurrentNote]:
+    """Every current note in `vault_root`, keyed by id.
+
+    Assumes the caller already confirmed `dry_run(vault_root, ...).ok` -
+    `import_vault` always does, right before calling this - so a file that
+    fails to parse here is silently skipped rather than reported again; it
+    cannot happen once `dry_run` is clean.
+    """
+    catalog: dict[str, _CurrentNote] = {}
+    for file_path in iter_md_files(vault_root):
+        rel = file_path.relative_to(vault_root).as_posix()
+        if rel.endswith(_CONFLICT_SUFFIX):
+            continue
+        try:
+            note_path = parse_note_path(rel, allow_archive=True)
+        except PathRejected:
+            continue
+        data = file_path.read_bytes()
+        try:
+            note = parse_note_structural(data)
+        except NoteFormatError:
+            continue
+        catalog[note.id] = _CurrentNote(
+            note_id=note.id, git_namespace=note_path.namespace, note_path=note_path, content=data
+        )
+    return catalog
+
+
+@dataclass(frozen=True)
+class NamespaceImportResult:
+    """What `import_vault` did for one mapped Git namespace."""
+
+    git_namespace: str
+    target: MapEntry
+    stored_alias: str
+    imported_notes: int
+    imported_revisions: int
+    refused: bool
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ImportReport:
+    """Everything `import_vault` did, one `NamespaceImportResult` per mapped namespace."""
+
+    namespaces: tuple[NamespaceImportResult, ...]
+
+    @property
+    def ok(self) -> bool:
+        """Whether every mapped namespace actually got imported, none refused."""
+        return all(not ns.refused for ns in self.namespaces)
+
+
+_SELECT_NAMESPACE_HAS_NOTES = "select exists(select 1 from vault_notes where namespace = $1)"
+
+_INSERT_NAMESPACE = """
+insert into namespaces (kind, external_key, alias)
+values ($1, $2, $3)
+on conflict (kind, external_key) do update
+    set alias = coalesce(namespaces.alias, excluded.alias)
+returning alias
+"""
+
+_INSERT_CURRENT_NOTE = """
+insert into vault_notes (id, namespace, path, content, version, current_revision)
+values ($1, $2, $3, $4, $5, $6)
+"""
+
+_INSERT_IMPORTED_REVISION = """
+insert into vault_revisions
+    (note_id, revision, path, content, version, author, client, message, created_at, author_oid)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+"""
+
+
+async def _resolve_or_create_namespace(
+    conn: asyncpg.pool.PoolConnectionProxy, target: MapEntry
+) -> str:
+    """The stored alias `target` resolves to, creating the registry row if needed.
+
+    `kind == "user"` reuses `mm_ensure_personal_ns()`
+    (`migrations/0009_namespace_resolution.sql`) rather than duplicating its
+    id-derived `u-<id>` alias scheme: `set_config('app.oid', ..., true)`
+    scopes the identity to this call's own transaction only (`is_local`), so
+    it never leaks onto anything else sharing `conn`. Every other kind
+    already carries a concrete alias (`MapEntry`'s own invariant, enforced
+    by `parse_map_entry`); the upsert is idempotent, so a namespace a
+    previous run - or WP-19's own provisioning - already created is reused
+    unchanged rather than fought over.
+    """
+    if target.kind == "user":
+        await conn.execute("select set_config('app.oid', $1, true)", target.key)
+        alias = await conn.fetchval("select mm_ensure_personal_ns()")
+        if (
+            alias is None
+        ):  # pragma: no cover - target.key is never empty, parse_map_entry rejects that
+            raise MigrationError(f"could not resolve a personal namespace for oid {target.key!r}")
+        return str(alias)
+
+    if target.alias is None:  # pragma: no cover - MapEntry's own invariant for group/project/org
+        raise MigrationError(f"map entry for {target.git_namespace!r} carries no alias")
+    row = await conn.fetchrow(_INSERT_NAMESPACE, target.kind, target.key, target.alias)
+    if row is None:  # pragma: no cover - the upsert's own RETURNING always produces one row
+        raise MigrationError(f"could not resolve a namespace for {target.kind}:{target.key}")
+    return str(row["alias"])
+
+
+@dataclass(frozen=True)
+class _ImportedNoteAudit:
+    """One imported note's audit record, built while its transaction is still open,
+    but only ever written to `audit_log` once that transaction has actually committed
+    (`_import_namespace`'s own docstring).
+    """
+
+    path: str
+    version: str
+    revisions_written: int
+    commit_sha: str | None
+
+
+async def _import_namespace(
+    conn: asyncpg.pool.PoolConnectionProxy,
+    git_namespace: str,
+    target: MapEntry,
+    notes: Sequence[_CurrentNote],
+    history: Mapping[str, Sequence[_HistoricalRevision]],
+    audit: AuditWriter,
+) -> NamespaceImportResult:
+    """Import every one of `notes` and its history into Postgres, in one transaction.
+
+    Refused (without writing a single row) if the stored namespace already
+    has any note at all - the "merge into a non-empty namespace" case this
+    task deliberately leaves out (#247's "Not included"). Any other failure
+    - a bug or an `asyncpg.PostgresError` - is never caught here: it
+    propagates out of `conn.transaction()`, which rolls back everything this
+    namespace wrote so far, leaving it exactly as empty as before this call.
+
+    Only the current (HEAD) bytes of each note were scanned for secrets, in
+    the `dry_run` preflight `import_vault` already ran; a historical
+    revision's content is written unchanged from Git, never re-scanned -
+    Git's own history already holds it unchanged, so importing it creates no
+    new exposure beyond what the vault's own history already is, and
+    rewriting history to redact one is explicitly out of scope (ADR-0007 §6
+    "Git history as revisions").
+
+    `audit_log` gets one row per note actually committed here (CLAUDE.md
+    "audit log for every write"; ADR-0008 addendum: system-identity writes
+    are audited too, same as every other write) - or exactly one row for
+    the namespace if it was refused - written only *after* `conn`'s own
+    transaction has committed or rolled back, the same ordering
+    `app.py`'s own write-queue/`PostgresBackend` audit hooks use: a
+    rolled-back write (the injected-failure case) is therefore never
+    audited as having happened. `detail` carries a version, a revision
+    count and a commit sha only, never a note's content or body text -
+    `AuditWriter`'s own docstring, "the one place a note's content could
+    leak into the audit log".
+    """
+    imported: list[_ImportedNoteAudit] = []
+    refused_reason: str | None = None
+
+    async with conn.transaction():
+        stored_alias = await _resolve_or_create_namespace(conn, target)
+        already_populated = await conn.fetchval(_SELECT_NAMESPACE_HAS_NOTES, stored_alias)
+        if already_populated:
+            refused_reason = f"namespace {stored_alias!r} already holds notes"
+        else:
+            # ADR-0008 addendum "curate is author-based": only a 'user'
+            # namespace's revisions carry an `author_oid` at all, so curate
+            # stays the owner's; every shared namespace's imported revisions
+            # are NULL, i.e. foreign.
+            author_oid = target.key if target.kind == "user" else None
+            for note in sorted(notes, key=lambda n: n.note_path.relative):
+                note_revisions = history.get(note.note_id, ())
+                current_revision = len(note_revisions) or 1
+                stored_path = replace(note.note_path, namespace=stored_alias).relative
+                note_content_version = note_version(note.content)
+                await conn.execute(
+                    _INSERT_CURRENT_NOTE,
+                    note.note_id,
+                    stored_alias,
+                    stored_path,
+                    note.content,
+                    note_content_version,
+                    current_revision,
+                )
+                last_sha: str | None = None
+                revisions_written = 0
+                for revision_number, revision in enumerate(note_revisions, start=1):
+                    revision_path = replace(
+                        parse_note_path(revision.path, allow_archive=True), namespace=stored_alias
+                    ).relative
+                    await conn.execute(
+                        _INSERT_IMPORTED_REVISION,
+                        note.note_id,
+                        revision_number,
+                        revision_path,
+                        revision.content,
+                        note_version(revision.content),
+                        revision.author,
+                        _IMPORT_CLIENT,
+                        revision.message,
+                        revision.created_at,
+                        author_oid,
+                    )
+                    last_sha = revision.sha
+                    revisions_written += 1
+                imported.append(
+                    _ImportedNoteAudit(
+                        path=stored_path,
+                        version=note_content_version,
+                        revisions_written=revisions_written,
+                        commit_sha=last_sha,
+                    )
+                )
+
+    if refused_reason is not None:
+        await audit.record(
+            actor=_IMPORT_ACTOR,
+            client=_IMPORT_CLIENT,
+            op=_IMPORT_OP,
+            path=None,
+            commit_sha=None,
+            outcome="rejected",
+            detail={"namespace": stored_alias, "reason": refused_reason},
+        )
+        return NamespaceImportResult(
+            git_namespace=git_namespace,
+            target=target,
+            stored_alias=stored_alias,
+            imported_notes=0,
+            imported_revisions=0,
+            refused=True,
+            reason=refused_reason,
+        )
+
+    for note_audit in imported:
+        await audit.record(
+            actor=_IMPORT_ACTOR,
+            client=_IMPORT_CLIENT,
+            op=_IMPORT_OP,
+            path=note_audit.path,
+            commit_sha=note_audit.commit_sha,
+            outcome="ok",
+            detail={"version": note_audit.version, "revisions": note_audit.revisions_written},
+        )
+
+    return NamespaceImportResult(
+        git_namespace=git_namespace,
+        target=target,
+        stored_alias=stored_alias,
+        imported_notes=len(imported),
+        imported_revisions=sum(note_audit.revisions_written for note_audit in imported),
+        refused=False,
+        reason=None,
+    )
+
+
+async def import_vault(
+    pool: asyncpg.Pool, vault_root: Path, map_entries: Mapping[str, MapEntry]
+) -> ImportReport:
+    """Import `vault_root` into Postgres per `map_entries` (#247, ADR-0007 §6).
+
+    Re-runs `dry_run` itself first and raises `MigrationError` if it is not
+    `.ok` - a caller must never import a vault this module itself would
+    refuse to even report cleanly, and `report.ok` already guarantees every
+    `map_entries` key names a namespace that actually exists and every
+    discovered namespace has an entry (`DryRunReport.ok`'s own check of
+    `unmapped`/`unknown_mappings`), so the loop below never has to re-check
+    either. Every mapped namespace gets its own connection and its own
+    transaction (`_import_namespace`) - one namespace failing or being
+    refused never stops another from importing.
+    """
+    report = dry_run(vault_root, map_entries)
+    if not report.ok:
+        raise MigrationError("dry run found problems - run --dry-run first and fix them")
+
+    vault_root = _require_git_vault(vault_root)
+    history = _revisions_by_id(vault_root)
+    current = _catalog_current_notes(vault_root)
+
+    notes_by_namespace: dict[str, list[_CurrentNote]] = {}
+    for note in current.values():
+        notes_by_namespace.setdefault(note.git_namespace, []).append(note)
+
+    audit = AuditWriter(pool)
+    results: list[NamespaceImportResult] = []
+    for git_namespace in sorted(map_entries):
+        target = map_entries[git_namespace]
+        notes = notes_by_namespace.get(git_namespace, [])
+        async with pool.acquire() as conn:
+            result = await _import_namespace(conn, git_namespace, target, notes, history, audit)
+        results.append(result)
+
+    return ImportReport(namespaces=tuple(results))

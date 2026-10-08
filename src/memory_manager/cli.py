@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The `memory-manager` command-line entry point (#17, #26, #33, #34, #246).
+"""The `memory-manager` command-line entry point (#17, #26, #33, #34, #246, #247).
 
 `reindex`, `doctor`, `eval`, `export` and `import` work on the vault and
-index; `migrate git-to-postgres --dry-run` reports how a Git vault would
-import into the Postgres backend without writing anything (#246,
-`migrate_git.py`; writing is #247, not yet implemented, so `--dry-run` is
-currently required); `serve --stdio` runs the MCP server for a local Claude
-Code connection, `serve --http` runs it over Streamable HTTP (`http.py`);
+index; `migrate git-to-postgres` imports a Git vault's current notes and
+history into the Postgres backend (#247, `migrate_git.py`), connecting as
+the owner role per ADR-0008 addendum #100 and rebuilding the derived index
+from `vault_notes` afterwards; `--dry-run` reports the same mapping and note
+counts without writing anything (#246). `serve --stdio` runs the MCP server
+for a local Claude Code connection, `serve --http` runs it over Streamable
+HTTP (`http.py`);
 `token create|list|revoke` manage the static bearer tokens `/mcp` accepts
 once `DATABASE_URL` is set (ADR-0004, #34); `token create --owner --role`
 gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
@@ -75,11 +77,14 @@ from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.migrate_git import (
     DryRunReport,
+    MapEntry,
     MapError,
     MigrationError,
     dry_run,
+    import_vault,
     parse_map_entries,
 )
+from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -155,9 +160,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "migrate":
         if args.migrate_target == "git-to-postgres":
-            return _run_migrate_git_to_postgres_command(
-                args.vault, args.map or [], dry_run_flag=args.dry_run
-            )
+            if args.dry_run:
+                return _run_migrate_git_to_postgres_dry_run(args.vault, args.map or [])
+            return asyncio.run(_run_migrate_git_to_postgres_apply(args.vault, args.map or []))
         parser.print_help()
         return 1
 
@@ -371,8 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         dest="dry_run",
         action="store_true",
-        help="report the mapping and every note that would be imported, writing nothing "
-        "(required for now - writing to Postgres is not implemented yet)",
+        help="report the mapping and every note that would be imported, writing nothing",
     )
 
     serve_parser = subparsers.add_parser("serve", help="run the MCP server")
@@ -588,15 +592,7 @@ def _print_import_report(report: ImportReport, *, apply: bool) -> None:
         print("dry run - nothing was written, pass --apply to write")
 
 
-def _run_migrate_git_to_postgres_command(
-    vault: str | None, raw_maps: list[str], *, dry_run_flag: bool
-) -> int:
-    if not dry_run_flag:
-        print(
-            "migrate git-to-postgres: pass --dry-run - writing to Postgres is not implemented yet",
-            file=sys.stderr,
-        )
-        return 2
+def _run_migrate_git_to_postgres_dry_run(vault: str | None, raw_maps: list[str]) -> int:
     if not vault:
         print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
         return 2
@@ -617,15 +613,63 @@ def _run_migrate_git_to_postgres_command(
     return 0 if report.ok else 1
 
 
+async def _run_migrate_git_to_postgres_apply(vault: str | None, raw_maps: list[str]) -> int:
+    """Actually import `vault` into Postgres (#247), after a clean dry run.
+
+    Refuses to touch the database at all if the dry run itself is not
+    `.ok` - the same problems `--dry-run` would have reported. The index is
+    rebuilt from `vault_notes` (`VaultNotesSource`) once every namespace has
+    been imported, so a fresh Postgres backend is searchable right away.
+    """
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+
+    try:
+        map_entries = parse_map_entries(raw_maps)
+    except MapError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    vault_path = Path(vault)
+    try:
+        preflight = dry_run(vault_path, map_entries)
+    except MigrationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not preflight.ok:
+        _print_migrate_dry_run_report(preflight)
+        print("dry run found problems - nothing was imported", file=sys.stderr)
+        return 1
+
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+    try:
+        import_report = await import_vault(pool, vault_path, map_entries)
+        _print_migrate_import_report(import_report)
+        if not import_report.ok:
+            return 1
+        stats = await Indexer(pool, VaultNotesSource()).reindex_full()
+        _print_stats(stats)
+    finally:
+        await pool.close()
+    return 0
+
+
+def _format_migrate_target(target: MapEntry | None) -> str:
+    """`target` as `_print_migrate_*`'s shared label, `"UNMAPPED"` for `None`."""
+    if target is None:
+        return "UNMAPPED"
+    desc = f"{target.kind}:{target.key}"
+    if target.alias is not None:
+        desc += f":{target.alias}"
+    return desc
+
+
 def _print_migrate_dry_run_report(report: DryRunReport) -> None:
     for namespace in report.namespaces:
-        target = namespace.target
-        if target is None:
-            target_desc = "UNMAPPED"
-        else:
-            target_desc = f"{target.kind}:{target.key}"
-            if target.alias is not None:
-                target_desc += f":{target.alias}"
+        target_desc = _format_migrate_target(namespace.target)
         print(
             f"{namespace.git_namespace} -> {target_desc}  "
             f"live={namespace.live_notes} archived={namespace.archived_notes} "
@@ -646,6 +690,27 @@ def _print_migrate_dry_run_report(report: DryRunReport) -> None:
     )
     if not report.ok:
         print("dry run found problems - nothing was written")
+
+
+def _print_migrate_import_report(report: MigrateImportReport) -> None:
+    for namespace in report.namespaces:
+        if namespace.refused:
+            print(
+                f"{namespace.git_namespace} -> {namespace.stored_alias}  "
+                f"REFUSED: {namespace.reason}"
+            )
+            continue
+        target_desc = _format_migrate_target(namespace.target)
+        print(
+            f"{namespace.git_namespace} -> {target_desc}  "
+            f"imported_notes={namespace.imported_notes} "
+            f"imported_revisions={namespace.imported_revisions}"
+        )
+
+    refused = sum(1 for ns in report.namespaces if ns.refused)
+    print(f"{len(report.namespaces)} namespace(s) imported, {refused} refused")
+    if not report.ok:
+        print("one or more namespaces already held notes - nothing was overwritten")
 
 
 async def _open_migrated_pool() -> asyncpg.Pool | None:
