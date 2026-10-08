@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
+import pytest
 
 from memory_manager.db.migrate import migrate
 
@@ -245,3 +246,61 @@ class TestMigrate:
             )
         }
         assert dims == {3, 5}
+
+
+class TestMigrateBackendPostgres:
+    """`backend="postgres"` (ADR-0016, #220) additionally applies `migrations/
+    postgres/0012_vector_layout.sql` - `backend="git"` (every test above, the
+    default) never does, which is what keeps the Git backend's own flat,
+    `vector`-typed `chunks` "exactly as it is today" (ADR-0016 Consequences).
+    """
+
+    async def test_backend_postgres_applies_the_vector_layout_migration_too(
+        self, conn: asyncpg.Connection
+    ) -> None:
+        applied = await migrate(conn, backend="postgres")
+
+        assert applied == [
+            "0001_index_schema",
+            "0002_static_tokens",
+            "0003_oauth",
+            "0004_vault",
+            "0005_rls",
+            "0006_shared_state",
+            "0007_token_principal",
+            "0008_frequent_lexemes",
+            "0009_namespace_resolution",
+            "0010_oauth_token_principal",
+            "0011_jobs",
+            "0012_vector_layout",
+            "0013_vault_notes_namespace_idx",
+        ]
+        tables = {
+            row["table_name"]
+            for row in await conn.fetch(
+                "select table_name from information_schema.tables where table_schema = 'public'"
+            )
+        }
+        assert {
+            "chunks",
+            "chunks_user",
+            "chunks_group",
+            "chunks_project",
+            "chunks_org",
+            "embedding_dimension",
+        } <= tables
+
+    async def test_backend_git_default_never_applies_it(self, conn: asyncpg.Connection) -> None:
+        applied = await migrate(conn)
+
+        assert "0012_vector_layout" not in applied
+
+        exists = await conn.fetchval(
+            "select exists(select 1 from information_schema.tables "
+            "where table_schema = 'public' and table_name = 'embedding_dimension')"
+        )
+        assert exists is False
+
+    async def test_an_unknown_backend_is_refused(self, conn: asyncpg.Connection) -> None:
+        with pytest.raises(ValueError, match="backend"):
+            await migrate(conn, backend="enterprise")

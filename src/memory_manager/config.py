@@ -18,6 +18,7 @@ __all__ = [
     "AuditConfigError",
     "EmbeddingConfig",
     "EmbeddingConfigError",
+    "EmbeddingDimensionPinError",
     "ServerConfig",
     "ServerConfigError",
     "StorageConfigError",
@@ -241,6 +242,18 @@ def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
 
 class EmbeddingConfigError(ValueError):
     """A required `EMBEDDING_*` environment variable is missing or invalid."""
+
+
+class EmbeddingDimensionPinError(EmbeddingConfigError):
+    """`EMBEDDING_DIMENSIONS` (or a provider's actual response) disagrees with the
+    dimension a Postgres-mode backend was first migrated with (PLAN O23,
+    ADR-0016, #220: pinned at first `migrate(..., backend="postgres")`, immutable
+    afterwards). Raised by `db.migrate.migrate` at startup and by
+    `index.indexer.Indexer` the first time a provider's own response disagrees -
+    a subclass of `EmbeddingConfigError` so every caller that already catches
+    that broadly (`cli.py`'s command dispatch) reports this the same way,
+    with exit code 2, rather than an unhandled traceback.
+    """
 
 
 @dataclass(frozen=True)

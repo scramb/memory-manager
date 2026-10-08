@@ -230,7 +230,21 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    return asyncio.run(_reindex(database_url, vault_dir, embedding_config, full=args.full))
+    try:
+        return asyncio.run(
+            _reindex(
+                database_url,
+                vault_dir,
+                embedding_config,
+                full=args.full,
+                backend=storage_backend,
+            )
+        )
+    except EmbeddingConfigError as exc:
+        # `EmbeddingDimensionPinError` (ADR-0016, #220): `migrate()` refuses a
+        # dimension pin mismatch only once connected, inside `_reindex` itself.
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -565,7 +579,7 @@ def _run_export_command(
 async def _run_export_postgres_command(
     out_path: Path, *, include_archive: bool, namespaces: list[str] | None
 ) -> int:
-    pool = await _open_migrated_pool()
+    pool = await _open_migrated_pool(backend="postgres")
     if pool is None:
         return 2
     try:
@@ -728,7 +742,7 @@ async def _run_migrate_git_to_postgres_apply(vault: str | None, raw_maps: list[s
         print("dry run found problems - nothing was imported", file=sys.stderr)
         return 1
 
-    pool = await _open_migrated_pool()
+    pool = await _open_migrated_pool(backend="postgres")
     if pool is None:
         return 2
     try:
@@ -799,8 +813,17 @@ def _print_migrate_import_report(report: MigrateImportReport) -> None:
         print("one or more namespaces already held notes - nothing was overwritten")
 
 
-async def _open_migrated_pool() -> asyncpg.Pool | None:
-    """A connection pool to `DATABASE_URL`, migrated first. `None` if it is unset."""
+async def _open_migrated_pool(
+    *, backend: str = "git", embedding_dimensions: int | None = None
+) -> asyncpg.Pool | None:
+    """A connection pool to `DATABASE_URL`, migrated first. `None` if it is unset.
+
+    `backend`/`embedding_dimensions` are threaded straight into
+    `db.migrate.migrate` - `token create|list|revoke` never pass either
+    (tokens are backend-agnostic, `backend`'s default is enough), while
+    `export`'s and `migrate git-to-postgres`'s own Postgres-only callers
+    pass `backend="postgres"` explicitly (ADR-0016, #220).
+    """
     try:
         database_url = _require_env("DATABASE_URL")
     except _MissingEnvironment as exc:
@@ -809,7 +832,7 @@ async def _open_migrated_pool() -> asyncpg.Pool | None:
 
     migration_conn = await asyncpg.connect(database_url)
     try:
-        await migrate(migration_conn)
+        await migrate(migration_conn, backend=backend, embedding_dimensions=embedding_dimensions)
     finally:
         await migration_conn.close()
 
@@ -906,19 +929,28 @@ async def _run_token_revoke(name: str) -> int:
 
 
 async def _reindex(
-    database_url: str, vault_dir: Path | None, embedding_config: EmbeddingConfig, *, full: bool
+    database_url: str,
+    vault_dir: Path | None,
+    embedding_config: EmbeddingConfig,
+    *,
+    full: bool,
+    backend: str,
 ) -> int:
     """Reindex `database_url` from `vault_dir` (`"git"`) or `vault_notes` (`"postgres"`).
 
     `vault_dir` is `None` for the `postgres` backend (ADR-0007 §2, WP-18):
     there is no vault to walk, `vault_notes` is `Indexer`'s source instead
-    (`VaultNotesSource`).
+    (`VaultNotesSource`). `backend` is the caller's own already-computed
+    `storage_backend_from_env` value, threaded into `migrate()` (ADR-0016,
+    #220) rather than re-derived here from `vault_dir is None`.
     """
     # A plain connection for the migration, not one from the pool below:
     # `migrate` takes an `asyncpg.Connection`, not a pool's connection proxy.
     migration_conn = await asyncpg.connect(database_url)
     try:
-        await migrate(migration_conn)
+        await migrate(
+            migration_conn, backend=backend, embedding_dimensions=embedding_config.dimensions
+        )
     finally:
         await migration_conn.close()
 
@@ -988,7 +1020,11 @@ async def _eval(
     try:
         migration_conn = await asyncpg.connect(eval_db_url)
         try:
-            await migrate(migration_conn)
+            # `backend="git"` (named explicitly): `eval` always indexes from
+            # `vault_dir` (the research baseline this schema measures,
+            # docs/research/vector-index.md §4) - never the Postgres-mode,
+            # ADR-0016 layout (#220).
+            await migrate(migration_conn, backend="git")
         finally:
             await migration_conn.close()
 
@@ -1231,7 +1267,9 @@ async def _serve_worker() -> int:
     worker_config = WorkerConfig.from_env(dict(os.environ))
     embedding_config = EmbeddingConfig.from_env(dict(os.environ))
 
-    pool = await _open_migrated_pool()
+    pool = await _open_migrated_pool(
+        backend=storage_backend, embedding_dimensions=embedding_config.dimensions
+    )
     if pool is None:
         return 2
 

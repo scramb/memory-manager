@@ -204,6 +204,13 @@ async def _open_backend(
     on it, but every content access below still goes through the switched
     role regardless) - this process keeps starting, the risk is operational,
     not something to refuse on.
+
+    `migrate(..., backend="postgres")` additionally applies ADR-0016's
+    `chunks` layout (#220) and pins `embedding_config.dimensions` (`None` -
+    no `embedding_config`, `open_storage`'s own call shape - pins the
+    default instead): a later call with a different, non-`None` value
+    raises `EmbeddingDimensionPinError` (PLAN O23), surfacing before a pool
+    is even opened.
     """
     if backend_name == "postgres":
         if (
@@ -212,7 +219,13 @@ async def _open_backend(
             raise AssertionError("_open_backend('postgres', ...) called without a database_url")
         migration_conn = await asyncpg.connect(database_url)
         try:
-            await migrate(migration_conn)
+            await migrate(
+                migration_conn,
+                backend="postgres",
+                embedding_dimensions=(
+                    embedding_config.dimensions if embedding_config is not None else None
+                ),
+            )
             if app_role is not None:
                 owner_is_superuser = await migration_conn.fetchval(
                     "select rolsuper from pg_roles where rolname = current_user"
@@ -428,7 +441,10 @@ async def _open_index(
     """Migrate, build the `Indexer` and bring it in step with the vault at startup."""
     migration_conn = await asyncpg.connect(database_url)
     try:
-        await migrate(migration_conn)
+        # `backend="git"` (the default, named explicitly here): the Git
+        # backend's own derived index, ADR-0016's Postgres-mode-only
+        # migration never applies to it.
+        await migrate(migration_conn, backend="git")
     finally:
         await migration_conn.close()
 
