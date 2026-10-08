@@ -45,14 +45,8 @@ operator never configured).
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import json
 import logging
-import secrets
-import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
 
@@ -70,6 +64,14 @@ from memory_manager.auth.login import (
     parse_namespace_map,
     parse_namespaces,
     resolve_namespaces,
+)
+from memory_manager.auth.oidc_client import (
+    CallbackCapable,
+    DiscoveryDocument,
+    OidcDiscoveryClient,
+    OidcError,
+    begin_pending_login,
+    take_pending_login,
 )
 from memory_manager.auth.shared_state import InMemorySharedState, SharedState
 from memory_manager.auth.templates import (
@@ -98,28 +100,6 @@ _CONFIRMED = "1"
 #: authorization TTL, since a stale `state` can never outlive the pending
 #: authorization it is bound to being useful at all.
 _STATE_TTL = 600.0
-
-
-class _OidcError(Exception):
-    """Something about discovery, the token exchange or userinfo failed - caught by
-    `handle`/`handle_callback` and turned into a generic, detail-free error page."""
-
-
-@dataclass(frozen=True)
-class _Discovery:
-    issuer: str
-    authorization_endpoint: str
-    token_endpoint: str
-    userinfo_endpoint: str
-
-
-@dataclass(frozen=True)
-class _PendingState:
-    """What `handle` parks under `state`, for `handle_callback` to pick back up."""
-
-    pending_id: str
-    code_verifier: str
-    nonce: str
 
 
 class OidcAuthenticator:
@@ -152,8 +132,9 @@ class OidcAuthenticator:
         # caller-supplied one (every test) stays the caller's own responsibility.
         self._owns_http_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
-        self._discovery: _Discovery | None = None
-        self._discovery_at = 0.0
+        self._client = OidcDiscoveryClient(
+            issuer=issuer, http_client=self._http, cache_ttl_seconds=_DISCOVERY_CACHE_TTL
+        )
         self._shared_state: SharedState = InMemorySharedState()
 
     def bind_shared_state(self, state: SharedState) -> None:
@@ -246,21 +227,17 @@ class OidcAuthenticator:
             )
 
         try:
-            discovery = await self._discovery_document()
-        except _OidcError as exc:
+            discovery = await self._client.discovery_document()
+        except OidcError as exc:
             _logger.warning("oidc discovery failed: %s", exc)
             return html_response(
                 login_error_page("Sign-in is temporarily unavailable. Please try again shortly."),
                 status_code=503,
             )
 
-        code_verifier = secrets.token_urlsafe(48)
-        nonce = secrets.token_urlsafe(24)
-        state = secrets.token_urlsafe(32)
-        payload = json.dumps(
-            {"pending_id": pending.id, "code_verifier": code_verifier, "nonce": nonce}
+        state, nonce, code_challenge = await begin_pending_login(
+            self._shared_state, pending_id=pending.id, ttl_seconds=_STATE_TTL
         )
-        await self._shared_state.put_pending(state, payload, ttl_seconds=_STATE_TTL)
 
         params = {
             "response_type": "code",
@@ -269,7 +246,7 @@ class OidcAuthenticator:
             "scope": _SCOPE,
             "state": state,
             "nonce": nonce,
-            "code_challenge": _pkce_challenge(code_verifier),
+            "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
         return RedirectResponse(
@@ -290,7 +267,7 @@ class OidcAuthenticator:
             )
 
         code = params.get("code")
-        pending_state = await self._pop_state(params.get("state", ""))
+        pending_state = await take_pending_login(self._shared_state, params.get("state", ""))
         if pending_state is None or not code:
             return html_response(
                 login_error_page(
@@ -300,15 +277,20 @@ class OidcAuthenticator:
             )
 
         try:
-            discovery = await self._discovery_document()
-            token_response = await self._exchange_code(
-                discovery, code=code, code_verifier=pending_state.code_verifier
+            discovery = await self._client.discovery_document()
+            token_response = await self._client.exchange_code(
+                discovery,
+                code=code,
+                code_verifier=pending_state.code_verifier,
+                redirect_uri=self._redirect_uri,
+                client_id=self._client_id,
+                client_secret=self._client_secret,
             )
             access_token = token_response.get("access_token")
             if not isinstance(access_token, str) or not access_token:
-                raise _OidcError("token response carried no access_token")
+                raise OidcError("token response carried no access_token")
             claims = await self._userinfo(discovery, access_token=access_token)
-        except _OidcError as exc:
+        except OidcError as exc:
             _logger.warning("oidc login failed: %s", exc)
             return html_response(
                 login_error_page("Sign-in failed. Please try again."), status_code=400
@@ -351,83 +333,11 @@ class OidcAuthenticator:
             return True
         return email is not None and email_verified and email in self._allowed_emails
 
-    # ---- pending state (SharedState) -------------------------------------------------
+    # ---- userinfo (the one part of the discovery document only `oidc` mode needs) ---
 
-    async def _pop_state(self, state: str) -> _PendingState | None:
-        """`_PendingState` parked under `state` (single-use - `SharedState.take_pending`
-        deletes it in the same round trip), or `None` if `state` is empty, unknown,
-        already used, or past `_STATE_TTL`."""
-        if not state:
-            return None
-        payload = await self._shared_state.take_pending(state)
-        if payload is None:
-            return None
-        try:
-            data = json.loads(payload)
-            return _PendingState(
-                pending_id=data["pending_id"],
-                code_verifier=data["code_verifier"],
-                nonce=data["nonce"],
-            )
-        except (ValueError, KeyError, TypeError):  # pragma: no cover - defensive
-            return None
-
-    # ---- discovery / token / userinfo ------------------------------------------------
-
-    async def _discovery_document(self) -> _Discovery:
-        now = time.monotonic()
-        if self._discovery is not None and now - self._discovery_at < _DISCOVERY_CACHE_TTL:
-            return self._discovery
-
-        url = f"{self._issuer.rstrip('/')}/.well-known/openid-configuration"
-        try:
-            response = await self._http.get(url)
-            response.raise_for_status()
-            data: dict[str, Any] = response.json()
-        except httpx.HTTPError as exc:
-            raise _OidcError(f"discovery request to {url!r} failed: {exc}") from exc
-
-        issuer = data.get("issuer")
-        if issuer != self._issuer:
-            raise _OidcError(
-                f"discovery document issuer {issuer!r} does not match configured "
-                f"OIDC_ISSUER {self._issuer!r}"
-            )
-        try:
-            discovery = _Discovery(
-                issuer=issuer,
-                authorization_endpoint=data["authorization_endpoint"],
-                token_endpoint=data["token_endpoint"],
-                userinfo_endpoint=data["userinfo_endpoint"],
-            )
-        except KeyError as exc:
-            raise _OidcError(f"discovery document is missing {exc}") from exc
-
-        self._discovery = discovery
-        self._discovery_at = now
-        return discovery
-
-    async def _exchange_code(
-        self, discovery: _Discovery, *, code: str, code_verifier: str
-    ) -> dict[str, Any]:
-        try:
-            response = await self._http.post(
-                discovery.token_endpoint,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": self._redirect_uri,
-                    "code_verifier": code_verifier,
-                },
-                auth=(self._client_id, self._client_secret),
-            )
-            response.raise_for_status()
-            result: dict[str, Any] = response.json()
-            return result
-        except httpx.HTTPError as exc:
-            raise _OidcError(f"token exchange failed: {exc}") from exc
-
-    async def _userinfo(self, discovery: _Discovery, *, access_token: str) -> dict[str, Any]:
+    async def _userinfo(self, discovery: DiscoveryDocument, *, access_token: str) -> dict[str, Any]:
+        if discovery.userinfo_endpoint is None:
+            raise OidcError("discovery document is missing 'userinfo_endpoint'")
         try:
             response = await self._http.get(
                 discovery.userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"}
@@ -436,24 +346,19 @@ class OidcAuthenticator:
             result: dict[str, Any] = response.json()
             return result
         except httpx.HTTPError as exc:
-            raise _OidcError(f"userinfo request failed: {exc}") from exc
+            raise OidcError(f"userinfo request failed: {exc}") from exc
 
 
-def oidc_routes(
-    *, complete: AuthorizationCompleter, authenticator: OidcAuthenticator
-) -> list[Route]:
-    """`{CALLBACK_PATH}` (`GET`) - mounted by `http.py` only when the configured
-    `Authenticator` is an `OidcAuthenticator` (`LOGIN_MODE=oidc`)."""
+def oidc_routes(*, complete: AuthorizationCompleter, authenticator: CallbackCapable) -> list[Route]:
+    """`{CALLBACK_PATH}` (`GET`) - mounted by `http.py` when the configured
+    `Authenticator` is an `OidcAuthenticator` (`LOGIN_MODE=oidc`) or an
+    `EntraAuthenticator` (`LOGIN_MODE=entra`, #215 - both reuse this callback path,
+    ADR-0006 §9)."""
 
     async def callback(request: Request) -> Response:
         return await authenticator.handle_callback(request, complete)
 
     return [Route(CALLBACK_PATH, endpoint=callback, methods=["GET"])]
-
-
-def _pkce_challenge(code_verifier: str) -> str:
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def _parse_csv(raw: str | None) -> list[str]:

@@ -102,6 +102,7 @@ from memory_manager.auth.login import (
     PendingAuthorizationLookup,
     login_routes,
 )
+from memory_manager.auth.login_entra import EntraAuthenticator, entra_routes
 from memory_manager.auth.login_oidc import OidcAuthenticator, oidc_routes
 from memory_manager.auth.login_password import PasswordAuthenticator
 from memory_manager.auth.metadata import WELL_KNOWN_PATH as OAUTH_METADATA_PATH
@@ -321,7 +322,7 @@ def create_app(
                 "the 'valkey' extra to use Valkey-backed shared state, e.g. "
                 "`uv sync --extra valkey` or `pip install 'memory-manager[valkey]'`"
             ) from exc
-    if isinstance(authenticator, (PasswordAuthenticator, OidcAuthenticator)):
+    if isinstance(authenticator, (PasswordAuthenticator, OidcAuthenticator, EntraAuthenticator)):
         # Bound now, against the handle - not the backend it starts with: `lifespan`
         # below may still swap `shared_state.backend` to a `PostgresSharedState` once
         # `services.pool` exists (unless Valkey already won, just above), and this
@@ -339,6 +340,15 @@ def create_app(
                 # already gate on below. Skipped when a `ValkeySharedState` already
                 # won above (#104): the two are never combined.
                 shared_state.backend = PostgresSharedState(services.pool, cipher=cipher)
+
+            if isinstance(authenticator, EntraAuthenticator):
+                if services.pool is None:  # pragma: no cover - defensive
+                    # `build_authenticator` refuses to start `LOGIN_MODE=entra` without
+                    # `STORAGE_BACKEND=postgres` (ADR-0006 addendum 2026-10-08) -
+                    # `services.pool` is `None` only for the `git` backend, so this
+                    # would be this module's own wiring bug, not a client-facing one.
+                    raise RuntimeError("EntraAuthenticator was configured without a database pool")
+                authenticator.bind_pool(services.pool)
 
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
@@ -407,11 +417,11 @@ def create_app(
                     cleanup_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await cleanup_task
-                if isinstance(authenticator, OidcAuthenticator):
-                    # Closes the `httpx.AsyncClient` `OidcAuthenticator.__init__` creates
-                    # itself when no `http_client` is given (production; tests always
-                    # pass their own mocked one, which stays theirs to close) - otherwise
-                    # that client, and its connection pool, outlives this app's lifespan.
+                if isinstance(authenticator, (OidcAuthenticator, EntraAuthenticator)):
+                    # Closes the `httpx.AsyncClient` `__init__` creates itself when no
+                    # `http_client` is given (production; tests always pass their own
+                    # mocked one, which stays theirs to close) - otherwise that client,
+                    # and its connection pool, outlives this app's lifespan.
                     await authenticator.aclose()
                 if isinstance(shared_state.backend, ValkeySharedState):
                     # Closes the `redis.asyncio.Redis` connection pool `create_app`
@@ -454,6 +464,15 @@ def create_app(
             # carries the pending authorization across that round trip instead).
             routes.extend(
                 oidc_routes(
+                    complete=_authorization_completer(oauth_cell), authenticator=authenticator
+                )
+            )
+        if isinstance(authenticator, EntraAuthenticator):
+            # Same callback path, same reasoning as the `OidcAuthenticator` branch
+            # above - `entra_routes` is `login_entra`'s own, so this module never has
+            # to import `EntraAuthenticator` through `login_oidc`.
+            routes.extend(
+                entra_routes(
                     complete=_authorization_completer(oauth_cell), authenticator=authenticator
                 )
             )
@@ -516,6 +535,9 @@ def create_app(
     # Known synchronously (no vault/DB work needed), unlike `services`/`mcp_app`
     # above - set right away rather than deferred into `lifespan`.
     app.state.config = config
+    # `_readyz`'s own Entra-discovery check (ADR-0009 §5) reads this directly -
+    # `None` for every other `authenticator`, in which case that check is skipped.
+    app.state.authenticator = authenticator
     # Flipped to `True` by `GracefulShutdownServer.handle_exit` on `SIGTERM`/
     # `SIGINT` (ADR-0009 §5) - `_readyz` checks this before anything else.
     app.state.draining = False
@@ -573,13 +595,22 @@ def _build_oauth_provider(
 
 
 def build_authenticator(config: ServerConfig, environ: Mapping[str, str]) -> Authenticator | None:
-    """The production `Authenticator` for `config.login_mode` (ADR-0004 L1/L2, #37) -
-    `None` if `login_mode` is unset (no OAuth authorization server at all).
+    """The production `Authenticator` for `config.login_mode` (ADR-0004 L1/L2, ADR-0006
+    for `entra`) - `None` if `login_mode` is unset (no OAuth authorization server at
+    all).
 
     `cli.py`'s `_serve_http` calls this and passes the result into `create_app` as
-    `authenticator`; `PasswordAuthenticator.from_env`/`OidcAuthenticator.from_env` raise
-    `ServerConfigError` for a missing or inconsistent `LOGIN_MODE=password`/`oidc`
-    configuration, which `cli.py`'s `_serve` already turns into a clean startup refusal.
+    `authenticator`; `PasswordAuthenticator.from_env`/`OidcAuthenticator.from_env`/
+    `EntraAuthenticator.from_env` raise `ServerConfigError` for a missing or
+    inconsistent `LOGIN_MODE=password`/`oidc`/`entra` configuration, which `cli.py`'s
+    `_serve` already turns into a clean startup refusal.
+
+    `LOGIN_MODE=entra` additionally requires `STORAGE_BACKEND=postgres` (ADR-0006
+    addendum 2026-10-08): roles, groups and `me` exist only with the namespace
+    registry (ADR-0008), which the `git` backend has no table for at all. Checked
+    here, before an `EntraAuthenticator` is even built, the same "fails before
+    anything is started" contract `config.storage_backend_from_env` already gives
+    `STORAGE_BACKEND`/`DATABASE_URL`.
     """
     if config.login_mode is None:
         return None
@@ -587,7 +618,16 @@ def build_authenticator(config: ServerConfig, environ: Mapping[str, str]) -> Aut
         return PasswordAuthenticator.from_env(environ)
     if config.login_mode == "oidc":
         return OidcAuthenticator.from_env(environ)
-    raise ServerConfigError(f"LOGIN_MODE must be 'password' or 'oidc', got {config.login_mode!r}")
+    if config.login_mode == "entra":
+        if environ.get("STORAGE_BACKEND", "git") != "postgres":
+            raise ServerConfigError(
+                "LOGIN_MODE=entra requires STORAGE_BACKEND=postgres (ADR-0006 addendum "
+                "2026-10-08): roles, groups and 'me' exist only with the namespace registry"
+            )
+        return EntraAuthenticator.from_env(environ)
+    raise ServerConfigError(
+        f"LOGIN_MODE must be 'password', 'oidc' or 'entra', got {config.login_mode!r}"
+    )
 
 
 def _build_auth_settings(
@@ -1091,8 +1131,9 @@ async def _healthz(_request: Request) -> Response:
 
 
 async def _readyz(request: Request) -> Response:
-    """503 when draining (ADR-0009 §5), the vault clone is missing, or a configured
-    database is unreachable.
+    """503 when draining (ADR-0009 §5), the vault clone is missing, a configured
+    database is unreachable, or (`LOGIN_MODE=entra`) Entra discovery has never
+    succeeded.
 
     The draining check runs first and skips the database round trip entirely -
     once `GracefulShutdownServer.handle_exit` has set `app.state.draining`, this
@@ -1121,12 +1162,23 @@ async def _readyz(request: Request) -> Response:
         vault_ready = database_ready
 
     ready = vault_ready and database_ready
-    body = {
+    body: dict[str, object] = {
         "ready": ready,
         "vault": vault_ready,
         "database": database_ready,
         "draining": False,
     }
+
+    authenticator: Authenticator | None = request.app.state.authenticator
+    if isinstance(authenticator, EntraAuthenticator):
+        # ADR-0009 §5: "true only after ... Entra discovery ... is reachable" -
+        # cached for an hour once it has succeeded once (`OidcDiscoveryClient`), so
+        # this live check is cheap on every probe after the first.
+        entra_discovery_ready = await authenticator.discovery_reachable()
+        body["entra_discovery"] = entra_discovery_ready
+        ready = ready and entra_discovery_ready
+        body["ready"] = ready
+
     return JSONResponse(body, status_code=200 if ready else 503)
 
 
