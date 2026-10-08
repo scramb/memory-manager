@@ -125,7 +125,7 @@ class TestAuditExporterOtlp:
     def test_exports_one_log_record_with_the_expected_attributes(self) -> None:
         from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
-        in_memory = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+        in_memory = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call, unused-ignore]
         exporter = AuditExporter.from_env({"AUDIT_EXPORT": "otlp"}, otlp_exporter=in_memory)
 
         exporter.export(_record_fields(request_id="req-otlp"))
@@ -146,7 +146,7 @@ class TestAuditExporterOtlp:
     def test_both_targets_export_independently(self, capsys: pytest.CaptureFixture[str]) -> None:
         from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
-        in_memory = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+        in_memory = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call, unused-ignore]
         exporter = AuditExporter.from_env({"AUDIT_EXPORT": "stdout,otlp"}, otlp_exporter=in_memory)
 
         exporter.export(_record_fields())
@@ -165,7 +165,7 @@ class TestAuditExporterOtlp:
         from opentelemetry.sdk._logs._internal import ReadableLogRecord
         from opentelemetry.sdk._logs.export import LogRecordExporter, LogRecordExportResult
 
-        class _BoomExporter(LogRecordExporter):
+        class _BoomExporter(LogRecordExporter):  # type: ignore[misc, unused-ignore]
             def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
                 raise RuntimeError("SIEM is unreachable")
 
