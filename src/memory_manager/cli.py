@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The `memory-manager` command-line entry point (#17, #26, #33, #34).
+"""The `memory-manager` command-line entry point (#17, #26, #33, #34, #246, #247).
 
 `reindex`, `doctor`, `eval`, `export` and `import` work on the vault and
-index; `serve --stdio` runs the MCP server for a local Claude Code
-connection, `serve --http` runs it over Streamable HTTP (`http.py`);
+index; `migrate git-to-postgres` imports a Git vault's current notes and
+history into the Postgres backend (#247, `migrate_git.py`), connecting as
+the owner role per ADR-0008 addendum #100 and rebuilding the derived index
+from `vault_notes` afterwards; `--dry-run` reports the same mapping and note
+counts without writing anything (#246). `serve --stdio` runs the MCP server
+for a local Claude Code connection, `serve --http` runs it over Streamable
+HTTP (`http.py`);
 `token create|list|revoke` manage the static bearer tokens `/mcp` accepts
 once `DATABASE_URL` is set (ADR-0004, #34); `token create --owner --role`
 gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
@@ -58,7 +63,7 @@ from memory_manager.config import (
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
-from memory_manager.exporter import ExportError, Manifest, export_vault
+from memory_manager.exporter import ExportError, Manifest, export_postgres, export_vault
 from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
@@ -70,6 +75,16 @@ from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats, VaultNotesSource
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
+from memory_manager.migrate_git import (
+    DryRunReport,
+    MapEntry,
+    MapError,
+    MigrationError,
+    dry_run,
+    import_vault,
+    parse_map_entries,
+)
+from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -109,7 +124,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "export":
         return _run_export_command(
-            args.vault, out=args.out, include_archive=args.include_archive, force=args.force
+            args.vault,
+            out=args.out,
+            include_archive=args.include_archive,
+            force=args.force,
+            namespaces=args.namespace,
         )
 
     if args.command == "import":
@@ -143,6 +162,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         parser.print_help()
         return 1
+    if args.command == "migrate":
+        if args.migrate_target == "git-to-postgres":
+            if args.dry_run:
+                return _run_migrate_git_to_postgres_dry_run(args.vault, args.map or [])
+            return asyncio.run(_run_migrate_git_to_postgres_apply(args.vault, args.map or []))
+        parser.print_help()
+        return 1
+
     if args.command == "serve":
         return _serve(stdio=args.stdio, http=args.http)
 
@@ -256,6 +283,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="overwrite --out if it already exists",
     )
+    export_parser.add_argument(
+        "--namespace",
+        dest="namespace",
+        action="append",
+        default=None,
+        help="limit the export to this namespace (repeatable; default: every namespace)",
+    )
 
     import_parser = subparsers.add_parser("import", help="import notes from an external source")
     import_subparsers = import_parser.add_subparsers(dest="import_source")
@@ -326,6 +360,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="actually write notes (default is a dry run that writes nothing)",
+    )
+
+    migrate_parser = subparsers.add_parser(
+        "migrate", help="migrate a Git vault into the Postgres backend (ADR-0007 §6)"
+    )
+    migrate_subparsers = migrate_parser.add_subparsers(dest="migrate_target")
+    migrate_git_parser = migrate_subparsers.add_parser(
+        "git-to-postgres", help="import a Git vault's notes and history into Postgres"
+    )
+    migrate_git_parser.add_argument(
+        "--vault",
+        default=os.environ.get("VAULT_DIR"),
+        help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    migrate_git_parser.add_argument(
+        "--map",
+        dest="map",
+        action="append",
+        default=None,
+        metavar="<git-ns>=<kind>:<key>[:<alias>]",
+        help="repeatable; maps one top-level Git namespace to a Postgres namespace "
+        "(kind: user|group|project|org); every namespace in the vault needs one",
+    )
+    migrate_git_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="report the mapping and every note that would be imported, writing nothing",
     )
 
     serve_parser = subparsers.add_parser("serve", help="run the MCP server")
@@ -425,21 +487,69 @@ def _print_doctor_report(report: DoctorReport) -> None:
 
 
 def _run_export_command(
-    vault: str | None, *, out: Path | None, include_archive: bool, force: bool
+    vault: str | None,
+    *,
+    out: Path | None,
+    include_archive: bool,
+    force: bool,
+    namespaces: list[str] | None,
 ) -> int:
-    if not vault:
-        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
-        return 2
+    """`memory-manager export`: the Postgres path when `STORAGE_BACKEND=postgres`, Git otherwise.
+
+    `STORAGE_BACKEND` is read first (`storage_backend_from_env`, same as
+    every other command) - a `"postgres"` call needs no `--vault`/`VAULT_DIR`
+    at all (#283, ADR-0007 §2); Git behaviour below is otherwise unchanged
+    from before `export_postgres` existed.
+    """
     out_path = out or Path(f"memory-export-{datetime.now(UTC).date().isoformat()}.tar.gz")
     if out_path.exists() and not force:
         print(f"'{out_path}' already exists, pass --force to overwrite", file=sys.stderr)
         return 2
 
     try:
-        manifest = export_vault(Path(vault), out_path, include_archive=include_archive)
+        storage_backend = storage_backend_from_env(dict(os.environ))
+    except StorageConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if storage_backend == "postgres":
+        return asyncio.run(
+            _run_export_postgres_command(
+                out_path, include_archive=include_archive, namespaces=namespaces
+            )
+        )
+
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+
+    try:
+        manifest = export_vault(
+            Path(vault), out_path, include_archive=include_archive, namespaces=namespaces
+        )
     except ExportError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    _print_export_manifest(manifest, out_path)
+    return 0
+
+
+async def _run_export_postgres_command(
+    out_path: Path, *, include_archive: bool, namespaces: list[str] | None
+) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+    try:
+        manifest = await export_postgres(
+            pool, out_path, include_archive=include_archive, namespaces=namespaces
+        )
+    except ExportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        await pool.close()
 
     _print_export_manifest(manifest, out_path)
     return 0
@@ -539,6 +649,127 @@ def _print_import_report(report: ImportReport, *, apply: bool) -> None:
         print(f"REJECTED: {source_ref}: {reason}")
     if not apply:
         print("dry run - nothing was written, pass --apply to write")
+
+
+def _run_migrate_git_to_postgres_dry_run(vault: str | None, raw_maps: list[str]) -> int:
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+
+    try:
+        map_entries = parse_map_entries(raw_maps)
+    except MapError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        report = dry_run(Path(vault), map_entries)
+    except MigrationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    _print_migrate_dry_run_report(report)
+    return 0 if report.ok else 1
+
+
+async def _run_migrate_git_to_postgres_apply(vault: str | None, raw_maps: list[str]) -> int:
+    """Actually import `vault` into Postgres (#247), after a clean dry run.
+
+    Refuses to touch the database at all if the dry run itself is not
+    `.ok` - the same problems `--dry-run` would have reported. The index is
+    rebuilt from `vault_notes` (`VaultNotesSource`) once every namespace has
+    been imported, so a fresh Postgres backend is searchable right away.
+    """
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+
+    try:
+        map_entries = parse_map_entries(raw_maps)
+    except MapError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    vault_path = Path(vault)
+    try:
+        preflight = dry_run(vault_path, map_entries)
+    except MigrationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not preflight.ok:
+        _print_migrate_dry_run_report(preflight)
+        print("dry run found problems - nothing was imported", file=sys.stderr)
+        return 1
+
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+    try:
+        import_report = await import_vault(pool, vault_path, map_entries)
+        _print_migrate_import_report(import_report)
+        if not import_report.ok:
+            return 1
+        stats = await Indexer(pool, VaultNotesSource()).reindex_full()
+        _print_stats(stats)
+    finally:
+        await pool.close()
+    return 0
+
+
+def _format_migrate_target(target: MapEntry | None) -> str:
+    """`target` as `_print_migrate_*`'s shared label, `"UNMAPPED"` for `None`."""
+    if target is None:
+        return "UNMAPPED"
+    desc = f"{target.kind}:{target.key}"
+    if target.alias is not None:
+        desc += f":{target.alias}"
+    return desc
+
+
+def _print_migrate_dry_run_report(report: DryRunReport) -> None:
+    for namespace in report.namespaces:
+        target_desc = _format_migrate_target(namespace.target)
+        print(
+            f"{namespace.git_namespace} -> {target_desc}  "
+            f"live={namespace.live_notes} archived={namespace.archived_notes} "
+            f"revisions={namespace.revisions}"
+        )
+        for problem in namespace.problems:
+            print(f"  PROBLEM: {problem}")
+
+    for stale in report.unknown_mappings:
+        print(f"PROBLEM: --map references namespace {stale!r}, which does not exist in the vault")
+
+    total_problems = sum(len(ns.problems) for ns in report.namespaces) + len(
+        report.unknown_mappings
+    )
+    print(
+        f"{len(report.namespaces)} namespace(s), {len(report.unmapped)} unmapped, "
+        f"{total_problems} problem(s)"
+    )
+    if not report.ok:
+        print("dry run found problems - nothing was written")
+
+
+def _print_migrate_import_report(report: MigrateImportReport) -> None:
+    for namespace in report.namespaces:
+        if namespace.refused:
+            print(
+                f"{namespace.git_namespace} -> {namespace.stored_alias}  "
+                f"REFUSED: {namespace.reason}"
+            )
+            continue
+        target_desc = _format_migrate_target(namespace.target)
+        print(
+            f"{namespace.git_namespace} -> {target_desc}  "
+            f"imported_notes={namespace.imported_notes} "
+            f"imported_revisions={namespace.imported_revisions}"
+        )
+
+    refused = sum(1 for ns in report.namespaces if ns.refused)
+    print(f"{len(report.namespaces)} namespace(s) imported, {refused} refused")
+    if not report.ok:
+        print("one or more namespaces already held notes - nothing was overwritten")
 
 
 async def _open_migrated_pool() -> asyncpg.Pool | None:

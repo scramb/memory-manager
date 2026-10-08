@@ -106,6 +106,8 @@ Remote setup for both clients (OAuth, verified 2026-10-07): [`docs/guides/remote
 - GitOps example with Flux: [`deploy/flux/README.md`](./deploy/flux/README.md)
 - Exposing a self-hosted instance without a public ingress (Cloudflare Tunnel):
   [`docs/guides/cloudflare-tunnel.md`](./docs/guides/cloudflare-tunnel.md)
+- Migrating an existing Git vault into the enterprise `postgres` storage backend:
+  [`docs/guides/migrate-git-to-postgres.md`](./docs/guides/migrate-git-to-postgres.md)
 - Cutting and verifying a release (image and chart signatures, SBOM):
   [`docs/releasing.md`](./docs/releasing.md)
 
