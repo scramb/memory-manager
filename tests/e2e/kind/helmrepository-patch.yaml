@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Points ../../../deploy/flux/enterprise/helmrepository.yaml's OCI source at
+# the throwaway local registry instead of ghcr.io - scripts/e2e-kind.sh
+# substitutes __LOCAL_REGISTRY__ after `kubectl kustomize` renders this
+# directory (kustomization.yaml's own comment: a pod cannot resolve the
+# registry by name, only by this raw "ip:port"). `insecure: true` is the
+# documented HelmRepository field for a plain-HTTP OCI registry
+# (docs/research/kind-e2e.md).
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: memory-manager
+  namespace: memory-manager
+spec:
+  url: oci://__LOCAL_REGISTRY__/charts
+  insecure: true

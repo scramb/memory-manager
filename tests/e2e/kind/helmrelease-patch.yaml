@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Patches ../../../deploy/flux/enterprise/helmrelease.yaml's own values to
+# what this E2E actually needs, on top of everything that file already sets
+# (3 api/2 worker replicas, Entra login, the 3-instance CNPG Cluster,
+# per-component NetworkPolicies - all left as-is):
+#
+# - chart.spec.version: the exact version scripts/e2e-kind.sh packages and
+#   pushes (0.2.0, no pre-release suffix - Helm's own semver range matching,
+#   via Masterminds/semver, excludes pre-release versions from a plain
+#   ">=0.2.0 <0.3.0" range unless the range itself carries one).
+# - image: the e2e-tagged image scripts/e2e-kind.sh builds and pushes to
+#   the local registry instead of ghcr.io/scramb/memory-manager -
+#   `pullPolicy: Always` so a second local run with the same "e2e" tag never
+#   serves a stale image a kubelet happened to still have cached.
+# - login.entra.authority/allowInsecureAuthority: the in-cluster mock IdP
+#   (mock-idp.yaml) instead of real Entra - plain HTTP, so
+#   allowInsecureAuthority has to be true too (EntraAuthenticator's own
+#   guard, ADR-0006 §1). tenantId/clientId are arbitrary here: the mock
+#   never validates either against a registered app (tests/mock_idp/
+#   app.py's own `_discovery` is generic per-tid) - only `/readyz`'s own
+#   discovery check (ADR-0009 §5) is in scope, not the sign-in flow itself
+#   (WP-30's "Not included").
+# - publicUrl: a fixed test placeholder, the same shape
+#   tests/e2e/test_replicas.py's own `_PUBLIC_URL` uses - never resolved,
+#   `/readyz` does not read it.
+# - database.cnpg.backup.enabled: off - coordinator decision 2026-10-08,
+#   #258's own "Not included" (backups/WAL are 29d's own chart test, not
+#   this E2E).
+# - httpRoute.enabled: off - no Gateway API CRDs installed in the kind
+#   cluster (out of scope for #258); `/readyz` is checked through the pod
+#   proxy subresource instead (scripts/e2e-kind.sh), never through this
+#   route.
+# networkPolicy is deliberately left at the enterprise profile's own
+# "enabled: true" (values-enterprise.yaml), not turned off here: kind's
+# default CNI (kindnet) does enforce NetworkPolicy (confirmed locally: a
+# non-allow-listed pod's connection to a ClusterIP times out), so this E2E
+# is what actually proves the per-component policies
+# (templates/networkpolicy.yaml) let the rollout itself succeed - a real gap
+# there (the CNPG peer selector required cnpg.io/podRole: instance, which a
+# joining replica's own pg_basebackup Job never carries, so the Cluster
+# never reached 3 ready instances with policies on) was found and fixed in
+# templates/networkpolicy.yaml/tests/chart/test_networkpolicies.py as a fix
+# for #255, not here.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: memory-manager
+  namespace: memory-manager
+spec:
+  chart:
+    spec:
+      version: "0.2.0"
+  values:
+    image:
+      repository: localhost:5001/memory-manager
+      tag: e2e
+      pullPolicy: Always
+    publicUrl: https://mm-e2e.example.test
+    login:
+      mode: entra
+      entra:
+        tenantId: e2e-tenant
+        clientId: e2e-client
+        authority: http://mock-idp.memory-manager.svc.cluster.local:8080
+        allowInsecureAuthority: true
+    database:
+      cnpg:
+        backup:
+          enabled: false
+    httpRoute:
+      enabled: false
