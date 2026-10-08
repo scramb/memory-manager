@@ -2,15 +2,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 #
 # Loads a synthetic vault into the Postgres backend and runs the k6 search/
-# read/write scenarios against one server replica (#108, WP-21): waits for
-# `mm-pg`, generates `LOADTEST_NOTES` notes (`loadtest.generate`, #107),
-# bulk-loads them into a dedicated `mm_loadtest` database (`loadtest.load` -
-# never the shared `mm` database other tests/worktrees use), reindexes it,
-# analyzes `chunks`/`notes` (planner statistics `mm_frequent_lexemes`, #117,
-# needs to bound full-text search for a very frequent term), starts one
+# read/write scenarios against one server replica (#108, #124, WP-21): waits
+# for `mm-pg`, generates `LOADTEST_NOTES` notes (`loadtest.generate`, #107),
+# bulk-loads them - under RLS, with every synthetic principal registered -
+# into a dedicated `mm_loadtest` database (`loadtest.load` - never the
+# shared `mm` database other tests/worktrees use), reindexes it, analyzes
+# `chunks`/`notes` (planner statistics `mm_frequent_lexemes`, #117, needs to
+# bound full-text search for a very frequent term), starts one
 # `memory-manager serve --http` directly - not via `uv run`, so
-# `$SERVER_PID` below is the real process the EXIT trap kills - then, before
-# any concurrency, times one search/read/write call sequentially against the
+# `$SERVER_PID` below is the real process the EXIT trap kills - with
+# `DATABASE_APP_ROLE` set (ADR-0008 addendum, #116: `serve` refuses postgres
+# mode without it, and runs `db.rls.check_app_role`/`grant_app_role` against
+# it at startup - `loadtest.load`'s own `ensure_app_role` already made sure
+# the role exists and the owner is a member of it) - then, before any
+# concurrency, times one search/read/write call sequentially against the
 # idle server (#108 round 2) so a red k6 threshold can be told apart from
 # latency that is already there with no load at all - then runs
 # `loadtest/k6/smoke.js` in a container against it. k6's own exit code is
@@ -25,6 +30,7 @@ K6_IMAGE="${K6_IMAGE:-docker.io/grafana/k6:2.3.0}"
 
 ADMIN_URL="${MM_TEST_DATABASE_URL:-postgresql://mm:mm@localhost:55432/mm}"
 DB_NAME="mm_loadtest"
+APP_ROLE="mm_loadtest_app"
 BASE_URL="http://127.0.0.1:${LOADTEST_PORT}/mcp"
 DATABASE_URL="${ADMIN_URL%/*}/${DB_NAME}"
 
@@ -43,12 +49,22 @@ drop_database() {
     >/dev/null 2>&1 || true
 }
 
+drop_app_role() {
+  # Only safe once $DB_NAME is gone: the role's own table/function grants
+  # (`db.rls.grant_app_role`, run by `serve` at startup) live inside that
+  # database and would otherwise still make it a dependent object.
+  podman exec mm-pg psql -U mm -d mm -v ON_ERROR_STOP=1 \
+    -c "drop role if exists ${APP_ROLE};" \
+    >/dev/null 2>&1 || true
+}
+
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
   drop_database
+  drop_app_role
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -77,6 +93,7 @@ echo "loading the synthetic vault into ${DB_NAME}..."
   --vault "${WORKDIR}/vault-out" \
   --admin-url "$ADMIN_URL" \
   --db-name "$DB_NAME" \
+  --app-role "$APP_ROLE" \
   --base-url "$BASE_URL" \
   --context-out "${WORKDIR}/k6-context.json"
 
@@ -88,7 +105,7 @@ echo "analyzing ${DB_NAME} (chunks, notes) so mm_frequent_lexemes has fresh plan
 podman exec mm-pg psql -U mm -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "analyze chunks, notes;" >/dev/null
 
 echo "starting memory-manager serve --http on 127.0.0.1:${LOADTEST_PORT}..."
-STORAGE_BACKEND=postgres DATABASE_URL="$DATABASE_URL" \
+STORAGE_BACKEND=postgres DATABASE_URL="$DATABASE_URL" DATABASE_APP_ROLE="$APP_ROLE" \
   HOST=127.0.0.1 PORT="$LOADTEST_PORT" PUBLIC_URL="http://127.0.0.1:${LOADTEST_PORT}" \
   EMBEDDING_PROVIDER=none LOG_LEVEL=WARNING \
   RATE_LIMIT_MCP_PER_MINUTE=1000000 RATE_LIMIT_MCP_BURST=100000 \
@@ -118,9 +135,9 @@ echo "isolated baseline (one sequential call each, idle server, no concurrency):
 # load tool: if this is already slow, the k6 thresholds below never had a
 # chance regardless of load modelling.
 BASELINE_TOKEN=$(jq -r '.tokens[0].token' "${WORKDIR}/k6-context.json")
-BASELINE_READ_PATH=$(jq -r '.read_paths[0]' "${WORKDIR}/k6-context.json")
+BASELINE_READ_PATH=$(jq -r '.tokens[0].read_paths[0]' "${WORKDIR}/k6-context.json")
 BASELINE_QUERY=$(head -n1 "${WORKDIR}/vault-out/queries.jsonl" | jq -r '.query')
-BASELINE_WRITE_PATH="loadtest-writes/fact/baseline-$(date +%s).md"
+BASELINE_WRITE_PATH="me/fact/baseline-$(date +%s).md"
 
 mcp_call() {
   curl --silent --show-error --output /dev/null --write-out '%{time_total}' \

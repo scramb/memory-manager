@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// memory_write + memory_edit scenario (#108): each iteration creates a new
-// note in a dedicated namespace (`loadtest-writes`, never one of the
-// generator's synthetic namespaces) and edits it once, so the scenario
-// measures both write-tool call shapes end to end. The path is keyed by
-// `RUN_ID`-`__VU`-`__ITER`, so two runs - or two iterations of the same VU -
-// never collide on `if_version: 'new'`.
+// memory_write + memory_edit scenario (#108, #124): each iteration creates a
+// new note in the calling principal's own personal namespace (`me`, never a
+// namespace outside what RLS lets this token write to) and edits it once, so
+// the scenario measures both write-tool call shapes end to end. The path is
+// keyed by `RUN_ID`-`__VU`-`__ITER`, so two runs - or two iterations of the
+// same VU - never collide on `if_version: 'new'`.
 //
 // Round 2 (#108): `RUN_ID` is `Date.now()` - a bare 13-digit number - and
 // used to go straight into the note's `title` frontmatter value. The
@@ -17,7 +17,7 @@
 // *path* only (paths are never secret-scanned) - the written content below
 // never repeats it, so it can never trip the rule.
 
-import { toolsCall, vuToken } from './lib.js';
+import { toolsCall, vuPrincipal } from './lib.js';
 
 const RUN_ID = __ENV.MM_RUN_ID || `${Date.now()}`;
 
@@ -26,8 +26,9 @@ const OLD_STR = 'lumen vantrix obelisk cobalt ember.';
 const NEW_STR = 'lumen vantrix obelisk cobalt ember edited.';
 
 export function write() {
+  const principal = vuPrincipal();
   const slug = `${RUN_ID}-${__VU}-${__ITER}`;
-  const path = `loadtest-writes/fact/${slug}.md`;
+  const path = `me/fact/${slug}.md`;
   const content =
     '---\n' +
     'title: Load test write\n' +
@@ -36,7 +37,7 @@ export function write() {
     '---\n' +
     BODY;
 
-  const token = vuToken();
+  const token = principal.token;
   const created = toolsCall(token, 'memory_write', {
     path: path,
     content: content,

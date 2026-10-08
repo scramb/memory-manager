@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Shared k6 helpers for the loadtest scenarios (#108): one `tools/call`
+// Shared k6 helpers for the loadtest scenarios (#108, #124): one `tools/call`
 // JSON-RPC POST against the MCP endpoint, stateless - no prior `initialize`,
 // the server's stateless Streamable HTTP transport serves a bare `tools/call`
 // anyway (ADR-0009 §1, pinned server-side by `tests/test_stateless_transport.
 // py`) - plus the context side file `loadtest/load.py` writes: the server's
-// base URL, a sample of known note paths (`memory_read` must never be driven
-// by a ULID, only a vault-relative path), and one static token per synthetic
-// principal.
+// base URL and one synthetic principal per static token, each carrying its
+// own `alias` (its generator namespace alias), `namespaces` (its full
+// membership, for bookkeeping) and `read_paths` (a sample of its own
+// `me/...`/`org/...` paths - `memory_read` must never be driven by a ULID,
+// only a vault-relative path, and never a path this principal cannot
+// actually read under RLS).
 //
 // `MCP_JSON_RESPONSE` defaults to true (`config.py`), so every response here
 // is a single JSON object, never an SSE stream - `toolsCall` always calls
@@ -27,7 +30,6 @@ if (!CONTEXT_FILE) {
 const context = JSON.parse(open(CONTEXT_FILE));
 
 export const BASE_URL = context.base_url;
-export const READ_PATHS = context.read_paths;
 
 export const TOKENS = new SharedArray('loadtest-tokens', function () {
   return context.tokens;
@@ -60,11 +62,11 @@ function logErrorSample(name, payload) {
   );
 }
 
-// Each VU keeps one synthetic principal's token for the run's whole
-// lifetime - every VU exercises one principal end to end, rather than a
-// fresh random pick per request.
-export function vuToken() {
-  return TOKENS[(__VU - 1) % TOKENS.length].token;
+// Each VU keeps one synthetic principal for the run's whole lifetime - every
+// VU exercises one principal end to end (its own token, namespaces and
+// read_paths), rather than a fresh random pick per request.
+export function vuPrincipal() {
+  return TOKENS[(__VU - 1) % TOKENS.length];
 }
 
 // One `tools/call` JSON-RPC POST, checked for transport success (HTTP 200,
