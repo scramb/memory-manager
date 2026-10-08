@@ -17,19 +17,18 @@
 storage:
   backend: postgres
 
-# Entra login (ADR-0006) - WP-22 defines the Entra-specific env/secret
-# keys this mode actually needs; the oidc block below is unused once
-# that lands and stays only as a placeholder until then (#250's own "Not
-# included": "Entra env keys beyond placeholders").
+# Entra login (ADR-0006) - this mode's own entra sub-block carries the
+# ENTRA_* envs/secret the EntraAuthenticator's own `from_env` builder
+# actually needs (#257); the oidc sub-block above stays the chart's own
+# unused default in this mode.
 login:
   mode: entra
-  oidc:
-    # Placeholder only - a real tenant's issuer is Microsoft's own fixed
-    # identity-platform hostname followed by that tenant's own id; set
-    # your own tenant's issuer here.
-    issuer: https://login.example.com/00000000-0000-0000-0000-000000000000
-    clientId: memory-manager
-    allowedEmails: you@example.com
+  entra:
+    # Placeholders only - deploy/entra's OpenTofu module creates the real
+    # app registration and prints both (#256); set your own in a further
+    # overlay, never by editing this file in place.
+    tenantId: "00000000-0000-0000-0000-000000000000"
+    clientId: "00000000-0000-0000-0000-000000000000"
 
 database:
   appRole: memory_manager_app

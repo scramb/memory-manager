@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Installs charts/memory-manager (#45) with the enterprise profile
+# (charts/memory-manager/values-enterprise.yaml, WP-29) instead of
+# ../helmrelease.yaml's single-replica defaults: storage's own backend
+# "postgres", Entra login (ADR-0006), a 3-instance CNPG Cluster with
+# Barman Cloud plugin backups (#252), a CPU HorizontalPodAutoscaler for
+# both the api and worker Deployments, and per-component NetworkPolicies
+# (#255). Every value below mirrors values-enterprise.yaml's own
+# settings, plus the operator-specific bits that file deliberately
+# leaves open for a further overlay (publicUrl, hostnames, the
+# ExternalSecret target names, the backup bucket/endpoint) - every one of
+# those is still a placeholder here too (CLAUDE.md: a public repository
+# carries no operator-specific values); patch them in your own Flux
+# Kustomization, same pattern as ../README.md's own "Applying this"
+# example.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager
+spec:
+  interval: 10m
+  releaseName: memory-manager
+  chart:
+    spec:
+      chart: memory-manager
+      # The enterprise profile ships from 0.2.0 onward (WP-29/WP-30);
+      # ../helmrelease.yaml's own ">=0.1.0 <0.2.0" stays pinned to the
+      # single-replica line that predates it.
+      version: ">=0.2.0 <0.3.0"
+      sourceRef:
+        kind: HelmRepository
+        name: memory-manager
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    storage:
+      backend: postgres
+    publicUrl: https://memory.example.com
+    vault:
+      remote: "git@git.example.com:memory-manager/vault.git"
+      branch: main
+    # ADR-0006 - deploy/entra's own OpenTofu module creates the app
+    # registration and prints tenantId/clientId (#256); set your own in a
+    # further overlay.
+    login:
+      mode: entra
+      entra:
+        tenantId: "00000000-0000-0000-0000-000000000000"
+        clientId: "00000000-0000-0000-0000-000000000000"
+      namespaces: personal
+    # Points at externalsecret.yaml's own "memory-manager-secrets" target,
+    # not the chart's "<release>-secrets" default (that coincides only
+    # when the release is also named "memory-manager", same note
+    # ../helmrelease.yaml's own comment makes) - explicit either way.
+    secrets:
+      existingSecret: memory-manager-secrets
+    database:
+      appRole: memory_manager_app
+      cnpg:
+        enabled: true
+        instances: 3
+        backup:
+          enabled: true
+          # Placeholder bucket/endpoint (values.yaml) - set your own in a
+          # further overlay.
+          destinationPath: s3://memory-manager-backups/
+          endpointURL: https://object-store.example.com
+          # Points at externalsecret.yaml's own
+          # "memory-manager-backup-credentials" target, not the chart's
+          # "<cnpg cluster name>-backup-credentials" default - explicit
+          # for the same reason the secrets block's own existingSecret
+          # above is.
+          existingSecret: memory-manager-backup-credentials
+    api:
+      autoscaling:
+        enabled: true
+    worker:
+      autoscaling:
+        enabled: true
+    # Off here: the 3-instance CNPG Cluster above already covers the same
+    # rate-limit/login state (values-enterprise.yaml's own comment).
+    valkey:
+      enabled: false
+    # Per-component policies (#255); namespaceSelector/podSelector stay
+    # "matches everywhere" until patched to the operator's own
+    # gateway/Prometheus/CNPG-operator namespace in a further overlay.
+    networkPolicy:
+      enabled: true
+    httpRoute:
+      enabled: true
+      parentRefs:
+        - name: gateway-name
+          namespace: gateway-namespace
+      hostnames:
+        - memory.example.com

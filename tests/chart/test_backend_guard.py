@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Guards the storage.backend <-> scaling contract (#249, ADR-0007,
 ADR-0009 §6): the Git backend stays single replica with no autoscaler;
-only storage.backend "postgres" may scale. Exercised through a real `helm
-template` render, so both the schema's own "if"/"then"
-(values.schema.json) and the template-side guard
-(templates/_helpers.tpl's "memory-manager.validate") are proven, not just
-read.
+only storage.backend "postgres" may scale. Also guards login.mode "entra"
+against the Git backend (#257, ADR-0006 addendum 2026-10-08: the server's
+own build_authenticator, http.py, refuses LOGIN_MODE=entra without
+STORAGE_BACKEND=postgres). Exercised through a real `helm template`
+render, so both the schema's own "if"/"then" (values.schema.json) and the
+template-side guard (templates/_helpers.tpl's "memory-manager.validate")
+are proven, not just read.
 """
 
 from __future__ import annotations
@@ -75,6 +77,20 @@ def test_git_backend_refuses_an_autoscaler(render: Callable[..., _ChartRender]) 
 
     assert result.returncode != 0
     assert "autoscaler" in (result.stdout + result.stderr).lower()
+
+
+def test_git_backend_refuses_entra_login(render: Callable[..., _ChartRender]) -> None:
+    # Caught by values.schema.json's own "if"/"then" (login.mode's enum
+    # drops "entra" once storage.backend is "git") before
+    # templates/_helpers.tpl's "memory-manager.validate" guard ever runs -
+    # same layering test_git_backend_refuses_more_than_one_replica above
+    # exercises for replicaCount.
+    result = render(set_values={"login.mode": "entra"})
+
+    assert result.returncode != 0
+    error = (result.stdout + result.stderr).lower()
+    assert "login" in error and "mode" in error
+    assert "oidc" in error and "password" in error
 
 
 def test_postgres_backend_allows_more_than_one_replica(render: Callable[..., _ChartRender]) -> None:

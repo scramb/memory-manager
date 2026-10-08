@@ -126,6 +126,14 @@ against the real Flux/External Secrets CRD schemas (the CRD catalog `-schema-loc
 it does not render the Helm chart itself (that is `helm template` + `kubeconform`, already covered
 by `charts/memory-manager/README.md`'s own "Validate before installing" and the CI `deploy` job).
 
+## Enterprise variant
+
+[`enterprise/`](./enterprise/README.md) installs the chart's own enterprise profile instead
+(`storage` → `backend` `postgres`, Entra login, autoscaling, CNPG with Barman Cloud plugin backups,
+per-component `NetworkPolicy` objects, #257) - a separate directory, not a patch on top of this
+one, since the two differ in almost every value that matters (backend, login mode, replica
+model).
+
 ## Not included
 
 - Cloudflare Tunnel as an `HTTPRoute`/`Ingress` alternative - [`docs/guides/cloudflare-tunnel.md`](../../docs/guides/cloudflare-tunnel.md) (#47).

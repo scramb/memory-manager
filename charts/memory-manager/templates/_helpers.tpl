@@ -162,15 +162,17 @@ Included by templates/valkey.yaml; renders no output of its own.
 
 {{/*
 Fails fast when storage's own backend is "git" and combined with more
-than one replica or any autoscaler (ADR-0007, ADR-0009 §6: only a
-"postgres" backend may scale) - a template-side guard alongside
-values.schema.json's own "if"/"then", since `helm template
---skip-schema-validation` exists. Included by templates/deployment.yaml;
-renders no output of its own. Checks both a generic top-level
-"autoscaling" block (kept for callers that set one directly) and the
-api and worker blocks' own component-scoped autoscaling (and, for api,
-keda) sub-blocks the chart itself renders from (#251, ADR-0009 addendum
-2026-10-08).
+than one replica, any autoscaler (ADR-0007, ADR-0009 §6: only a
+"postgres" backend may scale), or login's own mode "entra" (ADR-0006
+addendum 2026-10-08: the server's own build_authenticator, http.py,
+refuses to start LOGIN_MODE=entra without STORAGE_BACKEND=postgres,
+#257) - a template-side guard alongside values.schema.json's own
+"if"/"then", since `helm template --skip-schema-validation` exists.
+Included by templates/deployment.yaml; renders no output of its own.
+Checks both a generic top-level "autoscaling" block (kept for callers
+that set one directly) and the api and worker blocks' own
+component-scoped autoscaling (and, for api, keda) sub-blocks the chart
+itself renders from (#251, ADR-0009 addendum 2026-10-08).
 */}}
 {{- define "memory-manager.validate" -}}
 {{- if eq .Values.storage.backend "git" }}
@@ -183,6 +185,9 @@ keda) sub-blocks the chart itself renders from (#251, ADR-0009 addendum
 {{- end }}
 {{- if or .Values.api.autoscaling.enabled .Values.api.keda.enabled .Values.worker.autoscaling.enabled }}
 {{- fail "storage.backend \"git\" does not allow an autoscaler (HPA or KEDA) - only storage.backend \"postgres\" may scale (ADR-0007, ADR-0009 §6)" }}
+{{- end }}
+{{- if eq .Values.login.mode "entra" }}
+{{- fail "login.mode \"entra\" requires storage.backend \"postgres\" (ADR-0006 addendum 2026-10-08, http.py's own build_authenticator check) - storage.backend \"git\" never starts with LOGIN_MODE=entra" }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -198,6 +203,22 @@ Included by templates/api-deployment.yaml; renders no output of its own.
 {{- define "memory-manager.validateApiAutoscaling" -}}
 {{- if and .Values.api.autoscaling.enabled .Values.api.keda.enabled }}
 {{- fail "api.autoscaling.enabled and api.keda.enabled are mutually exclusive - a KEDA ScaledObject creates its own HorizontalPodAutoscaler (ADR-0009 addendum 2026-10-08)" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fails fast when login's own mode is "entra" and its own entra sub-block
+is missing tenantId/clientId (#257) - the same two variables the
+EntraAuthenticator's own `from_env` builder (src/memory_manager/auth/
+login_entra.py) refuses to start without, caught here instead of at
+container start. Included by templates/api-deployment.yaml; renders no
+output of its own.
+*/}}
+{{- define "memory-manager.validateEntra" -}}
+{{- if eq .Values.login.mode "entra" }}
+{{- if or (not .Values.login.entra.tenantId) (not .Values.login.entra.clientId) }}
+{{- fail "login.mode \"entra\" requires login.entra.tenantId and login.entra.clientId (ADR-0006, EntraAuthenticator.from_env)" }}
+{{- end }}
 {{- end }}
 {{- end }}
 

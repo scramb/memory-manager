@@ -10,6 +10,7 @@
 {{- if eq .Values.storage.backend "postgres" }}
 {{- include "memory-manager.validateShutdown" . }}
 {{- include "memory-manager.validateApiAutoscaling" . }}
+{{- include "memory-manager.validateEntra" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -114,10 +115,51 @@ spec:
             # ADMIN_PASSWORD_HASH secret key) is the quickstart alternative.
             - name: LOGIN_MODE
               value: {{ .Values.login.mode | quote }}
-            {{- /* "entra" reuses the OIDC client (ADR-0006 §1); WP-22 adds
-            the Entra-specific envs this mode also needs - out of scope
-            here (#250's own "Not included"). */}}
-            {{- if or (eq .Values.login.mode "oidc") (eq .Values.login.mode "entra") }}
+            {{- /* "entra" delegates the human login step to Microsoft Entra
+            ID (ADR-0006) and reads only its own ENTRA_* envs below - the
+            EntraAuthenticator's own `from_env` builder
+            (src/memory_manager/auth/login_entra.py) never touches the
+            oidc sub-block above login, unlike the plain "oidc" mode
+            (#257, validateEntra included above). */}}
+            {{- if eq .Values.login.mode "entra" }}
+            - name: ENTRA_TENANT_ID
+              value: {{ .Values.login.entra.tenantId | quote }}
+            - name: ENTRA_CLIENT_ID
+              value: {{ .Values.login.entra.clientId | quote }}
+            - name: ENTRA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memory-manager.secretName" . }}
+                  key: ENTRA_CLIENT_SECRET
+            {{- with .Values.login.entra.allowedTenants }}
+            - name: ENTRA_ALLOWED_TENANTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.login.entra.authority }}
+            - name: ENTRA_AUTHORITY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.login.entra.graphUrl }}
+            - name: ENTRA_GRAPH_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.login.entra.allowInsecureAuthority }}
+            - name: ENTRA_ALLOW_INSECURE_AUTHORITY
+              value: "true"
+            {{- end }}
+            {{- if .Values.login.entra.groupsTtlSeconds }}
+            - name: ENTRA_GROUPS_TTL_SECONDS
+              value: {{ .Values.login.entra.groupsTtlSeconds | quote }}
+            {{- end }}
+            {{- if .Values.login.entra.accessTokenMinutes }}
+            - name: ENTRA_ACCESS_TOKEN_MINUTES
+              value: {{ .Values.login.entra.accessTokenMinutes | quote }}
+            {{- end }}
+            {{- if .Values.login.entra.maxSessionSeconds }}
+            - name: ENTRA_MAX_SESSION
+              value: {{ .Values.login.entra.maxSessionSeconds | quote }}
+            {{- end }}
+            {{- else if eq .Values.login.mode "oidc" }}
             - name: OIDC_ISSUER
               value: {{ .Values.login.oidc.issuer | quote }}
             - name: OIDC_CLIENT_ID

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Identical to ../namespace.yaml - duplicated rather than referenced by
+# relative path, because `kustomize build`'s own root-only load
+# restriction (the default `kubectl kustomize` runs with, kept on
+# purpose: "this does ... break the relocatability of the kustomization")
+# refuses a `resources:` entry outside this directory. An operator who
+# wants a different namespace renames this file's own `name` and the
+# `namespace:` transformer in `kustomization.yaml` together, in their own
+# fork/overlay, not here (CLAUDE.md: no operator-specific values in this
+# public repository).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: memory-manager
+  labels:
+    app.kubernetes.io/name: memory-manager

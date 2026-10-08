@@ -247,10 +247,13 @@ vault:
   branch: main
 
 # Login at /authorize (ADR-0004 L2). "oidc" (default, production) needs an
-# upstream provider; "password" (deploy/README.md's quickstart
-# alternative) needs the secrets block's own "values" adminPasswordHash
-# field (or its "existingSecret"'s ADMIN_PASSWORD_HASH key) instead,
-# generated with `memory-manager hash-password`.
+# upstream provider; "entra" (ADR-0006, enterprise) delegates to Microsoft
+# Entra ID instead, via the entra block below - its own tenantId/clientId
+# are required once mode is "entra" (chart's own validateEntra helper);
+# "password" (deploy/README.md's quickstart alternative) needs the
+# secrets block's own "values" adminPasswordHash field (or its
+# "existingSecret"'s ADMIN_PASSWORD_HASH key) instead, generated with
+# `memory-manager hash-password`.
 login:
   mode: oidc
   oidc:
@@ -258,6 +261,25 @@ login:
     clientId: memory-manager
     # Deny-by-default allowlist (ADR-0004 addendum), comma-separated.
     allowedEmails: you@example.com
+  # mode: entra only - the EntraAuthenticator's own `from_env` builder's
+  # ENTRA_* variables (src/memory_manager/auth/login_entra.py); unused in
+  # every other mode.
+  # The client secret lives in the secrets block below (ENTRA_CLIENT_SECRET),
+  # never here.
+  entra:
+    # Required (placeholders; set your own tenant and app registration -
+    # deploy/entra's OpenTofu module creates one and prints both, #256).
+    tenantId: ""
+    clientId: ""
+    # Optional - defaults (ADR-0006 §1-§5) match the EntraAuthenticator's
+    # own `from_env` fallbacks when left empty/false/null.
+    allowedTenants: ""
+    authority: ""
+    graphUrl: ""
+    allowInsecureAuthority: false
+    groupsTtlSeconds: null
+    accessTokenMinutes: null
+    maxSessionSeconds: null
   # Subjects with no entry in LOGIN_NAMESPACE_MAP fall back to this.
   namespaces: personal
 
@@ -283,9 +305,10 @@ logFormat: json
 secrets:
   # An operator-managed Secret carrying the keys deploy/secrets.yaml
   # documents (SSH_PRIVATE_KEY, SSH_KNOWN_HOSTS, VAULT_WEBHOOK_SECRET,
-  # OIDC_CLIENT_SECRET, OAUTH_CLIENT_SECRET_KEY, and ADMIN_PASSWORD_HASH
-  # when login's own mode is "password") - recommended for every real
-  # install. Defaults to "<release>-memory-manager-secrets" when empty.
+  # OIDC_CLIENT_SECRET, OAUTH_CLIENT_SECRET_KEY, ADMIN_PASSWORD_HASH when
+  # login's own mode is "password", and ENTRA_CLIENT_SECRET when it is
+  # "entra") - recommended for every real install. Defaults to
+  # "<release>-memory-manager-secrets" when empty.
   existingSecret: ""
   # Chart-managed Secret from this block's own "values" below instead - a
   # quick-install convenience, NOT for production (templates/secret.yaml):
@@ -298,6 +321,7 @@ secrets:
     # oidcClientSecret: ""
     # oauthClientSecretKey: ""
     # adminPasswordHash: ""
+    # entraClientSecret: ""
 
 database:
   cnpg:
