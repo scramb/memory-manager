@@ -41,6 +41,8 @@ import httpx
 import uvicorn
 from http_fixtures import Server, free_port, wait_until_ready
 
+from memory_manager import jobs
+from memory_manager.db.migrate import migrate
 from memory_manager.http import GracefulShutdownServer
 from memory_manager.worker import Job, _job_loop, _lock_key, _run_singleton, create_worker_app
 
@@ -371,3 +373,64 @@ async def test_sigterm_turns_readyz_503_and_the_process_exits_cleanly(
         returncode = await asyncio.wait_for(server.process.wait(), timeout=10.0)
 
     assert returncode == -signal.SIGTERM
+
+
+async def test_create_worker_apps_lifespan_consumes_an_enqueued_job(test_database_url: str) -> None:
+    """`create_worker_app`'s own `jobs`-outbox wiring (#218): passing
+    `jobs_listen_conn`/`job_handlers` starts a real `worker.consume_jobs`
+    loop inside the app's `lifespan` - the same wiring `cli.py`'s
+    `_serve_worker` does for the real `memory-manager worker` process
+    (`jobs_listen_conn=<a dedicated connection>`, `job_handlers=
+    build_job_handlers(config)`), not just `consume_jobs` called directly
+    (`tests/jobs/test_queue.py`'s own tests).
+
+    No job kind is registered in production yet (`build_job_handlers` is
+    empty today, #219's own follow-up) - this test registers one of its own
+    (`"probe"`) to prove the wiring actually dispatches a claimed job to a
+    handler and completes it, which only a `consume_jobs` loop genuinely
+    running inside this app's `lifespan` could ever do.
+    """
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    listen_conn = await asyncpg.connect(test_database_url)
+    handled = asyncio.Event()
+
+    async def handler(_pool: asyncpg.Pool, _payload: Mapping[str, object]) -> None:
+        handled.set()
+
+    app = create_worker_app(
+        pool,
+        [],
+        shutdown_grace_seconds=5,
+        jobs_listen_conn=listen_conn,
+        job_handlers={"probe": handler},
+        jobs_poll_seconds=0.2,
+    )
+    try:
+        async with app.router.lifespan_context(app):
+            async with pool.acquire() as conn, conn.transaction():
+                job_id = await jobs.enqueue(conn, "probe", {"note_id": "n-1"})
+
+            await asyncio.wait_for(handled.wait(), timeout=5.0)
+
+            # `handled` is set inside the handler, just before `consume_jobs`'s
+            # own `jobs.complete` call - a short, bounded wait for the state to
+            # actually land, rather than a race against that one extra `UPDATE`.
+            row = None
+            for _ in range(20):
+                row = await pool.fetchrow("select state from jobs where id = $1", job_id)
+                assert row is not None
+                if row["state"] == "done":
+                    break
+                await asyncio.sleep(0.05)
+    finally:
+        await listen_conn.close()
+        await pool.close()
+
+    assert row is not None
+    assert row["state"] == "done"

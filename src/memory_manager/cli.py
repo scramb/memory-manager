@@ -16,9 +16,10 @@ gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
-`worker` runs `worker.py`'s periodic singleton jobs as a separate process
-(#217, ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still
-runs its own equivalent sweep inside every `serve --http` process instead
+`worker` runs `worker.py`'s periodic singleton jobs, plus the `jobs` outbox
+consumer (#218, `worker.consume_jobs`), as a separate process (#217,
+ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still runs
+its own equivalent sweep inside every `serve --http` process instead
 (ADR-0009 §6, `http.py`'s `_cleanup_loop`); connects to Postgres as the
 owner, like `reindex`/`token ...` already do (ADR-0008 addendum), never
 switching to `DATABASE_APP_ROLE`.
@@ -97,7 +98,7 @@ from memory_manager.migrate_git import ImportReport as MigrateImportReport
 from memory_manager.observability.logging import configure_logging_from_env
 from memory_manager.vault.blocklist import BlocklistConfigError
 from memory_manager.vault.validate import NOTE_TYPES
-from memory_manager.worker import build_jobs, create_worker_app
+from memory_manager.worker import build_job_handlers, build_jobs, create_worker_app
 
 __all__ = ["main"]
 
@@ -1192,6 +1193,14 @@ async def _serve_worker() -> int:
     (`_open_migrated_pool`, the same connection shape `reindex`/`token ...` already
     use) - never `DATABASE_APP_ROLE` (ADR-0008 addendum: a system identity, not a
     request principal).
+
+    Also opens one dedicated connection (`jobs_listen_conn`, never from
+    `pool`) for the `jobs` outbox's `LISTEN` (#218, `worker.consume_jobs`'s
+    own docstring: a pool connection's `RESET ALL` on release would drop it)
+    - `DATABASE_URL` is read a second time here rather than threaded out of
+    `_open_migrated_pool`, which only ever returns the pool it already
+    opened from that same URL; by this point `_open_migrated_pool` having
+    returned a pool at all already proves the variable is set.
     """
     storage_backend = storage_backend_from_env(dict(os.environ))
     if storage_backend != "postgres":
@@ -1210,10 +1219,17 @@ async def _serve_worker() -> int:
     if pool is None:
         return 2
 
+    jobs_listen_conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     try:
         jobs = build_jobs(config)
+        job_handlers = build_job_handlers(config)
         app = create_worker_app(
-            pool, jobs, shutdown_grace_seconds=worker_config.shutdown_grace_seconds
+            pool,
+            jobs,
+            shutdown_grace_seconds=worker_config.shutdown_grace_seconds,
+            jobs_listen_conn=jobs_listen_conn,
+            job_handlers=job_handlers,
+            jobs_poll_seconds=worker_config.jobs_poll_seconds,
         )
         uvicorn_config = uvicorn.Config(
             app,
@@ -1225,6 +1241,7 @@ async def _serve_worker() -> int:
         server = GracefulShutdownServer(uvicorn_config)
         await server.serve()
     finally:
+        await jobs_listen_conn.close()
         await pool.close()
     return 0
 

@@ -75,6 +75,12 @@ _Connectable = asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 # is append-only: no `update`/`delete` grant.
 _FULL_DML_TABLES = ("vault_notes", "notes", "chunks", "links")
 _APPEND_ONLY_TABLES = ("vault_revisions",)
+# `jobs` (migration 0011_jobs.sql, #218): a request transaction only ever
+# enqueues - `claim`/`complete`/`fail`/`fail_or_retry` run as the owner, never
+# under this role (`jobs.py`'s own module docstring) - so, unlike
+# `_APPEND_ONLY_TABLES` above, the app role gets no `SELECT` here at all; it
+# can insert a row but never read one back.
+_INSERT_ONLY_TABLES = ("jobs",)
 # `(name, argument signature)`: `grant_app_role`'s loop below formats the
 # signature straight into the `GRANT EXECUTE` statement, so
 # `mm_principal_namespaces` (0009_namespace_resolution.sql) - the one
@@ -137,6 +143,8 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
             await conn.execute(f'grant select, insert, update, delete on "{table}" to "{role}"')
         for table in _APPEND_ONLY_TABLES:
             await conn.execute(f'grant select, insert on "{table}" to "{role}"')
+        for table in _INSERT_ONLY_TABLES:
+            await conn.execute(f'grant insert on "{table}" to "{role}"')
         # `chunks.id` is a plain `bigserial`, not an identity column: its
         # sequence needs its own `USAGE` grant for `insert` to work. The
         # other tables' primary keys are either client-supplied text

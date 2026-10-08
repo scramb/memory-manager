@@ -53,6 +53,10 @@ _FALSY_BOOL_ENV = frozenset({"0", "false", "no", "off", ""})
 _DEFAULT_WORKER_HOST = "127.0.0.1"
 _DEFAULT_WORKER_PORT = 8090
 
+# `WorkerConfig.jobs_poll_seconds` (#218): docs/research/enterprise.md
+# §"Queue" names 1-5s polling as the `jobs` outbox's NOTIFY fallback.
+_DEFAULT_JOBS_POLL_SECONDS = 5.0
+
 # Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
 # "burst" is the token bucket's capacity - how many calls a key can make
 # back-to-back before the per-minute rate takes over. See `ServerConfig`'s
@@ -707,20 +711,29 @@ class WorkerConfig:
     knob, not two, since both processes drain the same way on `SIGTERM`:
     stop scheduling new work, let whatever is already running finish within
     this many seconds, then exit.
+
+    `jobs_poll_seconds` (`JOBS_POLL_SECONDS`, default 5s) is the `jobs`
+    outbox consumer's poll fallback (#218, `worker.consume_jobs`,
+    docs/research/enterprise.md §"Queue": "1-5 s polling as fallback") -
+    `LISTEN/NOTIFY` is only ever a wake-up hint, so this is the ceiling on
+    how long a claimable job can wait for a notification that never
+    arrives, not how often the worker normally wakes up.
     """
 
     host: str = _DEFAULT_WORKER_HOST
     port: int = _DEFAULT_WORKER_PORT
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
+    jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> WorkerConfig:
         """Build a `WorkerConfig` from `WORKER_HOST`/`WORKER_PORT`/
-        `SHUTDOWN_GRACE_SECONDS` entries of `environ`.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS` entries of `environ`.
 
         Raises `WorkerConfigError` with a message naming the offending
-        variable if `WORKER_PORT` is not a valid port number, or
-        `SHUTDOWN_GRACE_SECONDS` is not a positive integer.
+        variable if `WORKER_PORT` is not a valid port number, or either
+        `SHUTDOWN_GRACE_SECONDS` or `JOBS_POLL_SECONDS` is not a positive
+        number.
         """
         host = environ.get("WORKER_HOST", _DEFAULT_WORKER_HOST)
         try:
@@ -730,13 +743,22 @@ class WorkerConfig:
             shutdown_grace_seconds = _parse_positive_int(
                 environ, "SHUTDOWN_GRACE_SECONDS", _DEFAULT_SHUTDOWN_GRACE_SECONDS
             )
+            jobs_poll_seconds = _parse_positive_float(
+                environ, "JOBS_POLL_SECONDS", _DEFAULT_JOBS_POLL_SECONDS
+            )
         except ServerConfigError as exc:
-            # `_parse_port`/`_parse_positive_int` raise `ServerConfigError` (shared with
-            # `ServerConfig`, which reuses both) - re-raised as this module's own
-            # `WorkerConfigError` so a caller catching errors for `memory-manager worker`
-            # never has to also know about `ServerConfig`'s.
+            # `_parse_port`/`_parse_positive_int`/`_parse_positive_float` raise
+            # `ServerConfigError` (shared with `ServerConfig`, which reuses all three) -
+            # re-raised as this module's own `WorkerConfigError` so a caller catching
+            # errors for `memory-manager worker` never has to also know about
+            # `ServerConfig`'s.
             raise WorkerConfigError(str(exc)) from exc
-        return cls(host=host, port=port, shutdown_grace_seconds=shutdown_grace_seconds)
+        return cls(
+            host=host,
+            port=port,
+            shutdown_grace_seconds=shutdown_grace_seconds,
+            jobs_poll_seconds=jobs_poll_seconds,
+        )
 
 
 def _parse_port(raw: str | None, *, name: str = "PORT", default: int = _DEFAULT_PORT) -> int:

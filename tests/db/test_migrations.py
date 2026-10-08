@@ -43,6 +43,7 @@ class TestMigrate:
             "0008_frequent_lexemes",
             "0009_namespace_resolution",
             "0010_oauth_token_principal",
+            "0011_jobs",
             "0013_vault_notes_namespace_idx",
         ]
         tables = {
@@ -71,6 +72,7 @@ class TestMigrate:
             "project_members",
             "namespace_settings",
             "break_glass_grants",
+            "jobs",
         }
 
     async def test_running_twice_applies_nothing_the_second_time(
@@ -90,6 +92,7 @@ class TestMigrate:
             "0008_frequent_lexemes",
             "0009_namespace_resolution",
             "0010_oauth_token_principal",
+            "0011_jobs",
             "0013_vault_notes_namespace_idx",
         ]
         assert second == []
@@ -116,6 +119,7 @@ class TestMigrate:
             "0008_frequent_lexemes",
             "0009_namespace_resolution",
             "0010_oauth_token_principal",
+            "0011_jobs",
             "0013_vault_notes_namespace_idx",
         ]
 
@@ -180,6 +184,7 @@ class TestMigrate:
                 "0008_frequent_lexemes",
                 "0009_namespace_resolution",
                 "0010_oauth_token_principal",
+                "0011_jobs",
                 "0013_vault_notes_namespace_idx",
             ]
         finally:

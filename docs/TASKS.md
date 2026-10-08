@@ -226,7 +226,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 
 - [ ] #125 Vector-index spike → `docs/research/vector-index.md` + ADR-0016 (Proposed)
 - [x] #217 `memory-manager worker` with health/ready/metrics port; singleton jobs; OAuth cleanup moved from api
-- [ ] #218 `jobs` outbox: enqueue in write tx, `SKIP LOCKED`, `LISTEN/NOTIFY` + poll ⛔ blocked by #217
+- [x] #218 `jobs` outbox: enqueue in write tx, `SKIP LOCKED`, `LISTEN/NOTIFY` + poll ⛔ blocked by #217
 - [ ] #219 Asynchronous embeddings via `jobs` in Postgres mode ⛔ blocked by #218
 - [ ] #220 Chunks schema per ADR-0016; `EMBEDDING_DIMENSIONS` pinned at first migrate ⛔ blocked by #125, ADR-0016 accepted (spike #125), #219
 - [ ] #221 Per-kind vector search with ADR-0016 HNSW settings, RRF-fused ⛔ blocked by #220
