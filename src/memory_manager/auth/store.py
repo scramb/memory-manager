@@ -135,7 +135,11 @@ class PendingRow:
 
 @dataclass(frozen=True)
 class StoredCode:
-    """One row of `oauth_auth_codes`: a single-use authorization code, not yet exchanged."""
+    """One row of `oauth_auth_codes`: a single-use authorization code, not yet exchanged.
+
+    `user_oid`/`roles` are the Entra principal a completed Entra login established
+    (ADR-0006, #213) - `None`/`()` for every `password`/`oidc` code, unchanged.
+    """
 
     client_id: str
     subject: str
@@ -146,11 +150,19 @@ class StoredCode:
     redirect_uri_provided_explicitly: bool
     resource: str | None
     expires_at: datetime
+    user_oid: str | None
+    roles: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class StoredToken:
-    """One row of `oauth_tokens` - an access or a refresh token, by its plaintext's hash."""
+    """One row of `oauth_tokens` - an access or a refresh token, by its plaintext's hash.
+
+    `user_oid`/`roles` are the Entra principal this token's grant was issued to
+    (`None`/`()` for a `password`/`oidc` token, unchanged); `family_started_at` is the
+    family's own session start, carried unchanged across every refresh rotation of it
+    (`auth.provider`), `None` for the same `password`/`oidc` case.
+    """
 
     kind: str
     client_id: str
@@ -162,6 +174,9 @@ class StoredToken:
     client_label: str
     expires_at: datetime
     revoked_at: datetime | None
+    user_oid: str | None
+    roles: tuple[str, ...]
+    family_started_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -296,13 +311,18 @@ async def save_code(
     redirect_uri_provided_explicitly: bool,
     resource: str | None,
     ttl: timedelta,
+    user_oid: str | None = None,
+    roles: Sequence[str] = (),
 ) -> None:
+    """`user_oid`/`roles` are the Entra principal `auth.login.complete_authorization`
+    established (ADR-0006, #213); `None`/`()` for a `password`/`oidc` code, unchanged."""
     await pool.execute(
         """
         insert into oauth_auth_codes (
             code_hash, client_id, subject, namespaces, scopes, code_challenge,
-            redirect_uri, redirect_uri_provided_explicitly, resource, expires_at
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + $10)
+            redirect_uri, redirect_uri_provided_explicitly, resource, expires_at,
+            user_oid, roles
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + $10, $11, $12)
         """,
         _hash(code),
         client_id,
@@ -314,6 +334,8 @@ async def save_code(
         redirect_uri_provided_explicitly,
         resource,
         ttl,
+        user_oid,
+        list(roles),
     )
 
 
@@ -328,6 +350,8 @@ def _row_to_code(row: asyncpg.Record) -> StoredCode:
         redirect_uri_provided_explicitly=row["redirect_uri_provided_explicitly"],
         resource=row["resource"],
         expires_at=row["expires_at"],
+        user_oid=row["user_oid"],
+        roles=tuple(row["roles"]),
     )
 
 
@@ -367,13 +391,21 @@ async def save_token(
     family_id: str,
     client_label: str,
     ttl: timedelta,
+    user_oid: str | None = None,
+    roles: Sequence[str] = (),
+    family_started_at: datetime | None = None,
 ) -> None:
+    """`user_oid`/`roles`/`family_started_at` are the Entra principal and the family's
+    own session start (ADR-0006, #213) - `None`/`()`/`None` for a `password`/`oidc`
+    token, unchanged. `auth.provider._issue` sets `family_started_at` once, on the
+    first token of a family, and carries that same value, unmodified, through every
+    later rotation of it."""
     await pool.execute(
         """
         insert into oauth_tokens (
             token_hash, kind, client_id, subject, namespaces, scopes, resource,
-            family_id, client_label, expires_at
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + $10)
+            family_id, client_label, expires_at, user_oid, roles, family_started_at
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + $10, $11, $12, $13)
         """,
         _hash(token),
         kind,
@@ -385,6 +417,9 @@ async def save_token(
         family_id,
         client_label,
         ttl,
+        user_oid,
+        list(roles),
+        family_started_at,
     )
 
 
@@ -419,6 +454,9 @@ async def get_token(
         client_label=row["client_label"],
         expires_at=row["expires_at"],
         revoked_at=row["revoked_at"],
+        user_oid=row["user_oid"],
+        roles=tuple(row["roles"]),
+        family_started_at=row["family_started_at"],
     )
 
 
