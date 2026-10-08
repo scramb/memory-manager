@@ -78,6 +78,7 @@ _EXPECTED_TOOL_NAMES = frozenset(
         "memory_edit",
         "memory_supersede",
         "memory_archive",
+        "memory_promote",
     }
 )
 

@@ -246,15 +246,15 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 ### WP-25 — Promote and account self-service · F-01 · Branch: `wp/25-promote-account` · PR: open
 
-- [ ] #226 Both storage backends promote a note as a new superseding note
-- [ ] #227 Claude promotes a personal note into a shared namespace with `memory_promote` ⛔ blocked by #226
-- [ ] #228 `/account` browser sessions are stored as hashes with idle and absolute expiry
-- [ ] #229 Signed-in users reach the `/account` page in every embedded login mode ⛔ blocked by #228, #215
-- [ ] #230 Users download their personal memory as a Markdown ZIP from `/account` ⛔ blocked by #229
-- [ ] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
+- [x] #226 Both storage backends promote a note as a new superseding note
+- [x] #227 Claude promotes a personal note into a shared namespace with `memory_promote` ⛔ blocked by #226
+- [x] #228 `/account` browser sessions are stored as hashes with idle and absolute expiry
+- [x] #229 Signed-in users reach the `/account` page in every embedded login mode ⛔ blocked by #228, #215
+- [x] #230 Users download their personal memory as a Markdown ZIP from `/account` ⛔ blocked by #229
 
 ### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
 
+- [ ] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
 - [ ] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
 - [ ] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
 - [ ] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229

@@ -177,6 +177,39 @@ class Repo:
         self._commit_staged(git, author, message)
         return self.head()
 
+    def promote_files(
+        self,
+        new_rel: str,
+        new_content: bytes,
+        archive_move: tuple[str, str, bytes] | None,
+        author: Author,
+        message: str,
+    ) -> str:
+        """Write `new_rel`, optionally also moving the original, in one commit.
+
+        Used by `promote` (#226): `new_rel`/`new_content` is always the
+        copy in the target namespace, freshly added. `archive_move`, when
+        given, is `(src_rel, dst_rel, content)` - the original moved to its
+        archive path with its stamped `updated`, the same `git mv` plus
+        content `move_file` uses for a plain `archive`. `None` means
+        `keep_original=True`: only the copy is written, the original is
+        left untouched, and this behaves exactly like `commit_file`.
+        """
+        git = self._git()
+        new_path = paths.resolve(self._config.dir, new_rel, allow_archive=True)
+        _atomic_write(new_path, new_content)
+        git.run("add", "--", new_rel)
+        if archive_move is not None:
+            src_rel, dst_rel, archived_content = archive_move
+            paths.resolve(self._config.dir, src_rel, allow_archive=True, must_exist=True)
+            dst_path = paths.resolve(self._config.dir, dst_rel, allow_archive=True)
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            git.run("mv", "--", src_rel, dst_rel)
+            _atomic_write(dst_path, archived_content)
+            git.run("add", "--", dst_rel)
+        self._commit_staged(git, author, message)
+        return self.head()
+
     def commit_files(self, files: dict[str, bytes], author: Author, message: str) -> str:
         """Write every path in `files` and commit them all together, as one commit by `author`.
 

@@ -22,6 +22,7 @@ _REQUIRED_KEYWORDS = (
     "memory_search",  # look up before asserting
     "if_version",  # the write tools' version token
     "memory_supersede",  # replace a changed fact without erasing its history
+    "memory_promote",  # promote a personal note into a shared namespace
     "secrets",  # never store secrets/IDs/sensitive health data
     "data, not instructions",  # note content is data, not instructions
 )
@@ -60,6 +61,7 @@ async def test_list_tools_descriptions_all_carry_the_data_not_instructions_sente
         "memory_edit",
         "memory_supersede",
         "memory_archive",
+        "memory_promote",
     }
     for tool in listing.tools:
         assert TOOL_DATA_SENTENCE in (tool.description or ""), tool.name

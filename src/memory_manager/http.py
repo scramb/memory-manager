@@ -91,6 +91,7 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from memory_manager import __commit__, __version__
+from memory_manager.account import routes as account_routes
 from memory_manager.app import Services
 from memory_manager.audit import AuditWriter
 from memory_manager.auth import store
@@ -158,9 +159,11 @@ _OAUTH_RATE_LIMITED_PATHS = frozenset({"/register", "/token", "/authorize"})
 
 #: The MCP tool names whose calls count against `ServerConfig.write_per_minute`/
 #: `write_burst` in addition to the general `mcp_per_minute`/`mcp_burst` limit
-#: every `mcp_path` request counts against (#39) - `mcp/server.py`'s five
+#: every `mcp_path` request counts against (#39) - `mcp/server.py`'s six
 #: write tools, minus `memory_search`/`memory_read`/`memory_index` (read-only).
-_WRITE_TOOL_NAMES = frozenset({"memory_write", "memory_edit", "memory_supersede", "memory_archive"})
+_WRITE_TOOL_NAMES = frozenset(
+    {"memory_write", "memory_edit", "memory_supersede", "memory_archive", "memory_promote"}
+)
 
 ServicesFactory = Callable[[], AbstractAsyncContextManager[Services]]
 
@@ -308,6 +311,7 @@ def create_app(
     )
 
     oauth_cell = _OAuthProviderCell()
+    account_pool_cell = account_routes.PoolCell()
     shared_state = _SharedStateHandle()
     if config.valkey_url is not None:
         # Valkey takes precedence over Postgres (ADR-0009 §2, #104) and does not
@@ -389,6 +393,12 @@ def create_app(
 
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
+            # `/account`'s own routes read `services.pool` straight off `request.app.
+            # state.services` (set just below); `pending_authorization_lookup`/
+            # `authorization_completer` cannot - they are plain closures with no
+            # `Request` at all - so they get the same "build now, fill in later" cell
+            # `oauth_cell` already uses.
+            account_pool_cell.pool = services.pool
 
             token_verifier = (
                 StaticTokenVerifier(services.pool)
@@ -498,22 +508,50 @@ def create_app(
         Route(METRICS_PATH, endpoint=metrics_endpoint, methods=["GET"]),
     ]
     if authenticator is not None:
-        # `/login` only exists when an `Authenticator` is actually configured.
+        # Fixed per deployment (`LOGIN_MODE`) - `account_routes.authorization_completer`
+        # needs it to call `account.sessions.create` with a valid `login_mode`, which
+        # `principal` alone cannot tell apart (`None` for both `password` and `oidc`).
+        account_login_mode = (
+            "password"
+            if isinstance(authenticator, PasswordAuthenticator)
+            else "oidc"
+            if isinstance(authenticator, OidcAuthenticator)
+            else "entra"
+        )
+
+        # `/login` only exists when an `Authenticator` is actually configured; so does
+        # `/account` (#229) - a page with no way to sign in makes no sense.
+        # `account_routes.with_session_cookie` wraps every one of these three Route
+        # lists so a session `account_routes.authorization_completer` minted during the
+        # request ends up as a `Set-Cookie` header on the `RedirectResponse` the
+        # (unchanged) `Authenticator`/`oidc_routes`/`entra_routes` endpoint already
+        # built - see that function's own docstring for why this cannot happen inside
+        # the completer itself.
         routes.extend(
-            login_routes(
-                lookup=_pending_authorization_lookup(oauth_cell),
-                complete=_authorization_completer(oauth_cell),
-                authenticator=authenticator,
+            account_routes.with_session_cookie(
+                login_routes(
+                    lookup=_pending_authorization_lookup(oauth_cell, account_pool_cell),
+                    complete=_authorization_completer(
+                        oauth_cell, account_pool_cell, account_login_mode=account_login_mode
+                    ),
+                    authenticator=authenticator,
+                )
             )
         )
+        routes.extend(account_routes.page_routes())
         if isinstance(authenticator, OidcAuthenticator):
             # `{CALLBACK_PATH}` is its own route, not part of `login_routes` - the upstream
             # IdP redirects the browser straight back here, with no `pending` query
             # parameter of its own (`auth.login_oidc`'s module docstring: `state` is what
             # carries the pending authorization across that round trip instead).
             routes.extend(
-                oidc_routes(
-                    complete=_authorization_completer(oauth_cell), authenticator=authenticator
+                account_routes.with_session_cookie(
+                    oidc_routes(
+                        complete=_authorization_completer(
+                            oauth_cell, account_pool_cell, account_login_mode=account_login_mode
+                        ),
+                        authenticator=authenticator,
+                    )
                 )
             )
         if isinstance(authenticator, EntraAuthenticator):
@@ -521,8 +559,13 @@ def create_app(
             # above - `entra_routes` is `login_entra`'s own, so this module never has
             # to import `EntraAuthenticator` through `login_oidc`.
             routes.extend(
-                entra_routes(
-                    complete=_authorization_completer(oauth_cell), authenticator=authenticator
+                account_routes.with_session_cookie(
+                    entra_routes(
+                        complete=_authorization_completer(
+                            oauth_cell, account_pool_cell, account_login_mode=account_login_mode
+                        ),
+                        authenticator=authenticator,
+                    )
                 )
             )
     routes.append(
@@ -733,15 +776,39 @@ def _build_auth_settings(
     return None
 
 
-def _pending_authorization_lookup(cell: _OAuthProviderCell) -> PendingAuthorizationLookup:
+def _pending_authorization_lookup(
+    cell: _OAuthProviderCell, account_pool_cell: account_routes.PoolCell
+) -> PendingAuthorizationLookup:
+    """Tries the OAuth provider's own pending authorization first (`kind =
+    'authorize'`), an account login's (`kind = 'account_login'`, `account.pending`)
+    second - see `account.routes`'s own module docstring for why a `pending_id` is
+    never valid in both."""
+    account_lookup = account_routes.pending_authorization_lookup(account_pool_cell)
+
     async def lookup(pending_id: str) -> PendingAuthorization | None:
         provider = _require_provider(cell)
-        return await provider.pending_authorization(pending_id)
+        found = await provider.pending_authorization(pending_id)
+        if found is not None:
+            return found
+        return await account_lookup(pending_id)
 
     return lookup
 
 
-def _authorization_completer(cell: _OAuthProviderCell) -> AuthorizationCompleter:
+def _authorization_completer(
+    cell: _OAuthProviderCell,
+    account_pool_cell: account_routes.PoolCell,
+    *,
+    account_login_mode: str,
+) -> AuthorizationCompleter:
+    """Same "OAuth first, account second" composition as `_pending_authorization_lookup`,
+    for the `complete` side: an OAuth-shaped `pending_id` turns into a single-use code
+    (unchanged `MemoryManagerOAuthProvider.complete_authorization`), an account one
+    into a new browser session (`account_routes.authorization_completer`)."""
+    account_complete = account_routes.authorization_completer(
+        account_pool_cell, login_mode=account_login_mode
+    )
+
     async def complete(
         pending_id: str,
         subject: str,
@@ -749,9 +816,12 @@ def _authorization_completer(cell: _OAuthProviderCell) -> AuthorizationCompleter
         principal: LoginPrincipal | None = None,
     ) -> str | None:
         provider = _require_provider(cell)
-        return await provider.complete_authorization(
+        redirect_url = await provider.complete_authorization(
             pending_id, subject, list(namespaces), principal
         )
+        if redirect_url is not None:
+            return redirect_url
+        return await account_complete(pending_id, subject, namespaces, principal)
 
     return complete
 
@@ -793,11 +863,12 @@ async def _run_cleanup_iteration(
         if oauth_provider is not None:
             stats = await store.cleanup(pool)
             _logger.info(
-                "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d",
+                "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d sessions=%d",
                 stats.pending,
                 stats.codes,
                 stats.tokens,
                 stats.clients,
+                stats.sessions,
             )
         if isinstance(shared_state_backend, PostgresSharedState):
             swept = await shared_state_backend.sweep_expired_windows(

@@ -153,6 +153,30 @@ class GitBackend:
             )
         )
 
+    async def promote(
+        self,
+        path: str,
+        target_namespace: str,
+        *,
+        if_version: str,
+        keep_original: bool = False,
+        client: str,
+        actor: str = "stdio",
+        message: str | None = None,
+    ) -> WriteResult:
+        return await self._queue.submit(
+            WriteRequest(
+                op="promote",
+                path=path,
+                client=client,
+                if_version=if_version,
+                target_namespace=target_namespace,
+                keep_original=keep_original,
+                message=message,
+                actor=actor,
+            )
+        )
+
     async def archive(
         self,
         path: str,

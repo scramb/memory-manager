@@ -15,6 +15,8 @@ Stable facts vs status: fix a stable fact in place with memory_write/memory_edit
 
 Writing: memory_write/memory_edit/memory_supersede/memory_archive all take if_version from the last memory_read of that note ('new' only to create a note that must not exist yet). On a conflict, the error result carries current_version and current_content - read them, merge your change into that content, and retry with the new version; never retry blindly with the same if_version.
 
+memory_promote copies a note from your own namespace into a shared one, archiving the original - use it for shared knowledge.
+
 Never store secrets, passwords, API keys, ID or account numbers, or sensitive health data.
 
 Types: user (who the user is, preferences), feedback (how the user reacted to Claude), project (ongoing work), reference (how-to/lookup material), fact (a stated fact about the user or world). A note lives at <namespace>/<type>/<slug>.md; namespace groups notes by area, e.g. 'personal' or 'work'.

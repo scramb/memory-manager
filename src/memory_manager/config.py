@@ -435,8 +435,8 @@ class ServerConfig:
     per_minute` seconds, the average throughput a token bucket of that
     capacity and refill rate would allow. Every request to `mcp_path` counts
     against the `mcp_*` pair, keyed by the hashed bearer token (or the client
-    IP, unauthenticated); every `memory_write`/`memory_edit`/
-    `memory_supersede`/`memory_archive` tool call *additionally* against the
+    IP, unauthenticated); every `memory_write`/`memory_edit`/`memory_supersede`/
+    `memory_archive`/`memory_promote` tool call *additionally* against the
     tighter `write_*` pair, same key; every request to `/register`/`/token`/
     `/authorize` against `oauth_*`, keyed by client IP; every request to the
     vault webhook against `webhook_*`, keyed by client IP. A key over its

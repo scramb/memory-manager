@@ -46,6 +46,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0016_account_sessions",
         ]
         tables = {
             row["table_name"]
@@ -73,6 +74,7 @@ class TestMigrate:
             "project_members",
             "namespace_settings",
             "break_glass_grants",
+            "account_sessions",
             "jobs",
         }
 
@@ -95,6 +97,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0016_account_sessions",
         ]
         assert second == []
 
@@ -122,6 +125,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0016_account_sessions",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -187,6 +191,7 @@ class TestMigrate:
                 "0010_oauth_token_principal",
                 "0011_jobs",
                 "0013_vault_notes_namespace_idx",
+                "0016_account_sessions",
             ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
@@ -274,6 +279,7 @@ class TestMigrateBackendPostgres:
             "0011_jobs",
             "0012_vector_layout",
             "0013_vault_notes_namespace_idx",
+            "0016_account_sessions",
         ]
         tables = {
             row["table_name"]

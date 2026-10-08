@@ -33,6 +33,7 @@ from memory_manager.vault import blocklist
 from memory_manager.vault.note import NoteFormatError, parse, serialize
 from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path
 from memory_manager.vault.secrets import SecretFound, check
+from memory_manager.vault.ulid import new_ulid
 from memory_manager.vault.validate import NoteInvalid, validate, validate_bytes
 
 __all__ = [
@@ -41,6 +42,8 @@ __all__ = [
     "new_content_for",
     "parse_note_path_or_raise",
     "prepare_archive",
+    "prepare_promote_content",
+    "prepare_promote_paths",
     "prepare_supersede_content",
     "prepare_supersede_paths",
     "prepare_write_or_edit",
@@ -266,3 +269,97 @@ def prepare_supersede_content(
         raise BlocklistRejected(new_path, exc.category) from exc
 
     return new_final_bytes, old_final_bytes
+
+
+def prepare_promote_paths(
+    path: str, target_namespace: str | None, current: bytes | None
+) -> tuple[NotePath, NotePath, str, bytes]:
+    """The parsed source/target note paths for `promote`, or the errors `queue.py`
+    must raise before it is safe to do the two existence lookups it enables (the
+    target path, and - unless `keep_original` - the source's archive path).
+
+    Returns `(source_note_path, target_note_path, target_path, current)` -
+    `current` narrowed to non-`None`, now that the check below has passed, so
+    the caller never needs an `assert`. The target path is always
+    `<target_namespace>/<type>/<slug>.md` with `path`'s own `type`/`slug`
+    carried over - never supplied by the caller. Raises `NotFound` if `path`'s
+    current note is missing, `InvalidNote` if `target_namespace` is empty,
+    `path` is not a valid, non-archived note path (an archived source is
+    rejected here, the same way `allow_archive=False` rejects any other
+    `_archive/...` path), or the constructed target path is invalid (e.g. a
+    malformed `target_namespace`).
+    """
+    if current is None:
+        raise NotFound(path)
+    if not target_namespace:
+        raise InvalidNote(path, "promote requires target_namespace")
+
+    source_note_path = parse_note_path_or_raise(path)
+    candidate = NotePath(
+        namespace=target_namespace, type=source_note_path.type, slug=source_note_path.slug
+    )
+    target_note_path = parse_note_path_or_raise(candidate.relative)
+    return source_note_path, target_note_path, target_note_path.relative, current
+
+
+def prepare_promote_content(
+    path: str,
+    target_path: str,
+    current: bytes,
+    *,
+    target_note_path: NotePath,
+    target_exists: bool,
+    archive_exists: bool,
+    keep_original: bool,
+    now: datetime,
+) -> tuple[bytes, bytes | None]:
+    """The canonical `(new_bytes, archived_original_bytes)` to commit for `promote`.
+
+    `archived_original_bytes` is `None` exactly when `keep_original` is set -
+    the original at `path` is left untouched, only the copy is written.
+    Otherwise it reuses `prepare_archive` for the original, the same
+    archive-target-exists check and `updated` stamp a plain `archive` uses.
+    Called after `prepare_promote_paths` and the two existence lookups it
+    enables. Raises `InvalidNote` if `target_path` already exists, the
+    original fails to parse, the copy fails ADR-0005 validation, or (when
+    archiving) the original's archive target already exists;
+    `SecretRejected` if the copy's text looks like it contains a secret;
+    `BlocklistRejected` if it matches an operator blocklist category, checked
+    right after the secret scan - the same check `prepare_write_or_edit`/
+    `prepare_supersede_content` already run (#244).
+    """
+    if target_exists:
+        raise InvalidNote(target_path, "already exists, promote needs an unused path")
+
+    try:
+        original = parse(current)
+    except NoteFormatError as exc:
+        raise InvalidNote(path, str(exc)) from exc
+
+    supersedes = original.supersedes
+    if original.id not in supersedes:
+        supersedes = (*supersedes, original.id)
+    new_note = replace(original, id=new_ulid(now), supersedes=supersedes)
+
+    try:
+        validate(new_note, expected_type=target_note_path.type)
+    except NoteInvalid as exc:
+        raise InvalidNote(target_path, str(exc)) from exc
+
+    new_bytes = serialize(new_note)
+
+    new_decoded = new_bytes.decode("utf-8")
+    try:
+        check(new_decoded)
+    except SecretFound as exc:
+        raise SecretRejected(target_path, str(exc)) from exc
+    try:
+        blocklist.check(new_decoded)
+    except blocklist.BlocklistFound as exc:
+        raise BlocklistRejected(target_path, exc.category) from exc
+
+    if keep_original:
+        return new_bytes, None
+
+    archived_bytes = prepare_archive(path, current, archive_exists=archive_exists, now=now)
+    return new_bytes, archived_bytes
