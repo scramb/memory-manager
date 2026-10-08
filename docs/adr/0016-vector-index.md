@@ -1,6 +1,6 @@
 # ADR-0016 — Vector index for `chunks`: `halfvec`, a B-tree on namespace, partitioning by namespace kind
 
-Status: Proposed · Date: 2026-10-08
+Status: Accepted · Date: 2026-10-08
 Relates to: index, search, storage, F-01 Enterprise Scale (M8, WP-23); [ADR-0007](./0007-storage-backend.md),
 [ADR-0008](./0008-namespace-permissions.md), [ADR-0013](./0013-agent-identity.md)
 
@@ -90,9 +90,9 @@ time at the same row count; the owner's O23 decision already pins
 `EMBEDDING_DIMENSIONS` at 1024, immutable without a reindex, making this a
 reindex-triggering change with no measured upside.
 
-## Recommendation
+## Decision
 
-**B**, for the owner to accept or reject. Checked against the guardrails:
+**B** — accepted 2026-10-08 under the owner's standing approval of recommendations that do not change F-01's functional scope. Checked against the guardrails:
 - Few dependencies: none new - `halfvec` ships in the `vector` extension already
   required (ADR-0001, ADR-0007); a B-tree is a built-in PostgreSQL index type.
 - OSS first: yes (PostgreSQL License, same as `vector`).
