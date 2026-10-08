@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -79,7 +79,7 @@ from pydantic import AnyUrl
 
 from memory_manager.auth import store
 from memory_manager.auth.cimd import CimdError, ClientMetadataFetcher
-from memory_manager.auth.login import PendingAuthorization
+from memory_manager.auth.login import LoginPrincipal, PendingAuthorization
 from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_bearer_token
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
@@ -105,9 +105,12 @@ _CLAUDE_AI_HOSTS = frozenset({"claude.ai", "claude.com"})
 
 
 class _AuthorizationCode(AuthorizationCode):
-    """`AuthorizationCode` plus the subject's namespaces, carried through to `_issue`."""
+    """`AuthorizationCode` plus the subject's namespaces and Entra principal (ADR-0006,
+    #213), carried through to `_issue`."""
 
     namespaces: list[str]
+    user_oid: str | None
+    roles: list[str]
 
 
 #: RFC 8252 loopback hosts - a CIMD client's redirect URI on one of these matches a
@@ -181,6 +184,9 @@ class _RefreshToken(RefreshToken):
     family_id: str
     client_label: str
     revoked: bool
+    user_oid: str | None
+    roles: list[str]
+    family_started_at: datetime | None
 
 
 class MemoryManagerOAuthProvider(
@@ -329,13 +335,21 @@ class MemoryManagerOAuthProvider(
         )
 
     async def complete_authorization(
-        self, pending_id: str, subject: str, namespaces: list[str]
+        self,
+        pending_id: str,
+        subject: str,
+        namespaces: list[str],
+        principal: LoginPrincipal | None = None,
     ) -> str | None:
         """Turn a parked `/authorize` call into a single-use code, for `auth.login.login_routes`.
 
         `None` if `pending_id` is unknown or expired - including a concurrent completion of the
         same pending authorization, since `auth.store.delete_pending` only removes a still-present
         row, never raises on a missing one.
+
+        `principal` (ADR-0006, #213) is the Entra identity an `entra`-mode login
+        established; `None` for `password`/`oidc` (unchanged) - carried onto the code
+        and, from there, onto every token `exchange_authorization_code` issues from it.
         """
         row = await store.get_pending(self._pool, pending_id)
         if row is None:
@@ -355,6 +369,8 @@ class MemoryManagerOAuthProvider(
             redirect_uri_provided_explicitly=row.redirect_uri_provided_explicitly,
             resource=row.resource,
             ttl=_CODE_TTL,
+            user_oid=principal.oid if principal is not None else None,
+            roles=list(principal.roles) if principal is not None else (),
         )
         return construct_redirect_uri(
             row.redirect_uri, code=code, state=row.state, iss=self._issuer
@@ -380,6 +396,8 @@ class MemoryManagerOAuthProvider(
             resource=stored.resource,
             subject=stored.subject,
             namespaces=list(stored.namespaces),
+            user_oid=stored.user_oid,
+            roles=list(stored.roles),
         )
 
     async def exchange_authorization_code(
@@ -415,6 +433,9 @@ class MemoryManagerOAuthProvider(
             resource=code.resource,
             family_id=str(uuid4()),
             client_label=_client_label_for(client),
+            user_oid=code.user_oid,
+            roles=code.roles,
+            family_started_at=datetime.now(UTC),
         )
 
     # ---- refresh ----------------------------------------------------------
@@ -436,6 +457,9 @@ class MemoryManagerOAuthProvider(
             family_id=stored.family_id,
             client_label=stored.client_label,
             revoked=stored.revoked_at is not None,
+            user_oid=stored.user_oid,
+            roles=list(stored.roles),
+            family_started_at=stored.family_started_at,
         )
 
     async def exchange_refresh_token(
@@ -471,6 +495,11 @@ class MemoryManagerOAuthProvider(
             resource=token.resource,
             family_id=token.family_id,
             client_label=token.client_label,
+            user_oid=token.user_oid,
+            roles=token.roles,
+            # Carried forward unchanged, never recomputed - the family's session start
+            # (ADR-0006 §5's `ENTRA_MAX_SESSION`, #216) must survive every rotation.
+            family_started_at=token.family_started_at,
         )
 
     # ---- access -------------------------------------------------------------
@@ -496,6 +525,9 @@ class MemoryManagerOAuthProvider(
         resource: str | None,
         family_id: str,
         client_label: str,
+        user_oid: str | None = None,
+        roles: list[str] | None = None,
+        family_started_at: datetime | None = None,
     ) -> OAuthToken:
         access = OAUTH_ACCESS_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         refresh = _REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
@@ -515,6 +547,9 @@ class MemoryManagerOAuthProvider(
                 family_id=family_id,
                 client_label=client_label,
                 ttl=ttl,
+                user_oid=user_oid,
+                roles=roles or (),
+                family_started_at=family_started_at,
             )
         return OAuthToken(
             access_token=access,

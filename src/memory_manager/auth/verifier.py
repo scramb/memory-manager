@@ -17,6 +17,16 @@ token with an owner principal (`owner_oid` + `roles`, ADR-0008 addendum
 without one carries exactly `{"namespaces": [...]}`, as before (#116 wires
 either into the request path).
 
+An OAuth access token issued from a completed Entra login (ADR-0006, #213)
+carries the same `claims["oid"]`/`claims["roles"]`, plus `claims["groups"]` -
+read live from `auth.users`/`user_groups` on every verification, never
+copied into the token row itself (ADR-0009 §3: "the verifier therefore reads
+user_groups", so a group change is visible on every replica without
+re-issuing anything). A user whose `disabled_at` is set verifies to `None`
+outright, same as a revoked token. An OAuth access token with no `user_oid`
+(a `password`/`oidc` token, or one issued before #213) keeps exactly
+today's claims - `{"namespaces": [...], "client_label": ...}`, no `oid`.
+
 `verify_bearer_token` is the merge the module docstring of `auth.provider`
 talks about: once the embedded OAuth authorization server is enabled, the
 SDK only ever calls *one* verifier for every bearer token on `/mcp` (its
@@ -33,7 +43,7 @@ from __future__ import annotations
 import asyncpg
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
-from memory_manager.auth import store
+from memory_manager.auth import store, users
 from memory_manager.auth.tokens import verify
 
 __all__ = ["OAUTH_ACCESS_TOKEN_PREFIX", "StaticTokenVerifier", "verify_bearer_token"]
@@ -97,6 +107,17 @@ async def _verify_oauth_access_token(
     stored = await store.get_token(pool, token, "access")
     if stored is None or stored.resource != oauth_resource:
         return None
+    claims: dict[str, object] = {
+        "namespaces": list(stored.namespaces),
+        "client_label": stored.client_label,
+    }
+    if stored.user_oid is not None:
+        user = await users.get_user(pool, stored.user_oid)
+        if user is None or user.disabled_at is not None:
+            return None
+        claims["oid"] = stored.user_oid
+        claims["roles"] = list(stored.roles)
+        claims["groups"] = list(await users.group_ids(pool, stored.user_oid))
     return AccessToken(
         token=token,
         client_id=stored.client_id,
@@ -104,5 +125,5 @@ async def _verify_oauth_access_token(
         expires_at=int(stored.expires_at.timestamp()),
         resource=stored.resource,
         subject=stored.subject,
-        claims={"namespaces": list(stored.namespaces), "client_label": stored.client_label},
+        claims=claims,
     )

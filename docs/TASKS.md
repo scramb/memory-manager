@@ -217,7 +217,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 ### WP-22 — Entra login · F-01 · Branch: `wp/22-entra-login` · PR: open
 
 - [x] #212 Mock Entra IdP (OIDC + Graph) under tests/mock_idp/
-- [ ] #213 Codes/tokens bound to `users`; verifier emits oid/roles/groups
+- [x] #213 Codes/tokens bound to `users`; verifier emits oid/roles/groups
 - [ ] #214 Graph client: app token, getMemberGroups, user state ⛔ blocked by #212
 - [ ] #215 `LOGIN_MODE=entra` with tenant allowlist, roles, groups incl. overage ⛔ blocked by #213, #214
 - [ ] #216 Refresh re-check via Graph, 15-min access tokens, `ENTRA_MAX_SESSION` ⛔ blocked by #215

@@ -97,6 +97,7 @@ from memory_manager.auth.cimd import ClientMetadataFetcher
 from memory_manager.auth.login import (
     Authenticator,
     AuthorizationCompleter,
+    LoginPrincipal,
     PendingAuthorization,
     PendingAuthorizationLookup,
     login_routes,
@@ -631,9 +632,16 @@ def _pending_authorization_lookup(cell: _OAuthProviderCell) -> PendingAuthorizat
 
 
 def _authorization_completer(cell: _OAuthProviderCell) -> AuthorizationCompleter:
-    async def complete(pending_id: str, subject: str, namespaces: Sequence[str]) -> str | None:
+    async def complete(
+        pending_id: str,
+        subject: str,
+        namespaces: Sequence[str],
+        principal: LoginPrincipal | None = None,
+    ) -> str | None:
         provider = _require_provider(cell)
-        return await provider.complete_authorization(pending_id, subject, list(namespaces))
+        return await provider.complete_authorization(
+            pending_id, subject, list(namespaces), principal
+        )
 
     return complete
 

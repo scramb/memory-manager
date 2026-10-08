@@ -53,6 +53,7 @@ __all__ = [
     "Authenticator",
     "AuthorizationCompleter",
     "BoundCompleter",
+    "LoginPrincipal",
     "PendingAuthorization",
     "PendingAuthorizationLookup",
     "login_routes",
@@ -96,15 +97,55 @@ class PendingAuthorization:
 #: `pending.id -> PendingAuthorization | None` (`None` if unknown or expired).
 PendingAuthorizationLookup = Callable[[str], Awaitable[PendingAuthorization | None]]
 
-#: `(pending_id, subject, namespaces) -> redirect URL | None` (`None` if the pending
-#: authorization vanished - expired, or already completed by a concurrent request -
-#: between the lookup above and this call).
-AuthorizationCompleter = Callable[[str, str, Sequence[str]], Awaitable[str | None]]
 
-#: What an `Authenticator.handle` call is given to finish a pending authorization:
-#: already bound to `pending.id`, so an implementation only ever supplies `subject`
-#: and the namespaces that subject may use.
-BoundCompleter = Callable[[str, Sequence[str]], Awaitable[str | None]]
+@dataclass(frozen=True)
+class LoginPrincipal:
+    """The Entra identity a login established (ADR-0006 "Identity"/"Facade tokens";
+    #213), carried from `complete()` through to the issued OAuth code and, from there,
+    every access/refresh token of that grant (`auth.provider`).
+
+    `None` everywhere in `password`/`oidc` mode (ADR-0004 L1/L2), which establishes no
+    Entra `oid` at all - those modes keep completing with no principal, unchanged.
+    `roles` may be empty; whether that is allowed to sign in at all is the `entra`
+    login completer's own decision (#215), not this module's or `auth.provider`'s.
+    """
+
+    oid: str
+    roles: tuple[str, ...] = ()
+
+
+class AuthorizationCompleter(Protocol):
+    """`(pending_id, subject, namespaces, principal=None) -> redirect URL | None`
+    (`None` if the pending authorization vanished - expired, or already completed by a
+    concurrent request - between the lookup above and this call).
+
+    `principal` is optional (and `None` by every caller today, #215 not being wired in
+    yet) precisely so `auth.login_oidc`'s own 3-argument call site keeps compiling and
+    behaving unchanged.
+    """
+
+    async def __call__(
+        self,
+        pending_id: str,
+        subject: str,
+        namespaces: Sequence[str],
+        principal: LoginPrincipal | None = None,
+    ) -> str | None: ...
+
+
+class BoundCompleter(Protocol):
+    """What an `Authenticator.handle` call is given to finish a pending authorization:
+    already bound to `pending.id`, so an implementation only ever supplies `subject`,
+    the namespaces that subject may use, and - once a login method actually
+    establishes one (#215) - the `LoginPrincipal` to carry onto the issued tokens.
+    """
+
+    async def __call__(
+        self,
+        subject: str,
+        namespaces: Sequence[str],
+        principal: LoginPrincipal | None = None,
+    ) -> str | None: ...
 
 
 class Authenticator(Protocol):
@@ -150,8 +191,10 @@ def login_routes(
                 status_code=400,
             )
 
-        async def bound_complete(subject: str, namespaces: Sequence[str]) -> str | None:
-            return await complete(pending.id, subject, namespaces)
+        async def bound_complete(
+            subject: str, namespaces: Sequence[str], principal: LoginPrincipal | None = None
+        ) -> str | None:
+            return await complete(pending.id, subject, namespaces, principal)
 
         return await authenticator.handle(request, pending, bound_complete)
 
