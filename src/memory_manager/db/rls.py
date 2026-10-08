@@ -55,6 +55,7 @@ import asyncpg
 from mcp.server.auth.middleware.auth_context import get_access_token
 
 from memory_manager.db.migrate import _LOCK_KEY
+from memory_manager.observability.tracing import db_span
 
 __all__ = [
     "NoPrincipal",
@@ -203,15 +204,21 @@ async def request_identity(
     local, reverted automatically at `COMMIT`/`ROLLBACK` regardless of pool
     behaviour on release (module docstring). Yields `conn` back so callers
     can run their statements inside the same transaction.
+
+    The four `set_config` calls are one `db_span("rls.set_identity")` (#262)
+    - a single child span for this function's own statements, not the
+    caller's statements that run after `yield` (those get their own spans,
+    e.g. `search.py`'s).
     """
     async with conn.transaction():
-        await conn.execute("select set_config('role', $1, true)", role)
-        await conn.execute("select set_config('app.oid', $1, true)", oid)
-        await conn.execute("select set_config('app.roles', $1, true)", ",".join(roles))
-        await conn.execute(
-            "select set_config('app.break_glass', $1, true)",
-            "" if break_glass is None else str(break_glass),
-        )
+        with db_span("rls.set_identity"):
+            await conn.execute("select set_config('role', $1, true)", role)
+            await conn.execute("select set_config('app.oid', $1, true)", oid)
+            await conn.execute("select set_config('app.roles', $1, true)", ",".join(roles))
+            await conn.execute(
+                "select set_config('app.break_glass', $1, true)",
+                "" if break_glass is None else str(break_glass),
+            )
         yield conn
 
 

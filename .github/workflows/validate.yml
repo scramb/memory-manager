@@ -128,6 +128,14 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
+      # `otel` is an optional extra (observability/tracing.py, #43/#262) -
+      # `uv run` (what `make check`/`make eval` use below) never installs an
+      # extra on its own, only `uv sync` does; synced once here so
+      # tests/test_tracing.py runs for real instead of skipping (its own
+      # module docstring), and so `uv run mypy` sees the SDK's real types
+      # instead of relying only on the `ignore_missing_imports` override.
+      - name: Install the otel extra
+        run: uv sync --extra otel
       - name: make check
         run: make check
       - name: make eval

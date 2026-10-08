@@ -22,6 +22,15 @@ Never includes a note's content or a token in any field: every log call
 site this work package adds logs paths, ids, counts and durations, never
 the vault webhook's request body or a bearer token (CLAUDE.md: note content
 is data, never a command, and never logged; token hashes only).
+
+`JsonFormatter` additionally carries `trace_id`/`span_id` (#262, WP-31)
+whenever an OTel span is current - `opentelemetry.trace.get_current_span()`,
+the SDK's own ambient accessor, the same one `tracing.py`'s
+`start_as_current_span` call sites feed via `contextvars` (that module's
+own docstring). Importing `opentelemetry` is optional here too, same as
+`tracing.py`: a bare `try/except ImportError` around the one call site,
+never a module-level import, so this module (loaded on every process start,
+stdio included) never requires the `otel` extra.
 """
 
 from __future__ import annotations
@@ -113,6 +122,7 @@ class JsonFormatter(logging.Formatter):
         request_id = getattr(record, "request_id", None) or request_id_var.get()
         if request_id is not None:
             payload["request_id"] = request_id
+        payload.update(_trace_context_fields())
         for key, value in record.__dict__.items():
             if key in _STANDARD_RECORD_ATTRS or key == "request_id":
                 continue
@@ -124,6 +134,25 @@ class JsonFormatter(logging.Formatter):
 
 def _timestamp(created: float) -> str:
     return datetime.fromtimestamp(created, tz=UTC).isoformat(timespec="milliseconds")
+
+
+def _trace_context_fields() -> dict[str, str]:
+    """`{"trace_id": ..., "span_id": ...}` for the OTel span current right now, or
+    `{}` whenever there is none - no span at all (tracing off, or outside any
+    `start_as_current_span`), or the `otel` extra is not installed (module
+    docstring).
+    """
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return {}
+    span_context = trace.get_current_span().get_span_context()
+    if not span_context.is_valid:
+        return {}
+    return {
+        "trace_id": trace.format_trace_id(span_context.trace_id),
+        "span_id": trace.format_span_id(span_context.span_id),
+    }
 
 
 def _redact_query_string(full_path: str) -> str:

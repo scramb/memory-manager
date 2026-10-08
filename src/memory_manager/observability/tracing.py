@@ -1,16 +1,38 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Optional OpenTelemetry tracing around MCP tool calls (#43, WP-12).
+"""Optional OpenTelemetry tracing from the HTTP edge to MCP tool calls and
+Postgres statements (#43 WP-12, #262 WP-31).
 
 Off by default, on two conditions both having to hold: `OTEL_EXPORTER_OTLP_ENDPOINT`
 is set in the environment, and the `otel` extra (`opentelemetry-sdk`,
 `opentelemetry-exporter-otlp`) is installed - neither is true by default
 (CLAUDE.md: few dependencies, every external service optional and
-pluggable). `trace_tool_call(tool)` is the one decorator `observability.
-instrument_tool` composes with `metrics.track_tool_call`; it lazily
-configures the SDK on its very first call (not at import time, and not
-via a separate startup hook `cli.py` would otherwise have to carry) and is
-a plain no-op - the wrapped function runs exactly as it would unwrapped -
-whenever the endpoint is unset or the SDK import fails.
+pluggable). `_active_tracer()` lazily configures the SDK on its very first
+call (not at import time, and not via a separate startup hook `cli.py`
+would otherwise have to carry) and is the one seam the three pieces below
+share, each a plain no-op - the wrapped code runs exactly as it would
+unwrapped - whenever the endpoint is unset or the SDK import fails:
+
+- `trace_tool_call(tool)`: one span per MCP tool call, the decorator
+  `observability.instrument_tool` composes with `metrics.track_tool_call`.
+- `TracingMiddleware`: one SERVER span per HTTP request (`http.py`),
+  continuing an incoming W3C `traceparent`/`tracestate`
+  (`opentelemetry.propagate.extract`, the same extractor the installed MCP
+  SDK's own `mcp.shared._otel.extract_trace_context` uses) rather than
+  starting a fresh trace for every request.
+- `db_span(op)`: one child span around a Postgres statement (or small,
+  fixed group of them) - `db/rls.py`'s `request_identity` and `search.py`'s
+  query functions are its only callers (#262). Carries `db.system`/
+  `db.operation` only, never SQL text or bound parameters (CLAUDE.md: note
+  content is data, never a command or a log/trace payload - the same rule
+  extends to query parameters here).
+
+Span nesting across all three follows the ambient OTel context
+(`contextvars`, not a value threaded through every call): as long as a
+tool call and the Postgres statements it makes run in the same `asyncio`
+task as the request's own `TracingMiddleware` span, `start_as_current_span`
+makes each one a child of whichever span is already current - verified by
+reading the installed SDK (`opentelemetry-sdk` 1.45.1) directly rather than
+assumed.
 """
 
 from __future__ import annotations
@@ -18,13 +40,17 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeVar
+
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["trace_tool_call"]
+__all__ = ["TracingMiddleware", "db_span", "trace_tool_call"]
 
 _logger = logging.getLogger(__name__)
 
@@ -74,11 +100,19 @@ def _ensure_configured() -> None:
     _tracer = trace.get_tracer(_SERVICE_NAME)
 
 
+def _active_tracer() -> Tracer | None:
+    """`_tracer` once `_ensure_configured` has run - `None` under the same
+    conditions `trace_tool_call`'s own docstring describes. The one call every
+    piece of this module makes before touching the SDK at all."""
+    _ensure_configured()
+    return _tracer
+
+
 def trace_tool_call(tool: str) -> Callable[[_ToolFunc], _ToolFunc]:
     """Decorate an async MCP tool function with one OTel span named `tool`.
 
     A no-op decorator (the wrapped function runs, nothing else happens)
-    until `_ensure_configured` finds both the endpoint and the SDK - see
+    until `_active_tracer()` finds both the endpoint and the SDK - see
     the module docstring. Uses `functools.wraps` for the same reason
     `metrics.track_tool_call` does: the SDK's schema generation and
     `Context` injection must still see the original signature.
@@ -87,12 +121,109 @@ def trace_tool_call(tool: str) -> Callable[[_ToolFunc], _ToolFunc]:
     def decorator(func: _ToolFunc) -> _ToolFunc:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            _ensure_configured()
-            if _tracer is None:
+            tracer = _active_tracer()
+            if tracer is None:
                 return await func(*args, **kwargs)
-            with _tracer.start_as_current_span(tool):
+            with tracer.start_as_current_span(tool):
                 return await func(*args, **kwargs)
 
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+@contextmanager
+def db_span(op: str) -> Iterator[None]:
+    """Wrap one Postgres statement (or one small, fixed group of them) in an
+    OTel span named `op`, a child of whatever span is already current (module
+    docstring) - a no-op context manager under the same conditions
+    `trace_tool_call` is (#262).
+
+    `op` is a short, fixed operation name (e.g. `"fulltext_search"`,
+    `"rls.set_identity"`) - never SQL text, never a table or column name
+    taken from caller input. Attributes carry only `db.system` (always
+    `"postgresql"`, the only backend this spans) and `db.operation` (`op`
+    again, as its own attribute rather than only the span name, so a query
+    across many traces does not need to parse span names) - no bound
+    parameters, ever (module docstring).
+    """
+    tracer = _active_tracer()
+    if tracer is None:
+        yield
+        return
+    with tracer.start_as_current_span(
+        op, attributes={"db.system": "postgresql", "db.operation": op}
+    ):
+        yield
+
+
+class TracingMiddleware:
+    """Pure ASGI middleware: one OTel SERVER span per HTTP request (#262).
+
+    A no-op middleware (`self._app` runs, nothing else happens) under the
+    same conditions `trace_tool_call` is - built unconditionally by
+    `http.py`, since whether it does anything depends on the environment,
+    not on how the app is wired.
+
+    Continues an incoming W3C `traceparent`/`tracestate` via
+    `opentelemetry.propagate.extract` on the request headers - Starlette's
+    `Headers` is a case-insensitive `Mapping[str, str]`, exactly the carrier
+    shape the default `TraceContextTextMapPropagator` getter reads
+    (`carrier.get("traceparent")`, verified by reading the installed SDK;
+    module docstring). A request with no such header, or an invalid one,
+    starts a fresh trace instead - `extract` always returns a usable
+    `Context`, never raises, for either case.
+
+    The span name is the request's path: every route this server exposes
+    (`http.py`'s route table) is a fixed path, never a `{param}` template,
+    so there is no separate "route template" to compute - `scope["path"]`
+    already is one. `http.method`/`http.route` are set going in;
+    `http.response.status_code` once the response actually starts, and a
+    5xx or an exception propagating out of `self._app` both mark the span
+    as an error (an exception additionally records it) - neither attribute
+    nor status ever carries a header value, a query string or a body.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        tracer = _active_tracer()
+        if tracer is None:
+            await self._app(scope, receive, send)
+            return
+
+        from opentelemetry import propagate
+        from opentelemetry.trace import SpanKind, StatusCode
+
+        path = scope["path"]
+        context = propagate.extract(Headers(scope=scope))
+        status_codes: list[int] = []
+
+        async def send_with_status(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                status_codes.append(message["status"])
+            await send(message)
+
+        with tracer.start_as_current_span(
+            path,
+            context=context,
+            kind=SpanKind.SERVER,
+            attributes={"http.method": scope.get("method", ""), "http.route": path},
+        ) as span:
+            try:
+                await self._app(scope, receive, send_with_status)
+            except Exception as exc:
+                span.set_attribute("error.type", type(exc).__qualname__)
+                span.record_exception(exc)
+                span.set_status(StatusCode.ERROR, str(exc))
+                raise
+            if status_codes:
+                status = status_codes[0]
+                span.set_attribute("http.response.status_code", status)
+                if status >= 500:
+                    span.set_status(StatusCode.ERROR)

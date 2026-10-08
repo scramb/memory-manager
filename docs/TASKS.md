@@ -307,7 +307,7 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 
 - [ ] #260 Every rate-limit and quota rejection is counted per limiter in /metrics ⛔ blocked by #242, #243
 - [ ] #261 Job queue length and embedding lag are exported as Prometheus gauges ⛔ blocked by #219
-- [ ] #262 OpenTelemetry traces cover an api request from the HTTP edge down to its database statements
+- [x] #262 OpenTelemetry traces cover an api request from the HTTP edge down to its database statements
 - [ ] #263 Worker jobs appear in the trace of the request that enqueued them ⛔ blocked by #262, #219
 - [ ] #264 The ServiceMonitor scrapes api and worker metrics separately ⛔ blocked by #250, #219
 - [ ] #265 A Grafana dashboard and PrometheusRule alerts cover latency budgets, errors, rate limits and embedding lag ⛔ blocked by #260, #261, #264
