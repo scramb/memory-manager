@@ -56,6 +56,7 @@ import asyncpg
 import uvicorn
 
 from memory_manager.app import open_services, open_storage
+from memory_manager.auth.graph import GraphClient
 from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
@@ -1295,6 +1296,13 @@ async def _serve_worker() -> int:
     `worker.enqueue_pending_embeddings` runs this indexer's own startup
     catch-up once, then `worker.build_job_handlers(indexer)` registers its
     `"embed_note"` handler.
+
+    Also builds `auth.graph.GraphClient.from_env(os.environ)` (`None` for a
+    deployment that never configured Entra) and passes it into `worker.
+    build_jobs` - the one production call site that can turn on the
+    `entra_delta_sync` job (#223, ADR-0006 §6) at all; a self-created
+    `GraphClient` owns its own `httpx.AsyncClient`, closed in this same
+    `finally` alongside `jobs_listen_conn`/`pool`.
     """
     storage_backend = storage_backend_from_env(dict(os.environ))
     if storage_backend != "postgres":
@@ -1317,6 +1325,7 @@ async def _serve_worker() -> int:
         return 2
 
     jobs_listen_conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    graph_client = GraphClient.from_env(os.environ)
     try:
         provider = provider_from_config(embedding_config)
         indexer = Indexer(pool, VaultNotesSource(), provider)
@@ -1324,7 +1333,7 @@ async def _serve_worker() -> int:
         if enqueued:
             _logger.info("worker startup: enqueued %d catch-up embedding job(s)", enqueued)
 
-        jobs = build_jobs(config)
+        jobs = build_jobs(config, worker_config=worker_config, graph_client=graph_client)
         job_handlers = build_job_handlers(indexer)
         app = create_worker_app(
             pool,
@@ -1344,6 +1353,8 @@ async def _serve_worker() -> int:
         server = GracefulShutdownServer(uvicorn_config)
         await server.serve()
     finally:
+        if graph_client is not None:
+            await graph_client.aclose()
         await jobs_listen_conn.close()
         await pool.close()
     return 0

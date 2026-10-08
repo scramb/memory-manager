@@ -246,13 +246,29 @@ async def disable_user(pool: asyncpg.Pool, oid: str, reason: str) -> RevocationC
     return counts
 
 
-async def enable_user(pool: asyncpg.Pool, oid: str) -> None:
-    """Clear `oid`'s `disabled_at` - revokes nothing back (#222).
+async def enable_user(pool: asyncpg.Pool, oid: str, reason: str) -> None:
+    """Clear `oid`'s `disabled_at` - revokes nothing back (#222) - then write one
+    `audit_log` entry for the call, the same "audit every write" shape
+    `disable_user` above already gives its own side of this pair (CLAUDE.md:
+    "audit log for every write").
 
     A previously revoked `oauth_tokens`/`static_tokens` row stays revoked
     (`revoke_token_row`/`revoke_family`/`revoke_all_credentials` only ever set
     `revoked_at`, never clear it - CLAUDE.md "never overwrite silently" plus the
     soft-delete convention `auth.store`'s own docstring explains): re-enabling a
     user never revives an old token, it only lets a fresh login issue new ones.
+
+    `reason` is free text for the audit trail (e.g. "entra delta sync: re-enabled
+    in Graph", "admin: back from leave") - never a token value, the same
+    convention `disable_user`'s own `reason` already follows.
     """
     await pool.execute("update users set disabled_at = null where oid = $1", oid)
+    await AuditWriter(pool).record(
+        actor=oid,
+        client="auth",
+        op="enable_user",
+        path=None,
+        commit_sha=None,
+        outcome="ok",
+        detail={"reason": reason},
+    )

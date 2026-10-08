@@ -239,7 +239,7 @@ class TestDisableUser:
         old_static = await _create_static_token(pool, "hank-static", owner_oid="oid-hank")
 
         await users.disable_user(pool, "oid-hank", reason="offboarding")
-        await users.enable_user(pool, "oid-hank")
+        await users.enable_user(pool, "oid-hank", reason="back from leave")
 
         hank = await users.get_user(pool, "oid-hank")
         assert hank is not None
