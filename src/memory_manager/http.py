@@ -795,11 +795,12 @@ async def _run_cleanup_iteration(
         if oauth_provider is not None:
             stats = await store.cleanup(pool)
             _logger.info(
-                "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d",
+                "oauth cleanup: pending=%d codes=%d tokens=%d clients=%d sessions=%d",
                 stats.pending,
                 stats.codes,
                 stats.tokens,
                 stats.clients,
+                stats.sessions,
             )
         if isinstance(shared_state_backend, PostgresSharedState):
             swept = await shared_state_backend.sweep_expired_windows(

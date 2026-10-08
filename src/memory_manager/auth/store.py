@@ -187,6 +187,7 @@ class CleanupStats:
     codes: int
     tokens: int
     clients: int
+    sessions: int
 
 
 async def save_client(
@@ -492,6 +493,13 @@ async def cleanup(pool: asyncpg.Pool) -> CleanupStats:
     expires would erase the evidence an operator might still want to look at. A DCR-registered
     client older than `_CLIENT_CLEANUP_AGE` with no token referencing it is swept last, so a
     client whose last token this same run just deleted is still eligible in the same pass.
+
+    Account sessions (`account/sessions.py`, #228) are swept by their own absolute
+    `expires_at`, deleted the instant it passes - unlike a refresh token, an expired
+    session carries no replay evidence worth keeping around. This is the one shared
+    place both `http.py`'s `_run_cleanup_iteration` (today, the Git backend) and the
+    Postgres-mode worker (WP-23) call, so the sweep lives here rather than in either
+    caller.
     """
     pending = await pool.fetchval(
         "with deleted as (delete from oauth_pending where expires_at <= now() returning 1) "
@@ -515,4 +523,10 @@ async def cleanup(pool: asyncpg.Pool) -> CleanupStats:
         ") select count(*) from deleted",
         _CLIENT_CLEANUP_AGE,
     )
-    return CleanupStats(pending=pending, codes=codes, tokens=tokens, clients=clients)
+    sessions = await pool.fetchval(
+        "with deleted as (delete from account_sessions where expires_at <= now() returning 1) "
+        "select count(*) from deleted"
+    )
+    return CleanupStats(
+        pending=pending, codes=codes, tokens=tokens, clients=clients, sessions=sessions
+    )
