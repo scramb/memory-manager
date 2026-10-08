@@ -481,7 +481,7 @@ def _audit_write_hook(audit: AuditWriter) -> AuditHook:
     async def hook(
         request: WriteRequest, result: WriteResult | None, error: Exception | None
     ) -> None:
-        outcome, detail = _audit_outcome(result, error)
+        outcome, detail = _audit_outcome(request.op, result, error)
         await audit.record(
             actor=request.actor,
             client=request.client,
@@ -496,7 +496,7 @@ def _audit_write_hook(audit: AuditWriter) -> AuditHook:
 
 
 def _audit_outcome(
-    result: WriteResult | None, error: Exception | None
+    op: str, result: WriteResult | None, error: Exception | None
 ) -> tuple[str, dict[str, object]]:
     """The `(outcome, detail)` pair `_audit_write_hook` records for one write.
 
@@ -504,12 +504,22 @@ def _audit_outcome(
     `detail` never carries `current_content`/`current_version`-adjacent note
     text, only a version, an error class name, a conflict file path, or -
     for `BlocklistRejected` - the matched category's name, never the text
-    that matched it (#244).
+    that matched it (#244). For a successful `"promote"` (#227) only, it
+    adds the original note's resulting path/version from
+    `WriteResult.related` (its archive path, or the unchanged original
+    `path` with `keep_original=True`), so one `audit_log` row carries both
+    paths a promote touched. `related` is `None`/empty for every other op
+    except `supersede`, which is deliberately not added here.
     """
     if error is None:
         if result is None:  # pragma: no cover - defensive, a write-queue invariant
             return "failed", {"error": "unknown"}
-        return "ok", {"version": result.version}
+        detail: dict[str, object] = {"version": result.version}
+        if op == "promote" and result.related:
+            original_path, original_version = next(iter(result.related.items()))
+            detail["original_path"] = original_path
+            detail["original_version"] = original_version
+        return "ok", detail
     if isinstance(error, VersionConflict):
         return "conflict", {"error": "VersionConflict", "current_version": error.current_version}
     if isinstance(error, WriteConflict):

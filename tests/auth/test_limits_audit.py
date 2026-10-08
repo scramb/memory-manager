@@ -506,6 +506,44 @@ async def test_write_tool_call_leaves_separately_prefixed_mcp_and_write_rows(
     assert all(row["count"] == 1 for row in rows)
 
 
+async def test_promote_tool_call_also_counts_against_the_write_limiter(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    """#227: `memory_promote` is in `http.py`'s `_WRITE_TOOL_NAMES`, the same as every
+    other write tool above - `_is_write_tool_call` only inspects the raw JSON-RPC body
+    naming the tool, so this never needs the call to actually succeed.
+    """
+    config = ServerConfig(
+        public_url=_PUBLIC_URL,
+        mcp_per_minute=60,
+        mcp_burst=60,
+        write_per_minute=60,
+        write_burst=60,
+    )
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    promote_call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "memory_promote", "arguments": {}},
+    }
+    async with _running_app(environ, config) as app:
+        pool: asyncpg.Pool = app.state.services.pool
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(config.mcp_path, json=promote_call, headers=headers)
+        assert response.status_code != 429
+
+        rows = await pool.fetch("select key, count from rate_limits order by key")
+
+    keys = [row["key"] for row in rows]
+    assert len(keys) == 2
+    assert any(key.startswith("mcp:token:") for key in keys)
+    assert any(key.startswith("write:token:") for key in keys)
+    assert all(row["count"] == 1 for row in rows)
+
+
 async def test_oversized_chunked_mcp_body_with_no_content_length_is_413(
     bare_remote: Path, tmp_path: Path
 ) -> None:
@@ -821,3 +859,43 @@ async def test_audit_row_recorded_for_a_supersede(
     assert row["op"] == "supersede"
     assert row["outcome"] == "ok"
     assert row["path"] == new_path
+
+
+async def test_audit_row_recorded_for_a_promote_carries_both_paths(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    """#227: a `memory_promote` leaves exactly one `audit_log` row - the copy's own
+    `path` (like every other write) plus the original's resulting path/version from
+    `app._audit_outcome`'s `promote`-only addition to `detail` (`WriteResult.related`),
+    so the one row carries both paths a promote touched.
+    """
+    path = "personal/fact/to-promote.md"
+    seed_notes(bare_remote, {path: _note_bytes(new_ulid(_CREATED))})
+    config = ServerConfig(public_url=_PUBLIC_URL)
+    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
+        pool: asyncpg.Pool = app.state.services.pool
+        plaintext, _info = await create_token(
+            pool, "ci", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+        )
+
+        async with _authed_mcp_client(app, config, plaintext) as client:
+            read_result = await client.call_tool("memory_read", {"items": [path]})
+            version_str = read_result.structured_content["result"][0]["version"]
+
+            promote_result = await client.call_tool(
+                "memory_promote",
+                {"path": path, "target_namespace": "team", "if_version": version_str},
+            )
+            assert promote_result.is_error is False
+
+        rows = await pool.fetch("select * from audit_log where op = 'promote'")
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["actor"] == "ci"
+    assert row["outcome"] == "ok"
+    assert row["path"] == "team/fact/to-promote.md"
+    detail = json.loads(row["detail"])
+    assert detail["version"]
+    assert detail["original_path"] == "_archive/" + path
+    assert detail["original_version"]

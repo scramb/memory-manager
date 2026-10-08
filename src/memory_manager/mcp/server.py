@@ -8,10 +8,12 @@ client reads first, `memory_read` fetches the notes it picked by path or id,
 (`memory_manager.storage.StorageBackend`, ADR-0007 §1 - every tool below
 calls only the interface, never a backend's own internals), and
 `memory_supersede`/`memory_archive` retire a note without ever deleting it
-(CLAUDE.md "Never hard-delete notes")
-- all five surface a conflict as an error result carrying the current
-content and version instead of ever overwriting silently (CLAUDE.md "Never
-overwrite silently"). `memory_search` (#30) ranks notes with
+(CLAUDE.md "Never hard-delete notes"), and `memory_promote` (#227) copies a
+note from the caller's own namespace into a shared one, archiving the
+original the same way `memory_archive` does unless `keep_original` is set
+- every one of these write tools surfaces a conflict as an error result
+carrying the current content and version instead of ever overwriting
+silently (CLAUDE.md "Never overwrite silently"). `memory_search` (#30) ranks notes with
 `memory_manager.search.hybrid_search` when `Services.indexer` is set - both
 the `git` backend with `DATABASE_URL` configured and the `postgres` backend
 (ADR-0007 §2/§4, WP-18: every write there indexes itself, so `Services.indexer`
@@ -36,8 +38,8 @@ RLS: `_resolve_namespaces` makes the one `namespaces.resolve` round trip a
 tool call needs, every path/namespace argument is rewritten from `me` to the
 caller's real personal-namespace alias before use and back to `me` in every
 success and error result (`_to_stored_path`/`_to_display_path`,
-`_rewrite_error_result`), and `_require_writable`/`_require_archive_access`
-replace `mcp/authz.py`'s plain, token-namespace-only
+`_rewrite_error_result`), and `_require_writable`/`_require_archive_access`/
+`_require_promote_access` replace `mcp/authz.py`'s plain, token-namespace-only
 `require_writable_namespace` with the full matrix, further narrowed by
 whatever a static/OAuth token's own `namespaces` claim (ADR-0004) still
 restricts (`_effective_readable`/`_effective_writable`). `"git"` mode
@@ -99,7 +101,7 @@ from memory_manager.search import NoteHit, SearchFilters, hybrid_search
 from memory_manager.search_fallback import ScanHit, scan_search
 from memory_manager.storage import InvalidNote, NotFound, StorageBackend, WriteError
 from memory_manager.vault.note import Note, NoteFormatError, parse, serialize
-from memory_manager.vault.paths import PathRejected, parse_note_path
+from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path
 from memory_manager.vault.ulid import is_ulid, new_ulid
 from memory_manager.vault.validate import NOTE_TYPES
 
@@ -216,6 +218,36 @@ class MemoryArchiveResult(TypedDict):
 
     archived_path: str
     version: str
+    commit: str
+
+
+class _PromotedCopy(TypedDict):
+    """The new, shared-namespace side of a successful `memory_promote`."""
+
+    path: str
+    id: str
+    version: str
+    # Additive (ADR-0008, #102): the ADR-0008 kind of the target namespace
+    # ('personal'/'group'/'project'/'org'), or `None` on the Git backend
+    # (`services.app_role is None` - no namespace registry at all).
+    namespace_kind: str | None
+
+
+class _PromotedOriginal(TypedDict):
+    """The original note's side of a successful `memory_promote`: its resulting path
+    (the archive path, or the unchanged original `path` when `keep_original=True`)
+    and version - never deleted, same as `memory_archive`/`memory_supersede`.
+    """
+
+    path: str
+    version: str
+
+
+class MemoryPromoteResult(TypedDict):
+    """The result of a successful `memory_promote`."""
+
+    new: _PromotedCopy
+    original: _PromotedOriginal
     commit: str
 
 
@@ -374,6 +406,28 @@ commit}}`. On a conflict - `if_version` is stale, `old` does not exist, or
 `new_path` already exists - returns an error result (`isError: true`) whose
 structured content carries enough to retry, the same way `memory_write` does."""
 
+_MEMORY_PROMOTE_DESCRIPTION = f"""\
+Copy the note at `path` into `target_namespace`, a shared namespace you can write to.
+
+{TOOL_DATA_SENTENCE}
+The default write target stays your own namespace (`me`) - use this only when a note
+should actually become shared, team-visible knowledge, and only into a namespace you
+already have write access to. The copy gets a new `id` at `<target_namespace>/<type>/
+<slug>.md` (`path`'s own `type`/`slug`); the original's id is added to its `supersedes`
+list; every other field is carried over unchanged. `if_version` is the `version` a
+previous `memory_read` returned for `path`.
+
+Unless `keep_original` is set, the original at `path` is archived in the same write
+(moved to `_archive/`, exactly like `memory_archive` - never deleted); `keep_original=true`
+leaves it untouched in place instead.
+
+On success returns `{{new: {{path, id, version, namespace_kind}}, original: {{path,
+version}}, commit}}`. `namespace_kind` is 'personal', 'group', 'project' or 'org' in
+enterprise mode, and `null` otherwise. On a conflict - `if_version` is stale, `path` does
+not exist or is archived, or the target path already exists - returns an error result
+(`isError: true`) whose structured content carries enough to retry, the same way
+`memory_write` does."""
+
 _MEMORY_ARCHIVE_DESCRIPTION = f"""\
 Archive the note at `path`: move it to `_archive/`, never delete it.
 
@@ -528,6 +582,51 @@ def _require_writable(path: str, resolved: namespaces.Resolution | None) -> None
     if note_path.namespace not in resolved.writable():
         raise ToolError(
             f"caller may not write to namespace {resolved.to_display(note_path.namespace)!r}"
+        )
+
+
+def _require_promote_access(
+    path: str, target_namespace: str, resolved: namespaces.Resolution | None
+) -> None:
+    """Raise `ToolError` unless the calling principal may promote `path` into
+    `target_namespace` (ADR-0008 "`memory_promote`"). `path`/`target_namespace` are
+    already in stored-alias form (`_to_stored_path`/`_to_stored_namespace`), not `me`.
+
+    `"postgres"` mode (`resolved` set): the source must be the caller's own `me` -
+    promote moves a *personal* note into a shared namespace, never someone else's
+    personal namespace nor one that is already shared (ADR-0008 "it copies a note
+    from `me`"); the target must be in the ADR-0008 matrix's `writable()` set, the
+    same check `_require_writable` makes for every other write tool. `"git"` mode
+    (`resolved is None`, no `me`, no registry - ADR-0008 "Git backend: unchanged"):
+    both source and target are checked against the token's own writable namespaces
+    instead (`mcp/authz.py`'s `require_writable_namespace`), the same way every
+    other write tool does. Best-effort on a `path` that does not even parse as a
+    note path - left to `storage.promote`'s own, sharper `InvalidNote`/`PathRejected`,
+    the same way `_require_writable` is.
+    """
+    try:
+        source_note_path = parse_note_path(path, allow_archive=False)
+    except PathRejected:
+        return
+
+    if resolved is None:
+        require_writable_namespace(path)
+        target_candidate = NotePath(
+            namespace=target_namespace,
+            type=source_note_path.type,
+            slug=source_note_path.slug,
+        ).relative
+        require_writable_namespace(target_candidate)
+        return
+
+    if resolved.own_alias is None or source_note_path.namespace != resolved.own_alias:
+        raise ToolError(
+            f"memory_promote only promotes from the caller's own namespace (me), "
+            f"not {resolved.to_display(source_note_path.namespace)!r}"
+        )
+    if target_namespace not in resolved.writable():
+        raise ToolError(
+            f"caller may not write to namespace {resolved.to_display(target_namespace)!r}"
         )
 
 
@@ -1063,6 +1162,70 @@ def build_server(
                     "path": _to_display_path(resolved_old, resolved),
                     "version": old_version,
                     "valid_to": valid_to,
+                },
+                "commit": result.commit,
+            }
+        )
+
+    @mcp.tool(description=_MEMORY_PROMOTE_DESCRIPTION)
+    @instrument_tool("memory_promote")
+    async def memory_promote(
+        path: str,
+        target_namespace: str,
+        if_version: str,
+        keep_original: bool = False,
+    ) -> Annotated[CallToolResult, MemoryPromoteResult]:
+        """Copy the note at `path` into `target_namespace`, a shared namespace you can write to."""
+        require_scope(WRITE_SCOPE)
+        resolved = await _resolve_namespaces(services)
+        stored_path_or_error = _to_stored_path_or_result(path, resolved)
+        if isinstance(stored_path_or_error, CallToolResult):
+            return stored_path_or_error
+        stored_path = stored_path_or_error
+
+        try:
+            stored_target_namespace = _to_stored_namespace(target_namespace, resolved)
+        except PathRejected as exc:
+            raise ToolError(
+                f"memory_promote got an invalid target_namespace {target_namespace!r}: {exc}"
+            ) from exc
+
+        _require_promote_access(stored_path, stored_target_namespace, resolved)
+
+        try:
+            result = await services.storage.promote(
+                stored_path,
+                stored_target_namespace,
+                if_version=if_version,
+                keep_original=keep_original,
+                client=current_client(),
+                actor=current_actor(),
+            )
+        except WriteError as exc:
+            return _rewrite_error_result(_error_result(exc), resolved)
+
+        original_path, original_version = next(iter((result.related or {}).items()), ("", ""))
+
+        new_stored = await services.storage.read(result.path)
+        if new_stored is None:  # pragma: no cover - defensive, see memory_edit above
+            raise RuntimeError(f"'{result.path}' was just written but is now missing")
+        new_id = parse(new_stored.content).id
+
+        namespace_kind = (
+            _namespace_kind_of_path(result.path, resolved) if resolved is not None else None
+        )
+
+        return _ok_result(
+            {
+                "new": {
+                    "path": _to_display_path(result.path, resolved),
+                    "id": new_id,
+                    "version": result.version,
+                    "namespace_kind": namespace_kind,
+                },
+                "original": {
+                    "path": _to_display_path(original_path, resolved),
+                    "version": original_version,
                 },
                 "commit": result.commit,
             }

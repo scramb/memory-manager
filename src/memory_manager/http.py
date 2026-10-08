@@ -158,9 +158,11 @@ _OAUTH_RATE_LIMITED_PATHS = frozenset({"/register", "/token", "/authorize"})
 
 #: The MCP tool names whose calls count against `ServerConfig.write_per_minute`/
 #: `write_burst` in addition to the general `mcp_per_minute`/`mcp_burst` limit
-#: every `mcp_path` request counts against (#39) - `mcp/server.py`'s five
+#: every `mcp_path` request counts against (#39) - `mcp/server.py`'s six
 #: write tools, minus `memory_search`/`memory_read`/`memory_index` (read-only).
-_WRITE_TOOL_NAMES = frozenset({"memory_write", "memory_edit", "memory_supersede", "memory_archive"})
+_WRITE_TOOL_NAMES = frozenset(
+    {"memory_write", "memory_edit", "memory_supersede", "memory_archive", "memory_promote"}
+)
 
 ServicesFactory = Callable[[], AbstractAsyncContextManager[Services]]
 
