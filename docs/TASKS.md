@@ -269,7 +269,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 ### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
 
 - [x] #242 Write rate quotas per user, namespace and token hold across replicas
-- [ ] #243 Note count and size quotas reject writes that would exceed a namespace's limit ⛔ blocked by #242
+- [x] #243 Note count and size quotas reject writes that would exceed a namespace's limit ⛔ blocked by #242
 - [ ] #244 Writes matching an operator blocklist category are rejected and audited without content ⛔ blocked by #226
 - [x] #245 Every audit record is exported to stdout or OTLP for a SIEM
 

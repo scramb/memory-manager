@@ -24,8 +24,9 @@ to `None` and `PostgresBackend(pool)` keeps working unchanged.
 
 Row-level security (ADR-0008 + both addenda, #116): `__init__`'s optional
 `app_role` turns on the request path's role switch. Every content-table
-access below - `read`/`list` and the inner flow of `write`/`edit`/`archive`/
-`supersede` - runs exclusively through `_content_connection`, this class's
+access below - `read`/`list`/`namespace_usage` and the inner flow of
+`write`/`edit`/`archive`/`supersede` - runs exclusively through
+`_content_connection`, this class's
 one seam onto a connection: without `app_role` (every existing
 `PostgresBackend(pool)` call, including every test in this package) it is a
 plain pool connection in its own transaction, exactly as before `app_role`
@@ -104,6 +105,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import asyncpg
@@ -126,7 +128,7 @@ from memory_manager.storage.base import (
 from memory_manager.vault.note import parse, version
 from memory_manager.vault.paths import PathRejected, parse_note_path
 
-__all__ = ["PostgresBackend"]
+__all__ = ["NamespaceUsage", "PostgresBackend"]
 
 _logger = logging.getLogger(__name__)
 
@@ -196,9 +198,48 @@ _SELECT_EXISTING_PATHS = """
 select path from vault_notes where path = any($1::text[])
 """
 
+#: `namespace_usage`'s one query (#243): `note_count` excludes an archived
+#: path (`left(path, 9) = '_archive/'`, `vault.paths.NotePath`'s own
+#: `_ARCHIVE_SEGMENT` prefix - CLAUDE.md/#243's own issue text: "archived
+#: notes count toward size, not toward count"), `total_bytes` does not -
+#: it sums every row for `namespace`, archived or not. `path_bytes` is the
+#: byte size already stored at the one `path` a write/edit/supersede is
+#: about to touch (`0` if it does not exist yet, via the `coalesce` below),
+#: read in the same round trip so a caller can compute "total after this
+#: write" as `total_bytes - path_bytes + <the write's own predicted size>`
+#: without a second query. Uses `vault_notes_namespace_idx` (`0013_vault_
+#: notes_namespace_idx.sql` - 0010-0012 are taken by WP-22/WP-23, applied
+#: in sorted-filename order regardless of the gap) for the `namespace` match.
+_SELECT_NAMESPACE_USAGE = """
+with ns as (
+    select
+        count(*) filter (where left(path, 9) <> '_archive/') as note_count,
+        coalesce(sum(octet_length(content)), 0) as total_bytes
+    from vault_notes
+    where namespace = $1
+)
+select
+    ns.note_count,
+    ns.total_bytes,
+    coalesce((select octet_length(content) from vault_notes where path = $2), 0) as path_bytes
+from ns
+"""
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class NamespaceUsage:
+    """What `namespace` currently holds, for `quotas.StorageQuotaChecker.check_write` (#243)
+    to predict a write's/edit's/supersede's resulting note count and byte size against,
+    before it runs. See `PostgresBackend.namespace_usage`'s own docstring for exactly what
+    each field counts."""
+
+    note_count: int
+    total_bytes: int
+    path_bytes: int
 
 
 class PostgresBackend:
@@ -317,6 +358,27 @@ class PostgresBackend:
                 StoredNote(path=path, content=bytes(row["content"]), version=row["version"])
             )
         return entries
+
+    async def namespace_usage(self, namespace: str, path: str) -> NamespaceUsage:
+        """`namespace`'s current note count/byte size, plus `path`'s own current byte size.
+
+        Read-only, through the same RLS-respecting `_content_connection` every
+        other read in this backend uses - under `app_role` once one is
+        configured, a plain pool connection otherwise, exactly like `read`/
+        `list` above. `path` need not exist yet (`NamespaceUsage.path_bytes`
+        is `0` then, the `_SELECT_NAMESPACE_USAGE` module constant's own
+        `coalesce`) - a caller computes "this write's predicted total" from
+        the three fields together, see that constant's own comment.
+        """
+        async with self._content_connection() as conn:
+            row = await conn.fetchrow(_SELECT_NAMESPACE_USAGE, namespace, path)
+        if row is None:  # pragma: no cover - the `ns` CTE above always returns exactly one row
+            raise AssertionError("_SELECT_NAMESPACE_USAGE returned no row")
+        return NamespaceUsage(
+            note_count=int(row["note_count"]),
+            total_bytes=int(row["total_bytes"]),
+            path_bytes=int(row["path_bytes"]),
+        )
 
     async def write(
         self,

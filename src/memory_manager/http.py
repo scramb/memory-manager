@@ -129,7 +129,8 @@ from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
 from memory_manager.observability.metrics import metrics_endpoint
-from memory_manager.quotas import QuotaChecker
+from memory_manager.quotas import QuotaChecker, StorageQuotaChecker
+from memory_manager.storage.postgres import PostgresBackend
 
 __all__ = ["GracefulShutdownServer", "ServicesFactory", "build_authenticator", "create_app"]
 
@@ -368,6 +369,26 @@ def create_app(
                 token_per_day=config.quota_token_per_day,
             )
 
+            # `StorageQuotaChecker` (#243) only ever applies to the Postgres
+            # backend - `vault_notes` stays empty for "git" (ADR-0007 §2), so a
+            # note-count/byte-size budget against it would be meaningless.
+            # `services.pool is not None` alone (as `quota_checker` above uses)
+            # is not enough here: that also holds for "git" with `DATABASE_URL`
+            # configured, where `services.storage` is a `storage.git.GitBackend`,
+            # not a `PostgresBackend`.
+            storage_quota_checker = (
+                StorageQuotaChecker(
+                    storage=services.storage,
+                    audit=AuditWriter(services.pool) if services.pool is not None else None,
+                    max_notes_personal=config.quota_max_notes_personal,
+                    max_bytes_personal=config.quota_max_bytes_personal,
+                    max_notes_shared=config.quota_max_notes_shared,
+                    max_bytes_shared=config.quota_max_bytes_shared,
+                )
+                if isinstance(services.storage, PostgresBackend)
+                else None
+            )
+
             oauth_provider = _build_oauth_provider(config, services, authenticator, cimd_fetcher)
             oauth_cell.provider = oauth_provider
 
@@ -391,6 +412,7 @@ def create_app(
                 token_verifier=token_verifier,
                 auth_server_provider=oauth_provider,
                 quota_checker=quota_checker,
+                storage_quota_checker=storage_quota_checker,
             )
             mcp_app = mcp.streamable_http_app(
                 streamable_http_path=config.mcp_path,

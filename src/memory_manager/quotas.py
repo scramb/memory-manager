@@ -52,6 +52,29 @@ a namespace string or a token hash) and never note content, matching
 rule. `audit` is `None` for `"git"` mode without a database configured (no
 `audit_log` table exists there at all) - a rejection then is logged at
 WARNING only, same as the backend-unavailable fail-open path above.
+
+`StorageQuotaChecker` (#243) is a second, independent budget: not how fast a
+caller may write, but how much a namespace may hold in total - a note-count
+and a byte-size cap, each in two flavours ("personal": the caller's own
+namespace, "shared": every group/project/org namespace). Postgres mode
+only (`storage.postgres.PostgresBackend`'s own `vault_notes`/`vault_revisions`
+are what the Git backend never populates) - `http.py` builds one only once
+`services.storage` actually is a `PostgresBackend`. Unlike `QuotaChecker`
+above, it is given the exact bytes/note a write is about to produce (`mcp/
+server.py` already has to compute those to submit the write at all) rather
+than counting requests itself; `PostgresBackend.namespace_usage` is its one
+query, under the same RLS-respecting connection every other read in that
+backend uses. A soft limit, by design (#243's own issue text): the usage
+query and the write it gates are two separate round trips, not one
+transaction, so two concurrent writes against a namespace already one slot
+or one byte under its cap can both pass the check and both land - the same
+"may overshoot by at most their number" soft-limit shape `QuotaChecker`'s
+own shared-state windows already have, just without a shared counter to
+make it precise even under concurrency. `check_write` is called only for
+`write`/`edit`/`supersede` (never `archive`, which only ever frees a slot -
+CLAUDE.md "archived notes count toward size, not toward count" is exactly
+why a count check only ever applies to a *new* note, never to editing an
+existing one or to archiving it in place).
 """
 
 from __future__ import annotations
@@ -68,8 +91,17 @@ from memory_manager.auth.shared_state import SharedState
 from memory_manager.db.rls import current_principal
 from memory_manager.observability.metrics import record_quota_hit
 from memory_manager.storage import Op
+from memory_manager.storage.postgres import PostgresBackend
 
-__all__ = ["QuotaChecker", "QuotaExceeded", "QuotaScope"]
+__all__ = [
+    "NamespaceKind",
+    "QuotaChecker",
+    "QuotaExceeded",
+    "QuotaResource",
+    "QuotaScope",
+    "StorageQuotaChecker",
+    "StorageQuotaExceeded",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -257,5 +289,209 @@ class QuotaChecker:
                 "window": window_name,
                 "limit": limit,
                 "retry_after": round(retry_after, 1),
+            },
+        )
+
+
+#: "personal": the caller's own namespace (ADR-0008's `me`). "shared": every
+#: other kind `mcp/namespaces.py`'s `Resolution.kind_of` reports (`'group'`,
+#: `'project'`, `'org'`) - #243's two budgets, "shared" collapsing all three
+#: registry kinds into one quota rather than giving each its own.
+NamespaceKind = Literal["personal", "shared"]
+
+#: What a `StorageQuotaExceeded` was raised over: a namespace's note count
+#: (excluding archived notes) or its total byte size (including them).
+QuotaResource = Literal["notes", "bytes"]
+
+
+class StorageQuotaExceeded(ToolError):
+    """Raised by `StorageQuotaChecker.check_write` once `namespace_kind`'s `resource`
+    budget would be over `limit` after this write.
+
+    Carries `resource`, `namespace_kind`, `limit` and `predicted` as attributes - the
+    same "structured, on top of the plain message every write tool surfaces to the
+    client unchanged" shape `QuotaExceeded` already has, just without a time
+    dimension (#243's budget is a static cap, not a window).
+    """
+
+    def __init__(
+        self,
+        *,
+        resource: QuotaResource,
+        namespace_kind: NamespaceKind,
+        limit: int,
+        predicted: int,
+    ) -> None:
+        self.resource = resource
+        self.namespace_kind = namespace_kind
+        self.limit = limit
+        self.predicted = predicted
+        unit = "notes" if resource == "notes" else "bytes"
+        super().__init__(
+            f"{namespace_kind} namespace storage quota exceeded: {resource} limit is "
+            f"{limit} {unit}, this write would bring it to {predicted}"
+        )
+
+
+class StorageQuotaChecker:
+    """Enforces the `personal`/`shared` note-count and byte-size quotas on `storage` (#243).
+
+    See the module docstring for the full design (Postgres mode only, soft
+    limit, why `archive` is never checked). `*_notes`/`*_bytes` are each `0`
+    (off) by default. `audit` is the sink a rejection is recorded to, `None`
+    to only log it - same contract `QuotaChecker.__init__` uses.
+    """
+
+    def __init__(
+        self,
+        *,
+        storage: PostgresBackend,
+        audit: AuditWriter | None = None,
+        max_notes_personal: int = 0,
+        max_bytes_personal: int = 0,
+        max_notes_shared: int = 0,
+        max_bytes_shared: int = 0,
+    ) -> None:
+        self._storage = storage
+        self._audit = audit
+        self._limits: dict[NamespaceKind, tuple[int, int]] = {
+            "personal": (max_notes_personal, max_bytes_personal),
+            "shared": (max_notes_shared, max_bytes_shared),
+        }
+
+    async def check_write(
+        self,
+        *,
+        op: Op,
+        path: str,
+        namespace: str,
+        namespace_kind: NamespaceKind,
+        is_new_note: bool,
+        final_size: int,
+        actor: str,
+        client: str,
+    ) -> None:
+        """Raise `StorageQuotaExceeded` if this write would push `namespace` over its
+        `namespace_kind` note-count or byte-size budget.
+
+        `is_new_note` is whether this write inserts a new row into
+        `vault_notes` (`write(if_version="new")`, or `supersede`'s new note -
+        never `edit`, which only ever changes an existing note's content):
+        the note-count budget is only ever checked then, never for an edit
+        or an overwrite of an existing path (CLAUDE.md "archived notes count
+        toward size, not toward count" is the same idea the other way:
+        editing in place changes nothing about how many notes a namespace
+        holds either). `final_size` is the byte length of what this write
+        would actually store at `path` - the caller already computed (or, for
+        `edit`, estimated) this to submit the write at all; never recomputed
+        here. Both budgets are skipped entirely (no query at all) when
+        neither is configured for `namespace_kind`.
+        """
+        max_notes, max_bytes = self._limits[namespace_kind]
+        if max_notes <= 0 and max_bytes <= 0:
+            return
+        try:
+            usage = await self._storage.namespace_usage(namespace, path)
+        except Exception:
+            _logger.warning(
+                "storage quota backend unavailable; failing open for namespace_kind=%s",
+                namespace_kind,
+                exc_info=True,
+            )
+            return
+
+        if is_new_note and max_notes > 0:
+            predicted_notes = usage.note_count + 1
+            if predicted_notes > max_notes:
+                await self._reject(
+                    resource="notes",
+                    namespace_kind=namespace_kind,
+                    limit=max_notes,
+                    predicted=predicted_notes,
+                    op=op,
+                    path=path,
+                    actor=actor,
+                    client=client,
+                )
+
+        if max_bytes > 0:
+            predicted_bytes = usage.total_bytes - usage.path_bytes + final_size
+            if predicted_bytes > max_bytes:
+                await self._reject(
+                    resource="bytes",
+                    namespace_kind=namespace_kind,
+                    limit=max_bytes,
+                    predicted=predicted_bytes,
+                    op=op,
+                    path=path,
+                    actor=actor,
+                    client=client,
+                )
+
+    async def _reject(
+        self,
+        *,
+        resource: QuotaResource,
+        namespace_kind: NamespaceKind,
+        limit: int,
+        predicted: int,
+        op: Op,
+        path: str,
+        actor: str,
+        client: str,
+    ) -> None:
+        _logger.warning(
+            "storage quota exceeded: resource=%s namespace_kind=%s limit=%d predicted=%d",
+            resource,
+            namespace_kind,
+            limit,
+            predicted,
+        )
+        await self._audit_rejection(
+            resource=resource,
+            namespace_kind=namespace_kind,
+            limit=limit,
+            predicted=predicted,
+            op=op,
+            path=path,
+            actor=actor,
+            client=client,
+        )
+        raise StorageQuotaExceeded(
+            resource=resource, namespace_kind=namespace_kind, limit=limit, predicted=predicted
+        )
+
+    async def _audit_rejection(
+        self,
+        *,
+        resource: QuotaResource,
+        namespace_kind: NamespaceKind,
+        limit: int,
+        predicted: int,
+        op: Op,
+        path: str,
+        actor: str,
+        client: str,
+    ) -> None:
+        """One `audit_log` row for a rejected write, if `self._audit` is configured.
+
+        `detail` never carries `namespace` itself - only `resource`,
+        `namespace_kind`, `limit` and `predicted` - the same "never the quota
+        key" rule `QuotaChecker._audit_rejection` already follows.
+        """
+        if self._audit is None:
+            return
+        await self._audit.record(
+            actor=actor,
+            client=client,
+            op=op,
+            path=path,
+            commit_sha=None,
+            outcome="rejected_quota",
+            detail={
+                "resource": resource,
+                "namespace_kind": namespace_kind,
+                "limit": limit,
+                "predicted": predicted,
             },
         )

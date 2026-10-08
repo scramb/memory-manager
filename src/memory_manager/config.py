@@ -63,6 +63,13 @@ _DEFAULT_FORWARDED_ALLOW_IPS = "127.0.0.1"
 _DEFAULT_QUOTA_WRITES_PER_MINUTE = 0.0
 _DEFAULT_QUOTA_WRITES_PER_DAY = 0.0
 
+# Storage quota defaults (#243): a namespace's note-count/byte-size budget,
+# Postgres mode only. All four default to 0, same "off unless a deployment
+# opts in" meaning as the `QUOTA_WRITES_*` defaults above - see `quotas.
+# StorageQuotaChecker`'s own docstring for what "personal"/"shared" mean.
+_DEFAULT_QUOTA_MAX_NOTES = 0
+_DEFAULT_QUOTA_MAX_BYTES = 0
+
 # Graceful-shutdown grace period (ADR-0009 §5, #105). uvicorn's own default for
 # `timeout_graceful_shutdown` is `None` (wait forever); this picks a bounded
 # value instead, so `SIGKILL` from an orchestrator is never what actually ends
@@ -426,6 +433,19 @@ class ServerConfig:
     keys on and why `user` only ever applies once a `db.rls.Principal` exists
     (`"postgres"` mode, ADR-0008 addendum) while `namespace`/`token` apply to
     both storage backends.
+
+    `quota_max_notes_personal`/`quota_max_bytes_personal`/
+    `quota_max_notes_shared`/`quota_max_bytes_shared` (`QUOTA_MAX_NOTES_PERSONAL`/
+    `QUOTA_MAX_BYTES_PERSONAL`/`QUOTA_MAX_NOTES_SHARED`/`QUOTA_MAX_BYTES_SHARED`,
+    #243) feed `quotas.StorageQuotaChecker`, built by `http.py`'s `create_app`
+    only once `services.storage` is a `storage.postgres.PostgresBackend`
+    ("postgres" mode - the Git backend's `vault_notes` always stays empty, so
+    a note-count/byte-size budget against it would be meaningless). Each of
+    the four defaults to `0`, same "off unless a deployment opts in"
+    behaviour the six `QUOTA_WRITES_*` fields above have; "personal" is the
+    caller's own namespace, "shared" every group/project/org namespace - see
+    `quotas.StorageQuotaChecker`'s own docstring for exactly what counts
+    toward each and why archived notes count toward size but not count.
     """
 
     host: str = _DEFAULT_HOST
@@ -456,6 +476,10 @@ class ServerConfig:
     quota_namespace_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
     quota_token_per_minute: float = _DEFAULT_QUOTA_WRITES_PER_MINUTE
     quota_token_per_day: float = _DEFAULT_QUOTA_WRITES_PER_DAY
+    quota_max_notes_personal: int = _DEFAULT_QUOTA_MAX_NOTES
+    quota_max_bytes_personal: int = _DEFAULT_QUOTA_MAX_BYTES
+    quota_max_notes_shared: int = _DEFAULT_QUOTA_MAX_NOTES
+    quota_max_bytes_shared: int = _DEFAULT_QUOTA_MAX_BYTES
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -487,12 +511,13 @@ class ServerConfig:
     def from_env(cls, environ: dict[str, str]) -> ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
-        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`
-        entries of `environ`.
+        `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`/
+        `QUOTA_MAX_*` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
         variable if `PORT` is not a valid port number, any size/rate limit is
-        not a positive number, or any `QUOTA_WRITES_*` variable is negative.
+        not a positive number, or any `QUOTA_WRITES_*`/`QUOTA_MAX_*` variable
+        is negative.
         """
         host = environ.get("HOST", _DEFAULT_HOST)
         port = _parse_port(environ.get("PORT"))
@@ -548,6 +573,18 @@ class ServerConfig:
         quota_token_per_day = _parse_nonnegative_float(
             environ, "QUOTA_WRITES_PER_DAY_TOKEN", _DEFAULT_QUOTA_WRITES_PER_DAY
         )
+        quota_max_notes_personal = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_NOTES_PERSONAL", _DEFAULT_QUOTA_MAX_NOTES
+        )
+        quota_max_bytes_personal = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_BYTES_PERSONAL", _DEFAULT_QUOTA_MAX_BYTES
+        )
+        quota_max_notes_shared = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_NOTES_SHARED", _DEFAULT_QUOTA_MAX_NOTES
+        )
+        quota_max_bytes_shared = _parse_nonnegative_int(
+            environ, "QUOTA_MAX_BYTES_SHARED", _DEFAULT_QUOTA_MAX_BYTES
+        )
 
         return cls(
             host=host,
@@ -578,6 +615,10 @@ class ServerConfig:
             quota_namespace_per_day=quota_namespace_per_day,
             quota_token_per_minute=quota_token_per_minute,
             quota_token_per_day=quota_token_per_day,
+            quota_max_notes_personal=quota_max_notes_personal,
+            quota_max_bytes_personal=quota_max_bytes_personal,
+            quota_max_notes_shared=quota_max_notes_shared,
+            quota_max_bytes_shared=quota_max_bytes_shared,
         )
 
 
@@ -630,6 +671,21 @@ def _parse_nonnegative_float(environ: dict[str, str], name: str, default: float)
         value = float(raw)
     except ValueError as exc:
         raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value < 0:
+        raise ServerConfigError(f"{name} must be zero or positive, got {value}")
+    return value
+
+
+def _parse_nonnegative_int(environ: dict[str, str], name: str, default: int) -> int:
+    """Like `_parse_nonnegative_float`, but for an integer count/byte-size budget -
+    the "off" value every `QUOTA_MAX_*` variable (#243) uses."""
+    raw = environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ServerConfigError(f"{name} must be an integer, got {raw!r}") from exc
     if value < 0:
         raise ServerConfigError(f"{name} must be zero or positive, got {value}")
     return value
