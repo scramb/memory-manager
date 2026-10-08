@@ -25,6 +25,62 @@ storage:
 # backend lifts the maximum (ADR-0007, ADR-0009 §6).
 replicaCount: 1
 
+# The separate api and worker Deployments storage's own backend
+# "postgres" renders instead of the Deployment above (ADR-0009 §4, #250) - each has
+# its own replica count and resources; topologySpreadConstraints spreads
+# each component's pods across zones and nodes ("ScheduleAnyway" never
+# blocks scheduling when a cluster has only one zone or node).
+api:
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+
+worker:
+  replicaCount: 2
+  # WORKER_PORT (default 8090, matching the worker's own default -
+  # WP-23); the pod always sets WORKER_HOST=0.0.0.0 so probes can reach
+  # it from the kubelet.
+  port: 8090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    whenUnsatisfiable: ScheduleAnyway
+
+# Graceful shutdown (ADR-0009 §5), storage's own backend "postgres" only
+# - the git-mode Deployment's single replica has no in-flight traffic to
+# drain across a rollout the way api/worker do. terminationGracePeriodSeconds
+# must be at least graceSeconds + preStopSleepSeconds (the chart's own
+# "validateShutdown" helper fails the render otherwise).
+shutdown:
+  # SHUTDOWN_GRACE_SECONDS - uvicorn's timeout_graceful_shutdown.
+  graceSeconds: 20
+  # Kubernetes preStop hook: sleep this long before SIGTERM, so the load
+  # balancer has time to stop routing here before uvicorn starts
+  # draining.
+  preStopSleepSeconds: 10
+  terminationGracePeriodSeconds: 40
+
+# PodDisruptionBudget for the api Deployment (ADR-0009 §5), storage's own
+# backend "postgres" only - the worker Deployment runs best-effort
+# background jobs and needs no PDB of its own.
+pdb:
+  api:
+    minAvailable: 2
+
 image:
   repository: ghcr.io/scramb/memory-manager
   pullPolicy: IfNotPresent
@@ -183,6 +239,14 @@ database:
   existingSecret:
     name: ""
     key: uri
+  # DATABASE_APP_ROLE (api only, storage's own backend "postgres") - the
+  # non-owner, non-BYPASSRLS role every request transaction switches to
+  # before touching a FORCE ROW LEVEL SECURITY content table (ADR-0008
+  # addendum "system identity under FORCE RLS"). The operator creates
+  # this role and grants it to the owner role already in DATABASE_URL;
+  # the worker Deployment connects as the owner instead and never gets
+  # this variable (ADR-0008 addendum: system jobs keep bypassing RLS).
+  appRole: memory_manager_app
 
 # Gateway API HTTPRoute (deploy/httproute.yaml) - the whole host goes to
 # the app, which decides who gets in on its own. Mutually exclusive with

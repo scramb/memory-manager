@@ -21,6 +21,64 @@
       "minimum": 0,
       "description": "0 or 1 while storage.backend is \"git\" - memory-manager is then a single writer to the vault's git remote, never a scaled service. storage.backend \"postgres\" lifts the maximum."
     },
+    "api": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "storage.backend \"postgres\" only (ADR-0009 §4) - renders a separate api Deployment instead of the Deployment above.",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "resources": { "type": "object", "additionalProperties": true },
+        "topologySpreadConstraints": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxSkew": { "type": "integer", "minimum": 1 },
+            "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+          }
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "storage.backend \"postgres\" only (ADR-0009 §4) - the embedding queue, Graph delta sync, retention and OAuth cleanup.",
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "resources": { "type": "object", "additionalProperties": true },
+        "topologySpreadConstraints": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxSkew": { "type": "integer", "minimum": 1 },
+            "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+          }
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Graceful shutdown (ADR-0009 §5), storage.backend \"postgres\" only - terminationGracePeriodSeconds must be at least graceSeconds + preStopSleepSeconds (enforced by the chart's own validateShutdown helper).",
+      "properties": {
+        "graceSeconds": { "type": "integer", "minimum": 0 },
+        "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "pdb": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "api": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": { "minAvailable": { "type": "integer", "minimum": 0 } }
+        }
+      }
+    },
     "image": {
       "type": "object",
       "additionalProperties": true,
@@ -73,7 +131,7 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "mode": { "type": "string", "enum": ["oidc", "password"] },
+        "mode": { "type": "string", "enum": ["oidc", "entra", "password"] },
         "oidc": { "type": "object", "additionalProperties": true },
         "namespaces": { "type": "string" }
       }
@@ -127,6 +185,10 @@
             "name": { "type": "string" },
             "key": { "type": "string" }
           }
+        },
+        "appRole": {
+          "type": "string",
+          "description": "api only (storage.backend \"postgres\") - DATABASE_APP_ROLE, the non-owner role request transactions switch to (ADR-0008 addendum)."
         }
       }
     },

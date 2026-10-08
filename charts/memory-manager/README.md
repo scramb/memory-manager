@@ -3,7 +3,10 @@
 Helm packaging of the same server `deploy/` ships as a generic Kustomize base (`deploy/README.md`):
 the `Deployment`/`Service`, a `HTTPRoute`/`Ingress`, an optional CloudNativePG `Cluster` and an
 optional NetworkPolicy, restricted Pod Security by default, single writer while `storage` → `backend`
-is `git` (`replicaCount` 0 or 1 - `postgres` lifts the maximum, ADR-0007/ADR-0009 §6). For operators
+is `git` (`replicaCount` 0 or 1 - `postgres` lifts the maximum, ADR-0007/ADR-0009 §6). While
+`storage` → `backend` is `postgres`, the chart renders a scaling `api` Deployment and a `worker`
+Deployment instead, with graceful shutdown, topology spread and a PodDisruptionBudget for `api`
+(ADR-0009 §4/§5, `values-enterprise.yaml`). For operators
 who prefer Helm over Flux+Kustomize. Every tagged release publishes this
 chart as a signed OCI artifact (`docs/releasing.md`):
 
@@ -44,7 +47,12 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | Key | Default | Description |
 |---|---|---|
 | `storage` → `backend` | `git` | `git` (default, ADR-0007) or `postgres` (enterprise) - only `postgres` may run more than one replica or an autoscaler (ADR-0009 §6), enforced by `values.schema.json` and the chart's own `validate` helper |
-| `replicaCount` | `1` | 0 or 1 while `storage` → `backend` is `git` (`values.schema.json`) - single writer to the vault's git remote and per-process OAuth login rate limiter, never a scaled service; `postgres` lifts the maximum |
+| `replicaCount` | `1` | 0 or 1 while `storage` → `backend` is `git` (`values.schema.json`) - single writer to the vault's git remote and per-process OAuth login rate limiter, never a scaled service; ignored once `storage` → `backend` is `postgres`, which renders `api`/`worker` instead |
+| `api` → `replicaCount`/`resources`/`topologySpreadConstraints` | 3 replicas | `storage` → `backend` `postgres` only - the stateless api Deployment (ADR-0009 §4) |
+| `worker` → `replicaCount`/`port`/`resources`/`topologySpreadConstraints` | 2 replicas, port `8090` | `storage` → `backend` `postgres` only - the embedding queue, Graph delta sync, retention and OAuth cleanup (ADR-0009 §4) |
+| `shutdown` → `graceSeconds`/`preStopSleepSeconds`/`terminationGracePeriodSeconds` | 20/10/40 | `storage` → `backend` `postgres` only - graceful shutdown (ADR-0009 §5); the last value must be at least the first two added together |
+| `pdb` → `api` → `minAvailable` | `2` | `storage` → `backend` `postgres` only - PodDisruptionBudget for the api Deployment (ADR-0009 §5) |
+| `database` → `appRole` | `memory_manager_app` | api only, `storage` → `backend` `postgres` only - `DATABASE_APP_ROLE`, the non-owner role request transactions switch to (ADR-0008 addendum); the worker Deployment never gets it |
 | `image` → `repository` | `ghcr.io/scramb/memory-manager` | |
 | `image` → `tag` | `""` | Defaults to the chart's own `appVersion`; never `latest` |
 | `image` → `pullPolicy` | `IfNotPresent` | |
@@ -71,6 +79,18 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed |
 
 See `values.yaml` itself for the full, commented reference - this table is the summary.
+
+## Enterprise profile
+
+`values-enterprise.yaml` sets `storage` → `backend` to `postgres` and turns on the `api`/`worker`
+split above, Entra login placeholders included. It is a starting overlay, not a complete install -
+layer your own values on top for the pieces it does not cover yet (HPA/KEDA autoscaling, CNPG
+backups and the app role migration, Valkey shared state, NetworkPolicies):
+
+```sh
+helm template memory-manager charts/memory-manager \
+  -f charts/memory-manager/values-enterprise.yaml -f my-enterprise-values.yaml
+```
 
 ## Validate before installing
 

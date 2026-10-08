@@ -105,3 +105,44 @@ renders no output of its own.
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{/*
+Component-qualified selector labels: the same base selector (the
+selectorLabels helper above) plus app.kubernetes.io/component, so the
+"postgres"-only api and worker Deployments (ADR-0009 §4) get distinct,
+immutable selectors while the "git"-only Deployment above keeps its own,
+unqualified one exactly as it was (golden render test, #249). Takes a
+dict `(dict "context" $ "component" "api")`, since a named template
+cannot otherwise take a second argument alongside the root context.
+*/}}
+{{- define "memory-manager.componentSelectorLabels" -}}
+{{ include "memory-manager.selectorLabels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Component-qualified labels: the full label set (the labels helper above)
+plus app.kubernetes.io/component. Same calling convention as
+componentSelectorLabels above.
+*/}}
+{{- define "memory-manager.componentLabels" -}}
+{{ include "memory-manager.labels" .context }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Fails fast when shutdown's own terminationGracePeriodSeconds does not
+cover both the uvicorn drain (shutdown's own graceSeconds, ADR-0009
+§1/§5) and the preStop sleep on top of it (shutdown's own
+preStopSleepSeconds) - otherwise Kubernetes SIGKILLs the process before
+uvicorn's own grace period even starts draining in-flight requests.
+Included by templates/api-deployment.yaml and
+templates/worker-deployment.yaml ("postgres" only - the "git" Deployment
+has no comparable drain to protect); renders no output of its own.
+*/}}
+{{- define "memory-manager.validateShutdown" -}}
+{{- $needed := add (int .Values.shutdown.graceSeconds) (int .Values.shutdown.preStopSleepSeconds) }}
+{{- if lt (int .Values.shutdown.terminationGracePeriodSeconds) $needed }}
+{{- fail (printf "shutdown.terminationGracePeriodSeconds (%d) must be at least shutdown.graceSeconds + shutdown.preStopSleepSeconds (%d) (ADR-0009 §5)" (int .Values.shutdown.terminationGracePeriodSeconds) $needed) }}
+{{- end }}
+{{- end }}

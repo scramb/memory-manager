@@ -78,7 +78,14 @@ def test_git_backend_refuses_an_autoscaler(render: Callable[..., _ChartRender]) 
 
 
 def test_postgres_backend_allows_more_than_one_replica(render: Callable[..., _ChartRender]) -> None:
-    result = render(set_values={"storage.backend": "postgres", "replicaCount": "3"})
+    # The generic Deployment above only ever renders for storage.backend
+    # "git" (#250); "postgres" renders the separate api Deployment
+    # instead (templates/api-deployment.yaml), scaled by api.replicaCount
+    # rather than the top-level replicaCount.
+    result = render(set_values={"storage.backend": "postgres", "api.replicaCount": "3"})
 
-    deployment = result.find("Deployment")
-    assert deployment["spec"]["replicas"] == 3
+    deployments = [doc for doc in result.documents() if doc.get("kind") == "Deployment"]
+    api_deployment = next(
+        d for d in deployments if d["metadata"]["labels"]["app.kubernetes.io/component"] == "api"
+    )
+    assert api_deployment["spec"]["replicas"] == 3
