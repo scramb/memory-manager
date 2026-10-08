@@ -27,6 +27,16 @@ What each metric answers:
 - `mm_quota_hits_total` (`scope`, `outcome`): every `quotas.QuotaChecker`
   write-quota check, labeled by scope (`user`/`namespace`/`token`) and
   `outcome` (`"allowed"`/`"rejected"`) - via `record_quota_hit`.
+- `mm_rate_limit_hits_total` (`limiter`): every request actually rejected by
+  a rate limiter or a quota check - never a fail-open backend error, which
+  every call site already treats as allowed before this is ever reached
+  (#260). Fixed `limiter` values: `"mcp"`/`"write"`/`"oauth"`/`"webhook"`
+  (`http.py`'s `_send_rate_limited` call sites, one per `RateLimiter`),
+  `"login"` (the password brute-force window, `auth/login_password.py`),
+  `"quota_user"`/`"quota_namespace"`/`"quota_token"` (WP-27's three
+  `quotas.QuotaChecker` scopes) and `"quota_storage_notes"`/
+  `"quota_storage_bytes"` (`quotas.StorageQuotaChecker`'s two resources,
+  #243) - via `record_rate_limit_hit`.
 - `mm_build_info` (`version`, `commit`): set once at import, same values
   `/healthz` already reports (ADR-0002 §13).
 
@@ -58,6 +68,7 @@ __all__ = [
     "QUEUE_DEPTH",
     "QUEUE_WRITES_TOTAL",
     "QUOTA_HITS_TOTAL",
+    "RATE_LIMIT_HITS_TOTAL",
     "SEARCH_DURATION_SECONDS",
     "TOOL_CALLS_TOTAL",
     "TOOL_DURATION_SECONDS",
@@ -65,6 +76,7 @@ __all__ = [
     "metrics_endpoint",
     "record_queue_write",
     "record_quota_hit",
+    "record_rate_limit_hit",
     "track_git_operation",
     "track_search",
     "track_tool_call",
@@ -92,6 +104,9 @@ SEARCH_DURATION_SECONDS = Histogram(
 )
 INDEX_NOTES = Gauge("mm_index_notes", "Notes currently held in the Postgres index.")
 QUOTA_HITS_TOTAL = Counter("mm_quota_hits_total", "Write quota checks.", ["scope", "outcome"])
+RATE_LIMIT_HITS_TOTAL = Counter(
+    "mm_rate_limit_hits_total", "Requests rejected by a rate limiter or quota.", ["limiter"]
+)
 
 _BUILD_INFO = Info("mm_build", "The version and commit this process was built from.")
 _BUILD_INFO.info({"version": __version__, "commit": __commit__})
@@ -164,6 +179,17 @@ def record_queue_write(op: str, outcome: str) -> None:
 def record_quota_hit(*, scope: str, outcome: str) -> None:
     """`mm_quota_hits_total`'s one call site: `quotas.QuotaChecker`'s own write check."""
     QUOTA_HITS_TOTAL.labels(scope=scope, outcome=outcome).inc()
+
+
+def record_rate_limit_hit(limiter: str) -> None:
+    """`mm_rate_limit_hits_total`'s one metric: a request actually rejected by
+    `limiter` - never a fail-open backend error (module docstring's list of
+    fixed `limiter` values). Called from `http.py`'s `_send_rate_limited`,
+    `auth/login_password.py`'s brute-force rejection, `quotas.QuotaChecker`'s
+    `_enforce` rejection branch and `quotas.StorageQuotaChecker`'s `_reject` -
+    each already past its own fail-open check by the time this runs, so a
+    transient backend outage never shows up here."""
+    RATE_LIMIT_HITS_TOTAL.labels(limiter=limiter).inc()
 
 
 def _git_op_name(args: Sequence[str]) -> str:

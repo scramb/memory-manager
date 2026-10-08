@@ -56,6 +56,14 @@ class RateLimiter:
         self._window_seconds = burst * 60.0 / per_minute
         self._name = name
 
+    @property
+    def name(self) -> str:
+        """This instance's own prefix - also the `limiter` label value
+        `observability.metrics.record_rate_limit_hit` records a rejection
+        under (`http.py`'s call sites read it off the `RateLimiter` they
+        just rejected on, rather than naming it a second time)."""
+        return self._name
+
     def _namespaced(self, key: str) -> str:
         return f"{self._name}:{key}"
 
