@@ -1,6 +1,6 @@
 # F-01 — Enterprise Scale
 
-Status: planned · Created: 2026-10-07
+Status: in progress · Created: 2026-10-07
 Milestones: M7, M8, M9, M10, M11 · Work packages: WP-16 … WP-34 · Label: `feature:F-01`
 
 ## Benefit
@@ -66,31 +66,50 @@ Risk first. M7 proves the data model at scale: Postgres as source of truth, RLS 
 | M10 — Enterprise operations | Helm enterprise profile, CNPG backups, optional Valkey, observability (OTel, metrics, Grafana dashboard, alerts), `deploy/entra/`, Flux example | `helm template` with the enterprise values passes the chart tests; a kind cluster rolls out the Flux example and `/readyz` is 200 on 3 API replicas | WP-29, WP-30, WP-31 |
 | M11 — Proven at target size, released as v0.2.0 | load test at target size incl. replica failure, threat model + pen-test checklist, compliance templates, upgrade guide, release | benchmark report in `docs/benchmarks/` meets all targets; `v0.2.0` tag with signed image and chart | WP-32, WP-33, WP-34 |
 
-Work packages of M8–M11 (one line each; cut into issues when the milestone starts):
+Work packages of M8–M11 (cut into issues on 2026-10-08, ahead of the code at the owner's request; each milestone's issues are re-read against the code when it starts):
 
-- **WP-22** `wp/22-entra-login`: login mode `entra` (confidential client, tenant allowlist, roles, groups incl. Graph overage), `users`/`user_groups` filled at login, refresh re-check, `ENTRA_MAX_SESSION`, mock IdP for tests.
-- **WP-23** `wp/23-worker-embeddings`: `worker` entry point, `jobs` outbox with `SKIP LOCKED` + `LISTEN/NOTIFY`, asynchronous embeddings, singleton jobs via advisory lock.
-- **WP-24** `wp/24-deprovisioning`: Graph delta sync job, token-family revocation for disabled/deleted users, static tokens with mandatory expiry/scopes/owner in enterprise mode.
-- **WP-25** `wp/25-promote-account`: `memory_promote`, `/account` page with export (Markdown ZIP) and delete-my-memory.
-- **WP-26** `wp/26-admin-erasure`: admin area (namespaces, ACLs, settings), break-glass with two-admin approval, erasure + `erasure_log` replay, retention job, deletion test.
-- **WP-27** `wp/27-quotas-blocklists`: quotas per user/namespace (count, size, rate) on shared state, configurable blocklist categories checked server-side, audit export to stdout/OTLP for SIEM.
-- **WP-28** `wp/28-migrate-git`: `memory-manager migrate git-to-postgres` with history as revisions, dry run, namespace mapping.
-- **WP-29** `wp/29-helm-enterprise`: enterprise values profile, `api`/`worker` deployments, HPA (CPU + RPS), PDB, topology spread, NetworkPolicies, CNPG + Barman Cloud plugin, optional Valkey.
-- **WP-30** `wp/30-entra-flux`: `deploy/entra/` OpenTofu module, Flux enterprise example, operator guide.
-- **WP-31** `wp/31-observability`: OTel traces across api/worker/DB, per-tool metrics (latency, errors, rate-limit hits, queue length, embedding lag), Grafana dashboard + alert rules, ServiceMonitor.
-- **WP-32** `wp/32-load-target`: target-size dataset, k6 runs on 3 replicas incl. replica kill, report and hardware profile in `docs/benchmarks/`.
-- **WP-33** `wp/33-security-compliance`: `docs/security/threat-model.md` (STRIDE), pen-test checklist, `docs/compliance/` templates (data flow, TOMs, deletion concept, roles and permissions, DPIA template, employee transparency notice).
-- **WP-34** `wp/34-release-0-2`: upgrade guide, README enterprise section, release `v0.2.0`.
+- **WP-22** `wp/22-entra-login`: login mode `entra` (confidential client, tenant allowlist, roles, groups incl. Graph overage), `users`/`user_groups` filled at login, refresh re-check, `ENTRA_MAX_SESSION`, mock IdP for tests. Issues: #212, #213, #214, #215, #216.
+- **WP-23** `wp/23-worker-embeddings`: vector-index spike (#125, proposes ADR-0016), `worker` entry point, `jobs` outbox with `SKIP LOCKED` + `LISTEN/NOTIFY`, asynchronous embeddings, singleton jobs via advisory lock. Issues: #125, #217, #218, #219, #220, #221.
+- **WP-24** `wp/24-deprovisioning`: Graph delta sync job, token-family revocation for disabled/deleted users, static tokens with mandatory expiry/scopes/owner in enterprise mode. Issues: #222, #223, #224, #225.
+- **WP-25** `wp/25-promote-account`: `memory_promote`, `/account` page with export (Markdown ZIP) and delete-my-memory. Issues: #226, #227, #228, #229, #230, #232.
+- **WP-26** `wp/26-admin-erasure`: admin area (namespaces, ACLs, settings), break-glass with two-admin approval, erasure + `erasure_log` replay, retention job, deletion test. Issues: #231, #233, #234, #235, #236, #237, #238, #239, #240, #241.
+- **WP-27** `wp/27-quotas-blocklists`: quotas per user/namespace (count, size, rate) on shared state, configurable blocklist categories checked server-side, audit export to stdout/OTLP for SIEM. Issues: #242, #243, #244, #245.
+- **WP-28** `wp/28-migrate-git`: `memory-manager migrate git-to-postgres` with history as revisions, dry run, namespace mapping. Issues: #246, #247, #248.
+- **WP-29** `wp/29-helm-enterprise`: enterprise values profile, `api`/`worker` deployments, HPA (CPU + RPS), PDB, topology spread, NetworkPolicies, CNPG + Barman Cloud plugin, optional Valkey. Issues: #249, #250, #251, #252, #253, #254, #255.
+- **WP-30** `wp/30-entra-flux`: `deploy/entra/` OpenTofu module, Flux enterprise example, operator guide. Issues: #256, #257, #258, #259.
+- **WP-31** `wp/31-observability`: OTel traces across api/worker/DB, per-tool metrics (latency, errors, rate-limit hits, queue length, embedding lag), Grafana dashboard + alert rules, ServiceMonitor. Issues: #260, #261, #262, #263, #264, #265.
+- **WP-32** `wp/32-load-target`: target-size dataset, k6 runs on 3 replicas incl. replica kill, report and hardware profile in `docs/benchmarks/`. Issues: #266, #267, #268, #269, #270, #271.
+- **WP-33** `wp/33-security-compliance`: `docs/security/threat-model.md` (STRIDE), pen-test checklist, `docs/compliance/` templates (data flow, TOMs, deletion concept, roles and permissions, DPIA template, employee transparency notice). Issues: #272, #273, #274, #275, #276.
+- **WP-34** `wp/34-release-0-2`: upgrade guide, README enterprise section, release `v0.2.0`. Issues: #277, #278, #279, #280.
 
 ## Open decisions
 
-None blocking M8. Remaining questions:
-
 | Question | Options | Blocks |
 |---|---|---|
-| Vector index and partitioning details | as proposed in ADR-0007 §5 vs. adjusted after the M7 baseline | WP-32 (own ADR after WP-21) |
+| Vector index and partitioning (PLAN O22) | measured by the spike #125 at the start of WP-23: `halfvec` vs `vector` (recall on the golden set, size, latency), HNSW parameters, partitioning of `chunks` by namespace kind incl. `agent` (ADR-0013); the result is proposed as ADR-0016 | the `chunks` schema in WP-23 and everything that builds on it; WP-32 |
 | R2 cost under load | — decided 2026-10-08 by the owner: keep R2 ([baseline](../benchmarks/baseline.md): ~1.6 ms vs ~0.1 ms per access-function call, targets met at 100k); re-evaluate only if WP-32 misses the budget at target size | — |
+
+Decided by the owner on 2026-10-08 while cutting M8–M11 (PLAN O23–O37):
+
+- **Embedding dimension:** the existing `EMBEDDING_DIMENSIONS` setting is pinned at the first migration in Postgres mode (default 1024) and immutable afterwards. A model with another dimension needs a reindex.
+- **Load test at target size:** runs on an existing operator Kubernetes cluster as it is. The report in `docs/benchmarks/` names only a generic hardware profile and is not a sizing commitment.
+- **`/account`:** cookie session with a hashed row in Postgres and CSRF tokens, available in every embedded-AS login mode; enterprise sections only with the Postgres backend ([ADR-0008](../adr/0008-namespace-permissions.md) addendum 2026-10-08).
+- **Blocklist:** operator-defined categories with regex/keyword lists. A hit rejects the write and is audited without content. Empty by default, with an example file.
+- **Quotas** also key per token, because agent quotas (ADR-0013) reuse them.
+- **Autoscaling:** CPU HPA always, RPS optional through a KEDA `ScaledObject` ([ADR-0009](../adr/0009-stateless-replicas.md) addendum 2026-10-08).
+- **Break-glass notification:** `/account` banner until acknowledged plus a system note in the user's `me` namespace (ADR-0008 addendum 2026-10-08).
+- **kind/Flux E2E:** own CI workflow, path-filtered on `charts/`, `deploy/` and `Dockerfile`, plus manual dispatch.
+- **Entra test double:** own mock IdP under `tests/`, imitating OIDC, Graph `getMemberGroups` and the users delta query. No new dependency.
+- **Compliance templates:** English, GDPR-generic, with an optional Germany section (works council, §87(1) no. 6 BetrVG).
+- **`migrate git-to-postgres`** takes repeatable `--map <git-ns>=<kind>:<key>[:<alias>]` flags, no map file.
+- **v0.2.0** is cut with a `Release-As: 0.2.0` footer, because release-please bumps only the patch for a `feat` in 0.x.
+- **Entra:** Graph permissions `User.Read.All` + `GroupMember.Read.All`; a removed role takes effect at the next Entra login; a Graph outage during refresh gives a retryable error; `entra` requires the Postgres backend; static-token owners must exist in `users` ([ADR-0006](../adr/0006-enterprise-auth-entra.md) addendum 2026-10-08).
+- **Erasure:** removes `me` and the identity, pseudonymizes the user's authorship in shared namespaces and redacts audit paths; `erasure_log` survives restores through the SIEM export and `ERASURE_LOG_REPLAY_FILE` ([ADR-0007](../adr/0007-storage-backend.md) addendum 2026-10-08).
+- **Break-glass reads** happen only in a read-only viewer on `/account`.
+- **Image:** ships the `otel` extra next to `valkey` (ADR-0009 addendum 2026-10-08).
+- **Worker** serves health and metrics on its own port; `jobs` carries a `traceparent` column; database spans are hand-written (no new dependency).
+- **Order:** F-01 is finished before F-02 starts.
 
 ## Spikes
 
-The latency baseline (WP-21) works as the spike for the index strategy and the RLS function cost. Its result goes to `docs/benchmarks/baseline.md` and decides the open questions above.
+The latency baseline (WP-21) was the spike for the RLS function cost (`docs/benchmarks/baseline.md`). It ran without embeddings, so the index strategy gets its own spike: #125 opens WP-23, writes `docs/research/vector-index.md` and proposes ADR-0016.

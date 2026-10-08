@@ -5,7 +5,7 @@
 > lives exclusively in `docs/TASKS.md`.
 > Source of truth for tasks: GitHub issues in `scramb/memory-manager`; `docs/TASKS.md` is the readable mirror.
 
-Last updated: 2026-10-08 (F-02 decisions) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
+Last updated: 2026-10-08 (F-02 decisions, F-01 M8–M11 decisions) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
 
 ## Goal
 
@@ -139,6 +139,8 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | M16 | web clients (F-02) | WP-56 … WP-58 |
 | M17 | v1.0.0-rc (F-02) | WP-59 … WP-62 |
 
+F-01 (M8–M11) is built before F-02 (M12–M17) starts (O32).
+
 ## Features
 
 | Feature | Benefit | Milestones | Status |
@@ -171,6 +173,22 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O19 | Client support matrix | — decided: draft approved as is ([F-02](./features/F-02-client-integrations.md)) | — | owner ✔ 2026-10-08 |
 | O20 | Docs website tooling | — decided: plain Markdown on GitHub, no site generator | — | owner ✔ 2026-10-08 |
 | O21 | Model API keys for CLI E2E in CI | — decided: none for now; CLI clients verified manually, agents and Open WebUI against a stub model in CI. Possible later: a CI token with a spend limit for the headless CLI checks | — | owner ✔ 2026-10-08 |
+| O22 | Vector index and partitioning in Postgres mode | measure first: the spike #125 opens WP-23 and proposes ADR-0016 (`halfvec` vs `vector`, HNSW parameters, partitioning by namespace kind incl. `agent`) | the `chunks` schema in WP-23, WP-32 | owner, after #125 |
+| O23 | Embedding dimension in Postgres mode | — decided: the existing `EMBEDDING_DIMENSIONS` is pinned at the first migration (default 1024) and immutable afterwards; another dimension means a reindex | — | owner ✔ 2026-10-08 |
+| O24 | Where the target-size load test runs | — decided: an operator Kubernetes cluster; the public report names only a generic hardware profile | — | owner ✔ 2026-10-08 |
+| O25 | Browser session for `/account` | — decided: opaque cookie session with hashed row in Postgres and CSRF token, page in every embedded-AS login mode (ADR-0008 addendum) | — | owner ✔ 2026-10-08 |
+| O26 | Blocklist semantics | — decided: operator-defined categories with regex/keyword lists, a hit rejects the write and is audited without content, empty by default | — | owner ✔ 2026-10-08 |
+| O27 | Request-based autoscaling | — decided: CPU HPA always; RPS scaling optional through a KEDA `ScaledObject` (ADR-0009 addendum) | — | owner ✔ 2026-10-08 |
+| O28 | Break-glass notification | — decided: `/account` banner until acknowledged plus a system note in the user's `me` namespace (ADR-0008 addendum) | — | owner ✔ 2026-10-08 |
+| O29 | kind/Flux end-to-end test | — decided: own CI workflow, path-filtered on `charts/`, `deploy/`, `Dockerfile`, plus manual dispatch | — | owner ✔ 2026-10-08 |
+| O30 | Entra test double | — decided: own mock IdP under `tests/` (OIDC plus Graph groups and delta), no new dependency | — | owner ✔ 2026-10-08 |
+| O31 | Compliance templates | — decided: English, GDPR-generic, optional Germany section (works council, §87(1) no. 6 BetrVG) | — | owner ✔ 2026-10-08 |
+| O32 | Order of F-01 and F-02 | — decided: F-01 up to v0.2.0 first, F-02 afterwards | — | owner ✔ 2026-10-08 |
+| O33 | Graph permissions, role removal, Graph outage, `entra` limits | — decided: `User.Read.All` + `GroupMember.Read.All`; role removal at next Entra login; retryable error on Graph outage; `entra` only with Postgres; static-token owners must exist (ADR-0006 addendum) | — | owner ✔ 2026-10-08 |
+| O34 | Erasure scope and replay after restore | — decided: erase `me` and identity, pseudonymize authorship in shared namespaces, redact audit paths; replay via SIEM export and `ERASURE_LOG_REPLAY_FILE` (ADR-0007 addendum) | — | owner ✔ 2026-10-08 |
+| O35 | Break-glass read surface | — decided: read-only viewer on `/account`, MCP unchanged (ADR-0008 addendum) | — | owner ✔ 2026-10-08 |
+| O36 | `otel` extra in the published image | — decided: shipped, like `valkey` (ADR-0009 addendum) | — | owner ✔ 2026-10-08 |
+| O37 | Capacity for the target-size load test | — decided: the existing operator cluster as it is; the report is not a sizing commitment | — | owner ✔ 2026-10-08 |
 
 ## Risks
 

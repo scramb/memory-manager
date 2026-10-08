@@ -78,3 +78,15 @@ Cheap. Shared state sits behind one small interface and is loss-tolerant, so swi
 ## Addendum 2026-10-07 — container image ships the `valkey` extra
 
 The owner decided that the published container image installs the optional `valkey` extra (redis-py, MIT, no transitive dependencies), so one image serves single- and multi-replica deployments and the Helm enterprise profile (WP-29) can use Valkey without a second image. This replaces the wording "only installed for Valkey" under *Checked against the guardrails* for the image; source installs keep the extra optional. Implemented with WP-29.
+
+## Addendum 2026-10-08 — request-based autoscaling through KEDA
+
+The decision above plans an `api` HPA on CPU and RPS. An RPS signal needs a custom-metrics service in the cluster. The owner decided on 2026-10-08:
+
+- The enterprise profile always renders a CPU-based `HorizontalPodAutoscaler` for `api` and `worker`.
+- RPS-based scaling is optional. When enabled, the chart renders a KEDA `ScaledObject` with a Prometheus trigger on the server's request-rate metric **instead of** the HPA for that deployment, never both. KEDA must already be installed in the cluster; the chart does not install it.
+- Rejected: Prometheus Adapter as the documented path (cluster-wide configuration outside the chart), and CPU only (no answer for I/O-bound load where CPU stays low).
+
+## Addendum 2026-10-08 — container image ships the `otel` extra
+
+The owner decided that the published container image also installs the optional `otel` extra (OpenTelemetry SDK and OTLP exporter, Apache-2.0), for the same reason as the `valkey` extra above: one image serves every deployment, and enterprise tracing and the SIEM audit export work without a derived image. The exporter is active only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Source installs keep the extra optional. Implemented with WP-29.
