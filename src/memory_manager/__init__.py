@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__: str = version("memory-manager")
 except PackageNotFoundError:  # pragma: no cover - only hit outside an installed env
-    __version__ = "0.1.3"
+    __version__ = "0.1.4"
 
 #: The git commit this process was built from, for `/healthz` (ADR-0002 §13:
 #: a modified deployment's build must point back at its own source). Set by
