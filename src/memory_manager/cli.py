@@ -12,6 +12,10 @@ HTTP (`http.py`);
 `token create|list|revoke` manage the static bearer tokens `/mcp` accepts
 once `DATABASE_URL` is set (ADR-0004, #34); `token create --owner --role`
 gives a token an owner principal (ADR-0008 addendum 2026-10-07, #115);
+with `STORAGE_BACKEND=postgres`, `token create` additionally requires an
+owner, an expiry within `STATIC_TOKEN_MAX_DAYS` (default 90) and an owner
+already in `users` (ADR-0006 §7, #224), and `token list` flags an existing
+token that does not meet that rule;
 `hash-password` is the operator helper for `LOGIN_MODE=password` (ADR-0004
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
@@ -55,10 +59,13 @@ from memory_manager.app import open_services, open_storage
 from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
+    DEFAULT_MAX_EXPIRES_DAYS,
     MEMORY_ROLES,
     TokenInfo,
     create_token,
+    enterprise_violations,
     list_tokens,
+    owners_not_in_users,
     revoke_token,
 )
 from memory_manager.config import (
@@ -199,6 +206,13 @@ def main(argv: list[str] | None = None) -> int:
         return _run_hash_password()
 
     if args.command == "token":
+        if args.subcommand in ("create", "list"):
+            try:
+                enterprise = storage_backend_from_env(dict(os.environ)) == "postgres"
+                max_expires_days = _static_token_max_days()
+            except (StorageConfigError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
         if args.subcommand == "create":
             return asyncio.run(
                 _run_token_create(
@@ -208,10 +222,14 @@ def main(argv: list[str] | None = None) -> int:
                     expires_days=args.expires_days,
                     owner_oid=args.owner,
                     roles=args.roles or [],
+                    enterprise=enterprise,
+                    max_expires_days=max_expires_days,
                 )
             )
         if args.subcommand == "list":
-            return asyncio.run(_run_token_list())
+            return asyncio.run(
+                _run_token_list(enterprise=enterprise, max_expires_days=max_expires_days)
+            )
         if args.subcommand == "revoke":
             return asyncio.run(_run_token_revoke(args.name))
         parser.print_help()
@@ -444,7 +462,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     token_parser = subparsers.add_parser(
-        "token", help="manage static bearer tokens for the HTTP transport (ADR-0004)"
+        "token",
+        help="manage static bearer tokens for the HTTP transport (ADR-0004); with "
+        "STORAGE_BACKEND=postgres, 'create' additionally requires --owner/--role and "
+        "--expires-days within STATIC_TOKEN_MAX_DAYS (default 90, ADR-0006 §7, #224)",
     )
     token_subparsers = token_parser.add_subparsers(dest="subcommand")
 
@@ -472,7 +493,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expires-days",
         type=int,
         default=None,
-        help="the token stops verifying this many days from now (default: never expires)",
+        help="the token stops verifying this many days from now (default: never expires; "
+        "required, within STATIC_TOKEN_MAX_DAYS, when STORAGE_BACKEND=postgres)",
     )
     token_create_parser.add_argument(
         "--owner",
@@ -847,6 +869,8 @@ async def _run_token_create(
     expires_days: int | None,
     owner_oid: str | None,
     roles: list[str],
+    enterprise: bool,
+    max_expires_days: int,
 ) -> int:
     pool = await _open_migrated_pool()
     if pool is None:
@@ -865,6 +889,8 @@ async def _run_token_create(
                 expires_at=expires_at,
                 owner_oid=owner_oid,
                 roles=roles,
+                enterprise=enterprise,
+                max_expires_days=max_expires_days,
             )
         except asyncpg.UniqueViolationError:
             print(f"a token named {name!r} already exists", file=sys.stderr)
@@ -885,29 +911,46 @@ async def _run_token_create(
     return 0
 
 
-async def _run_token_list() -> int:
+async def _run_token_list(*, enterprise: bool, max_expires_days: int) -> int:
     pool = await _open_migrated_pool()
     if pool is None:
         return 2
 
     try:
         tokens = await list_tokens(pool)
+        # Only in enterprise mode does "legacy violator" mean anything (ADR-0006
+        # §7, #224) - a non-enterprise deployment never enforced these rules, so
+        # flagging them there would just be noise. One batched query for every
+        # owner instead of one `owners_not_in_users` call per token.
+        unknown_owners = (
+            await owners_not_in_users(
+                pool, [info.owner_oid for info in tokens if info.owner_oid is not None]
+            )
+            if enterprise
+            else frozenset()
+        )
     finally:
         await pool.close()
 
     for info in tokens:
-        _print_token_info(info)
+        violations = (
+            enterprise_violations(info, max_expires_days=max_expires_days) if enterprise else ()
+        )
+        if info.owner_oid is not None and info.owner_oid in unknown_owners:
+            violations = (*violations, "owner-unknown")
+        _print_token_info(info, violations=violations)
     return 0
 
 
-def _print_token_info(info: TokenInfo) -> None:
+def _print_token_info(info: TokenInfo, *, violations: tuple[str, ...] = ()) -> None:
     status = "revoked" if info.revoked_at is not None else "active"
     print(
         f"{info.name}\tstatus={status}\tscopes={','.join(info.scopes)}\t"
         f"namespaces={','.join(info.namespaces)}\towner_oid={info.owner_oid or '-'}\t"
         f"roles={','.join(info.roles) or '-'}\tcreated_at={info.created_at.isoformat()}\t"
         f"expires_at={info.expires_at.isoformat() if info.expires_at else '-'}\t"
-        f"last_used_at={info.last_used_at.isoformat() if info.last_used_at else '-'}"
+        f"last_used_at={info.last_used_at.isoformat() if info.last_used_at else '-'}\t"
+        f"enterprise_violations={','.join(violations) or '-'}"
     )
 
 
@@ -1314,6 +1357,31 @@ def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise _MissingEnvironment(f"{name} is required but not set")
+    return value
+
+
+_STATIC_TOKEN_MAX_DAYS_ENV = "STATIC_TOKEN_MAX_DAYS"  # noqa: S105 - an env var name, not a credential
+
+
+def _static_token_max_days() -> int:
+    """The enterprise static-token expiry ceiling (`STATIC_TOKEN_MAX_DAYS`,
+    ADR-0006 §7, #224), default `tokens.DEFAULT_MAX_EXPIRES_DAYS` (90 days).
+
+    `token create`/`token list` read this once in `main()` regardless of
+    `STORAGE_BACKEND`, since computing it is cheap and free of side effects -
+    only `enterprise=True` (`STORAGE_BACKEND=postgres`) callers ever act on
+    the result. Raises `ValueError` naming the variable if it is set but not
+    a positive integer.
+    """
+    raw = os.environ.get(_STATIC_TOKEN_MAX_DAYS_ENV)
+    if raw is None:
+        return DEFAULT_MAX_EXPIRES_DAYS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be positive, got {value}")
     return value
 
 

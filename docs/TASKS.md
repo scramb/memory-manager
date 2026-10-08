@@ -235,7 +235,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 
 - [ ] #222 `disable_user`: revoke all token families + owned static tokens ⛔ blocked by #213, #216
 - [ ] #223 Graph users delta sync job in the worker ⛔ blocked by #222, #217, #214
-- [ ] #224 Static tokens in enterprise mode: mandatory expiry/scopes/owner
+- [x] #224 Static tokens in enterprise mode: mandatory expiry/scopes/owner
 - [ ] #225 M8 acceptance e2e with the mock IdP ⛔ blocked by #223, #219, #216
 
 ---
