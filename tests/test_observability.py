@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import secrets
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,10 +28,12 @@ import httpx2
 import pytest
 from mcp import Client as McpClient
 from mcp.client.streamable_http import streamable_http_client
+from prometheus_client import generate_latest
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.types import Message, Scope
 
+from memory_manager import jobs as jobs_outbox
 from memory_manager.app import open_services
 from memory_manager.auth.login import LOGIN_PATH, PendingAuthorization
 from memory_manager.auth.login_password import PasswordAuthenticator, hash_password
@@ -47,12 +50,16 @@ from memory_manager.observability.logging import (
 )
 from memory_manager.observability.metrics import (
     GIT_OPERATIONS_TOTAL,
+    JOBS_OLDEST_PENDING_AGE_SECONDS,
+    JOBS_PENDING,
     QUEUE_DEPTH,
     QUEUE_WRITES_TOTAL,
     RATE_LIMIT_HITS_TOTAL,
     SEARCH_DURATION_SECONDS,
     TOOL_CALLS_TOTAL,
+    set_embedding_lag_seconds,
 )
+from memory_manager.worker import _embedding_provider_configured, _refresh_metrics
 
 _NOTE_PATH = "personal/fact/a.md"
 _WEBHOOK_SECRET = "s3cr3t"  # noqa: S105 - test fixture value, not a real secret
@@ -94,6 +101,35 @@ async def _mcp_client(
 
 def _value(labels_fn: object) -> float:
     return cast(float, labels_fn._value.get())  # type: ignore[attr-defined]
+
+
+def _metric_text_value(body: str, name: str) -> float | None:
+    """The value of the one `name` sample line in `body` (a `/metrics` response
+    or `generate_latest()` output), or `None` if `name` is absent entirely -
+    `mm_embedding_lag_seconds` has no labels, so a plain `"<name> <value>"`
+    line prefix is enough, unlike `_value`'s labelled-metric lookup above.
+    """
+    prefix = f"{name} "
+    for line in body.splitlines():
+        if line.startswith(prefix):
+            return float(line[len(prefix) :])
+    return None
+
+
+def _seq_scans_on(node: object, table: str) -> list[dict[str, object]]:
+    """Every `Seq Scan` node on `table` anywhere in an `EXPLAIN (FORMAT JSON)` tree -
+    the same shape `tests/index/test_index_plans.py`'s own `_seq_scans` uses for
+    `notes`/`links`, scoped to one table name rather than a fixed set."""
+    found: list[dict[str, object]] = []
+    if isinstance(node, dict):
+        if node.get("Node Type") == "Seq Scan" and node.get("Relation Name") == table:
+            found.append(node)
+        for value in node.values():
+            found.extend(_seq_scans_on(value, table))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_seq_scans_on(item, table))
+    return found
 
 
 @asynccontextmanager
@@ -487,6 +523,176 @@ async def test_a_fail_open_rate_limit_backend_error_does_not_increment_the_hit_m
 
     assert response.status_code != 429
     assert after == before
+
+
+# --- Worker metrics refresh (#261) ----------------------------------------------
+
+
+def test_embedding_lag_feature_flag_reflects_the_embedding_provider_env() -> None:
+    """`worker._embedding_provider_configured` reads `EMBEDDING_PROVIDER`/`EMBEDDING_URL`
+    straight from an `environ` mapping - no database, no real provider construction."""
+    assert _embedding_provider_configured({}) is False
+    assert _embedding_provider_configured({"EMBEDDING_PROVIDER": "none"}) is False
+    assert (
+        _embedding_provider_configured(
+            {"EMBEDDING_PROVIDER": "ollama", "EMBEDDING_URL": "http://localhost:11434"}
+        )
+        is True
+    )
+    # An invalid configuration (missing `EMBEDDING_URL` for a real provider) is
+    # treated as "no provider", not raised through to the worker's own loop.
+    assert _embedding_provider_configured({"EMBEDDING_PROVIDER": "openai"}) is False
+
+
+async def test_jobs_pending_gauges_reflect_backlog_and_reset_once_processed(
+    test_database_url: str,
+) -> None:
+    """`worker._refresh_metrics` sets `mm_jobs_pending`/`mm_jobs_oldest_pending_age_
+    seconds` for every `kind` it is told about from a real `jobs` outbox query
+    (`jobs.pending_stats`) - and back to `0` once every row of that kind is `done`,
+    never left stuck at its last non-zero value."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    kind = f"wp31-probe-{secrets.token_hex(4)}"
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        job_ids = []
+        async with pool.acquire() as conn, conn.transaction():
+            for _ in range(2):
+                job_ids.append(await jobs_outbox.enqueue(conn, kind, {}))
+
+        await _refresh_metrics(pool, kinds=(kind,), embedding_lag_enabled=False)
+        assert _value(JOBS_PENDING.labels(kind=kind)) == 2
+        assert _value(JOBS_OLDEST_PENDING_AGE_SECONDS.labels(kind=kind)) >= 0.0
+
+        for job_id in job_ids:
+            await jobs_outbox.complete(pool, job_id)
+
+        await _refresh_metrics(pool, kinds=(kind,), embedding_lag_enabled=False)
+        assert _value(JOBS_PENDING.labels(kind=kind)) == 0
+        assert _value(JOBS_OLDEST_PENDING_AGE_SECONDS.labels(kind=kind)) == 0.0
+    finally:
+        await pool.close()
+
+
+async def test_jobs_pending_stats_query_never_plans_a_sequential_scan_on_jobs(
+    test_database_url: str,
+) -> None:
+    """`jobs.pending_stats` - the one query every #261 gauge is derived from, including
+    `mm_embedding_lag_seconds` (rework: no longer a `notes`/`chunks` join) - must use
+    `jobs_claimable_idx`'s partial index, never a sequential scan over `jobs`, even with
+    a large `done` backlog behind it. Same "assert via `EXPLAIN`, never via
+    `enable_seqscan` off" shape `tests/index/test_index_plans.py` already uses for
+    `notes`/`links`.
+    """
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+    from memory_manager.jobs import _PENDING_STATS_SQL
+
+    connection = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(connection)
+        # A large, already-`done` backlog - large enough that a sequential scan
+        # over `jobs` would be unmistakably worse than using the partial index
+        # in the planner's own cost estimate, after `ANALYZE`.
+        await connection.execute(
+            """
+            insert into jobs (id, kind, state, run_after, created_at)
+            select 'j' || lpad(i::text, 8, '0'), 'embed_note', 'done', now(), now()
+            from generate_series(1, 200000) as i
+            """
+        )
+        await connection.execute(
+            "insert into jobs (id, kind, state, run_after, created_at) values "
+            "('j-pending-1', 'embed_note', 'pending', now(), now() - interval '30 seconds')"
+        )
+        await connection.execute("analyze jobs")
+
+        rows = await connection.fetch(f"explain (format json) {_PENDING_STATS_SQL}")
+        raw_plan = rows[0]["QUERY PLAN"]
+        plan = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+        scans = _seq_scans_on(plan, "jobs")
+        assert not scans, f"sequential scan on jobs for pending_stats: {scans}"
+    finally:
+        await connection.close()
+
+
+async def test_embedding_lag_seconds_reflects_the_oldest_pending_embed_note_job(
+    test_database_url: str,
+) -> None:
+    """`worker._refresh_metrics` with `embedding_lag_enabled=True` sets
+    `mm_embedding_lag_seconds` to the age of the oldest still-pending `"embed_note"`
+    job (the `jobs` outbox, never a `notes`/`chunks` scan - #261 rework: that scan
+    has no supporting index and would run unbounded by backlog size on every
+    worker replica every round), and back to `0` (still exported, not absent - a
+    provider is configured in this branch) once that job is `complete`d."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            job_id = await jobs_outbox.enqueue(
+                conn, "embed_note", {"note_id": "n-1", "version": "h1"}
+            )
+
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=True)
+        body = generate_latest().decode()
+        lag = _metric_text_value(body, "mm_embedding_lag_seconds")
+        assert lag is not None
+        assert lag >= 0.0
+
+        await jobs_outbox.complete(pool, job_id)
+
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=True)
+        body_after = generate_latest().decode()
+        lag_after = _metric_text_value(body_after, "mm_embedding_lag_seconds")
+        assert lag_after == 0.0
+    finally:
+        await pool.close()
+
+
+async def test_embedding_lag_seconds_is_not_exported_without_an_embedding_provider(
+    test_database_url: str,
+) -> None:
+    """With `embedding_lag_enabled=False` (no embedding provider configured),
+    `mm_embedding_lag_seconds` is absent from `/metrics` altogether - even if an
+    earlier, provider-configured round of this same process already set it."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        set_embedding_lag_seconds(123.0)
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=False)
+        body = generate_latest().decode()
+        assert _metric_text_value(body, "mm_embedding_lag_seconds") is None
+    finally:
+        set_embedding_lag_seconds(None)
+        await pool.close()
 
 
 # --- /metrics -----------------------------------------------------------------
