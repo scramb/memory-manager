@@ -267,6 +267,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-35 — Client integration decisions · F-02 · Branch: `wp/35-client-decisions` · PR: open
 
 - [ ] #126 Client integration decisions are recorded as accepted ADRs with research and the F-02 plan ⛔ blocked by O13–O16 (owner)
+- [ ] #159 The client support matrix is approved by the owner ⛔ blocked by #129
 
 ### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: open
 
@@ -302,70 +303,159 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ## M13 — Open WebUI, released on its own
 
-Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O13 (ADR-0011) · Due: open
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. ⛔ blocked by O13 (ADR-0011) · Due: open
 
 ### WP-42 — Open WebUI spike and per-user auth · F-02 · Branch: `wp/42-openwebui-auth` · PR: open
 
+- [ ] #141 A pinned Open WebUI stack runs in Compose with memory-manager, Postgres and Ollama ⛔ blocked by #126
+- [ ] #142 Open WebUI's OAuth client, UserValves storage and filter token access are verified against the pinned stack ⛔ blocked by #141
+- [ ] #143 Open WebUI registers via DCR and each user completes OAuth against our authorization server ⛔ blocked by #142
+- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP ⛔ blocked by #143
+
 ### WP-43 — Open WebUI profile · F-02 · Branch: `wp/43-openwebui-profile` · PR: open
+
+- [ ] #145 The openwebui profile exists and passes the conformance suite ⛔ blocked by #136, #142
+- [ ] #146 Open WebUI tool calls return the same results as the conformance suite ⛔ blocked by #144, #145
 
 ### WP-44 — Open WebUI filter · F-02 · Branch: `wp/44-openwebui-filter` · PR: open
 
+- [ ] #147 The Open WebUI filter injects relevant notes as a marked data block within a token budget ⛔ blocked by #128, #142, #134
+- [ ] #148 The filter outlet saves or archives a note only on an explicit remember or forget request ⛔ blocked by #147
+- [ ] #149 `tool_memory.py` and `system_prompt.md` cover Open WebUI setups without native MCP ⛔ blocked by #128, #142
+- [ ] #150 The filter injects relevant notes and stays within its budget against the pinned stack ⛔ blocked by #144, #147
+- [ ] #151 A 7-8B local model gives useful memory answers in filter mode in a nightly check ⛔ blocked by #150
+
 ### WP-45 — Open WebUI memory import · F-02 · Branch: `wp/45-openwebui-import` · PR: open
 
+- [ ] #152 `memory-manager import openwebui` imports a user's built-in Open WebUI memories ⛔ blocked by #142
+- [ ] #153 The docs explain how to disable or fence Open WebUI's built-in memory ⛔ blocked by #142
+
 ### WP-46 — Open WebUI deployment, docs and release · F-02 · Branch: `wp/46-openwebui-release` · PR: open
+
+- [ ] #154 A Helm values example runs memory-manager next to the Open WebUI chart with a NetworkPolicy ⛔ blocked by #143
+- [ ] #155 Open WebUI docs let an admin connect it in under 15 minutes ⛔ blocked by #148, #152, #154, #129
+- [ ] #156 CI runs the Open WebUI E2E against the pinned version and the two previous minors ⛔ blocked by #146, #150
+- [ ] #157 Open WebUI works with Entra sign-in through the auth facade ⛔ blocked by #144, F-01 WP-22 (Entra login)
+- [ ] #158 A release with Open WebUI support is published ⛔ blocked by #155, #156
 
 ---
 
 ## M14 — IDE and CLI clients
 
-Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O19 (support matrix) · Due: open
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. ⛔ blocked by O19 (support matrix) · Due: open
 
 ### WP-47 — Headless CLI harness and Codex · F-02 · Branch: `wp/47-headless-cli` · PR: open
 
+- [ ] #161 A headless E2E harness runs client CLIs in containers against a test instance ⛔ blocked by #136, #159, O21 (owner)
+- [ ] #162 Claude Code runs headless in CI and reads and writes memory ⛔ blocked by #161, #137
+- [ ] #163 Codex has a profile, integration files and connect and doctor support ⛔ blocked by #159, #133, #137, #138
+- [ ] #164 Codex CLI runs headless in CI against the test instance ⛔ blocked by #161, #163
+
 ### WP-48 — Gemini CLI and Code Assist · F-02 · Branch: `wp/48-gemini-cli` · PR: open
+
+- [ ] #165 The authorization server returns `iss` in the authorization response when it advertises it
+- [ ] #166 Gemini CLI has a profile, integration files and connect and doctor support ⛔ blocked by #159, #165, #133, #137, #138
+- [ ] #167 Gemini CLI runs headless in CI against the test instance ⛔ blocked by #161, #166
+- [ ] #168 Gemini Code Assist setup is documented and checked manually ⛔ blocked by #166, #160
 
 ### WP-49 — Cursor · F-02 · Branch: `wp/49-cursor` · PR: open
 
+- [ ] #169 Cursor has a profile, integration files and connect and doctor support ⛔ blocked by #159, #133, #137, #138
+- [ ] #170 Cursor's handling of a static token next to OAuth discovery is verified and documented ⛔ blocked by #169
+- [ ] #171 Cursor Teams rollout is documented ⛔ blocked by #169, #160
+
 ### WP-50 — GitHub Copilot · F-02 · Branch: `wp/50-copilot` · PR: open
 
+- [ ] #172 GitHub Copilot in VS Code and Copilot CLI has a profile, integration files and connect and doctor support ⛔ blocked by #159, #133, #137, #138
+- [ ] #173 Copilot coding agent and JetBrains use memory-manager with a personal token ⛔ blocked by #172, #134, #160
+- [ ] #174 Copilot Business and Enterprise MCP policy rollout is documented ⛔ blocked by #172
+
 ### WP-51 — Google Antigravity · F-02 · Branch: `wp/51-antigravity` · PR: open
+
+- [ ] #175 Antigravity has a profile, integration files and connect and doctor support ⛔ blocked by #159, #133, #137, #138, #160
 
 ---
 
 ## M15 — Autonomous agent runtimes
 
-Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O16 (ADR-0013), O19 · Due: open
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. ⛔ blocked by O16 (ADR-0013), O19 · Due: open
 
 ### WP-52 — Agent identity and write guard · F-02 · Branch: `wp/52-agent-identity` · PR: open
 
+- [ ] #176 Agent tokens and the agent namespace kind exist on both storage backends ⛔ blocked by #126, #134
+- [ ] #177 The agent write policy is enforced on the server ⛔ blocked by #176
+- [ ] #178 Pending agent writes wait for owner approval through the CLI ⛔ blocked by #177
+- [ ] #179 Owners approve agent writes on `/account` ⛔ blocked by #178, F-01 WP-25 (/account)
+- [ ] #180 Delegation grants let an agent read or write its owner's namespace only when granted ⛔ blocked by #176
+- [ ] #181 Audit log and metrics name the agent and the triggering channel ⛔ blocked by #176
+- [ ] #182 Per-agent quotas limit requests and writes ⛔ blocked by #176, F-01 WP-27 (quotas)
+- [ ] #183 A third party's remember request never reaches the owner's namespace ⛔ blocked by #177, #180, #178
+
 ### WP-53 — Hermes Agent · F-02 · Branch: `wp/53-hermes` · PR: open
+
+- [ ] #184 Hermes Agent has a profile, config, skill and connect and doctor support ⛔ blocked by #159, #176, #132, #137, #138
+- [ ] #185 `memory-manager import hermes` imports Hermes memory files ⛔ blocked by #159, #176
+- [ ] #186 Hermes runs headless against memory-manager in a Compose E2E with a pinned version ⛔ blocked by #184, #183
 
 ### WP-54 — OpenClaw · F-02 · Branch: `wp/54-openclaw` · PR: open
 
+- [ ] #187 OpenClaw has a profile, config, skill and connect and doctor support ⛔ blocked by #159, #176, #137, #138
+- [ ] #188 `memory-manager import openclaw` imports OpenClaw memory files ⛔ blocked by #159, #176
+- [ ] #189 OpenClaw runs headless against memory-manager in a Compose E2E with a pinned version ⛔ blocked by #187, #183
+
 ### WP-55 — Native agent memory integration · F-02 · Branch: `wp/55-agent-native` · PR: open
+
+- [ ] #190 The decision on native agent memory integration is recorded ⛔ blocked by #159, #184, #187
+- [ ] #191 A Hermes memory provider stores through memory-manager ⛔ blocked by #190, #186
+- [ ] #192 An OpenClaw memory-slot plugin stores through memory-manager ⛔ blocked by #190, #189
 
 ---
 
 ## M16 — Web clients
 
-Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. ⛔ blocked by O19 · Due: open
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. ⛔ blocked by O19 · Due: open
 
 ### WP-56 — ChatGPT · F-02 · Branch: `wp/56-chatgpt` · PR: open
 
+- [ ] #194 ChatGPT has a profile, a docs page and connect steps ⛔ blocked by #159, #132, #137, #160
+- [ ] #195 ChatGPT Business and Enterprise rollout is documented ⛔ blocked by #194
+
 ### WP-57 — Gemini Enterprise · F-02 · Branch: `wp/57-gemini-enterprise` · PR: open
 
+- [ ] #196 The decision on pre-registered OAuth clients for Gemini Enterprise is recorded ⛔ blocked by #159
+- [ ] #197 Operators can register confidential OAuth clients in the authorization server ⛔ blocked by #196
+- [ ] #198 Gemini Enterprise is documented within its limits and the consumer Gemini app is documented as not possible ⛔ blocked by #196, #160
+
 ### WP-58 — Manual client checklist · F-02 · Branch: `wp/58-client-checklist` · PR: open
+
+- [ ] #160 `docs/release/client-checklist.md` lists the manual acceptance steps for every GUI and web client ⛔ blocked by #159
+- [ ] #193 The client checklist is part of the release process ⛔ blocked by #160
 
 ---
 
 ## M17 — v1.0.0-rc
 
-Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones; issues are cut when the milestone starts. · Due: open
+Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due: open
 
 ### WP-59 — Stable API and compatibility policy · F-02 · Branch: `wp/59-stable-api` · PR: open
 
+- [ ] #199 `docs/compatibility.md` defines the SemVer and deprecation policy ⛔ blocked by #159
+- [ ] #200 The tool contract, config format, note format and CLI are documented as stable reference ⛔ blocked by #199
+- [ ] #201 A contract snapshot test fails on breaking changes to the tool contract ⛔ blocked by #199
+- [ ] #202 An upgrade guide from the last 0.x release exists and its migrations are tested ⛔ blocked by #199, F-01 WP-34 (v0.2.0)
+
 ### WP-60 — Security review for the release candidate · F-02 · Branch: `wp/60-security-rc` · PR: open
+
+- [ ] #203 The threat model covers Open WebUI identity, personal tokens and agents with third-party input ⛔ blocked by F-01 WP-33 (threat model), #143, #183, #134
+- [ ] #204 The release candidate has no open High or Critical security findings ⛔ blocked by #203
 
 ### WP-61 — Documentation website · F-02 · Branch: `wp/61-docs-site` · PR: open
 
+- [ ] #205 The decision on docs website tooling is recorded ⛔ blocked by #159
+- [ ] #206 A docs website with quickstart, client pages, support matrix, operations and enterprise is built in CI ⛔ blocked by #205, #200, #155
+- [ ] #207 The README lists supported clients as text with links and no logos ⛔ blocked by #159
+
 ### WP-62 — Release v1.0.0-rc.1 · F-02 · Branch: `wp/62-release-rc` · PR: open
+
+- [ ] #208 Every feature in TASKS is done or deferred past 1.0 with a reason ⛔ blocked by #158, #204, #202
+- [ ] #209 `v1.0.0-rc.1` is released with notes, a signed image and the Helm chart ⛔ blocked by #208, #193, #206, #207, #201, F-01 WP-34 (v0.2.0)

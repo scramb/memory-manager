@@ -162,7 +162,7 @@ Risk first, then breadth: the vault and write queue (data safety) come before an
 | O16 | Agent identity and write guard | agent namespace kind + approval queue (recommended) · scopes only · runtime guards only ([ADR-0013](./adr/0013-agent-identity.md), Proposed) | M15 | owner |
 | O17 | Native agent memory integration (tier 2) | tier 1 (MCP) only in v1 (recommended) · Hermes provider (Python) · OpenClaw plugin (TypeScript, outside the pool) | WP-55 | owner |
 | O18 | Pre-registered confidential OAuth clients (Gemini Enterprise has no DCR) | static client registration · route via Entra · *Not possible* | WP-57 | owner, after O19 |
-| O19 | Client support matrix (*Full / Partial / Not possible*) | see [`docs/clients/README.md`](./features/F-02-client-integrations.md) once #129 lands | M14–M16 | owner |
+| O19 | Client support matrix (*Full / Partial / Not possible*) | draft in [F-02](./features/F-02-client-integrations.md), approved in `docs/clients/README.md` (#159) | M14–M16 | owner |
 | O20 | Docs website tooling | MkDocs Material · plain Markdown on GitHub | WP-61 | owner |
 | O21 | Model API keys and cost for headless CLI E2E in CI | secrets with spend cap, nightly · local model where possible · manual only | WP-47, WP-48 | owner |
 
