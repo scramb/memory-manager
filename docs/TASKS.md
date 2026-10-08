@@ -220,7 +220,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 - [x] #213 Codes/tokens bound to `users`; verifier emits oid/roles/groups
 - [x] #214 Graph client: app token, getMemberGroups, user state ⛔ blocked by #212
 - [x] #215 `LOGIN_MODE=entra` with tenant allowlist, roles, groups incl. overage ⛔ blocked by #213, #214
-- [ ] #216 Refresh re-check via Graph, 15-min access tokens, `ENTRA_MAX_SESSION` ⛔ blocked by #215
+- [x] #216 Refresh re-check via Graph, 15-min access tokens, `ENTRA_MAX_SESSION` ⛔ blocked by #215
 
 ### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: open
 

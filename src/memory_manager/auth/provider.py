@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -80,10 +81,11 @@ from pydantic import AnyUrl
 from memory_manager.auth import store
 from memory_manager.auth.cimd import CimdError, ClientMetadataFetcher
 from memory_manager.auth.login import LoginPrincipal, PendingAuthorization
+from memory_manager.auth.login_entra import EntraRefreshOutcome
 from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_bearer_token
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
-__all__ = ["MemoryManagerOAuthProvider"]
+__all__ = ["ENTRA_GRAPH_UNAVAILABLE_MARKER", "EntraRefreshCheck", "MemoryManagerOAuthProvider"]
 
 _logger = logging.getLogger(__name__)
 
@@ -96,6 +98,34 @@ _PENDING_TTL = timedelta(minutes=10)
 _CODE_TTL = timedelta(minutes=5)
 _ACCESS_TOKEN_TTL = timedelta(hours=1)
 _REFRESH_TOKEN_TTL = timedelta(days=30)
+#: `auth.login_entra.EntraAuthenticator`'s own defaults (`ENTRA_ACCESS_TOKEN_MINUTES`/
+#: `ENTRA_MAX_SESSION`), duplicated here so this provider still behaves sanely for an
+#: entra-bound token (`user_oid is not None`) when constructed without an
+#: `EntraAuthenticator` at all (every test that builds one directly, #216) - production
+#: always overrides both through `http.py`'s `_build_oauth_provider`.
+_ENTRA_DEFAULT_ACCESS_TOKEN_TTL = timedelta(minutes=15)
+_ENTRA_DEFAULT_MAX_SESSION = timedelta(hours=12)
+
+#: `(oid) -> EntraRefreshOutcome` - `auth.login_entra.EntraAuthenticator.check_refresh`,
+#: bound in by `http.py`'s `_build_oauth_provider`. A plain callable, not the
+#: authenticator itself, for the same "no import of the other side" reason
+#: `auth.login`'s `AuthorizationCompleter`/`PendingAuthorizationLookup` are callables
+#: too - this module imports only the `EntraRefreshOutcome` enum the callable answers
+#: with, never `EntraAuthenticator`.
+EntraRefreshCheck = Callable[[str], Awaitable[EntraRefreshOutcome]]
+
+#: Raised by `exchange_refresh_token` as a `TokenError.error_description` sentinel when
+#: the ADR-0006 §5 Graph re-check could not reach Graph (#216). Not a real OAuth
+#: `error` value of its own: the SDK's `TokenErrorCode` Literal has no
+#: `temporarily_unavailable` member to raise in the first place, and
+#: `TokenHandler.response` (`mcp/server/auth/handlers/token.py`, confirmed by reading
+#: it) always answers any `TokenError` with HTTP 400 regardless of `error` - neither
+#: fact leaves room to produce the retryable HTTP 503 `temporarily_unavailable` the
+#: owner decided on 2026-10-08 straight from this provider. `http.py`'s
+#: `_EntraGraphUnavailableMiddleware` recognizes exactly this marker on the `/token`
+#: response and rewrites it - the "wrap the token route" fallback issue #216 itself
+#: anticipates.
+ENTRA_GRAPH_UNAVAILABLE_MARKER = "entra refresh check: graph is temporarily unavailable"
 
 #: claude.ai's hosted callback host (docs/research/mcp-auth-and-connectors.md §4) - any
 #: client whose redirect URI points here authenticates Claude's hosted surfaces, not
@@ -208,6 +238,9 @@ class MemoryManagerOAuthProvider(
         issuer: str,
         client_secret_key: str,
         cimd_fetcher: ClientMetadataFetcher | None = None,
+        entra_access_token_ttl: timedelta = _ENTRA_DEFAULT_ACCESS_TOKEN_TTL,
+        entra_max_session: timedelta = _ENTRA_DEFAULT_MAX_SESSION,
+        entra_refresh_check: EntraRefreshCheck | None = None,
     ) -> None:
         self._pool = pool
         self._resource = resource
@@ -219,6 +252,16 @@ class MemoryManagerOAuthProvider(
         # `None` means CIMD is off (`CIMD_ENABLED=false`) - `get_client` then falls straight
         # through to the DCR-only lookup for every `client_id`, URL-shaped or not.
         self._cimd_fetcher = cimd_fetcher
+        # ADR-0006 §5, #216: applied in `_issue`/`exchange_refresh_token` only for a
+        # token whose `user_oid` is set, i.e. one an entra-mode login produced - every
+        # `password`/`oidc` token keeps `_ACCESS_TOKEN_TTL` and is never subject to a
+        # session cutoff at all. `entra_refresh_check` is `None` for every other
+        # `LOGIN_MODE` (`http.py` only ever passes one for an `EntraAuthenticator`),
+        # in which case a user-bound token is refreshed without any re-check - it
+        # cannot occur outside `entra` mode, since nothing else ever sets `user_oid`.
+        self._entra_access_token_ttl = entra_access_token_ttl
+        self._entra_max_session = entra_max_session
+        self._entra_refresh_check = entra_refresh_check
 
     @property
     def resource(self) -> str:
@@ -482,11 +525,42 @@ class MemoryManagerOAuthProvider(
                 error="invalid_grant",
                 error_description="refresh token was already used; the grant has been revoked",
             )
-        await store.revoke_token_row(self._pool, token.token, "refresh")
         if token.subject is None:  # pragma: no cover - always set by `_issue`
             raise TokenError(
                 error="invalid_grant", error_description="refresh token has no subject"
             )
+
+        if token.user_oid is not None:
+            # ADR-0006 §5 / #216: an entra-bound family is re-checked on every refresh,
+            # entirely before this token is rotated or consumed - a Graph outage or an
+            # expired session must leave the stored refresh token exactly as it was.
+            if (
+                token.family_started_at is not None
+                and datetime.now(UTC) - token.family_started_at > self._entra_max_session
+            ):
+                await store.revoke_family(self._pool, token.family_id)
+                raise TokenError(
+                    error="invalid_grant",
+                    error_description="session exceeded ENTRA_MAX_SESSION; sign in again",
+                )
+            if self._entra_refresh_check is not None:
+                outcome = await self._entra_refresh_check(token.user_oid)
+                if outcome is EntraRefreshOutcome.REVOKE:
+                    await store.revoke_family(self._pool, token.family_id)
+                    raise TokenError(
+                        error="invalid_grant",
+                        error_description="user is disabled or no longer exists in Entra",
+                    )
+                if outcome is EntraRefreshOutcome.UNAVAILABLE:
+                    # Deliberately returns here, before `revoke_token_row` - see
+                    # `ENTRA_GRAPH_UNAVAILABLE_MARKER`'s own docstring for why `error`
+                    # is `invalid_grant` on the wire from this provider's own point of
+                    # view, and how `http.py` turns it into the real HTTP 503.
+                    raise TokenError(
+                        error="invalid_grant", error_description=ENTRA_GRAPH_UNAVAILABLE_MARKER
+                    )
+
+        await store.revoke_token_row(self._pool, token.token, "refresh")
         return await self._issue(
             client_id=client.client_id,
             subject=token.subject,
@@ -531,8 +605,12 @@ class MemoryManagerOAuthProvider(
     ) -> OAuthToken:
         access = OAUTH_ACCESS_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         refresh = _REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
+        # ADR-0006 §5, #216: "Entra mode only" - a token with no `user_oid` is a
+        # `password`/`oidc` one and keeps the one-hour default regardless of what this
+        # provider's own `entra_access_token_ttl` is configured to.
+        access_ttl = self._entra_access_token_ttl if user_oid is not None else _ACCESS_TOKEN_TTL
         for token, kind, ttl in (
-            (access, "access", _ACCESS_TOKEN_TTL),
+            (access, "access", access_ttl),
             (refresh, "refresh", _REFRESH_TOKEN_TTL),
         ):
             await store.save_token(
@@ -554,7 +632,7 @@ class MemoryManagerOAuthProvider(
         return OAuthToken(
             access_token=access,
             token_type="Bearer",  # noqa: S106 - the RFC 6749 token type, not a credential
-            expires_in=int(_ACCESS_TOKEN_TTL.total_seconds()),
+            expires_in=int(access_ttl.total_seconds()),
             refresh_token=refresh,
             scope=" ".join(scopes),
         )

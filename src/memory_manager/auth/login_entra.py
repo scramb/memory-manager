@@ -34,19 +34,32 @@ What is different from `oidc` mode, all per ADR-0006:
   completes with a `LoginPrincipal` (`oid`, `roles`) and namespaces `["*"]` -
   per-namespace permission resolution from roles/groups is `mcp.namespaces`'s
   own job at request time (ADR-0008), not this module's.
-- `ENTRA_MAX_SESSION`, the refresh-time re-check against Graph and 15-minute
-  access tokens (§5) are #216's job, not this one's (issue #215 "Not
-  included").
+
+`check_refresh` is #216's own addition: the ADR-0006 §5 Graph re-check every
+refresh of an entra-bound token family goes through before `auth.provider.
+MemoryManagerOAuthProvider.exchange_refresh_token` is allowed to rotate the
+refresh token or issue a new access token. It is bound into that provider
+as a plain callable by `http.py`'s `_build_oauth_provider` - the same
+"no import of the other side" seam `auth.login`'s `AuthorizationCompleter`/
+`PendingAuthorizationLookup` already give `auth.provider` for
+`complete_authorization`/`pending_authorization`, so `auth.provider` never
+has to import `EntraAuthenticator` itself, only the `EntraRefreshOutcome`
+enum this method answers with. `ENTRA_ACCESS_TOKEN_MINUTES`/`ENTRA_MAX_SESSION`
+are parsed here, next to this authenticator's other `ENTRA_*` variables, and
+read back out through the `access_token_ttl`/`max_session` properties -
+`auth.provider._issue`/`exchange_refresh_token` are what actually apply them.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import enum
 import json
 import logging
 import time
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
@@ -56,7 +69,7 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 from starlette.routing import Route
 
-from memory_manager.auth.graph import GraphClient, GraphError
+from memory_manager.auth.graph import GraphClient, GraphError, UserState
 from memory_manager.auth.login import (
     LOGIN_PATH,
     PENDING_PARAM,
@@ -83,10 +96,16 @@ from memory_manager.auth.templates import (
     oidc_interstitial_page,
 )
 from memory_manager.auth.tokens import ALL_NAMESPACES, MEMORY_ROLES
-from memory_manager.auth.users import replace_groups, upsert_user
+from memory_manager.auth.users import (
+    get_user,
+    mark_disabled,
+    replace_groups,
+    touch_last_seen,
+    upsert_user,
+)
 from memory_manager.config import ServerConfigError, canonical_resource_url
 
-__all__ = ["CALLBACK_PATH", "EntraAuthenticator"]
+__all__ = ["CALLBACK_PATH", "EntraAuthenticator", "EntraRefreshOutcome"]
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +125,29 @@ _DEFAULT_AUTHORITY = "https://login.microsoftonline.com"
 #: which is private to that module) so `from_env`'s own default is self-contained.
 _DEFAULT_GRAPH_URL = "https://graph.microsoft.com/v1.0"
 _DEFAULT_GROUPS_TTL_SECONDS = 3600.0
+#: ADR-0006 §5, #216: "Access token 15 min (configurable)" - entra-bound tokens only,
+#: every other `LOGIN_MODE` keeps `auth.provider`'s own one-hour default.
+_DEFAULT_ACCESS_TOKEN_MINUTES = 15.0
+#: ADR-0006 §5, #216: "After ENTRA_MAX_SESSION (default 12 h ...) the refresh token dies".
+_DEFAULT_MAX_SESSION_SECONDS = 12.0 * 3600.0
+
+
+class EntraRefreshOutcome(enum.Enum):
+    """What `EntraAuthenticator.check_refresh` found for one `oid` (ADR-0006 §5, #216) -
+    `auth.provider.MemoryManagerOAuthProvider.exchange_refresh_token` is the only reader,
+    through the plain callable `http.py` binds in (see this module's own docstring for
+    why `auth.provider` imports this enum but not `EntraAuthenticator` itself)."""
+
+    #: The user is enabled; groups were refreshed if stale, `last_seen` was stamped.
+    OK = "ok"
+    #: Disabled or missing in Graph - `check_refresh` has already marked
+    #: `users.disabled_at`; the caller must revoke the token family and answer
+    #: `invalid_grant`.
+    REVOKE = "revoke"
+    #: Graph could not be reached after `auth.graph.GraphClient`'s own retries - the
+    #: caller must neither rotate nor consume the refresh token (ADR-0006 addendum
+    #: 2026-10-08: "a short Graph outage does not force every user to sign in again").
+    UNAVAILABLE = "unavailable"
 
 
 class EntraAuthenticator:
@@ -124,6 +166,8 @@ class EntraAuthenticator:
         allowed_tenants: frozenset[str] | None = None,
         allow_insecure_authority: bool = False,
         groups_ttl_seconds: float = _DEFAULT_GROUPS_TTL_SECONDS,
+        access_token_minutes: float = _DEFAULT_ACCESS_TOKEN_MINUTES,
+        max_session_seconds: float = _DEFAULT_MAX_SESSION_SECONDS,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._tenant_id = tenant_id
@@ -131,10 +175,15 @@ class EntraAuthenticator:
         self._client_secret = client_secret
         self._redirect_uri = redirect_uri
         self._allowed_tenants = allowed_tenants if allowed_tenants else frozenset({tenant_id})
-        # Not read anywhere yet - #216's refresh-time re-check is what decides
-        # whether a cached group membership is stale enough to refetch; a login
-        # always refetches regardless (see the module docstring).
+        # Read by `check_refresh` (#216) to decide whether a cached group membership
+        # is stale enough to refetch; a login always refetches regardless (see the
+        # module docstring).
         self._groups_ttl_seconds = groups_ttl_seconds
+        # Read back out through `access_token_ttl`/`max_session` below - `auth.provider`
+        # is what actually applies them (#216), this authenticator only owns the
+        # `ENTRA_*` parsing (`from_env`).
+        self._access_token_ttl = timedelta(minutes=access_token_minutes)
+        self._max_session = timedelta(seconds=max_session_seconds)
         self._issuer = f"{authority.rstrip('/')}/{tenant_id}/v2.0"
 
         # Only a self-created client is this instance's to close (`aclose`) - a
@@ -187,6 +236,67 @@ class EntraAuthenticator:
         Entra discovery ... is reachable"), never raising."""
         return await self._client.discovery_reachable()
 
+    @property
+    def access_token_ttl(self) -> timedelta:
+        """`ENTRA_ACCESS_TOKEN_MINUTES` as a `timedelta` (#216) - `http.py`'s
+        `_build_oauth_provider` passes this into `auth.provider.MemoryManagerOAuthProvider`
+        as the access-token lifetime for every entra-bound token, replacing that
+        provider's own one-hour default."""
+        return self._access_token_ttl
+
+    @property
+    def max_session(self) -> timedelta:
+        """`ENTRA_MAX_SESSION` as a `timedelta` (#216) - `http.py`'s `_build_oauth_provider`
+        passes this into `auth.provider.MemoryManagerOAuthProvider`, which refuses to
+        refresh an entra-bound family whose `family_started_at` is older than this."""
+        return self._max_session
+
+    async def check_refresh(self, oid: str) -> EntraRefreshOutcome:
+        """ADR-0006 §5 / addendum 2026-10-08, #216: the Graph re-check every refresh of
+        an entra-bound token family goes through, before `auth.provider.
+        MemoryManagerOAuthProvider.exchange_refresh_token` is allowed to rotate the
+        refresh token or issue a new access token.
+
+        `EntraRefreshOutcome.UNAVAILABLE` on any `GraphError` (timeout, `5xx`, a
+        malformed response, after `auth.graph.GraphClient`'s own bounded retries) -
+        the caller must answer the retryable HTTP 503 `temporarily_unavailable` the
+        owner decided on 2026-10-08, neither rotating nor consuming the refresh token
+        (`auth.provider`'s own job, not this method's - it never touches `oauth_tokens`
+        at all).
+
+        A role removal is deliberately **not** checked here (owner decision
+        2026-10-08: "Reading `appRoleAssignments` on every refresh ... is rejected") -
+        only `accountEnabled`/existence and the groups cache TTL.
+        """
+        pool = self._require_pool()
+        try:
+            state = await self._graph.user_state(oid)
+        except GraphError as exc:
+            _logger.warning("entra refresh: graph user_state check failed for %s: %s", oid, exc)
+            return EntraRefreshOutcome.UNAVAILABLE
+        if state is not UserState.ENABLED:
+            await mark_disabled(pool, oid)
+            return EntraRefreshOutcome.REVOKE
+
+        user = await get_user(pool, oid)
+        stale = (
+            user is None
+            or user.groups_fetched_at is None
+            or datetime.now(UTC) - user.groups_fetched_at
+            > timedelta(seconds=self._groups_ttl_seconds)
+        )
+        if stale:
+            try:
+                groups = await self._graph.member_groups(oid)
+            except GraphError as exc:
+                _logger.warning(
+                    "entra refresh: graph member_groups check failed for %s: %s", oid, exc
+                )
+                return EntraRefreshOutcome.UNAVAILABLE
+            await replace_groups(pool, oid, groups)
+        await touch_last_seen(pool, oid)
+        return EntraRefreshOutcome.OK
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> EntraAuthenticator:
         """Build an `EntraAuthenticator` from `ENTRA_*`/`PUBLIC_URL`.
@@ -219,7 +329,17 @@ class EntraAuthenticator:
         graph_url = environ.get("ENTRA_GRAPH_URL") or _DEFAULT_GRAPH_URL
         allow_insecure_authority = _parse_bool(environ.get("ENTRA_ALLOW_INSECURE_AUTHORITY"))
         groups_ttl_seconds = _parse_positive_float(
-            environ.get("ENTRA_GROUPS_TTL_SECONDS"), _DEFAULT_GROUPS_TTL_SECONDS
+            environ.get("ENTRA_GROUPS_TTL_SECONDS"),
+            _DEFAULT_GROUPS_TTL_SECONDS,
+            name="ENTRA_GROUPS_TTL_SECONDS",
+        )
+        access_token_minutes = _parse_positive_float(
+            environ.get("ENTRA_ACCESS_TOKEN_MINUTES"),
+            _DEFAULT_ACCESS_TOKEN_MINUTES,
+            name="ENTRA_ACCESS_TOKEN_MINUTES",
+        )
+        max_session_seconds = _parse_positive_float(
+            environ.get("ENTRA_MAX_SESSION"), _DEFAULT_MAX_SESSION_SECONDS, name="ENTRA_MAX_SESSION"
         )
         redirect_uri = canonical_resource_url(public_url, "") + CALLBACK_PATH
 
@@ -233,6 +353,8 @@ class EntraAuthenticator:
             allowed_tenants=allowed_tenants,
             allow_insecure_authority=allow_insecure_authority,
             groups_ttl_seconds=groups_ttl_seconds,
+            access_token_minutes=access_token_minutes,
+            max_session_seconds=max_session_seconds,
         )
 
     # ---- step 1: GET /login -------------------------------------------------------
@@ -487,13 +609,13 @@ def _parse_bool(raw: str | None) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
-def _parse_positive_float(raw: str | None, default: float) -> float:
+def _parse_positive_float(raw: str | None, default: float, *, name: str) -> float:
     if raw is None:
         return default
     try:
         value = float(raw)
     except ValueError as exc:
-        raise ServerConfigError(f"ENTRA_GROUPS_TTL_SECONDS must be a number, got {raw!r}") from exc
+        raise ServerConfigError(f"{name} must be a number, got {raw!r}") from exc
     if value <= 0:
-        raise ServerConfigError(f"ENTRA_GROUPS_TTL_SECONDS must be positive, got {value}")
+        raise ServerConfigError(f"{name} must be positive, got {value}")
     return value
