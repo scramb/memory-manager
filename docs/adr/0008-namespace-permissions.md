@@ -101,3 +101,20 @@ Owner decisions on 2026-10-07, taken while #101 was split:
 - **Curate is author-based.** Archiving your own note in a shared namespace counts as a write; archiving someone else's note counts as curate. To make the author reliable, `vault_revisions` records `author_oid`, and a note's author is the `author_oid` of its revision 1.
 
 **Curate requires write (2026-10-07, #119).** A `Memory.Curator` who may not write a namespace cannot curate it either. For example, a curator who is only a `reader` in a project where `project_write = 'writers'` cannot archive other people's notes there. This keeps the application matrix and `mm_writable_ns()` congruent, so every cell stays enforced twice. The owner chose this over widening the project branch of `mm_writable_ns()` for curators.
+
+## Addendum 2026-10-08 — `/account` session and break-glass notification
+
+The decision above names `/account` and the break-glass notice but not how the browser stays signed in or how the user is told. [ADR-0012](./0012-personal-tokens.md) has since widened `/account` to every login mode in which the embedded AS runs. The owner decided on 2026-10-08:
+
+**Browser session for `/account`**
+- After the existing login flow (`password`, `oidc` or `entra`), the server sets an opaque, random session id in a cookie with `HttpOnly`, `Secure`, `SameSite=Strict` and `Path=/account`.
+- Only the hash of the id is stored, in Postgres, together with the principal. Idle timeout 30 min, absolute lifetime 8 h. Logout and deprovisioning delete the row, so a session is revocable like a token.
+- Every state-changing form carries a per-session CSRF token that is checked server-side.
+- The page shell and login exist in every embedded-AS login mode and with both storage backends. Sections that need the Postgres backend (export, delete-my-memory, the admin area) appear only with `STORAGE_BACKEND=postgres`. F-02's token section (#135) and agent approvals (#179) plug into the same shell.
+- Rejected: a stateless HMAC-signed cookie. It saves one table but cannot be revoked before it expires, so a deprovisioned user would keep the admin area until then.
+
+**Break-glass notification** (replaces "notified on their next session (instructions note)")
+- While a grant on their namespace exists or has existed since their last visit, `/account` shows the user a banner (requester, approver, reason, time, expiry) until they acknowledge it.
+- In addition, the server writes a note of type `reference` into the user's `me` namespace with the same facts, so Claude finds it on the next search. It is written by the system identity, audited, and is ordinary data, not an instruction.
+- **Reading under a grant** happens only in a read-only viewer in the admin area on `/account`: the list of the namespace's notes and the rendered note. Every view is audited. The MCP surface does not change, so a grant cannot be used from Claude or any other client.
+- Rejected: per-user server `instructions`. Several clients never pass `instructions` to the model ([ADR-0010](./0010-client-compatibility-profiles.md)), and instructions come from one source (F-02).

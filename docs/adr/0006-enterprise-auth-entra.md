@@ -75,3 +75,13 @@ Checked against the guardrails:
 ## Reversibility
 
 Cheap to medium. Tokens are opaque and internal, so adding resource-server mode later is additive. Switching to option A would need clients and Entra to change first.
+
+## Addendum 2026-10-08 — Graph permissions, refresh behaviour and mode limits
+
+Cutting WP-22 and WP-24 into issues raised five points the decision above leaves open or gets wrong. The owner decided on 2026-10-08:
+
+- **Graph application permissions are `User.Read.All` and `GroupMember.Read.All`.** The users delta query of §6 needs `User.Read.All` as its least-privileged application permission; `User.ReadBasic.All` is not enough ([research](../research/enterprise.md) §1, Microsoft Graph reference retrieved 2026-10-08). `User.Read.All` with `GroupMember.Read.All` also covers `getMemberGroups` (§4). This replaces `User.ReadBasic.All` in §4 and §9. Admin consent stays a manual operator step.
+- **A removed app role takes effect at the next Entra login**, at the latest after `ENTRA_MAX_SESSION`. The refresh re-check in §5 stays limited to `accountEnabled`, existence and groups. Reading `appRoleAssignments` on every refresh would need `Directory.Read.All` and is rejected. When a role must go immediately, a `Memory.Admin` revokes the user's sessions and tokens in the admin area on `/account`.
+- **Graph unreachable during a refresh:** the facade answers with a retryable error (HTTP 503, `temporarily_unavailable`) and neither rotates nor consumes the refresh token. Access is never granted without the check, and a short Graph outage does not force every user to sign in again.
+- **`LOGIN_MODE=entra` requires `STORAGE_BACKEND=postgres`.** The server refuses to start otherwise, because roles, groups and `me` exist only with the namespace registry ([ADR-0008](./0008-namespace-permissions.md)).
+- **The owner of an enterprise static token must exist in `users`**, i.e. must have signed in once. Otherwise the delta sync could never revoke the token of a departed owner.

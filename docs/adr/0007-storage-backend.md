@@ -105,3 +105,19 @@ The owner decided on 2026-10-07 to keep the ranking unchanged and to bound only 
 - Without statistics, only the cap bounds the work.
 
 **Rejected:** AND-first with an OR fallback. It changes ranking semantics for every vault, and for natural-language questions the OR fallback still reads the saturated posting lists.
+
+## Addendum 2026-10-08 — erasure scope and replay after a restore
+
+Two points of §3 were incomplete. The owner decided on 2026-10-08:
+
+**What erasing a user removes**
+- The personal namespace with every note, revision, chunk and job, and the user's identity rows, are hard-deleted.
+- Notes the user wrote in shared namespaces stay, because they belong to the group, project or org. The author fields of that user's revisions (`author_oid` and the display author) are set to `erased`.
+- Audit rows keep only metadata. For erased notes, the path is redacted as well, because a slug can carry personal data.
+- Rejected: keeping the `oid` as a pseudonymous author (it stays linkable to a person) and erasing shared notes too (teams would lose knowledge they own).
+
+**Replay after a restore**
+- A restore or PITR rolls back `erasure_log` together with the data, so the table alone cannot replay what it lost.
+- Every `erasure_log` row (IDs, actor, reason, time, no content) is therefore also emitted through the audit/SIEM export.
+- After a restore, the operator passes the exported rows as a JSONL file in `ERASURE_LOG_REPLAY_FILE`. The server replays them before `/readyz` turns true. The restore runbook documents the step.
+- Rejected: writing the log to the backup object store (a cloud SDK dependency per provider) and a second database excluded from restores (one more database to operate).

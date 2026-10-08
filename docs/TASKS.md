@@ -1,7 +1,7 @@
 # TASKS — memory-manager
 
 Source of truth: GitHub issues in `scramb/memory-manager` — this file is the readable mirror and is updated with every change there. Milestones are carried as labels `milestone:M0`…`milestone:M17` until GitHub milestones exist.
-Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-07
+Plan and architecture: [`PLAN.md`](./PLAN.md) · Last updated: 2026-10-08
 
 Legend: `#13` = GitHub issue · `⛔` blocked · `O1` = open decision in the PLAN · ticked means **verified**, not "written".
 
@@ -212,51 +212,134 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 ## M8 — Entra ID sign-in and asynchronous embeddings
 
-Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+Goal: Entra sign-in through the facade with roles and groups, a worker with an embedding queue, and deprovisioning through the Graph delta sync. · Due: open
 
 ### WP-22 — Entra login · F-01 · Branch: `wp/22-entra-login` · PR: open
 
+- [ ] #212 Mock Entra IdP (OIDC + Graph) under tests/mock_idp/
+- [ ] #213 Codes/tokens bound to `users`; verifier emits oid/roles/groups
+- [ ] #214 Graph client: app token, getMemberGroups, user state ⛔ blocked by #212
+- [ ] #215 `LOGIN_MODE=entra` with tenant allowlist, roles, groups incl. overage ⛔ blocked by #213, #214
+- [ ] #216 Refresh re-check via Graph, 15-min access tokens, `ENTRA_MAX_SESSION` ⛔ blocked by #215
+
 ### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: open
 
+- [ ] #125 Vector-index spike → `docs/research/vector-index.md` + ADR-0016 (Proposed)
+- [ ] #217 `memory-manager worker` with health/ready/metrics port; singleton jobs; OAuth cleanup moved from api
+- [ ] #218 `jobs` outbox: enqueue in write tx, `SKIP LOCKED`, `LISTEN/NOTIFY` + poll ⛔ blocked by #217
+- [ ] #219 Asynchronous embeddings via `jobs` in Postgres mode ⛔ blocked by #218
+- [ ] #220 Chunks schema per ADR-0016; `EMBEDDING_DIMENSIONS` pinned at first migrate ⛔ blocked by #125, ADR-0016 accepted (spike #125), #219
+- [ ] #221 Per-kind vector search with ADR-0016 HNSW settings, RRF-fused ⛔ blocked by #220
+
 ### WP-24 — Deprovisioning · F-01 · Branch: `wp/24-deprovisioning` · PR: open
+
+- [ ] #222 `disable_user`: revoke all token families + owned static tokens ⛔ blocked by #213, #216
+- [ ] #223 Graph users delta sync job in the worker ⛔ blocked by #222, #217, #214
+- [ ] #224 Static tokens in enterprise mode: mandatory expiry/scopes/owner
+- [ ] #225 M8 acceptance e2e with the mock IdP ⛔ blocked by #223, #219, #216
 
 ---
 
 ## M9 — Data lifecycle and governance
 
-Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+Goal: `memory_promote`, `/account` self-service and admin area, break-glass, erasure and retention, quotas, blocklists, SIEM export and `migrate git-to-postgres`. · Due: open
 
 ### WP-25 — Promote and account self-service · F-01 · Branch: `wp/25-promote-account` · PR: open
 
+- [ ] #226 Both storage backends promote a note as a new superseding note
+- [ ] #227 Claude promotes a personal note into a shared namespace with `memory_promote` ⛔ blocked by #226
+- [ ] #228 `/account` browser sessions are stored as hashes with idle and absolute expiry
+- [ ] #229 Signed-in users reach the `/account` page in every embedded login mode ⛔ blocked by #228, #215
+- [ ] #230 Users download their personal memory as a Markdown ZIP from `/account` ⛔ blocked by #229
+- [ ] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
+
 ### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
+
+- [ ] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
+- [ ] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
+- [ ] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229
+- [ ] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222
+- [ ] #236 Admins erase a note, a namespace or a user on `/account` with a recorded reason ⛔ blocked by #231, #234
+- [ ] #237 Break-glass grants need a second admin's approval and expire after one hour ⛔ blocked by #234
+- [ ] #238 Admins read a break-glass namespace in a read-only, audited viewer on `/account` ⛔ blocked by #237
+- [ ] #239 Users see a break-glass banner and a reference note in `me` until they acknowledge it ⛔ blocked by #237
+- [ ] #240 Personal memories of deprovisioned users are erased after `PERSONAL_RETENTION_DAYS` ⛔ blocked by #231, #219, #223
+- [ ] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
 
 ### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
 
+- [ ] #242 Write rate quotas per user, namespace and token hold across replicas
+- [ ] #243 Note count and size quotas reject writes that would exceed a namespace's limit ⛔ blocked by #242
+- [ ] #244 Writes matching an operator blocklist category are rejected and audited without content ⛔ blocked by #226
+- [ ] #245 Every audit record is exported to stdout or OTLP for a SIEM
+
 ### WP-28 — Git-to-Postgres migration · F-01 · Branch: `wp/28-migrate-git` · PR: open
+
+- [ ] #246 `migrate git-to-postgres --dry-run` reports the namespace mapping and every note it would import
+- [ ] #247 `migrate git-to-postgres` imports current notes byte-identically with Git history as revisions ⛔ blocked by #246
+- [ ] #248 The example vault migrates to Postgres with identical versions ⛔ blocked by #247
 
 ---
 
 ## M10 — Enterprise operations
 
-Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kind, and observability. · Due: open
 
 ### WP-29 — Helm enterprise profile · F-01 · Branch: `wp/29-helm-enterprise` · PR: open
 
+- [ ] #249 The chart refuses more than one replica or an autoscaler unless storage.backend is postgres
+- [ ] #250 The chart renders separate api and worker Deployments with graceful shutdown for the postgres backend ⛔ blocked by #249, #219
+- [ ] #251 The api and worker Deployments scale on CPU, with optional RPS scaling through a KEDA ScaledObject ⛔ blocked by #250
+- [ ] #252 The CNPG cluster of the enterprise profile runs three instances with Barman Cloud plugin backups ⛔ blocked by #250
+- [ ] #253 The container image ships the valkey and otel extras
+- [ ] #254 The chart can deploy an optional Valkey without persistence for shared state ⛔ blocked by #250, #253
+- [ ] #255 NetworkPolicies limit api, worker, Valkey and Postgres traffic to the needed flows ⛔ blocked by #251, #252, #254
+
 ### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: open
 
+- [ ] #256 An OpenTofu module under deploy/entra creates the Entra app registration for the auth facade ⛔ blocked by #216
+- [ ] #257 A Flux enterprise example deploys the chart with the enterprise profile ⛔ blocked by #255, #216
+- [ ] #258 A kind E2E workflow rolls out the Flux enterprise example and gets /readyz 200 from three api replicas ⛔ blocked by #257, #216, #219
+- [ ] #259 An operator guide explains how to run the enterprise profile end to end ⛔ blocked by #256, #257, #258
+
 ### WP-31 — Observability · F-01 · Branch: `wp/31-observability` · PR: open
+
+- [ ] #260 Every rate-limit and quota rejection is counted per limiter in /metrics ⛔ blocked by #242, #243
+- [ ] #261 Job queue length and embedding lag are exported as Prometheus gauges ⛔ blocked by #219
+- [ ] #262 OpenTelemetry traces cover an api request from the HTTP edge down to its database statements
+- [ ] #263 Worker jobs appear in the trace of the request that enqueued them ⛔ blocked by #262, #219
+- [ ] #264 The ServiceMonitor scrapes api and worker metrics separately ⛔ blocked by #250, #219
+- [ ] #265 A Grafana dashboard and PrometheusRule alerts cover latency budgets, errors, rate limits and embedding lag ⛔ blocked by #260, #261, #264
 
 ---
 
 ## M11 — Proven at target size, released as v0.2.0
 
-Goal: see [F-01](./features/F-01-enterprise-scale.md) → Milestones; issues are cut when the milestone starts. · Due: open
+Goal: Target-size load test incl. replica failure, threat model and compliance templates, upgrade guide and release v0.2.0. · Due: open
 
 ### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: open
 
+- [ ] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
+- [ ] #267 Loader writes chunks with synthetic vectors and builds the ADR-0016 HNSW index ⛔ blocked by #266, #221
+- [ ] #268 Embedding stub answers query embeddings deterministically for load tests ⛔ blocked by #266
+- [ ] #269 Local load test runs 3 replicas with a replica kill on Postgres or Valkey shared state ⛔ blocked by #267, #268
+- [ ] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
+- [ ] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
+
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
 
+- [ ] #272 STRIDE threat model covers every trust boundary of the enterprise deployment ⛔ blocked by #232, #227, #230, #241, #233, #238, #239, #235, #243, #244, #245, #255
+- [ ] #273 Pen-test checklist turns the threat model into executable test cases ⛔ blocked by #272
+- [ ] #274 Compliance templates for data flow, records of processing and TOMs ⛔ blocked by #272, #263, #265
+- [ ] #275 Compliance templates for the deletion concept with backup horizon and roles and permissions ⛔ blocked by #274, #241, #233, #238, #239, #235, #243, #244, #245, #252
+- [ ] #276 Compliance templates for DPIA, employee transparency notice and Germany section ⛔ blocked by #274, #275
+
 ### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
+
+- [ ] #277 Upgrade smoke test proves 0.1.x → 0.2.0 incl. migration and export rollback ⛔ blocked by #248
+- [ ] #278 Upgrade guide 0.1.x → 0.2.0 incl. git-to-postgres migration and export rollback ⛔ blocked by #277, #259
+- [ ] #279 README enterprise section with links to guides, benchmark and compliance ⛔ blocked by #278, #271, #276
+- [ ] #280 v0.2.0 released with cosign-verified image and Helm chart ⛔ blocked by #224, #225, #273, #279
 
 ---
 
@@ -288,7 +371,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
 
 - [ ] #134 Personal tokens carry a kind and are bounded by their owner's rights
-- [ ] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, WP-25
+- [ ] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, #229
 
 ### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open
 
@@ -335,7 +418,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [ ] #154 A Helm values example runs memory-manager next to the Open WebUI chart with a NetworkPolicy ⛔ blocked by #143
 - [ ] #155 Open WebUI docs let an admin connect it in under 15 minutes ⛔ blocked by #148, #152, #154, #129
 - [ ] #156 CI runs the Open WebUI E2E against the pinned version and the two previous minors ⛔ blocked by #146, #150
-- [ ] #157 Open WebUI works with Entra sign-in through the auth facade ⛔ blocked by #144, F-01 WP-22 (Entra login)
+- [ ] #157 Open WebUI works with Entra sign-in through the auth facade ⛔ blocked by #144, #216 (F-01 WP-22)
 - [ ] #158 A release with Open WebUI support is published ⛔ blocked by #155, #156
 
 ---
@@ -385,10 +468,10 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [ ] #176 Agent tokens and the agent namespace kind exist on both storage backends ⛔ blocked by #134
 - [ ] #177 The agent write policy is enforced on the server ⛔ blocked by #176
 - [ ] #178 Pending agent writes wait for owner approval through the CLI ⛔ blocked by #177
-- [ ] #179 Owners approve agent writes on `/account` ⛔ blocked by #178, F-01 WP-25 (/account)
+- [ ] #179 Owners approve agent writes on `/account` ⛔ blocked by #178, #229 (F-01 WP-25)
 - [ ] #180 Delegation grants let an agent read or write its owner's namespace only when granted ⛔ blocked by #176
 - [ ] #181 Audit log and metrics name the agent and the triggering channel ⛔ blocked by #176
-- [ ] #182 Per-agent quotas limit requests and writes ⛔ blocked by #176, F-01 WP-27 (quotas)
+- [ ] #182 Per-agent quotas limit requests and writes ⛔ blocked by #176, #242 (F-01 WP-27)
 - [ ] #183 A third party's remember request never reaches the owner's namespace ⛔ blocked by #177, #180, #178
 
 ### WP-53 — Hermes Agent · F-02 · Branch: `wp/53-hermes` · PR: open
@@ -442,11 +525,11 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [ ] #199 `docs/compatibility.md` defines the SemVer and deprecation policy
 - [ ] #200 The tool contract, config format, note format and CLI are documented as stable reference ⛔ blocked by #199
 - [ ] #201 A contract snapshot test fails on breaking changes to the tool contract ⛔ blocked by #199
-- [ ] #202 An upgrade guide from the last 0.x release exists and its migrations are tested ⛔ blocked by #199, F-01 WP-34 (v0.2.0)
+- [ ] #202 An upgrade guide from the last 0.x release exists and its migrations are tested ⛔ blocked by #199, #280 (F-01 WP-34)
 
 ### WP-60 — Security review for the release candidate · F-02 · Branch: `wp/60-security-rc` · PR: open
 
-- [ ] #203 The threat model covers Open WebUI identity, personal tokens and agents with third-party input ⛔ blocked by F-01 WP-33 (threat model), #143, #183, #134
+- [ ] #203 The threat model covers Open WebUI identity, personal tokens and agents with third-party input ⛔ blocked by #272 (F-01 WP-33), #143, #183, #134
 - [ ] #204 The release candidate has no open High or Critical security findings ⛔ blocked by #203
 
 ### WP-61 — Documentation website · F-02 · Branch: `wp/61-docs-site` · PR: open
@@ -458,4 +541,4 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 ### WP-62 — Release v1.0.0-rc.1 · F-02 · Branch: `wp/62-release-rc` · PR: open
 
 - [ ] #208 Every feature in TASKS is done or deferred past 1.0 with a reason ⛔ blocked by #158, #204, #202
-- [ ] #209 `v1.0.0-rc.1` is released with notes, a signed image and the Helm chart ⛔ blocked by #208, #193, #206, #207, #201, F-01 WP-34 (v0.2.0)
+- [ ] #209 `v1.0.0-rc.1` is released with notes, a signed image and the Helm chart ⛔ blocked by #208, #193, #206, #207, #201, #280 (F-01 WP-34)

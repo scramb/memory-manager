@@ -55,14 +55,14 @@ F-01 is in progress. M7 is done except WP-21, and M8–M11 are not started. F-02
 | F-02 needs | Comes from | State on 2026-10-07 | Blocks in F-02 |
 |---|---|---|---|
 | namespaces, principal, permission matrix, RLS | WP-19 (#100, #101, #115, #116, #119) | done | nothing |
-| auth facade with Entra login (OAuth + DCR towards clients) | WP-22 (M8) | not started | enterprise variants of Open WebUI and web-client tests (WP-46, WP-56, WP-57) |
-| static tokens with owner, mandatory expiry in enterprise mode | #115 done; WP-24 (M8) | partly | personal tokens in enterprise mode (WP-39) |
-| `/account` page | WP-25 (M9) | not started | self-service tokens (WP-39, #135), agent approval UI (WP-52) |
-| quotas per token or namespace | WP-27 (M9) | not started | agent quotas (WP-52) |
-| threat model | WP-33 (M11) | not started | security review (WP-60) |
-| release v0.2.0 | WP-34 (M11) | not started | v1.0.0-rc (WP-62) |
+| auth facade with Entra login (OAuth + DCR towards clients) | WP-22 (M8): #216 | not started | enterprise variants of Open WebUI and web-client tests (WP-46, WP-56, WP-57) |
+| static tokens with owner, mandatory expiry in enterprise mode | #115 done; WP-24 (M8): #224 | partly | personal tokens in enterprise mode (WP-39) |
+| `/account` page | WP-25 (M9): #229 | not started | self-service tokens (WP-39, #135), agent approval UI (WP-52) |
+| quotas per token or namespace | WP-27 (M9): #242 | not started | agent quotas (WP-52) |
+| threat model | WP-33 (M11): #272 | not started | security review (WP-60) |
+| release v0.2.0 | WP-34 (M11): #280 | not started | v1.0.0-rc (WP-62) |
 
-Blocked items carry `⛔ blocked by WP-NN` in `docs/TASKS.md`. They become issue references once F-01 cuts those milestones into issues.
+F-01 cut M8–M11 into issues on 2026-10-08; blocked items in `docs/TASKS.md` reference those issues. F-01 is finished before F-02 starts (PLAN O32).
 
 ## Architecture delta
 
@@ -133,7 +133,7 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 - **WP-36** `wp/36-memory-guide`: `docs/memory-guide.md` as single source with a byte-identical generated `instructions` (#127), generator for short form and client instruction files with a CI staleness check (#128).
 - **WP-37** `wp/37-client-docs`: `docs/clients/` template, support-matrix skeleton, pages for claude.ai and Claude Code (#129).
 - **WP-38** `wp/38-compat-profiles`: profile model with `default`/`claude-ai`/`claude-code` (#130), selection per request (#131), tool annotations and core rules in descriptions (#132), schema linter + CI job (#133).
-- **WP-39** `wp/39-personal-tokens`: token kind, owner-bounded rights, CLI (#134); self-service on `/account` (#135) ⛔ WP-25.
+- **WP-39** `wp/39-personal-tokens`: token kind, owner-bounded rights, CLI (#134); self-service on `/account` (#135) ⛔ #229 (WP-25).
 - **WP-40** `wp/40-conformance-profiles`: per-profile conformance harness incl. error cases (#136).
 - **WP-41** `wp/41-connect-doctor`: `connect claude-code` / `connect claude-ai` (#137), `doctor --client` (#138).
 
@@ -142,7 +142,7 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 - **WP-43** `wp/43-openwebui-profile`: profile `openwebui` (no `instructions`, `<server_id>_` prefix budget); conformance over Open WebUI's MCP path. Issues: #145, #146.
 - **WP-44** `wp/44-openwebui-filter`: `filter_memory.py` (inlet, budget, data marker, Valves), explicit-only `outlet`, `tool_memory.py` fallback, `system_prompt.md`; unit tests with fake Open WebUI objects; E2E filter test; small-model check (7–8B via Ollama) as a nightly job. Issues: #147, #148, #149, #150, #151.
 - **WP-45** `wp/45-openwebui-import`: `memory-manager import openwebui` from `/api/v1/memories` or an export file; docs for disabling or fencing the built-in memory (`ENABLE_MEMORIES`, per-group permission). Issues: #152, #153.
-- **WP-46** `wp/46-openwebui-release`: Helm values example next to the official chart with NetworkPolicy, `docs/clients/openwebui.md`, `integrations/openwebui/README.md` with version matrix, CI matrix over the pinned and two previous minors, enterprise variant via the facade ⛔ WP-22, release. Issues: #154, #155, #156, #157, #158.
+- **WP-46** `wp/46-openwebui-release`: Helm values example next to the official chart with NetworkPolicy, `docs/clients/openwebui.md`, `integrations/openwebui/README.md` with version matrix, CI matrix over the pinned and two previous minors, enterprise variant via the facade ⛔ #216 (WP-22), release. Issues: #154, #155, #156, #157, #158.
 
 **M14 — IDE and CLI clients** (blocked by the support-matrix gate)
 - **WP-47** `wp/47-headless-cli`: local headless harness (self-tested in CI with a fake CLI, real CLIs run manually per O21); Claude Code `-p` and Codex CLI `exec`; profile, `integrations/codex/` (`config.toml`, `AGENTS.md`), `connect`/`doctor codex`. Issues: #161, #162, #163, #164.
@@ -152,7 +152,7 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 - **WP-51** `wp/51-antigravity`: profile, `integrations/antigravity/`, `connect`/`doctor antigravity`, manual checklist entry. Issues: #175.
 
 **M15 — Autonomous agent runtimes** (blocked by the support-matrix gate and ADR-0013)
-- **WP-52** `wp/52-agent-identity`: agent tokens, namespace kind `agent`, delegation grants, write policies incl. `pending_writes` + approval CLI, `MM-Agent-Channel` in the audit; approval on `/account` ⛔ WP-25; quotas ⛔ WP-27; injection test. Issues: #176, #177, #178, #179, #180, #181, #182, #183.
+- **WP-52** `wp/52-agent-identity`: agent tokens, namespace kind `agent`, delegation grants, write policies incl. `pending_writes` + approval CLI, `MM-Agent-Channel` in the audit; approval on `/account` ⛔ #229 (WP-25); quotas ⛔ #242 (WP-27); injection test. Issues: #176, #177, #178, #179, #180, #181, #182, #183.
 - **WP-53** `wp/53-hermes`: tier 1 (MCP with tool filter and `trust: untrusted`), skill with the usage rules, `connect`/`doctor hermes`, `import hermes` (`MEMORY.md`/`USER.md`), Compose example, E2E with a pinned version. Issues: #184, #185, #186.
 - **WP-54** `wp/54-openclaw`: tier 1 (MCP with `toolFilter`, per-requester OAuth), skill, `connect`/`doctor openclaw`, `import openclaw`, Compose example, E2E with a pinned version. Issues: #187, #188, #189.
 - **WP-55** `wp/55-agent-native`: decision recorded as [ADR-0014](../adr/0014-agent-integration-tier.md) (tier 1 only in v1, #190); the Hermes provider (#191) and the OpenClaw plugin (#192) are closed as not planned and revisited after 1.0.
@@ -164,9 +164,9 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 
 **M17 — v1.0.0-rc**
 - **WP-59** `wp/59-stable-api`: `docs/compatibility.md` (SemVer, deprecation policy); tool contract, config format, note format and CLI marked stable; upgrade guide from the last 0.x; migration tests. Issues: #199, #200, #201, #202.
-- **WP-60** `wp/60-security-rc`: threat model update (Open WebUI identity, personal tokens, agents with third-party input) ⛔ WP-33; review; no open High/Critical findings. Issues: #203, #204.
+- **WP-60** `wp/60-security-rc`: threat model update (Open WebUI identity, personal tokens, agents with third-party input) ⛔ #272 (WP-33); review; no open High/Critical findings. Issues: #203, #204.
 - **WP-61** `wp/61-docs-site`: Markdown docs on GitHub (O20): `docs/README.md` as index with quickstart, client pages, support matrix, operations, enterprise; README lists clients as text only. Issues: #205, #206, #207.
-- **WP-62** `wp/62-release-rc`: all features done in TASKS or deferred with a reason; release notes; signed image, chart, tag `v1.0.0-rc.1` ⛔ WP-34. Issues: #208, #209.
+- **WP-62** `wp/62-release-rc`: all features done in TASKS or deferred with a reason; release notes; signed image, chart, tag `v1.0.0-rc.1` ⛔ #280 (WP-34). Issues: #208, #209.
 
 ## Support matrix (approved 2026-10-08)
 
