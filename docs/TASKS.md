@@ -289,7 +289,7 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 
 - [x] #249 The chart refuses more than one replica or an autoscaler unless storage.backend is postgres
 - [x] #250 The chart renders separate api and worker Deployments with graceful shutdown for the postgres backend ⛔ blocked by #249, #219
-- [ ] #251 The api and worker Deployments scale on CPU, with optional RPS scaling through a KEDA ScaledObject ⛔ blocked by #250
+- [x] #251 The api and worker Deployments scale on CPU, with optional RPS scaling through a KEDA ScaledObject ⛔ blocked by #250
 - [ ] #252 The CNPG cluster of the enterprise profile runs three instances with Barman Cloud plugin backups ⛔ blocked by #250
 - [x] #253 The container image ships the valkey and otel extras
 - [ ] #254 The chart can deploy an optional Valkey without persistence for shared state ⛔ blocked by #250, #253

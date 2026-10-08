@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Optional request-rate scaling for the api Deployment through a KEDA
+# ScaledObject (keda.sh/v1alpha1, owner decision O27, ADR-0009 addendum
+# 2026-10-08, #251) - fields verified against KEDA's own docs, see
+# docs/research/kubernetes-scaling.md. Renders a "cpu" trigger (reusing
+# the api block's own autoscaling sub-block's targetCPUUtilizationPercentage,
+# the same target the plain HPA in templates/hpa.yaml would use) and a
+# "prometheus" trigger on the request-rate query below, instead of that
+# HPA - never both for the same Deployment, enforced by
+# templates/api-deployment.yaml's own "validateApiAutoscaling" include.
+# KEDA itself (https://keda.sh) must already be installed in the
+# cluster; this chart does not install it. storage's own backend
+# "postgres" only, since only that backend renders the api Deployment
+# this targets.
+{{- if eq .Values.storage.backend "postgres" }}
+{{- if .Values.api.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-api
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "api") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "memory-manager.fullname" . }}-api
+  minReplicaCount: {{ .Values.api.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.api.keda.maxReplicaCount }}
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage | quote }}
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.api.keda.prometheus.serverAddress | quote }}
+        query: {{ .Values.api.keda.prometheus.query | quote }}
+        threshold: {{ .Values.api.keda.prometheus.threshold | quote }}
+{{- end }}
+{{- end }}

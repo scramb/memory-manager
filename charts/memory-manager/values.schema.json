@@ -36,6 +36,36 @@
             "maxSkew": { "type": "integer", "minimum": 1 },
             "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
           }
+        },
+        "autoscaling": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "CPU HorizontalPodAutoscaler for the api Deployment (ADR-0009 addendum 2026-10-08) - mutually exclusive with api.keda.enabled.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 0 },
+            "maxReplicas": { "type": "integer", "minimum": 0 },
+            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        },
+        "keda": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Optional KEDA ScaledObject for the api Deployment instead of the CPU HPA above (ADR-0009 addendum 2026-10-08) - mutually exclusive with api.autoscaling.enabled.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicaCount": { "type": "integer", "minimum": 0 },
+            "maxReplicaCount": { "type": "integer", "minimum": 0 },
+            "prometheus": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "serverAddress": { "type": "string" },
+                "query": { "type": "string" },
+                "threshold": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },
@@ -54,6 +84,17 @@
             "enabled": { "type": "boolean" },
             "maxSkew": { "type": "integer", "minimum": 1 },
             "whenUnsatisfiable": { "type": "string", "enum": ["ScheduleAnyway", "DoNotSchedule"] }
+          }
+        },
+        "autoscaling": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "CPU HorizontalPodAutoscaler for the worker Deployment (ADR-0009 addendum 2026-10-08).",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "minReplicas": { "type": "integer", "minimum": 0 },
+            "maxReplicas": { "type": "integer", "minimum": 0 },
+            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
           }
         }
       }

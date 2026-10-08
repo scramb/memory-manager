@@ -92,7 +92,11 @@ than one replica or any autoscaler (ADR-0007, ADR-0009 §6: only a
 "postgres" backend may scale) - a template-side guard alongside
 values.schema.json's own "if"/"then", since `helm template
 --skip-schema-validation` exists. Included by templates/deployment.yaml;
-renders no output of its own.
+renders no output of its own. Checks both a generic top-level
+"autoscaling" block (kept for callers that set one directly) and the
+api and worker blocks' own component-scoped autoscaling (and, for api,
+keda) sub-blocks the chart itself renders from (#251, ADR-0009 addendum
+2026-10-08).
 */}}
 {{- define "memory-manager.validate" -}}
 {{- if eq .Values.storage.backend "git" }}
@@ -103,6 +107,23 @@ renders no output of its own.
 {{- if and $autoscaling (or $autoscaling.enabled (and $autoscaling.keda $autoscaling.keda.enabled)) }}
 {{- fail "storage.backend \"git\" does not allow an autoscaler (HPA or KEDA) - only storage.backend \"postgres\" may scale (ADR-0007, ADR-0009 §6)" }}
 {{- end }}
+{{- if or .Values.api.autoscaling.enabled .Values.api.keda.enabled .Values.worker.autoscaling.enabled }}
+{{- fail "storage.backend \"git\" does not allow an autoscaler (HPA or KEDA) - only storage.backend \"postgres\" may scale (ADR-0007, ADR-0009 §6)" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Fails fast when the api block's own autoscaling and keda sub-blocks are
+both enabled (#251, ADR-0009 addendum 2026-10-08): a KEDA ScaledObject
+creates its own HorizontalPodAutoscaler, so an HPA (templates/hpa.yaml)
+and a ScaledObject (templates/keda-scaledobject.yaml) for the same api
+Deployment would fight over the desired replica count - never both.
+Included by templates/api-deployment.yaml; renders no output of its own.
+*/}}
+{{- define "memory-manager.validateApiAutoscaling" -}}
+{{- if and .Values.api.autoscaling.enabled .Values.api.keda.enabled }}
+{{- fail "api.autoscaling.enabled and api.keda.enabled are mutually exclusive - a KEDA ScaledObject creates its own HorizontalPodAutoscaler (ADR-0009 addendum 2026-10-08)" }}
 {{- end }}
 {{- end }}
 

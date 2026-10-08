@@ -19,7 +19,12 @@ metadata:
   labels:
     {{- include "memory-manager.componentLabels" (dict "context" . "component" "worker") | nindent 4 }}
 spec:
+  {{- /* Omitted while the HPA manages this Deployment
+  (templates/hpa.yaml, #251), so a Helm upgrade never resets the replica
+  count the autoscaler set. */}}
+  {{- if not .Values.worker.autoscaling.enabled }}
   replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

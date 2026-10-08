@@ -49,7 +49,10 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `storage` → `backend` | `git` | `git` (default, ADR-0007) or `postgres` (enterprise) - only `postgres` may run more than one replica or an autoscaler (ADR-0009 §6), enforced by `values.schema.json` and the chart's own `validate` helper |
 | `replicaCount` | `1` | 0 or 1 while `storage` → `backend` is `git` (`values.schema.json`) - single writer to the vault's git remote and per-process OAuth login rate limiter, never a scaled service; ignored once `storage` → `backend` is `postgres`, which renders `api`/`worker` instead |
 | `api` → `replicaCount`/`resources`/`topologySpreadConstraints` | 3 replicas | `storage` → `backend` `postgres` only - the stateless api Deployment (ADR-0009 §4) |
+| `api` → `autoscaling` → `enabled`/`minReplicas`/`maxReplicas`/`targetCPUUtilizationPercentage` | off, 3/10/70% | `storage` → `backend` `postgres` only - CPU `HorizontalPodAutoscaler` for `api` (ADR-0009 addendum 2026-10-08); mutually exclusive with `api` → `keda` → `enabled` below |
+| `api` → `keda` → `enabled`/`minReplicaCount`/`maxReplicaCount`/`prometheus` | off, 3/10 | `storage` → `backend` `postgres` only - optional KEDA `ScaledObject` (`cpu` + `prometheus` triggers) instead of the HPA above; KEDA itself is not installed by this chart |
 | `worker` → `replicaCount`/`port`/`resources`/`topologySpreadConstraints` | 2 replicas, port `8090` | `storage` → `backend` `postgres` only - the embedding queue, Graph delta sync, retention and OAuth cleanup (ADR-0009 §4) |
+| `worker` → `autoscaling` → `enabled`/`minReplicas`/`maxReplicas`/`targetCPUUtilizationPercentage` | off, 2/6/70% | `storage` → `backend` `postgres` only - CPU `HorizontalPodAutoscaler` for `worker` (ADR-0009 addendum 2026-10-08) |
 | `shutdown` → `graceSeconds`/`preStopSleepSeconds`/`terminationGracePeriodSeconds` | 20/10/40 | `storage` → `backend` `postgres` only - graceful shutdown (ADR-0009 §5); the last value must be at least the first two added together |
 | `pdb` → `api` → `minAvailable` | `2` | `storage` → `backend` `postgres` only - PodDisruptionBudget for the api Deployment (ADR-0009 §5) |
 | `database` → `appRole` | `memory_manager_app` | api only, `storage` → `backend` `postgres` only - `DATABASE_APP_ROLE`, the non-owner role request transactions switch to (ADR-0008 addendum); the worker Deployment never gets it |
@@ -83,9 +86,12 @@ See `values.yaml` itself for the full, commented reference - this table is the s
 ## Enterprise profile
 
 `values-enterprise.yaml` sets `storage` → `backend` to `postgres` and turns on the `api`/`worker`
-split above, Entra login placeholders included. It is a starting overlay, not a complete install -
-layer your own values on top for the pieces it does not cover yet (HPA/KEDA autoscaling, CNPG
-backups and the app role migration, Valkey shared state, NetworkPolicies):
+split above plus a CPU `HorizontalPodAutoscaler` for both Deployments, Entra login placeholders
+included. KEDA request-rate scaling stays off; turn `api` → `keda` → `enabled` on and `api` →
+`autoscaling` → `enabled` off in your own overlay to use it instead (KEDA itself must already be
+installed in the cluster). It is a starting overlay, not a complete install - layer your own values
+on top for the pieces it does not cover yet (CNPG backups and the app role migration, Valkey shared
+state, NetworkPolicies):
 
 ```sh
 helm template memory-manager charts/memory-manager \

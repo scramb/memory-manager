@@ -42,6 +42,44 @@ api:
     enabled: true
     maxSkew: 1
     whenUnsatisfiable: ScheduleAnyway
+  # CPU-based autoscaling/v2 HorizontalPodAutoscaler for the api
+  # Deployment (templates/hpa.yaml), storage's own backend "postgres"
+  # only (owner decision O27, ADR-0009 addendum 2026-10-08: always a CPU
+  # HPA for the enterprise profile). Mutually exclusive with the keda
+  # sub-block's own enabled flag below - a KEDA ScaledObject creates its
+  # own HPA, so the chart's own "validate" helper fails the render if
+  # both are true at once. While either this or the keda sub-block below
+  # is enabled, replicaCount above is ignored: the Deployment omits its
+  # own replicas field so Helm upgrades never fight the autoscaler over
+  # the desired count.
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  # Optional request-rate scaling instead of the CPU HPA above, api only
+  # (owner decision O27, ADR-0009 addendum 2026-10-08: CPU HPA always,
+  # RPS scaling optional through KEDA) - renders a KEDA ScaledObject
+  # (templates/keda-scaledobject.yaml) with a "cpu" trigger (reusing the
+  # targetCPUUtilizationPercentage above) and a "prometheus" trigger on
+  # the query below, instead of the HPA. KEDA (https://keda.sh) must
+  # already be installed in the cluster; this chart does not install it.
+  # minReplicaCount should stay at least the api PDB's own minAvailable
+  # (below) plus one, so KEDA never scales below what the PDB allows to
+  # be evicted at once.
+  keda:
+    enabled: false
+    minReplicaCount: 3
+    maxReplicaCount: 10
+    prometheus:
+      # Placeholder; point this at your own Prometheus (or
+      # Prometheus-compatible) query endpoint.
+      serverAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
+      # mm_tool_calls_total (observability/metrics.py) summed across
+      # every tool and outcome, as requests/second over a 2-minute
+      # window - overridable for a different request-rate signal.
+      query: sum(rate(mm_tool_calls_total[2m]))
+      threshold: "50"
 
 worker:
   replicaCount: 2
@@ -59,6 +97,16 @@ worker:
     enabled: true
     maxSkew: 1
     whenUnsatisfiable: ScheduleAnyway
+  # CPU-based HorizontalPodAutoscaler for the worker Deployment
+  # (templates/hpa.yaml), storage's own backend "postgres" only - same
+  # owner decision as the api block's own autoscaling sub-block above.
+  # No KEDA option here: queue-length scaling of the worker is out of
+  # scope (#251's own "Not included").
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
 
 # Graceful shutdown (ADR-0009 §5), storage's own backend "postgres" only
 # - the git-mode Deployment's single replica has no in-flight traffic to
