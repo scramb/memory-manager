@@ -11,8 +11,11 @@ something a test can fake.
 `InMemorySharedState`'s bounded-LRU behaviour (moved here from
 `test_limits_audit.py`, #103) is not part of the shared contract:
 `PostgresSharedState`/`ValkeySharedState` have no in-process bound to test -
-their rows/keys grow with distinct keys until something else sweeps them
-(`auth.store.cleanup`/#106, out of scope here).
+their rows/keys grow with distinct keys until something else sweeps them.
+Valkey's own `PEXPIRE` already does that per key; `PostgresSharedState`'s
+own `sweep_expired_windows` (#106, exercised below in
+`TestPostgresSharedStateSweep`, called periodically by `http.py`'s cleanup
+loop) is what plays that role for `rate_limits`.
 """
 
 from __future__ import annotations
@@ -207,6 +210,31 @@ class TestPostgresSharedStateSecrecy:
         state = PostgresSharedState(pool)
         with pytest.raises(RuntimeError, match="cipher"):
             await state.put_pending("k", "payload", ttl_seconds=60.0)
+
+
+# === PostgresSharedState-specific: the periodic rate-limit sweep (#106) =============
+
+
+class TestPostgresSharedStateSweep:
+    async def test_sweep_removes_an_expired_window_but_keeps_a_running_one(
+        self, pool: asyncpg.Pool
+    ) -> None:
+        """A row backdated well past the threshold is gone afterwards; a window
+        `window_hit` just opened (`window_start` effectively `now()`) survives -
+        the invariant `sweep_expired_windows`'s docstring states: never shorten a
+        window still being counted against."""
+        state = _postgres_state(pool)
+        await pool.execute(
+            "insert into rate_limits (key, window_start, count) "
+            "values ('stale', now() - interval '2 hours', 3)"
+        )
+        await state.window_hit("running", window_seconds=60.0)
+
+        removed = await state.sweep_expired_windows(older_than_seconds=3600.0)
+
+        assert removed == 1
+        remaining = {row["key"] for row in await pool.fetch("select key from rate_limits")}
+        assert remaining == {"running"}
 
 
 # === ValkeySharedState-specific: at-rest secrecy and the cipher requirement ==========

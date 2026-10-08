@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 import asyncpg
 from mcp.server.auth.middleware.auth_context import get_access_token
 
+from memory_manager.db.migrate import _LOCK_KEY
+
 __all__ = [
     "NoPrincipal",
     "Principal",
@@ -104,6 +106,16 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
     entirely, which defeats the point of granting it the request role
     (ADR-0008 addendum: "the bypass is tied to the owner credential, not to
     a setting any code can flip").
+
+    Takes `db.migrate`'s own advisory lock (`_LOCK_KEY`) for the duration of
+    the grants (#123): several replicas starting at once each call this
+    against the same, possibly not-yet-granted role on their own connection,
+    and concurrent `GRANT`s on the same table/function can otherwise fail
+    with Postgres' "tuple concurrently updated" - a catalog-row update race,
+    not a privilege conflict. Reusing the migration key (rather than a
+    dedicated one) also means a grant never races a still-running `migrate()`
+    on another connection; both serialize on the one key regardless of which
+    of the two a process happens to run first.
     """
     row = await conn.fetchrow(
         "select rolsuper, rolbypassrls from pg_roles where rolname = $1", role
@@ -120,6 +132,7 @@ async def grant_app_role(conn: _Connectable, role: str) -> None:
         raise RoleRefused(f"role {role!r} is the owner that ran this migration")
 
     async with conn.transaction():
+        await conn.execute("select pg_advisory_xact_lock($1)", _LOCK_KEY)
         for table in _FULL_DML_TABLES:
             await conn.execute(f'grant select, insert, update, delete on "{table}" to "{role}"')
         for table in _APPEND_ONLY_TABLES:

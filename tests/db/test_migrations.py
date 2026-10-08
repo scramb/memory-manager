@@ -40,6 +40,7 @@ class TestMigrate:
             "0005_rls",
             "0006_shared_state",
             "0007_token_principal",
+            "0008_frequent_lexemes",
             "0009_namespace_resolution",
         ]
         tables = {
@@ -84,6 +85,7 @@ class TestMigrate:
             "0005_rls",
             "0006_shared_state",
             "0007_token_principal",
+            "0008_frequent_lexemes",
             "0009_namespace_resolution",
         ]
         assert second == []
@@ -107,6 +109,7 @@ class TestMigrate:
             "0005_rls",
             "0006_shared_state",
             "0007_token_principal",
+            "0008_frequent_lexemes",
             "0009_namespace_resolution",
         ]
 
@@ -168,6 +171,7 @@ class TestMigrate:
                 "0005_rls",
                 "0006_shared_state",
                 "0007_token_principal",
+                "0008_frequent_lexemes",
                 "0009_namespace_resolution",
             ]
         finally:

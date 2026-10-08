@@ -107,7 +107,7 @@ class _FakeClock:
 async def test_rate_limiter_allows_up_to_the_window_limit_then_rejects_with_retry_after() -> None:
     clock = _FakeClock()
     state = InMemorySharedState(clock=clock)
-    limiter = RateLimiter(state=state, per_minute=60, burst=3)  # limit=3, window=180s
+    limiter = RateLimiter(state=state, per_minute=60, burst=3, name="mcp")  # limit=3, window=180s
 
     assert await limiter.allow("k") == (True, 0.0)
     assert await limiter.allow("k") == (True, 0.0)
@@ -121,7 +121,7 @@ async def test_rate_limiter_allows_up_to_the_window_limit_then_rejects_with_retr
 async def test_rate_limiter_rolls_over_once_the_window_passes_on_the_injected_clock() -> None:
     clock = _FakeClock()
     state = InMemorySharedState(clock=clock)
-    limiter = RateLimiter(state=state, per_minute=60, burst=1)  # limit=1, window=60s
+    limiter = RateLimiter(state=state, per_minute=60, burst=1, name="mcp")  # limit=1, window=60s
     assert (await limiter.allow("k"))[0] is True
     assert (await limiter.allow("k"))[0] is False
 
@@ -133,11 +133,55 @@ async def test_rate_limiter_rolls_over_once_the_window_passes_on_the_injected_cl
 async def test_rate_limiter_isolates_two_keys_from_each_other() -> None:
     clock = _FakeClock()
     state = InMemorySharedState(clock=clock)
-    limiter = RateLimiter(state=state, per_minute=60, burst=1)
+    limiter = RateLimiter(state=state, per_minute=60, burst=1, name="mcp")
 
     assert (await limiter.allow("a"))[0] is True
     assert (await limiter.allow("a"))[0] is False
     assert (await limiter.allow("b"))[0] is True
+
+
+async def test_rate_limiter_rejects_an_empty_name() -> None:
+    state = InMemorySharedState()
+
+    with pytest.raises(ValueError, match="name"):
+        RateLimiter(state=state, per_minute=60, burst=1, name="")
+
+
+async def test_two_named_rate_limiters_on_one_shared_state_count_separately(
+    # #122: before each `RateLimiter` had its own `name` prefix, two limiters
+    # sharing one `SharedState` (`http.py`'s `mcp_limiter`/`write_limiter`, both
+    # on `shared_state`) collided on the exact same raw key - a hit recorded by
+    # one counted against the other's budget too. This reproduces that at the
+    # `RateLimiter` level, without the HTTP app: the same raw key `"k"`, through
+    # two differently named limiters on one `InMemorySharedState`, must stay in
+    # two independent windows.
+) -> None:
+    clock = _FakeClock()
+    state = InMemorySharedState(clock=clock)
+    mcp_limiter = RateLimiter(state=state, per_minute=60, burst=100, name="mcp")
+    write_limiter = RateLimiter(state=state, per_minute=60, burst=1, name="write")
+
+    # Three "reads" against the MCP limiter on the same raw key the write
+    # limiter will use below - comfortably within the MCP limiter's own
+    # budget of 100, and must never touch the write limiter's budget of 1.
+    for _ in range(3):
+        allowed, _ = await mcp_limiter.allow("k")
+        assert allowed is True
+
+    # The write limiter has never been hit yet - its one-call budget on "k"
+    # must still be fully available, regardless of the three MCP hits above.
+    allowed, _ = await write_limiter.allow("k")
+    assert allowed is True
+
+    # The write limiter's budget of 1 is now spent - its own second hit on
+    # "k" is rejected...
+    allowed, _ = await write_limiter.allow("k")
+    assert allowed is False
+
+    # ...while the MCP limiter, still well under its budget of 100, is
+    # unaffected by the write limiter's hits on the very same raw key.
+    allowed, _ = await mcp_limiter.allow("k")
+    assert allowed is True
 
 
 # --- `ServerConfig`'s limits knobs ------------------------------------------
@@ -331,6 +375,48 @@ async def test_mcp_rate_limit_is_isolated_per_token(bare_remote: Path, tmp_path:
     assert first_b.status_code != 429  # token-b has never been charged
 
 
+async def test_reads_do_not_spend_the_write_limiters_budget(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    """#122: before every `RateLimiter` had its own key prefix, `mcp_limiter` and
+    `write_limiter` hit the exact same `token:<sha>` key on `http.py`'s shared
+    `SharedState` - so a handful of read-only calls (`ping`, never passed to
+    `write_limiter` at all) could already exhaust the *write* limiter's much
+    tighter budget purely by inflating the counter the write limiter's own hit
+    then read back. `mcp_burst`/`mcp_per_minute` is set far above what this test
+    sends; `write_burst`/`write_per_minute` is tight (3 calls) and, with the same
+    `window_seconds` as the MCP limiter (60s for both here), would have shared
+    that one counter before the fix.
+    """
+    config = ServerConfig(
+        public_url=_PUBLIC_URL,
+        mcp_per_minute=100,
+        mcp_burst=100,
+        write_per_minute=3,
+        write_burst=3,
+    )
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        write_call = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "memory_write", "arguments": {}},
+        }
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            reads = [
+                await client.post(config.mcp_path, json=_PING, headers=headers) for _ in range(3)
+            ]
+            write_response = await client.post(config.mcp_path, json=write_call, headers=headers)
+
+    assert all(read.status_code != 429 for read in reads)
+    # The write limiter's own budget (3) has never been touched by the three
+    # reads above - its first hit, from this one write call, must not be
+    # rejected.
+    assert write_response.status_code != 429
+
+
 async def test_oauth_endpoints_are_rate_limited_by_client_ip(
     bare_remote: Path, tmp_path: Path
 ) -> None:
@@ -379,6 +465,45 @@ async def test_mcp_rate_limiting_writes_to_the_shared_postgres_state(
 
     assert row is not None
     assert row["count"] == 1
+
+
+async def test_write_tool_call_leaves_separately_prefixed_mcp_and_write_rows(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    """#122: a single `tools/call` naming a write tool must leave *two* `rate_limits`
+    rows for the same token - one counted by `mcp_limiter` (`mcp:token:<sha>`), one by
+    `write_limiter` (`write:token:<sha>`) - never one shared row either limiter's hit
+    could overwrite the other's count in.
+    """
+    config = ServerConfig(
+        public_url=_PUBLIC_URL,
+        mcp_per_minute=60,
+        mcp_burst=60,
+        write_per_minute=60,
+        write_burst=60,
+    )
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    write_call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "memory_write", "arguments": {}},
+    }
+    async with _running_app(environ, config) as app:
+        pool: asyncpg.Pool = app.state.services.pool
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(config.mcp_path, json=write_call, headers=headers)
+        assert response.status_code != 429
+
+        rows = await pool.fetch("select key, count from rate_limits order by key")
+
+    keys = [row["key"] for row in rows]
+    assert len(keys) == 2
+    assert any(key.startswith("mcp:token:") for key in keys)
+    assert any(key.startswith("write:token:") for key in keys)
+    assert all(row["count"] == 1 for row in rows)
 
 
 async def test_oversized_chunked_mcp_body_with_no_content_length_is_413(

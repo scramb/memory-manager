@@ -84,12 +84,12 @@ Work packages of M8–M11 (one line each; cut into issues when the milestone sta
 
 ## Open decisions
 
-None blocking M7. To be decided by the owner when the milestone starts:
+None blocking M8. Remaining questions:
 
 | Question | Options | Blocks |
 |---|---|---|
 | Vector index and partitioning details | as proposed in ADR-0007 §5 vs. adjusted after the M7 baseline | WP-32 (own ADR after WP-21) |
-| R2 cost under load | keep R2 vs. fall back to R1 (ADR-0008) if the baseline misses the budget | WP-21 result |
+| R2 cost under load | — decided 2026-10-08 by the owner: keep R2 ([baseline](../benchmarks/baseline.md): ~1.6 ms vs ~0.1 ms per access-function call, targets met at 100k); re-evaluate only if WP-32 misses the budget at target size | — |
 
 ## Spikes
 

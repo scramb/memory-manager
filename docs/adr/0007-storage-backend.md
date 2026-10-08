@@ -83,3 +83,25 @@ Checked against the guardrails:
 ## Reversibility
 
 Expensive. Once enterprise data lives in Postgres, going back to Git means a full export and losing revision metadata. The interface itself is cheap, and Git deployments are untouched.
+
+## Addendum 2026-10-07 — full-text search with very frequent terms (#117)
+
+The load test (#108) showed the cost of OR semantics: a query containing a term that occurs in every chunk ranked all chunks, which took 1.3 s at 60k chunks and 8.8 s at 1M rows.
+
+The owner decided on 2026-10-07 to keep the ranking unchanged and to bound only the candidate stage.
+
+**Detecting frequent terms**
+- Very frequent lexemes are recognised from the planner statistics: `pg_stats.most_common_elems` × `pg_class.reltuples`.
+- Those lexemes are left out of the match condition, so their posting lists are never read.
+- Ranking runs only over a hard-capped candidate set.
+
+**Access from the app role**
+- Under RLS, the non-owner app role cannot see `pg_stats` rows for `chunks`.
+- A `SECURITY DEFINER` function owned by the schema owner therefore answers only one question: which of the given lexemes exceed the frequency threshold.
+- This discloses that a term is very common across all namespaces. It discloses nothing about rare terms or about any content.
+
+**Limitations**
+- Detection depends on `ANALYZE` having run. Bulk loads and `reindex --full` must analyze `chunks`.
+- Without statistics, only the cap bounds the work.
+
+**Rejected:** AND-first with an OR fallback. It changes ranking semantics for every vault, and for natural-language questions the OR fallback still reads the saturated posting lists.

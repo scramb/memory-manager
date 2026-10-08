@@ -289,6 +289,26 @@ class PostgresSharedState:
         params = json.loads(row["params"])
         return self._cipher.decrypt(params["payload"])
 
+    async def sweep_expired_windows(self, *, older_than_seconds: float) -> int:
+        """Delete `rate_limits` rows whose window started more than
+        `older_than_seconds` ago - called from `http.py`'s periodic cleanup sweep
+        (#106), not from `window_hit`/`window_peek` themselves (both already roll
+        a stale window over on their own next hit; this only reclaims the storage
+        of a window nobody hits again).
+
+        `older_than_seconds` must be at least as long as the longest window any
+        `RateLimiter`/the login brute-force check in this deployment actually
+        uses (`http.py`'s `_max_rate_limit_window_seconds` computes it from
+        `ServerConfig`) - never shorter, so a window still being counted against
+        is never deleted out from under it. Returns the number of rows removed,
+        for the caller's own logging only.
+        """
+        rows = await self._pool.fetch(
+            "delete from rate_limits where now() - window_start > $1 returning 1",
+            timedelta(seconds=older_than_seconds),
+        )
+        return len(rows)
+
 
 def _hash_key(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()

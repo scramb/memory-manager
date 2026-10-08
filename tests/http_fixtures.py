@@ -6,9 +6,17 @@ on top of the ambient one, waiting for `/healthz`, and tearing it down again
 
 Used by `tests/conformance/test_http.py` (protocol conformance over the real
 transport), `tests/test_stateless_transport.py` (the four stateless-transport
-behaviours ADR-0009 §1 pins) and `tests/test_shutdown.py` (graceful shutdown,
-ADR-0009 §5) - three different sets of assertions against the same kind of
-process, so starting and stopping it lives here once.
+behaviours ADR-0009 §1 pins), `tests/test_shutdown.py` (graceful shutdown,
+ADR-0009 §5) and `tests/e2e/test_replicas.py` (two such processes on one
+Postgres, ADR-0009, #106) - four different sets of assertions against the
+same kind of process, so starting and stopping it lives here once.
+
+`run_http_server`'s teardown tolerates a process a test already `kill()`ed
+itself (`process.returncode` already set, e.g. `tests/e2e/test_replicas.py`'s
+own SIGKILL scenario): `terminate()`/`wait_for(... kill())` on a process that
+already exited would otherwise be harmless too, but checking first avoids
+sending a second signal to a since-reused pid on a platform that recycles
+them quickly.
 """
 
 from __future__ import annotations
@@ -96,9 +104,10 @@ async def run_http_server(env: Mapping[str, str]) -> AsyncIterator[Server]:
         await wait_until_ready(process, base_url)
         yield Server(process=process, base_url=base_url, mcp_url=f"{base_url}/mcp")
     finally:
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
