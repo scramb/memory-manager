@@ -99,7 +99,14 @@ consumed. If anything about the import looks wrong, the simplest rollback is to 
 `memory-manager serve` at the untouched Git vault (`STORAGE_BACKEND` unset, or `git`) while you
 fix the Postgres side and try again.
 
-There is no `export` path back out of the `postgres` backend into Markdown yet - `StorageBackend`
-reserves the interface for it ([ADR-0007](../adr/0007-storage-backend.md)), but today's `export`
-subcommand only reads a `--vault` Git working tree, not a Postgres-backed one. Until that lands,
-the Git vault you migrated from is your rollback path, not a re-export from Postgres.
+If you need the Postgres side's own current state back out as Markdown - for example because the
+source Git vault has since drifted from what is actually live in Postgres - `export` also reads a
+`postgres`-backed deployment: with `STORAGE_BACKEND=postgres` and `DATABASE_URL` set, the same
+`export` subcommand writes the current notes of `vault_notes` into the same tar.gz + manifest
+archive it writes for a Git vault (`--vault`/`VAULT_DIR` are ignored in this mode). This is
+one-way and never read back ([ADR-0007](../adr/0007-storage-backend.md)): it exports current
+content only, not revision history, so going back this way loses every revision's metadata.
+
+```sh
+STORAGE_BACKEND=postgres DATABASE_URL=... memory-manager export --out rollback.tar.gz
+```

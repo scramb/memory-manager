@@ -63,7 +63,7 @@ from memory_manager.config import (
 from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
-from memory_manager.exporter import ExportError, Manifest, export_vault
+from memory_manager.exporter import ExportError, Manifest, export_postgres, export_vault
 from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
@@ -124,7 +124,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "export":
         return _run_export_command(
-            args.vault, out=args.out, include_archive=args.include_archive, force=args.force
+            args.vault,
+            out=args.out,
+            include_archive=args.include_archive,
+            force=args.force,
+            namespaces=args.namespace,
         )
 
     if args.command == "import":
@@ -278,6 +282,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="overwrite --out if it already exists",
+    )
+    export_parser.add_argument(
+        "--namespace",
+        dest="namespace",
+        action="append",
+        default=None,
+        help="limit the export to this namespace (repeatable; default: every namespace)",
     )
 
     import_parser = subparsers.add_parser("import", help="import notes from an external source")
@@ -476,21 +487,69 @@ def _print_doctor_report(report: DoctorReport) -> None:
 
 
 def _run_export_command(
-    vault: str | None, *, out: Path | None, include_archive: bool, force: bool
+    vault: str | None,
+    *,
+    out: Path | None,
+    include_archive: bool,
+    force: bool,
+    namespaces: list[str] | None,
 ) -> int:
-    if not vault:
-        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
-        return 2
+    """`memory-manager export`: the Postgres path when `STORAGE_BACKEND=postgres`, Git otherwise.
+
+    `STORAGE_BACKEND` is read first (`storage_backend_from_env`, same as
+    every other command) - a `"postgres"` call needs no `--vault`/`VAULT_DIR`
+    at all (#283, ADR-0007 §2); Git behaviour below is otherwise unchanged
+    from before `export_postgres` existed.
+    """
     out_path = out or Path(f"memory-export-{datetime.now(UTC).date().isoformat()}.tar.gz")
     if out_path.exists() and not force:
         print(f"'{out_path}' already exists, pass --force to overwrite", file=sys.stderr)
         return 2
 
     try:
-        manifest = export_vault(Path(vault), out_path, include_archive=include_archive)
+        storage_backend = storage_backend_from_env(dict(os.environ))
+    except StorageConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if storage_backend == "postgres":
+        return asyncio.run(
+            _run_export_postgres_command(
+                out_path, include_archive=include_archive, namespaces=namespaces
+            )
+        )
+
+    if not vault:
+        print("--vault is required (or set VAULT_DIR)", file=sys.stderr)
+        return 2
+
+    try:
+        manifest = export_vault(
+            Path(vault), out_path, include_archive=include_archive, namespaces=namespaces
+        )
     except ExportError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    _print_export_manifest(manifest, out_path)
+    return 0
+
+
+async def _run_export_postgres_command(
+    out_path: Path, *, include_archive: bool, namespaces: list[str] | None
+) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+    try:
+        manifest = await export_postgres(
+            pool, out_path, include_archive=include_archive, namespaces=namespaces
+        )
+    except ExportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    finally:
+        await pool.close()
 
     _print_export_manifest(manifest, out_path)
     return 0
