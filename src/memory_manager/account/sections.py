@@ -38,10 +38,19 @@ from dataclasses import dataclass
 
 import asyncpg
 
-from memory_manager.account.sessions import SessionInfo
+from memory_manager.account.export import CSRF_FORM_EXPORT, EXPORT_PATH
+from memory_manager.account.sessions import SessionInfo, csrf_token
+from memory_manager.account.templates import CSRF_FIELD_NAME
 from memory_manager.db import rls
 
-__all__ = ["DEFAULT_SECTIONS", "OVERVIEW_SECTION", "Section", "SectionContext", "render_sections"]
+__all__ = [
+    "DEFAULT_SECTIONS",
+    "EXPORT_SECTION",
+    "OVERVIEW_SECTION",
+    "Section",
+    "SectionContext",
+    "render_sections",
+]
 
 #: `left(path, 9) <> '_archive/'` - `len("_archive/")`, the same literal
 #: `storage.postgres`'s own `_SELECT_NAMESPACE_USAGE` filters archived notes with.
@@ -63,6 +72,10 @@ class SectionContext:
     #: required to call `mm_ensure_personal_ns()` under the identity switch
     #: `db.rls.request_identity` performs; `OVERVIEW_SECTION` is the only reader today.
     app_role: str | None
+    #: The raw (plaintext) session cookie value - needed only to mint a per-form
+    #: CSRF token (`account.sessions.csrf_token`, keyed by the raw id, never the
+    #: stored hash); `EXPORT_SECTION`'s own form is the only reader today.
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -124,9 +137,34 @@ async def _render_overview(ctx: SectionContext) -> str:
 #: `STORAGE_BACKEND=postgres` with an Entra `oid` (`_personal_note_count`).
 OVERVIEW_SECTION = Section(name="overview", enabled=lambda _ctx: True, render=_render_overview)
 
+
+def _export_enabled(ctx: SectionContext) -> bool:
+    """`STORAGE_BACKEND=postgres` plus an Entra `oid` - the same gate
+    `_personal_note_count` uses: there is no personal namespace to export at all
+    otherwise (#230, `account.export`'s own module docstring)."""
+    return ctx.is_postgres_backend and ctx.session.oid is not None
+
+
+async def _render_export(ctx: SectionContext) -> str:
+    token = csrf_token(ctx.session_id, CSRF_FORM_EXPORT)
+    return (
+        "<section><h2>Export</h2>"
+        "<p>Download every note in your personal namespace, archived notes "
+        "included, as a Markdown ZIP.</p>"
+        f'<form method="post" action="{html.escape(EXPORT_PATH)}">'
+        f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{html.escape(token)}">'
+        '<button type="submit">Download my memory</button>'
+        "</form></section>"
+    )
+
+
+#: Enterprise only (`_export_enabled`) - a `password`/`oidc` session or a
+#: `STORAGE_BACKEND=git` deployment never shows this section at all (#230).
+EXPORT_SECTION = Section(name="export", enabled=_export_enabled, render=_render_export)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
-DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION,)
+DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION, EXPORT_SECTION)
 
 
 async def render_sections(

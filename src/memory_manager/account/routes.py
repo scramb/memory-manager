@@ -45,6 +45,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from memory_manager.account import export as account_export
 from memory_manager.account import pending as account_pending
 from memory_manager.account import sessions
 from memory_manager.account.sections import DEFAULT_SECTIONS, SectionContext, render_sections
@@ -235,6 +236,7 @@ async def _account_page(request: Request) -> Response:
         pool=pool,
         is_postgres_backend=isinstance(services.storage, PostgresBackend),
         app_role=services.app_role,
+        session_id=session_id,
     )
     sections_html = await render_sections(ctx, DEFAULT_SECTIONS)
     csrf = sessions.csrf_token(session_id, _CSRF_FORM_LOGOUT)
@@ -262,15 +264,19 @@ async def _logout(request: Request) -> Response:
 
 
 def page_routes() -> list[Route]:
-    """`GET /account`, `GET /account/login`, `POST /account/logout` - mounted by
-    `http.py` whenever an `Authenticator` is configured, the same condition `/login`
-    itself is mounted under (an account with no login method configured at all makes
-    no sense). None of these three carry a session cookie of their own to set
-    (`_account_page`/`_logout` only ever read or clear one); only the shared `/login`/
-    `{CALLBACK_PATH}` routes need `with_session_cookie`.
+    """`GET /account`, `GET /account/login`, `POST /account/logout`, `POST
+    /account/export` - mounted by `http.py` whenever an `Authenticator` is
+    configured, the same condition `/login` itself is mounted under (an account
+    with no login method configured at all makes no sense). None of these carry
+    a session cookie of their own to set (each only ever reads or clears one);
+    only the shared `/login`/`{CALLBACK_PATH}` routes need `with_session_cookie`.
+    `account.export.export_routes` takes `SESSION_COOKIE` as a parameter rather
+    than importing it, so that module stays free to be imported here without a
+    cycle back (that function's own docstring).
     """
     return [
         Route(PATH, endpoint=_account_page, methods=["GET"]),
         Route(LOGIN_PATH_START, endpoint=_start_login, methods=["GET"]),
         Route(LOGOUT_PATH, endpoint=_logout, methods=["POST"]),
+        *account_export.export_routes(SESSION_COOKIE),
     ]
