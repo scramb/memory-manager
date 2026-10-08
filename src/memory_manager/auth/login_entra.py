@@ -97,8 +97,8 @@ from memory_manager.auth.templates import (
 )
 from memory_manager.auth.tokens import ALL_NAMESPACES, MEMORY_ROLES
 from memory_manager.auth.users import (
+    disable_user,
     get_user,
-    mark_disabled,
     replace_groups,
     touch_last_seen,
     upsert_user,
@@ -275,7 +275,7 @@ class EntraAuthenticator:
             _logger.warning("entra refresh: graph user_state check failed for %s: %s", oid, exc)
             return EntraRefreshOutcome.UNAVAILABLE
         if state is not UserState.ENABLED:
-            await mark_disabled(pool, oid)
+            await disable_user(pool, oid, reason="entra refresh: disabled or missing in Graph")
             return EntraRefreshOutcome.REVOKE
 
         user = await get_user(pool, oid)

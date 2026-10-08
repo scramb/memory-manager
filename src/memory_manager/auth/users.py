@@ -7,15 +7,27 @@ creates and `0010_oauth_token_principal.sql` extends, the same convention
 `Store` class of its own.
 
 `upsert_user`/`replace_groups` are the two writes a completed Entra login
-(#215) performs; `mark_disabled`/`touch_last_seen` are the refresh-time
-re-check's own writes (ADR-0006 §5, #216) - `auth.login_entra.
-EntraAuthenticator.check_refresh` is their only caller today, the Graph
-delta-sync worker (ADR-0006 §6, a later task) will be `mark_disabled`'s
-other one. `get_user` is what `auth.verifier` already calls, for the
-`disabled_at` check on every verification of a user-bound OAuth access
+(#215) performs; `touch_last_seen` is the refresh-time re-check's own write
+(ADR-0006 §5, #216). `get_user` is what `auth.verifier` already calls, for
+the `disabled_at` check on every verification of a user-bound OAuth access
 token (ADR-0009 §3: group membership and disabled state are read live from
 Postgres, never copied into the token row, so a change is visible on every
 replica at once).
+
+`mark_disabled`/`revoke_all_credentials`/`disable_user`/`enable_user` are
+ADR-0006 §6's deprovisioning (#222). `mark_disabled` only ever stamps
+`users.disabled_at`; `revoke_all_credentials` only ever revokes
+`oauth_tokens`/`static_tokens`; `disable_user` is the one call that does
+both, atomically, plus the audit entry - `auth.login_entra.
+EntraAuthenticator.check_refresh` (#216) and the later Graph delta-sync
+worker (ADR-0006 §6, #223) are its two callers. `revoke_all_credentials` is
+also exposed on its own, reusable by WP-26's admin "revoke all sessions"
+action (#235) without disabling the user. Both take a `_Queryable` (a pool
+or a caller-held connection, the same seam `memory_manager.search` already
+uses for the same reason) so `disable_user` can run its own write and
+`revoke_all_credentials` inside one transaction, while a caller that already
+holds a connection of its own - the delta-sync worker's own per-user
+transaction - can join that instead of opening a second one.
 """
 
 from __future__ import annotations
@@ -25,16 +37,31 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import asyncpg
+import asyncpg.pool
+
+from memory_manager.audit import AuditWriter
 
 __all__ = [
+    "RevocationCounts",
     "User",
+    "disable_user",
+    "enable_user",
     "get_user",
     "group_ids",
     "mark_disabled",
     "replace_groups",
+    "revoke_all_credentials",
     "touch_last_seen",
     "upsert_user",
 ]
+
+# A pool or a single connection acquired from one (including one already inside a
+# caller's own transaction) - both expose the same `execute`/`fetchval` methods, the
+# same `_Queryable` idiom `memory_manager.search` already uses, for the same reason:
+# `disable_user` needs its writes and `revoke_all_credentials`'s to share one
+# transaction, while a standalone caller (a future admin action, a test) just wants
+# to pass its pool.
+_Queryable = asyncpg.Pool | asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 _SELECT_COLUMNS = "oid, tid, display_name, disabled_at, last_seen, groups_fetched_at"
 
@@ -107,14 +134,15 @@ async def group_ids(pool: asyncpg.Pool, oid: str) -> tuple[str, ...]:
     return tuple(row["group_id"] for row in rows)
 
 
-async def mark_disabled(pool: asyncpg.Pool, oid: str) -> None:
+async def mark_disabled(pool: _Queryable, oid: str) -> None:
     """Record that `oid` is disabled or no longer exists in Entra (ADR-0006 §5/§6).
 
     Idempotent: `disabled_at` is set once, at the first sighting, and never moved by a
-    later call - both the refresh-time re-check (`EntraAuthenticator.check_refresh`,
-    #216) and the later Graph delta-sync worker (ADR-0006 §6) call this on the same
-    "disabled or missing" condition, and neither should overwrite the other's
-    timestamp with a more recent "now".
+    later call - `disable_user` below is this function's only caller today (from
+    inside its own transaction), on the same "disabled or missing" condition the
+    refresh-time re-check (`EntraAuthenticator.check_refresh`, #216) and the later
+    Graph delta-sync worker (ADR-0006 §6, #223) detect; neither should overwrite the
+    other's timestamp with a more recent "now".
     """
     await pool.execute(
         "update users set disabled_at = coalesce(disabled_at, now()) where oid = $1", oid
@@ -146,3 +174,85 @@ async def replace_groups(pool: asyncpg.Pool, oid: str, group_ids_: Sequence[str]
                 [(oid, group_id) for group_id in group_ids_],
             )
         await conn.execute("update users set groups_fetched_at = now() where oid = $1", oid)
+
+
+@dataclass(frozen=True)
+class RevocationCounts:
+    """How many credentials one `revoke_all_credentials` call actually revoked -
+    returned to its caller and, from `disable_user`, written into that call's own
+    audit entry (never the token values themselves, CLAUDE.md "token hashes only")."""
+
+    oauth_tokens: int
+    static_tokens: int
+
+
+async def revoke_all_credentials(conn: _Queryable, oid: str) -> RevocationCounts:
+    """Revoke every `oauth_tokens` row with `user_oid = oid` and every `static_tokens`
+    row with `owner_oid = oid` - without touching `users.disabled_at` (#222).
+
+    Idempotent: an already-revoked row (`revoked_at is not null`) is left alone and
+    not counted again, so calling this twice in a row reports zero the second time.
+    A separate public function from `disable_user` on purpose - WP-26's admin "revoke
+    all sessions" action (#235) calls this on its own, for a user that stays enabled.
+    """
+    oauth_tokens = await conn.fetchval(
+        "with revoked as ("
+        "update oauth_tokens set revoked_at = now() "
+        "where user_oid = $1 and revoked_at is null "
+        "returning 1"
+        ") select count(*) from revoked",
+        oid,
+    )
+    static_tokens = await conn.fetchval(
+        "with revoked as ("
+        "update static_tokens set revoked_at = now() "
+        "where owner_oid = $1 and revoked_at is null "
+        "returning 1"
+        ") select count(*) from revoked",
+        oid,
+    )
+    return RevocationCounts(oauth_tokens=oauth_tokens, static_tokens=static_tokens)
+
+
+async def disable_user(pool: asyncpg.Pool, oid: str, reason: str) -> RevocationCounts:
+    """Mark `oid` disabled and revoke every OAuth token family and static token it
+    owns, in one transaction (ADR-0006 §6, #222) - then write one `audit_log` entry
+    for the call, success or not-yet-seen alike.
+
+    Idempotent, and safe to call again for a user that is already disabled:
+    `mark_disabled` never moves an already-set `disabled_at`, and
+    `revoke_all_credentials` only ever touches a not-yet-revoked row, so a second
+    call simply reports `RevocationCounts(0, 0)` - but still writes its own audit
+    entry, since the call itself (and `reason`) is the fact worth recording, not only
+    its effect. `reason` is free text for the audit trail (e.g. "entra refresh:
+    disabled or missing in Graph", "admin: offboarding") - never a token value.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await mark_disabled(conn, oid)
+        counts = await revoke_all_credentials(conn, oid)
+    await AuditWriter(pool).record(
+        actor=oid,
+        client="auth",
+        op="disable_user",
+        path=None,
+        commit_sha=None,
+        outcome="ok",
+        detail={
+            "reason": reason,
+            "oauth_tokens_revoked": counts.oauth_tokens,
+            "static_tokens_revoked": counts.static_tokens,
+        },
+    )
+    return counts
+
+
+async def enable_user(pool: asyncpg.Pool, oid: str) -> None:
+    """Clear `oid`'s `disabled_at` - revokes nothing back (#222).
+
+    A previously revoked `oauth_tokens`/`static_tokens` row stays revoked
+    (`revoke_token_row`/`revoke_family`/`revoke_all_credentials` only ever set
+    `revoked_at`, never clear it - CLAUDE.md "never overwrite silently" plus the
+    soft-delete convention `auth.store`'s own docstring explains): re-enabling a
+    user never revives an old token, it only lets a fresh login issue new ones.
+    """
+    await pool.execute("update users set disabled_at = null where oid = $1", oid)
