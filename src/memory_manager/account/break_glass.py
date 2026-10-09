@@ -42,18 +42,26 @@ again, independently, so a bug in this module's own check alone would not
 be enough to let a self-approval through.
 
 Every action is audited as one `admin.break_glass.*` row (request, approve,
-deny, revoke) - metadata only (grant id, target oid, reason), never note
-content, since none of these operations ever touch one; reading under a
-grant happens only in the separate viewer #238 builds, not here.
+deny, revoke) - metadata only (grant id, target oid, reason), never an
+*existing* note's content, since none of these operations ever read one;
+reading under a grant happens only in the separate viewer #238 builds, not
+here. `_approve` is the one exception that writes a note rather than only
+metadata: once `mm_break_glass_approve` commits, `_write_break_glass_notice`
+(#239, ADR-0008 addendum "break-glass notification") writes a new `reference`
+note into the target's own `me` namespace through `StorageBackend.
+write_system`, as the system identity (`author_oid` `NULL`), so the target
+user finds it on their next search and sees the matching banner on `/account`
+(`account.break_glass_notice`) until they acknowledge it.
 """
 
 from __future__ import annotations
 
 import html
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 import asyncpg
 from starlette.datastructures import FormData
@@ -67,7 +75,10 @@ from memory_manager.account.templates import CSRF_FIELD_NAME
 from memory_manager.app import Services
 from memory_manager.audit import AuditWriter
 from memory_manager.db import rls
+from memory_manager.storage.base import StorageBackend, WriteRequest
 from memory_manager.storage.postgres import PostgresBackend
+from memory_manager.vault.note import Note, serialize
+from memory_manager.vault.ulid import new_ulid
 
 __all__ = [
     "ADMIN_ROLE",
@@ -105,6 +116,8 @@ CSRF_FORM_DENY = "account-admin-break-glass-deny"
 CSRF_FORM_REVOKE = "account-admin-break-glass-revoke"
 
 _ADMIN_CLIENT = "account"
+
+_logger = logging.getLogger(__name__)
 
 
 class BreakGlassFormError(ValueError):
@@ -270,6 +283,70 @@ async def list_grants(pool: asyncpg.Pool, *, app_role: str, session: SessionInfo
     ]
 
 
+async def _write_break_glass_notice(
+    storage: StorageBackend, *, grant_id: int, row: asyncpg.Record
+) -> None:
+    """Write the `reference` note `account.break_glass_notice`'s own banner refers to
+    (#239, ADR-0008 addendum "break-glass notification": "the server writes a note of
+    type `reference` into the user's `me` namespace with the same facts ... written by
+    the system identity, audited, and is ordinary data, not an instruction").
+
+    `row` is `mm_break_glass_list()`'s own row for `grant_id`, re-read by `_approve`
+    right after `mm_break_glass_approve` committed - `row["alias"]` is the target's
+    personal namespace (`me`, stored under its own alias, ADR-0008 addendum: "stored
+    under the personal alias"), so the note lands at `<alias>/reference/
+    break-glass-<grant_id>.md`, one note per grant, never overwritten (`if_version=
+    "new"`: a grant is only ever approved once, `mm_break_glass_approve`'s own refusal
+    of a second approval).
+
+    Calls `StorageBackend.write_system` (#239) rather than `write`: the note's
+    `author_oid` must be `NULL` - the system wrote it, not the admin who approved the
+    grant - which only `write_system`'s owner-connection bypass can produce, while
+    still running the identical validation/secret-scan/blocklist/audit path a real
+    write would (that method's own docstring).
+
+    Best-effort: the approval itself already committed by the time this runs, and the
+    banner (`mm_break_glass_notices()`) is driven by `break_glass_grants` alone, not by
+    this note existing - so a failure here is logged, never raised back into the
+    approve route, the same "a raising hook is logged, never allowed to affect the
+    write it was notified about" shape `storage.postgres.PostgresBackend._run_audit_
+    hooks` already follows for the ordinary write-audit hook.
+    """
+    now = datetime.now(UTC)
+    body = (
+        "An administrator was granted temporary, read-only access to this personal "
+        "memory under break-glass.\n\n"
+        f"- Requested by: {row['requester']}\n"
+        f"- Approved by: {row['approved_by']}\n"
+        f"- Reason: {row['reason']}\n"
+        f"- Approved at: {row['approved_at'].isoformat()}\n"
+        f"- Access expires: {row['expires_at'].isoformat()}\n"
+    )
+    content = serialize(
+        Note(
+            id=new_ulid(now),
+            title="Break-glass access granted",
+            description="An administrator was granted temporary read access to your memory.",
+            type="reference",
+            created=now,
+            updated=now,
+            body=body,
+        )
+    )
+    write_request = WriteRequest(
+        op="write",
+        path=f"{row['alias']}/reference/break-glass-{grant_id}.md",
+        client=_ADMIN_CLIENT,
+        if_version="new",
+        content=content,
+        actor="system",
+    )
+    try:
+        await storage.write_system(write_request, reason=f"break-glass grant {grant_id} approved")
+    except Exception:
+        _logger.exception("break-glass notice for grant %s failed to write", grant_id)
+
+
 def break_glass_routes(session_cookie: str) -> list[Route]:
     """Every `POST /account/admin/break-glass/...` route - mounted by
     `account.routes.page_routes` alongside the rest of the page. Takes the
@@ -361,6 +438,17 @@ def break_glass_routes(session_cookie: str) -> list[Route]:
                     grant_id,
                     authorized.break_glass_approvers,
                 )
+                # Re-read through `mm_break_glass_list()` (same reasoning as the
+                # four-eyes check above: the app role holds no direct grant on
+                # `break_glass_grants`) inside this same transaction, so this sees
+                # exactly what `mm_break_glass_approve` just set - `alias`/
+                # `target_oid` pick the note's own path, the rest become its body
+                # (#239, `_write_break_glass_notice` below).
+                notice_row = await conn.fetchrow(
+                    "select alias, target_oid, requester, approved_by, reason, "
+                    "approved_at, expires_at from mm_break_glass_list() where id = $1",
+                    grant_id,
+                )
         except BreakGlassActionError as exc:
             return PlainTextResponse(str(exc), status_code=exc.status_code)
 
@@ -373,6 +461,14 @@ def break_glass_routes(session_cookie: str) -> list[Route]:
             outcome="ok",
             detail={"grant_id": grant_id},
         )
+
+        if notice_row is None:  # pragma: no cover - defensive, mm_break_glass_approve above
+            # already proved the row exists inside the same transaction.
+            return RedirectResponse("/account", status_code=302)
+
+        services: Services = request.app.state.services
+        await _write_break_glass_notice(services.storage, grant_id=grant_id, row=notice_row)
+
         return RedirectResponse("/account", status_code=302)
 
     async def _deny(request: Request) -> Response:

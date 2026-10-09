@@ -18,7 +18,7 @@ from storage.contract import (
 
 from memory_manager.config import VaultConfig
 from memory_manager.queue import WriteQueue
-from memory_manager.storage.base import StorageBackend
+from memory_manager.storage.base import StorageBackend, SystemWriteUnsupported, WriteRequest
 from memory_manager.storage.git import GitBackend
 from memory_manager.vault.repo import Repo
 
@@ -62,3 +62,21 @@ class TestList(ListContract):
 
 class TestChangesSince(ChangesSinceContract):
     pass
+
+
+class TestWriteSystem:
+    """`GitBackend.write_system` (#239, ADR-0008 addendum "break-glass
+    notification"): always refuses, since Git has no owner-bypass concept and
+    no `author_oid` column a write could ever leave `NULL` on (`storage.base.
+    SystemWriteUnsupported`'s own docstring)."""
+
+    async def test_always_raises_system_write_unsupported(self, backend: StorageBackend) -> None:
+        request = WriteRequest(
+            op="write",
+            path="personal/reference/a.md",
+            client="account",
+            if_version="new",
+            content=b"irrelevant",
+        )
+        with pytest.raises(SystemWriteUnsupported):
+            await backend.write_system(request, reason="irrelevant")

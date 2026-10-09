@@ -47,6 +47,7 @@ from starlette.routing import Route
 
 from memory_manager.account import admin as account_admin
 from memory_manager.account import break_glass as account_break_glass
+from memory_manager.account import break_glass_notice as account_break_glass_notice
 from memory_manager.account import delete as account_delete
 from memory_manager.account import export as account_export
 from memory_manager.account import pending as account_pending
@@ -270,17 +271,21 @@ def page_routes() -> list[Route]:
     """`GET /account`, `GET /account/login`, `POST /account/logout`, `POST
     /account/export`, `POST /account/delete`, plus every `POST /account/admin/...`
     route (`account.admin.admin_routes`), plus every `POST /account/admin/
-    break-glass/...` route (`account.break_glass.break_glass_routes`) -
+    break-glass/...` route (`account.break_glass.break_glass_routes`), plus
+    `POST /account/break-glass/acknowledge` (`account.break_glass_notice.
+    break_glass_notice_routes`, #239 - note the path: no `/admin/` segment, since
+    acknowledging is the *affected user's* own action, not an admin one) -
     mounted by `http.py` whenever an `Authenticator` is configured, the same
     condition `/login` itself is mounted under (an account with no login
     method configured at all makes no sense). None of these carry a session
     cookie of their own to set (each only ever reads or clears one); only
     the shared `/login`/`{CALLBACK_PATH}` routes need `with_session_cookie`.
     `account.export.export_routes`/`account.delete.delete_routes`/
-    `account.admin.admin_routes`/`account.break_glass.break_glass_routes`
-    take `SESSION_COOKIE` as a parameter rather than importing it directly,
-    so those modules stay free to be imported here without a cycle back
-    (their own docstrings).
+    `account.admin.admin_routes`/`account.break_glass.break_glass_routes`/
+    `account.break_glass_notice.break_glass_notice_routes` take
+    `SESSION_COOKIE` as a parameter rather than importing it directly, so
+    those modules stay free to be imported here without a cycle back (their
+    own docstrings).
     """
     return [
         Route(PATH, endpoint=_account_page, methods=["GET"]),
@@ -290,4 +295,5 @@ def page_routes() -> list[Route]:
         *account_delete.delete_routes(SESSION_COOKIE),
         *account_admin.admin_routes(SESSION_COOKIE),
         *account_break_glass.break_glass_routes(SESSION_COOKIE),
+        *account_break_glass_notice.break_glass_notice_routes(SESSION_COOKIE),
     ]

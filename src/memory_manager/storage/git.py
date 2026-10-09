@@ -31,6 +31,7 @@ from memory_manager.storage.base import (
     ErasureUnsupported,
     StorageChanges,
     StoredNote,
+    SystemWriteUnsupported,
     WriteRequest,
     WriteResult,
 )
@@ -218,6 +219,19 @@ class GitBackend:
         raise ErasureUnsupported(
             "erasure is not supported by the git backend - git is the source of truth there "
             "and nothing can be provably hard-deleted from every clone and remote (ADR-0007 §3)"
+        )
+
+    async def write_system(self, request: WriteRequest, *, reason: str) -> WriteResult:
+        """Always raises `SystemWriteUnsupported` (#239, ADR-0008 addendum
+        "break-glass notification": "Postgres mode only, like every enterprise
+        `/account` section"). Git has no owner role that bypasses row security and
+        no `author_oid` column a write could ever leave `NULL` on, so there is no
+        connection shape here that means "the system wrote this, not a person"."""
+        _ = (request, reason)
+        raise SystemWriteUnsupported(
+            "a system-authored write is not supported by the git backend - there is "
+            "no owner-bypass concept and no author_oid column to leave NULL (ADR-0008 "
+            "addendum)"
         )
 
     async def changes_since(self, cursor: str | None) -> StorageChanges:
