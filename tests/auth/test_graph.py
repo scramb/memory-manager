@@ -17,7 +17,7 @@ import httpx
 import pytest
 from mock_idp_fixtures import mock_idp_client
 
-from memory_manager.auth.graph import GraphClient, GraphError, UserState
+from memory_manager.auth.graph import GraphClient, GraphDeltaExpired, GraphError, UserState
 from memory_manager.config import ServerConfigError
 
 __all__ = ["mock_idp_client"]
@@ -195,3 +195,142 @@ async def test_constructor_allows_non_https_authority_with_opt_in(
         allow_insecure_authority=True,
     )
     assert client is not None
+
+
+# --- users_delta (#223, ADR-0006 §6) ----------------------------------------
+
+
+async def _set_delta_page_size(client: httpx.AsyncClient, page_size: int) -> None:
+    response = await client.post(
+        "/_mock/graph/delta-page-size", json={"tid": _TID, "page_size": page_size}
+    )
+    assert response.status_code == 200
+
+
+async def _patch_user(client: httpx.AsyncClient, oid: str, **fields: Any) -> None:
+    response = await client.patch(f"/_mock/users/{_TID}/{oid}", json=fields)
+    assert response.status_code == 200
+
+
+async def _delete_user(client: httpx.AsyncClient, oid: str) -> None:
+    response = await client.delete(f"/_mock/users/{_TID}/{oid}")
+    assert response.status_code == 204
+
+
+async def test_users_delta_full_sync_reports_every_known_user(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _create_user(mock_idp_client, "user-a", account_enabled=True)
+    await _create_user(mock_idp_client, "user-b", account_enabled=False)
+
+    result = await _graph_client(mock_idp_client).users_delta(None)
+
+    changes = {change.oid: change.enabled for change in result.changes}
+    assert changes == {"user-a": True, "user-b": False}
+    assert result.delta_link
+
+
+async def test_users_delta_reports_removed_entries_as_disabled(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _create_user(mock_idp_client, "user-deleted", account_enabled=True)
+    await _delete_user(mock_idp_client, "user-deleted")
+
+    result = await _graph_client(mock_idp_client).users_delta(None)
+
+    changes = {change.oid: change.enabled for change in result.changes}
+    assert changes == {"user-deleted": False}
+
+
+async def test_users_delta_follows_every_page_before_returning(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    for oid in ("user-1", "user-2", "user-3"):
+        await _create_user(mock_idp_client, oid, account_enabled=True)
+    await _set_delta_page_size(mock_idp_client, 1)
+
+    result = await _graph_client(mock_idp_client).users_delta(None)
+
+    assert {change.oid for change in result.changes} == {"user-1", "user-2", "user-3"}
+    calls = await mock_idp_client.get("/_mock/calls")
+    assert calls.json()["users.delta"] == 3
+
+
+async def test_users_delta_second_round_reports_only_the_new_change(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _create_user(mock_idp_client, "user-stable", account_enabled=True)
+    await _create_user(mock_idp_client, "user-to-disable", account_enabled=True)
+    graph = _graph_client(mock_idp_client)
+
+    first = await graph.users_delta(None)
+    assert {change.oid for change in first.changes} == {"user-stable", "user-to-disable"}
+
+    await _patch_user(mock_idp_client, "user-to-disable", account_enabled=False)
+    second = await graph.users_delta(first.delta_link)
+
+    assert [(change.oid, change.enabled) for change in second.changes] == [
+        ("user-to-disable", False)
+    ]
+    assert second.delta_link != first.delta_link
+
+
+async def test_users_delta_raises_graph_delta_expired_on_410(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _inject_fault(mock_idp_client, endpoint="users.delta", status=410, count=1)
+    # A real (if stale) delta link - the mock's own route only matches this exact
+    # path, the `410` fault above is what actually makes it "expired" here.
+    stale_delta_link = f"{_GRAPH_BASE_URL}/users/delta?$deltatoken=stale-token"
+
+    with pytest.raises(GraphDeltaExpired):
+        await _graph_client(mock_idp_client).users_delta(stale_delta_link)
+
+
+async def test_users_delta_raises_graph_error_on_persistent_503(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _inject_fault(mock_idp_client, endpoint="users.delta", status=503, count=5)
+
+    with pytest.raises(GraphError):
+        await _graph_client(mock_idp_client).users_delta(None)
+
+
+# --- from_env (#223) ---------------------------------------------------------
+
+
+async def test_from_env_returns_none_without_entra_tenant_id() -> None:
+    assert GraphClient.from_env({}) is None
+
+
+async def test_from_env_builds_a_client_from_entra_variables(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    client = GraphClient.from_env(
+        {
+            "ENTRA_TENANT_ID": _TID,
+            "ENTRA_CLIENT_ID": _CLIENT_ID,
+            "ENTRA_CLIENT_SECRET": _CLIENT_SECRET,
+            "ENTRA_AUTHORITY": _AUTHORITY_BASE_URL,
+            "ENTRA_GRAPH_URL": _GRAPH_BASE_URL,
+        },
+        http_client=mock_idp_client,
+    )
+    assert client is not None
+
+    await _register_client(mock_idp_client, graph_roles=["User.Read.All"])
+    await _create_user(mock_idp_client, "user-from-env", account_enabled=True)
+    state = await client.user_state("user-from-env")
+
+    assert state is UserState.ENABLED
+
+
+async def test_from_env_raises_when_client_id_is_missing() -> None:
+    with pytest.raises(ServerConfigError):
+        GraphClient.from_env({"ENTRA_TENANT_ID": _TID, "ENTRA_CLIENT_SECRET": _CLIENT_SECRET})

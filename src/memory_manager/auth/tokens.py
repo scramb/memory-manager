@@ -21,6 +21,17 @@ against `MEMORY_ROLES` and the owner/roles pairing before the insert
 (CLAUDE.md "validated in Python before insert AND by DB CHECK");
 `migrations/0007_token_principal.sql` enforces the same two rules again in
 the database.
+
+`create_token(..., enterprise=True)` additionally enforces ADR-0006 §7
+(#224): an owner with at least one role, an expiry no further out than
+`max_expires_days` from now, and an owner that already exists in `users` -
+otherwise the delta sync could never revoke a departed owner's token
+(ADR-0006 §7 addendum 2026-10-08). `cli.py`'s `token create` sets
+`enterprise` from `STORAGE_BACKEND=postgres`; deployments without it keep
+today's fully optional owner/expiry (F-01 "Existing users"). `token list`
+flags a token that predates enterprise mode (or was inserted directly) with
+`enterprise_violations`/`owners_not_in_users` instead of re-deriving the
+same checks.
 """
 
 from __future__ import annotations
@@ -35,10 +46,13 @@ import asyncpg
 
 __all__ = [
     "ALL_NAMESPACES",
+    "DEFAULT_MAX_EXPIRES_DAYS",
     "MEMORY_ROLES",
     "TokenInfo",
     "create_token",
+    "enterprise_violations",
     "list_tokens",
+    "owners_not_in_users",
     "revoke_token",
     "verify",
 ]
@@ -47,6 +61,10 @@ _TOKEN_PREFIX = "mm_"  # noqa: S105 - a format marker, not a credential
 _TOKEN_ENTROPY_BYTES = 32
 
 ALL_NAMESPACES = "*"
+
+#: ADR-0006 §7's default maximum lifetime for an enterprise static token,
+#: overridable per deployment via `STATIC_TOKEN_MAX_DAYS` (`cli.py`).
+DEFAULT_MAX_EXPIRES_DAYS = 90
 
 #: The three Entra app role values `0005_rls.sql`'s `mm_readable_ns`/`mm_writable_ns`
 #: read from `app.roles` (ADR-0008 §3's permission matrix). The only roles a token's
@@ -140,6 +158,36 @@ def _validate_owner_and_roles(owner_oid: str | None, roles: Sequence[str]) -> tu
     return tuple(deduped)
 
 
+def _validate_enterprise(
+    *,
+    owner_oid: str | None,
+    roles: Sequence[str],
+    expires_at: datetime | None,
+    max_expires_days: int,
+) -> None:
+    """ADR-0006 §7 (#224): raise `ValueError` naming the first enterprise
+    rule `create_token(..., enterprise=True)` does not meet.
+
+    Runs after `_validate_owner_and_roles`, so by the time this is called
+    `owner_oid is None` implies `roles == ()` and vice versa - the pairing
+    itself is already enforced unconditionally, in both modes. This only
+    adds what enterprise mode additionally requires: an owner at all, and an
+    expiry within `max_expires_days`.
+    """
+    if owner_oid is None:
+        raise ValueError(
+            "enterprise mode (ADR-0006 §7) requires an owner with at least one "
+            "role: pass --owner and --role"
+        )
+    if expires_at is None:
+        raise ValueError("enterprise mode (ADR-0006 §7) requires an expiry")
+    if expires_at > datetime.now(UTC) + timedelta(days=max_expires_days):
+        raise ValueError(
+            "enterprise mode (ADR-0006 §7) allows an expiry of at most "
+            f"{max_expires_days} days from now, got {expires_at.isoformat()}"
+        )
+
+
 async def create_token(
     pool: asyncpg.Pool,
     name: str,
@@ -149,16 +197,37 @@ async def create_token(
     expires_at: datetime | None = None,
     owner_oid: str | None = None,
     roles: Sequence[str] = (),
+    enterprise: bool = False,
+    max_expires_days: int = DEFAULT_MAX_EXPIRES_DAYS,
 ) -> tuple[str, TokenInfo]:
     """Create a new token named `name` and return `(plaintext, TokenInfo)`.
 
     The plaintext is generated here and returned exactly once - nothing else
     in this module can ever reproduce it from what is stored. Raises
     `asyncpg.UniqueViolationError` if `name` is already taken, `ValueError`
-    if `roles` contains anything outside `MEMORY_ROLES` or the owner/roles
-    pairing is invalid (`_validate_owner_and_roles`).
+    if `roles` contains anything outside `MEMORY_ROLES`, the owner/roles
+    pairing is invalid (`_validate_owner_and_roles`), or - with
+    `enterprise=True` (ADR-0006 §7, #224; `cli.py`'s `token create` sets it
+    from `STORAGE_BACKEND=postgres`) - the owner, expiry or owner-in-`users`
+    rule that mode additionally requires is not met (`_validate_enterprise`).
     """
     deduped_roles = _validate_owner_and_roles(owner_oid, roles)
+    if enterprise:
+        _validate_enterprise(
+            owner_oid=owner_oid,
+            roles=deduped_roles,
+            expires_at=expires_at,
+            max_expires_days=max_expires_days,
+        )
+        owner_known = await pool.fetchval(
+            "select exists (select 1 from users where oid = $1)", owner_oid
+        )
+        if not owner_known:
+            raise ValueError(
+                f"owner_oid {owner_oid!r} is not in users (ADR-0006 §7): the owner "
+                "must sign in at least once before an enterprise token can be "
+                "created for it"
+            )
     plaintext = _generate_plaintext()
     row = await pool.fetchrow(
         # `_SELECT_COLUMNS` is a module constant, never caller input - not the
@@ -189,6 +258,45 @@ async def list_tokens(pool: asyncpg.Pool) -> list[TokenInfo]:
         f"select {_SELECT_COLUMNS} from static_tokens order by name"  # noqa: S608
     )
     return [_row_to_info(row) for row in rows]
+
+
+def enterprise_violations(
+    info: TokenInfo, *, max_expires_days: int = DEFAULT_MAX_EXPIRES_DAYS
+) -> tuple[str, ...]:
+    """Every ADR-0006 §7 enterprise rule `info` fails, as short reason
+    strings (`"no-owner"`, `"no-expiry"`, `"expiry-too-far"`) - empty if it
+    meets every one of them.
+
+    For `cli.py`'s `token list` to flag a token created before enterprise
+    mode turned on, or by a direct SQL insert that bypassed `create_token`
+    entirely - a token `create_token(..., enterprise=True)` itself accepted
+    never fails any of these, since it already enforced them before the
+    insert (`_validate_enterprise`). Does not check the owner against
+    `users` - that needs a database round trip `owners_not_in_users` below
+    batches once for every token being listed, not once per token here.
+    """
+    reasons: list[str] = []
+    if info.owner_oid is None or not info.roles:
+        reasons.append("no-owner")
+    if info.expires_at is None:
+        reasons.append("no-expiry")
+    elif info.expires_at > info.created_at + timedelta(days=max_expires_days):
+        reasons.append("expiry-too-far")
+    return tuple(reasons)
+
+
+async def owners_not_in_users(pool: asyncpg.Pool, owner_oids: Sequence[str]) -> frozenset[str]:
+    """The subset of `owner_oids` that has no row in `users` (ADR-0006 §7:
+    "the owner must exist in users") - one query for every `owner_oid`
+    `cli.py`'s `token list` is about to render, instead of one query per
+    token. Empty input returns an empty set without querying.
+    """
+    unique = sorted({oid for oid in owner_oids})
+    if not unique:
+        return frozenset()
+    rows = await pool.fetch("select oid from users where oid = any($1::text[])", unique)
+    known = {row["oid"] for row in rows}
+    return frozenset(oid for oid in unique if oid not in known)
 
 
 async def revoke_token(pool: asyncpg.Pool, name: str) -> bool:

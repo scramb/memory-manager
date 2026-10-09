@@ -39,8 +39,23 @@ full-text chunks and enqueues this job rather than embedding inline, so
 `memory_search` already finds a fresh note through full text before its
 embedding exists; `_embed_note_job` below is the handler, and
 `enqueue_pending_embeddings` is this process's startup catch-up for any
-chunk a lost job, a provider outage or a model change left stale. Graph
-delta sync and retention jobs ADR-0009 §4 also names are WP-24/WP-26's.
+chunk a lost job, a provider outage or a model change left stale. Retention
+(WP-26) is still open.
+
+`build_jobs` also registers `entra_delta_sync` (#223, ADR-0006 §6) as a
+second periodic singleton job, next to `_cleanup_job` - but only when
+`graph_client` is given (`cli.py`'s `_serve_worker` passes `auth.graph.
+GraphClient.from_env(os.environ)`, `None` for a deployment that never
+configured Entra at all): one Graph `users/delta` round per
+`WorkerConfig.entra_delta_sync_seconds` (default 300s), applied to `users`
+through `auth.users.disable_user`/`enable_user` - `_entra_delta_sync_job`
+below is the job body, `entra_delta_cursor` (migration 0014) the single-row
+cursor it reads and advances. Like `_cleanup_job`, a failed run is simply
+retried next interval (`_job_loop`'s own guarantee) - this job additionally
+leaves `entra_delta_cursor.delta_link` exactly where it was on any failure,
+so a retry re-fetches the identical round rather than skipping ahead
+(`auth.graph.GraphClient.users_delta`'s own docstring: "a partial round is
+never half-applied").
 
 This process always connects to Postgres as the owner, never switching to
 `DATABASE_APP_ROLE` (ADR-0008 addendum: "the worker is a system identity,
@@ -101,8 +116,10 @@ from starlette.routing import Route
 
 from memory_manager import __commit__, __version__, jobs
 from memory_manager.auth import store
+from memory_manager.auth.graph import GraphClient, GraphDeltaExpired
 from memory_manager.auth.shared_state import PostgresSharedState
-from memory_manager.config import ServerConfig, rate_limit_sweep_floor_seconds
+from memory_manager.auth.users import disable_user, enable_user, get_user
+from memory_manager.config import ServerConfig, WorkerConfig, rate_limit_sweep_floor_seconds
 from memory_manager.index.indexer import Indexer
 from memory_manager.observability.metrics import metrics_endpoint
 
@@ -222,22 +239,151 @@ async def _cleanup_job(pool: asyncpg.Pool, *, rate_limit_window_floor_seconds: f
     _logger.info("rate limit sweep: removed %d expired rate-limit window(s)", swept)
 
 
-def build_jobs(config: ServerConfig) -> list[Job]:
-    """This worker's job registry: today, just `_cleanup_job` (module docstring).
+#: `Job.name` for the Entra deprovisioning delta sync below (#223, ADR-0006 §6) -
+#: a module-level constant (not inlined at the one `build_jobs` call site) so a
+#: test can derive the same `_lock_key` without hardcoding the string twice.
+_ENTRA_DELTA_SYNC_JOB_NAME = "entra_delta_sync"
+
+
+async def _entra_delta_cursor_link(pool: asyncpg.Pool) -> str | None:
+    """The stored `@odata.deltaLink` from the previous successful round
+    (`entra_delta_cursor`, migration 0014), or `None` before any round has ever
+    completed - exactly the meaning `auth.graph.GraphClient.users_delta`'s own
+    `delta_link` parameter already gives a bare `None` (a full sync)."""
+    delta_link: str | None = await pool.fetchval(
+        "select delta_link from entra_delta_cursor where id"
+    )
+    return delta_link
+
+
+async def _touch_entra_delta_run(pool: asyncpg.Pool) -> None:
+    """Stamp `entra_delta_cursor.last_run_at` to now, creating the singleton row
+    with `delta_link = null` if this is the very first attempt - called at the
+    start of every `_entra_delta_sync_job` run, whether or not it goes on to
+    succeed (`last_run_at` vs. `last_success_at`, the migration's own docstring)."""
+    await pool.execute(
+        """
+        insert into entra_delta_cursor (id, last_run_at) values (true, now())
+        on conflict (id) do update set last_run_at = excluded.last_run_at
+        """
+    )
+
+
+async def _save_entra_delta_cursor(pool: asyncpg.Pool, delta_link: str) -> None:
+    """Persist `delta_link` plus `last_success_at` - called only once every page of
+    one round was already applied (module docstring: "cursor advanced only after
+    all pages were applied"), never from inside the paging itself."""
+    await pool.execute(
+        """
+        insert into entra_delta_cursor (id, delta_link, last_run_at, last_success_at)
+        values (true, $1, now(), now())
+        on conflict (id) do update
+            set delta_link = excluded.delta_link,
+                last_run_at = excluded.last_run_at,
+                last_success_at = excluded.last_success_at
+        """,
+        delta_link,
+    )
+
+
+async def _entra_delta_sync_job(pool: asyncpg.Pool, graph: GraphClient) -> None:
+    """One Graph `users/delta` round, applied to `users` (#223, ADR-0006 §6).
+
+    `auth.graph.GraphClient.users_delta` already follows every `@odata.nextLink`
+    page of the round itself before returning, so every change below is applied
+    from one complete, in-memory `UsersDeltaResult` - `_save_entra_delta_cursor`
+    only ever runs after every one of them went through, never mid-round. Any
+    `GraphError` (including a `GraphDeltaExpired` from the *second* attempt
+    below) propagates straight out of this function to `_job_loop`'s own
+    try/except, which logs it and retries next interval - `entra_delta_cursor`
+    is left exactly where `_touch_entra_delta_run` put it, i.e. `delta_link`
+    unchanged, so that retry re-fetches the identical round rather than one
+    that silently skipped ahead.
+
+    A `GraphDeltaExpired` from the *first* attempt (the stored `delta_link` is
+    older than Entra's 7-day retention, or was reset upstream) is caught once:
+    this round restarts immediately with a full sync (`users_delta(None)`) -
+    `docs/research/entra-contract.md` §6's own "the application must restart
+    with a full sync".
+
+    An oid this server has never seen (`auth.users.get_user` returns `None`) is
+    skipped outright - #223's own Implementation checklist: "unknown oids
+    ignored", the sync only ever narrows what is already known, never imports
+    the tenant.
+    """
+    await _touch_entra_delta_run(pool)
+    delta_link = await _entra_delta_cursor_link(pool)
+    try:
+        result = await graph.users_delta(delta_link)
+    except GraphDeltaExpired:
+        _logger.warning(
+            "entra delta sync: stored delta link expired or was reset, restarting with a full sync"
+        )
+        result = await graph.users_delta(None)
+
+    for change in result.changes:
+        user = await get_user(pool, change.oid)
+        if user is None:
+            continue
+        if change.enabled:
+            await enable_user(pool, change.oid, reason="entra delta sync: re-enabled in Graph")
+        else:
+            await disable_user(
+                pool, change.oid, reason="entra delta sync: disabled or removed in Graph"
+            )
+
+    await _save_entra_delta_cursor(pool, result.delta_link)
+
+
+def build_jobs(
+    config: ServerConfig,
+    *,
+    worker_config: WorkerConfig | None = None,
+    graph_client: GraphClient | None = None,
+) -> list[Job]:
+    """This worker's job registry: `_cleanup_job` always, plus `_entra_delta_sync_job`
+    (#223) when `graph_client` is given - `cli.py`'s `_serve_worker` is the one
+    production caller that passes `auth.graph.GraphClient.from_env(os.environ)`,
+    `None` for a deployment that never configured Entra (`GraphClient.from_env`'s
+    own docstring); every existing test of this function omits both new
+    parameters and gets exactly the one job it always has.
 
     `config` is read only for its `RATE_LIMIT_*`/`mcp_path`-independent fields
     (`config.rate_limit_sweep_floor_seconds`, shared with `http.py`'s own
     cleanup sweep rather than duplicated here) - `ServerConfig.from_env(os.
     environ)` builds one without requiring `PUBLIC_URL` or anything else
     HTTP-transport-specific to be set, since `resource_url()` (the one method
-    that does require it) is never called here.
+    that does require it) is never called here. `worker_config` supplies the
+    interval for the Entra job alone (`WorkerConfig.entra_delta_sync_seconds`,
+    default 300s) - defaulted to a bare `WorkerConfig()`'s own value when
+    omitted, same default `cli.py`'s own `WorkerConfig.from_env` would give.
     """
     floor_seconds = rate_limit_sweep_floor_seconds(config)
 
-    async def run(pool: asyncpg.Pool) -> None:
+    async def run_cleanup(pool: asyncpg.Pool) -> None:
         await _cleanup_job(pool, rate_limit_window_floor_seconds=floor_seconds)
 
-    return [Job(name="cleanup", interval_seconds=_CLEANUP_INTERVAL_SECONDS, run=run)]
+    jobs_list = [Job(name="cleanup", interval_seconds=_CLEANUP_INTERVAL_SECONDS, run=run_cleanup)]
+
+    if graph_client is not None:
+        interval_seconds = (
+            worker_config.entra_delta_sync_seconds
+            if worker_config is not None
+            else WorkerConfig().entra_delta_sync_seconds
+        )
+
+        async def run_entra_delta_sync(pool: asyncpg.Pool) -> None:
+            await _entra_delta_sync_job(pool, graph_client)
+
+        jobs_list.append(
+            Job(
+                name=_ENTRA_DELTA_SYNC_JOB_NAME,
+                interval_seconds=interval_seconds,
+                run=run_entra_delta_sync,
+            )
+        )
+
+    return jobs_list
 
 
 # --- the `jobs` outbox consumer (#218) --------------------------------------

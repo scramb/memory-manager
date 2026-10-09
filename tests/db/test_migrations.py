@@ -46,6 +46,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0014_entra_delta_cursor",
             "0016_account_sessions",
         ]
         tables = {
@@ -76,6 +77,7 @@ class TestMigrate:
             "break_glass_grants",
             "account_sessions",
             "jobs",
+            "entra_delta_cursor",
         }
 
     async def test_running_twice_applies_nothing_the_second_time(
@@ -97,6 +99,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0014_entra_delta_cursor",
             "0016_account_sessions",
         ]
         assert second == []
@@ -125,6 +128,7 @@ class TestMigrate:
             "0010_oauth_token_principal",
             "0011_jobs",
             "0013_vault_notes_namespace_idx",
+            "0014_entra_delta_cursor",
             "0016_account_sessions",
         ]
 
@@ -191,6 +195,7 @@ class TestMigrate:
                 "0010_oauth_token_principal",
                 "0011_jobs",
                 "0013_vault_notes_namespace_idx",
+                "0014_entra_delta_cursor",
                 "0016_account_sessions",
             ]
         finally:
@@ -279,6 +284,7 @@ class TestMigrateBackendPostgres:
             "0011_jobs",
             "0012_vector_layout",
             "0013_vault_notes_namespace_idx",
+            "0014_entra_delta_cursor",
             "0016_account_sessions",
         ]
         tables = {

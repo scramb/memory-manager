@@ -58,6 +58,11 @@ _DEFAULT_WORKER_PORT = 8090
 # §"Queue" names 1-5s polling as the `jobs` outbox's NOTIFY fallback.
 _DEFAULT_JOBS_POLL_SECONDS = 5.0
 
+# `WorkerConfig.entra_delta_sync_seconds` (#223, ADR-0006 §6): "a Graph delta
+# query every 5 min (configurable), worst case bounded by the 15-min access
+# token".
+_DEFAULT_ENTRA_DELTA_SYNC_SECONDS = 300.0
+
 # Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
 # "burst" is the token bucket's capacity - how many calls a key can make
 # back-to-back before the per-minute rate takes over. See `ServerConfig`'s
@@ -731,22 +736,31 @@ class WorkerConfig:
     `LISTEN/NOTIFY` is only ever a wake-up hint, so this is the ceiling on
     how long a claimable job can wait for a notification that never
     arrives, not how often the worker normally wakes up.
+
+    `entra_delta_sync_seconds` (`ENTRA_DELTA_SYNC_SECONDS`, default 300s/5min)
+    is how often `worker.build_jobs` schedules the `entra_delta_sync` job
+    (#223, ADR-0006 §6) - read regardless of whether Entra is even configured
+    for this deployment; `build_jobs` is what decides whether to register the
+    job at all (`auth.graph.GraphClient.from_env` returning `None` otherwise),
+    this field only ever carries the interval to use once it does.
     """
 
     host: str = _DEFAULT_WORKER_HOST
     port: int = _DEFAULT_WORKER_PORT
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
     jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS
+    entra_delta_sync_seconds: float = _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> WorkerConfig:
         """Build a `WorkerConfig` from `WORKER_HOST`/`WORKER_PORT`/
-        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS` entries of `environ`.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
+        entries of `environ`.
 
         Raises `WorkerConfigError` with a message naming the offending
-        variable if `WORKER_PORT` is not a valid port number, or either
-        `SHUTDOWN_GRACE_SECONDS` or `JOBS_POLL_SECONDS` is not a positive
-        number.
+        variable if `WORKER_PORT` is not a valid port number, or any of
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
+        is not a positive number.
         """
         host = environ.get("WORKER_HOST", _DEFAULT_WORKER_HOST)
         try:
@@ -758,6 +772,9 @@ class WorkerConfig:
             )
             jobs_poll_seconds = _parse_positive_float(
                 environ, "JOBS_POLL_SECONDS", _DEFAULT_JOBS_POLL_SECONDS
+            )
+            entra_delta_sync_seconds = _parse_positive_float(
+                environ, "ENTRA_DELTA_SYNC_SECONDS", _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
             )
         except ServerConfigError as exc:
             # `_parse_port`/`_parse_positive_int`/`_parse_positive_float` raise
@@ -771,6 +788,7 @@ class WorkerConfig:
             port=port,
             shutdown_grace_seconds=shutdown_grace_seconds,
             jobs_poll_seconds=jobs_poll_seconds,
+            entra_delta_sync_seconds=entra_delta_sync_seconds,
         )
 
 
