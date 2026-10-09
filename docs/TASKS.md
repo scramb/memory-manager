@@ -258,7 +258,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 - [x] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
 - [x] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
 - [x] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229
-- [ ] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222
+- [x] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222
 - [ ] #236 Admins erase a note, a namespace or a user on `/account` with a recorded reason ⛔ blocked by #231, #234
 - [ ] #237 Break-glass grants need a second admin's approval and expire after one hour ⛔ blocked by #234
 - [ ] #238 Admins read a break-glass namespace in a read-only, audited viewer on `/account` ⛔ blocked by #237

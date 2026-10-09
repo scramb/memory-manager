@@ -307,6 +307,13 @@ alert works regardless of the operator's own version.
 Grafana sidecar to pick up - Grafana and its sidecar are an operator's own install, same as
 Prometheus itself.
 
+## See also
+
+[`data-lifecycle.md`](./data-lifecycle.md) covers the account-level operator
+questions this guide does not: what happens (and how fast) when a role is removed
+in Entra, the admin "revoke access" remedy, self-service and admin erasure, and
+retention after deprovisioning.
+
 ## Not included
 
 - The v0.2.0 upgrade guide (WP-34).

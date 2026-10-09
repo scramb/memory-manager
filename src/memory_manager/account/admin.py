@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Admin area on `/account`: namespace creation, project members and namespace
+"""Admin area on `/account`: namespace creation, project members, namespace
 settings (#234, ADR-0008 "`Memory.Admin` manages namespaces and ACLs. It grants
-no content access").
+no content access") and the "revoke access" action (#235).
 
 Postgres mode only, like every enterprise `/account` section
 (`account.sections`'s own docstring on `is_postgres_backend`/`session.oid`) -
@@ -47,6 +47,26 @@ Every change is audited as one `admin.namespace.*`/`admin.member.*`/
 `admin.settings.*` row (the issue's own op names) - metadata only (kind,
 alias, external_key, principal, role, the write-mode strings), never note
 content, since none of these operations ever touch one.
+
+"Revoke access" (#235) is a different shape from the namespace actions above:
+it never calls a `mm_admin_*` SQL function at all, since its two targets -
+`oauth_tokens`/`static_tokens` (`auth.users.revoke_all_credentials`) and
+`account_sessions` (`account.sessions.revoke_all_for_oid`) - carry no row-level
+security in the first place (only the vault's own content tables do,
+`migrations/0005_rls.sql`); it runs both directly against `services.pool`, the
+same way `auth.users.disable_user` already does, rather than through
+`_admin_identity`'s caller-scoped connection. `_authorize_admin_form` is still
+the only gate: a non-admin session never reaches either call. It deliberately
+calls `revoke_all_credentials`, not `disable_user` - this action ends every
+session and token a user already holds without touching `users.disabled_at`,
+so the user can sign in again right away (`auth.users.revoke_all_credentials`'s
+own docstring: "reusable by WP-26's admin ... action without disabling the
+user"); disabling the account outright is Entra's own job, surfaced here only
+as a documented remedy for Entra's own propagation delay (ADR-0006 §5). The
+reason is mandatory - free text, the same convention `disable_user`'s own
+`reason` parameter already follows - and the action is audited as one
+`admin.user.revoke` row (actor, target oid, reason, the revoked counts),
+metadata only, same as every other admin action above.
 """
 
 from __future__ import annotations
@@ -69,6 +89,7 @@ from memory_manager.account.sessions import SessionInfo
 from memory_manager.account.templates import CSRF_FIELD_NAME
 from memory_manager.app import Services
 from memory_manager.audit import AuditWriter
+from memory_manager.auth import users
 from memory_manager.db import rls
 from memory_manager.storage.postgres import PostgresBackend
 
@@ -81,9 +102,11 @@ __all__ = [
     "CSRF_FORM_CREATE_NAMESPACE",
     "CSRF_FORM_REMOVE_MEMBER",
     "CSRF_FORM_RENAME_NAMESPACE",
+    "CSRF_FORM_REVOKE_USER",
     "CSRF_FORM_UPDATE_SETTINGS",
     "REMOVE_MEMBER_PATH",
     "RENAME_NAMESPACE_PATH",
+    "REVOKE_USER_PATH",
     "UPDATE_SETTINGS_PATH",
     "AdminActionError",
     "AdminFormError",
@@ -105,6 +128,7 @@ RENAME_NAMESPACE_PATH = "/account/admin/namespaces/alias"
 ADD_MEMBER_PATH = "/account/admin/members"
 REMOVE_MEMBER_PATH = "/account/admin/members/remove"
 UPDATE_SETTINGS_PATH = "/account/admin/settings"
+REVOKE_USER_PATH = "/account/admin/users/revoke"
 
 #: One distinct `account.sessions.csrf_token`/`verify_csrf` form label per
 #: admin form - same "every state-changing form gets its own label" shape
@@ -116,6 +140,7 @@ CSRF_FORM_RENAME_NAMESPACE = "account-admin-rename-namespace"
 CSRF_FORM_ADD_MEMBER = "account-admin-add-member"
 CSRF_FORM_REMOVE_MEMBER = "account-admin-remove-member"
 CSRF_FORM_UPDATE_SETTINGS = "account-admin-update-settings"
+CSRF_FORM_REVOKE_USER = "account-admin-revoke-user"
 
 _ADMIN_CLIENT = "account"
 _ACCOUNT_PATH = "/account"
@@ -561,12 +586,48 @@ def admin_routes(session_cookie: str) -> list[Route]:
         )
         return RedirectResponse(_ACCOUNT_PATH, status_code=302)
 
+    async def _revoke_user(request: Request) -> Response:
+        authorized = await _authorize_admin_form(
+            request, session_cookie=session_cookie, csrf_form=CSRF_FORM_REVOKE_USER
+        )
+        if isinstance(authorized, Response):
+            return authorized
+        pool, session, form = authorized.pool, authorized.session, authorized.form
+
+        target_oid = str(form.get("oid", "")).strip()
+        reason = str(form.get("reason", "")).strip()
+        if not target_oid:
+            return PlainTextResponse("oid must not be empty.", status_code=400)
+        if not reason:
+            return PlainTextResponse("reason must not be empty.", status_code=400)
+
+        counts = await users.revoke_all_credentials(pool, target_oid)
+        sessions_revoked = await sessions.revoke_all_for_oid(pool, target_oid)
+
+        await AuditWriter(pool).record(
+            actor=session.subject,
+            client=_ADMIN_CLIENT,
+            op="admin.user.revoke",
+            path=None,
+            commit_sha=None,
+            outcome="ok",
+            detail={
+                "target_oid": target_oid,
+                "reason": reason,
+                "oauth_tokens_revoked": counts.oauth_tokens,
+                "static_tokens_revoked": counts.static_tokens,
+                "account_sessions_revoked": sessions_revoked,
+            },
+        )
+        return RedirectResponse(_ACCOUNT_PATH, status_code=302)
+
     return [
         Route(CREATE_NAMESPACE_PATH, endpoint=_create_namespace, methods=["POST"]),
         Route(RENAME_NAMESPACE_PATH, endpoint=_rename_namespace, methods=["POST"]),
         Route(ADD_MEMBER_PATH, endpoint=_add_member, methods=["POST"]),
         Route(REMOVE_MEMBER_PATH, endpoint=_remove_member, methods=["POST"]),
         Route(UPDATE_SETTINGS_PATH, endpoint=_update_settings, methods=["POST"]),
+        Route(REVOKE_USER_PATH, endpoint=_revoke_user, methods=["POST"]),
     ]
 
 
@@ -598,6 +659,7 @@ def render_admin_section(rows: list[NamespaceRow], *, session_id: str) -> str:
     add_member_token = sessions.csrf_token(session_id, CSRF_FORM_ADD_MEMBER)
     remove_member_token = sessions.csrf_token(session_id, CSRF_FORM_REMOVE_MEMBER)
     settings_token = sessions.csrf_token(session_id, CSRF_FORM_UPDATE_SETTINGS)
+    revoke_user_token = sessions.csrf_token(session_id, CSRF_FORM_REVOKE_USER)
 
     kind_options = "".join(
         f'<option value="{kind.value}">{kind.value}</option>' for kind in CREATABLE_KINDS
@@ -654,6 +716,13 @@ def render_admin_section(rows: list[NamespaceRow], *, session_id: str) -> str:
         '<option value="readers">readers</option><option value="writers">writers</option>'
         "</select></label>"
         '<button type="submit">Update settings</button>'
+        "</form>"
+        "<h3>Revoke user access</h3>"
+        f'<form method="post" action="{html.escape(REVOKE_USER_PATH)}">'
+        f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{html.escape(revoke_user_token)}">'
+        '<label>Entra object id <input type="text" name="oid"></label>'
+        '<label>Reason <input type="text" name="reason"></label>'
+        '<button type="submit">Revoke access</button>'
         "</form>"
         "</section>"
     )
