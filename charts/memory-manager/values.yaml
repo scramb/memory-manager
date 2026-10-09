@@ -340,6 +340,19 @@ database:
     # templates/cnpg-cluster.yaml's comment. This one ships the `vector`
     # extension compiled in.
     imageName: ghcr.io/cloudnative-pg/postgresql:16-standard-trixie
+    # Off by default (#270): CNPG's own standard Cluster field, passed
+    # straight through. Once true, CNPG also creates a
+    # "<cnpg cluster name>-superuser" Secret for the Postgres superuser -
+    # never used by api/worker (ADR-0008: they always connect as the
+    # non-superuser owner/app role), and never read by this chart's own
+    # templates either. Test/maintenance only: a load-testing or
+    # data-migration job that needs to bulk-`COPY` into a FORCE ROW LEVEL
+    # SECURITY table (ADR-0008 addendum - COPY has no row-security
+    # evaluation path at all, so neither the owner role nor any policy can
+    # let it through, only BYPASSRLS/superuser can) connects with that
+    # Secret instead of the owner's own - `loadtest/k8s/values-loadtest.yaml`
+    # is the one place in this repository that turns this on.
+    enableSuperuserAccess: false
     storage:
       size: 5Gi
       storageClassName: ""

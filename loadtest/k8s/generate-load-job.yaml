@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Generates a synthetic vault (loadtest.generate, #266) and bulk-loads it
+# - chunks and the ADR-0016 HNSW index included (--with-chunks, #267) -
+# straight into the already-running chart's own "memory_manager" database
+# (#270), using the CNPG superuser Secret (the chart's own cnpg block's
+# enableSuperuserAccess flag, charts/memory-manager/templates/
+# cnpg-cluster.yaml) rather than the owner's own: COPY has no row-security
+# evaluation path at all and is rejected outright for any non-superuser,
+# non-BYPASSRLS role on a FORCE ROW LEVEL SECURITY table
+# (migrations/0005_rls.sql), confirmed manually against a throwaway table
+# with an explicit, permissive policy before --use-existing-database
+# existed. --use-existing-database (loadtest/load.py) is what keeps this
+# from ever dropping/recreating that database out from under the 3
+# already-ready, already-serving api replicas scripts/loadtest-cluster.sh
+# installs before this Job ever runs.
+#
+# The CNPG superuser Secret's own "uri" carries a literal "*" database
+# name (any database, not one in particular) - this Job's own command
+# rewrites it to "memory_manager" before handing it to loadtest.load's
+# own --admin-url.
+#
+# __LOADTEST_IMAGE__/__LOADTEST_NOTES__/__LOADTEST_APP_ROLE__/
+# __LOADTEST_MCP_BASE_URL__ are substituted by scripts/loadtest-cluster.sh
+# (sed) - the image this run built and pushed, LOADTEST_NOTES, the
+# chart's own database block's appRole value, and the api Service's own
+# in-cluster base URL (both namespace- and release-name-dependent,
+# CLAUDE.md: no operator-specific values committed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mm-loadtest-generate-load
+  labels:
+    app.kubernetes.io/name: mm-loadtest-generate-load
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mm-loadtest-generate-load
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: generate-load
+          image: __LOADTEST_IMAGE__
+          # Always, not the default IfNotPresent: LOADTEST_IMAGE_TAG is
+          # fixed (default "loadtest"), not unique per run.
+          imagePullPolicy: Always
+          env:
+            - name: LOADTEST_NOTES
+              value: "__LOADTEST_NOTES__"
+            - name: LOADTEST_APP_ROLE
+              value: "__LOADTEST_APP_ROLE__"
+            - name: LOADTEST_MCP_BASE_URL
+              value: "__LOADTEST_MCP_BASE_URL__"
+            - name: ADMIN_URI_RAW
+              valueFrom:
+                secretKeyRef:
+                  name: memory-manager-db-superuser
+                  key: uri
+          command:
+            - sh
+            - -euc
+            - |
+              admin_url="${ADMIN_URI_RAW%/*}/memory_manager"
+              echo "generating ${LOADTEST_NOTES} synthetic notes..."
+              # 200 users/tokens - the same shape scripts/loadtest-smoke.sh
+              # already validates (its own comment: every personal
+              # namespace needs its own token, so --users and --tokens
+              # must match). loadtest/k8s/k6-job.yaml's own lowered
+              # MM_SEARCH_RATE/MM_READ_RATE/MM_WRITE_RATE - not a higher
+              # token count - is what keeps this run under the chart's
+              # own default per-token rate-limit budget (see that file's
+              # own comment): raising --tokens instead, tried first,
+              # cleared the rate-limit thresholds but then measured a low
+              # search_correctness_hit_rate{check:vector} - this run's own
+              # deterministic correctness pairs (loadtest/k6/search.js)
+              # are seed-selected from the generated vault, and an
+              # untested --users value shifts which ones get picked.
+              python -m loadtest.generate \
+                --notes "$LOADTEST_NOTES" --users 200 --groups 20 --seed 1 \
+                --out /data/vault-out
+              echo "loading into memory_manager via the CNPG superuser secret..."
+              python -m loadtest.load \
+                --vault /data/vault-out \
+                --admin-url "$admin_url" \
+                --db-name memory_manager \
+                --app-role "$LOADTEST_APP_ROLE" \
+                --context-out /data/vault-out/k6-context.json \
+                --base-url "$LOADTEST_MCP_BASE_URL" \
+                --tokens 200 \
+                --with-chunks \
+                --embedding-model loadtest-stub \
+                --results-out /data/vault-out/chunk-results.json \
+                --use-existing-database
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mm-loadtest-data

@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Load-test profile (#270, WP-32) on top of charts/memory-manager/
+# values-enterprise.yaml: a fixed 3-replica api (no HPA/KEDA during the
+# measured run - owner decision 3, 2026-10-08's own "no HPA during the
+# measurement", scripts/loadtest-cluster.sh), CNPG superuser access for
+# the generate+load Job's own bulk COPY, and no external IdP (tokens come
+# straight from loadtest.load, never through /authorize).
+#
+# Namespace/registry/storage-class/image and the embedding stub's own
+# in-cluster URL are all cluster- or run-specific - scripts/
+# loadtest-cluster.sh passes those as `--set`, never baked in here
+# (CLAUDE.md: a public repository carries no operator-specific values).
+# Every secret value below is a fixed, fake, test-only one (same pattern
+# as tests/e2e/kind/secret.yaml) - OAUTH_CLIENT_SECRET_KEY still has to be
+# a *syntactically* valid Fernet key, since the client-secret cipher
+# rejects a malformed one at startup (ADR-0004).
+
+database:
+  cnpg:
+    # CNPG's own standard field (charts/memory-manager's own README/
+    # values.yaml document it) - creates a "<cnpg cluster name>-superuser"
+    # Secret the generate+load Job connects with instead of the owner's
+    # own: COPY has no row-security evaluation path at all and is
+    # rejected outright for any non-superuser, non-BYPASSRLS role on a
+    # FORCE ROW LEVEL SECURITY table (migrations/0005_rls.sql) - including
+    # the owner itself, confirmed manually before this flag existed.
+    # api/worker never read this Secret (ADR-0008: they always connect as
+    # the non-superuser owner/app role) - test/maintenance only, never
+    # turned on anywhere else in this repository.
+    enableSuperuserAccess: true
+    # Off here (vs. values-enterprise.yaml's own "true"): needs the
+    # Barman Cloud plugin and cert-manager already installed in the CNPG
+    # operator's own namespace - neither the kind-cluster verification
+    # path nor a plain `helm install` run of this overlay provisions
+    # either, same reasoning as tests/e2e/kind's own helmrelease-patch.
+    # Backups are out of scope for a throwaway load-test database anyway.
+    backup:
+      enabled: false
+
+# No HPA/KEDA during the measured run (owner decision 3, 2026-10-08) -
+# values-enterprise.yaml turns both on; a fixed replica count is what lets
+# this run compare like-for-like against a known worker/api count instead
+# of a moving target.
+api:
+  autoscaling:
+    enabled: false
+worker:
+  autoscaling:
+    enabled: false
+
+# Off here (vs. values-enterprise.yaml's own "true"): every one needs a
+# Prometheus Operator / Grafana sidecar already installed, which neither
+# the kind-cluster verification path nor a plain `helm install` run of
+# this overlay provisions - turning them on is the operator's own choice
+# for the target-size run (#271), not this runner's job.
+networkPolicy:
+  enabled: false
+serviceMonitor:
+  enabled: false
+grafanaDashboard:
+  enabled: false
+prometheusRule:
+  enabled: false
+
+# No external IdP: every token this run's traffic uses comes straight out
+# of `loadtest.load` (`create_token`, never through /authorize) - "password"
+# needs no reachable upstream at all, unlike "oidc"/"entra" (ADR-0009 §5's
+# own Entra-discovery readyz check would otherwise gate on a mock IdP this
+# runner has no reason to stand up).
+login:
+  mode: password
+  namespaces: personal
+
+# No Gateway API CRDs on the kind-cluster verification path (nor assumed
+# on a plain `helm install` into an arbitrary cluster) - same reasoning
+# tests/e2e/kind's own helmrelease-patch gives for its own "no Gateway
+# API CRDs installed" choice. k6 reaches the api Service directly
+# in-cluster (scripts/loadtest-cluster.sh), never through this route.
+httpRoute:
+  enabled: false
+
+secrets:
+  create: true
+  values:
+    oauthClientSecretKey: "3s5VgYmDGSJR2ptAyfRNwuKBowX2oLAPr9822Jo_Szc="
+    adminPasswordHash: "$argon2id$v=19$m=65536,t=3,p=4$t05m8KmQ2hjlJoSiguINnQ$YicWbwcBOaouGAp/g+fn9hO840gemsdmkS/ZENux/z8"
+    # api-deployment.yaml/worker-deployment.yaml reference this key
+    # unconditionally (not gated behind a check of login's own mode,
+    # unlike the keys above) - the server itself treats a missing/unset
+    # VAULT_WEBHOOK_SECRET as "no webhook configured" (404), but the
+    # Secret this chart renders has to carry the key either way, or the
+    # Pod never starts at all (CreateContainerConfigError). Never actually
+    # used by this runner (no push webhook in a load test).
+    vaultWebhookSecret: "loadtest-unused-webhook-secret"
+
+# Off by default (`sharedState` switch, #270's own Context) - 3-instance
+# CNPG already covers rate-limit/login state at this scale (values-
+# enterprise.yaml's own comment); scripts/loadtest-cluster.sh flips this
+# on with `--set` for `LOADTEST_SHARED_STATE=valkey`.
+valkey:
+  enabled: false

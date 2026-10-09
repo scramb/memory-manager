@@ -33,6 +33,14 @@
 # "validateCnpgInstances" helper below fails the render otherwise,
 # alongside values.schema.json's own "if"/"then".
 #
+# The cnpg block's own enableSuperuserAccess, off by default (#270): CNPG's
+# standard field, passed straight through only when true, so the default
+# render never carries it at all. api/worker never use the superuser
+# Secret it makes CNPG create - this is for a test/maintenance job that
+# needs to bulk-COPY into a FORCE ROW LEVEL SECURITY table, which neither
+# the owner role nor any policy can do (COPY has no row-security
+# evaluation path - values.yaml's own comment).
+#
 # The cnpg block's own backup sub-block, once enabled (#252), adds a
 # Barman Cloud plugin entry (a WAL-archiving plugins list entry below)
 # pointing at the ObjectStore templates/cnpg-objectstore.yaml renders -
@@ -50,6 +58,9 @@ metadata:
 spec:
   instances: {{ .Values.database.cnpg.instances }}
   imageName: {{ .Values.database.cnpg.imageName }}
+  {{- if .Values.database.cnpg.enableSuperuserAccess }}
+  enableSuperuserAccess: true
+  {{- end }}
   bootstrap:
     initdb:
       database: memory_manager

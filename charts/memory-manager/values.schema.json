@@ -233,6 +233,10 @@
               "description": "More than 1 requires storage.backend \"postgres\" (ADR-0007, ADR-0009 §6)."
             },
             "imageName": { "type": "string", "minLength": 1 },
+            "enableSuperuserAccess": {
+              "type": "boolean",
+              "description": "Test/maintenance only (#270) - CNPG's own standard field; creates a \"<cnpg cluster name>-superuser\" Secret, never read by this chart's own templates."
+            },
             "storage": { "type": "object", "additionalProperties": true },
             "resources": { "type": "object", "additionalProperties": true },
             "backup": {

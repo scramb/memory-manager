@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke
+.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -87,6 +87,19 @@ loadtest-smoke: db-up
 		LOADTEST_REPLICAS=$(LOADTEST_REPLICAS) LOADTEST_KILL_AFTER=$(LOADTEST_KILL_AFTER) \
 		LOADTEST_SHARED_STATE=$(LOADTEST_SHARED_STATE) LOADTEST_EMBEDDINGS=$(LOADTEST_EMBEDDINGS) \
 		scripts/loadtest-smoke.sh
+
+# Generic Kubernetes load-test runner (#270, WP-32) - installs
+# charts/memory-manager's enterprise profile plus loadtest/k8s/
+# values-loadtest.yaml against KUBE_CONTEXT (a disposable local kind
+# cluster when unset, scripts/loadtest-cluster.sh's own default) and runs
+# the same k6 scenarios in-cluster against 3 api replicas, with an
+# optional forced Pod kill (LOADTEST_KILL_AFTER). See that script's own
+# module docstring for every other env var (LOADTEST_NAMESPACE,
+# LOADTEST_REGISTRY, LOADTEST_STORAGE_CLASS, LOADTEST_RESULTS_DIR, ...).
+loadtest-cluster:
+	LOADTEST_NOTES=$(LOADTEST_NOTES) LOADTEST_KILL_AFTER=$(LOADTEST_KILL_AFTER) \
+		LOADTEST_SHARED_STATE=$(LOADTEST_SHARED_STATE) K6_IMAGE=$(K6_IMAGE) \
+		scripts/loadtest-cluster.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
 # vault-init one-shot seeding a local vault remote. See README.md.

@@ -860,6 +860,11 @@ async def _recreate_database(admin_url: str, db_name: str) -> str:
         await admin_conn.execute(f'create database "{db_name}"')
     finally:
         await admin_conn.close()
+    return _sibling_database_url(admin_url, db_name)
+
+
+def _sibling_database_url(admin_url: str, db_name: str) -> str:
+    """`admin_url`, with its own database name component replaced by `db_name`."""
     base, _, _ = admin_url.rpartition("/")
     return f"{base}/{db_name}"
 
@@ -877,10 +882,18 @@ async def ensure_app_role(admin_url: str, role: str) -> None:
     (`pg_has_role(current_user, role, 'MEMBER')`) needs that membership to
     already be there before `serve` can switch to `role` for a request.
 
-    Safe to call again: an existing role is left alone, and granting a
-    membership a second time is a Postgres no-op (`GRANT ... TO` on an
-    already-held membership, not an error) - the same idempotency
-    `db.rls.grant_app_role` itself relies on for repeated `serve` starts.
+    Safe to call again: an existing role is left alone, and an already-held
+    membership is left alone too, checked via `pg_has_role` rather than
+    re-issued - `GRANT role TO role` is only a privilege-check no-op for a
+    grantor who already holds `ADMIN OPTION` on `role` (a superuser, like
+    the local/CI admin connection, always does); `--use-existing-database`
+    (#270) connects as a CNPG-provisioned owner role that is already a
+    *plain* member of the app role (the chart's own `postInitApplicationSQL`
+    granted it, without `WITH ADMIN OPTION`) - re-issuing the same `GRANT`
+    from that connection fails with "permission denied to grant role",
+    confirmed manually against a throwaway non-superuser role before this
+    guard existed, even though the membership it would (re)create already
+    holds.
     """
     conn = await asyncpg.connect(admin_url)
     try:
@@ -888,7 +901,9 @@ async def ensure_app_role(admin_url: str, role: str) -> None:
         if not exists:
             await conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
         owner = await conn.fetchval("select current_user")
-        await conn.execute(f'grant "{role}" to "{owner}"')
+        already_member = await conn.fetchval("select pg_has_role($1, $2, 'member')", owner, role)
+        if not already_member:
+            await conn.execute(f'grant "{role}" to "{owner}"')
     finally:
         await conn.close()
 
@@ -1137,6 +1152,7 @@ async def load(
     maintenance_work_mem: str | None = _DEFAULT_MAINTENANCE_WORK_MEM,
     max_parallel_maintenance_workers: int | None = None,
     chunk_workers: int | None = None,
+    use_existing_database: bool = False,
 ) -> None:
     """Load `vault_out` (a `loadtest.generate` output directory) into `db_name`
     under RLS, with a registered principal per sampled token, and write
@@ -1157,6 +1173,19 @@ async def load(
     given, gets that call's own JSON summary (chunk counts, load
     throughput, HNSW build time/size); also ignored when `with_chunks` is
     `False`.
+
+    `use_existing_database` (#270): skips `_recreate_database`'s drop/create
+    entirely and loads straight into `db_name`, which must already exist
+    and already be owned by whatever role `admin_url` connects as - the
+    shape a chart-provisioned CNPG `Cluster` already comes in (`bootstrap.
+    initdb.owner`/`database`, `charts/memory-manager/templates/
+    cnpg-cluster.yaml`), where that owner role has neither `CREATEDB` nor
+    superuser (verified against a kind cluster's own `-app` secret: `\\du`
+    shows no attributes at all) and so cannot run the drop/create this
+    module otherwise always does. `migrate(..., backend=...)` below still
+    runs unconditionally either way - this flag only ever skips the
+    database-level drop/create, never the schema migration that guarantees
+    `vault_notes`/`vault_revisions`/`chunks` exist.
     """
     vault_dir = vault_out / "vault"
     rows = build_rows(vault_dir)
@@ -1166,7 +1195,11 @@ async def load(
     namespaces = json.loads((vault_out / "namespaces.json").read_text(encoding="utf-8"))
 
     await ensure_app_role(admin_url, app_role)
-    database_url = await _recreate_database(admin_url, db_name)
+    database_url = (
+        _sibling_database_url(admin_url, db_name)
+        if use_existing_database
+        else await _recreate_database(admin_url, db_name)
+    )
     await load_vault(database_url, rows, backend="postgres" if with_chunks else "git")
 
     rng = random.Random(seed)  # noqa: S311 - deterministic sampling, not a secret
@@ -1219,7 +1252,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("MM_TEST_DATABASE_URL"),
         help="admin Postgres URL used to (re)create --db-name (defaults to $MM_TEST_DATABASE_URL)",
     )
-    parser.add_argument("--db-name", default=_DEFAULT_DB_NAME, help="database to drop and recreate")
+    parser.add_argument(
+        "--db-name",
+        default=_DEFAULT_DB_NAME,
+        help="database to load into - dropped and recreated first, unless --use-existing-database",
+    )
     parser.add_argument(
         "--app-role",
         default=_DEFAULT_APP_ROLE,
@@ -1285,6 +1322,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="process-pool size for chunking+synthetic-vector generation (--with-chunks); "
         "unset uses every core on this host",
     )
+    parser.add_argument(
+        "--use-existing-database",
+        action="store_true",
+        help="load into --db-name as-is instead of dropping/recreating it first (#270) - for "
+        "a database --admin-url's own role does not have CREATEDB/superuser on (a "
+        "chart-provisioned CNPG Cluster's own owner role); --db-name must already exist "
+        "and already be owned by that role",
+    )
     return parser
 
 
@@ -1314,6 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
             maintenance_work_mem=args.maintenance_work_mem,
             max_parallel_maintenance_workers=args.max_parallel_maintenance_workers,
             chunk_workers=args.chunk_workers,
+            use_existing_database=args.use_existing_database,
         )
     )
     return 0

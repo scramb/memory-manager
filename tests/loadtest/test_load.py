@@ -9,6 +9,7 @@ import json
 import random
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
@@ -19,7 +20,9 @@ from loadtest.load import (
     build_chunk_rows_parallel,
     build_rows,
     create_principal_tokens,
+    ensure_app_role,
     hnsw_indexes_from_migration,
+    load,
     load_chunks_with_index,
     load_vault,
     namespace_kinds,
@@ -546,3 +549,125 @@ async def test_build_chunk_rows_parallel_matches_the_serial_version(tmp_path: Pa
 
     assert parallel == serial
     assert serial  # the generated vault actually has chunks to compare
+
+
+async def test_use_existing_database_loads_with_chunks_via_a_superuser_connection(
+    tmp_path: Path, test_database_url: str
+) -> None:
+    """`--use-existing-database` (#270, gate round 2 - option D): the
+    generate+load Job connects with CNPG's own `enableSuperuserAccess`
+    Secret (`charts/memory-manager/templates/cnpg-cluster.yaml`,
+    `database.cnpg.enableSuperuserAccess`), not the owner's - `COPY FROM`
+    has no row-security evaluation path at all and is rejected outright
+    for *any* non-superuser, non-BYPASSRLS role on a FORCE ROW LEVEL
+    SECURITY table (migrations/0005_rls.sql), including the owner itself,
+    confirmed manually against a throwaway table with an explicit,
+    permissive `to current_user` policy ('COPY FROM not supported with
+    row-level security') before this test existed - a superuser has no
+    such restriction.
+
+    `test_database_url` (a fresh, empty, admin-owned database) stands in
+    for the CNPG superuser's own target: `admin_database_url`'s role is
+    already a full Postgres superuser locally (`MM_TEST_DATABASE_URL`,
+    `make db-up`), the same shape the CNPG `-superuser` Secret's `postgres`
+    role has in the cluster. `use_existing_database=True` is still what
+    makes this safe against a database 3 already-ready, already-serving
+    api replicas are connected to (the chart installs with a fixed replica
+    count *before* this Job runs, #270's own Context) - skipping
+    `_recreate_database` means this never terminates their connections or
+    drops their database out from under them, independent of which role
+    connects. `with_chunks=True` exercises `load_chunks_with_index`'s own
+    `COPY` into `chunks` too, not just `load_vault`'s into
+    `vault_notes`/`vault_revisions` - both are FORCE RLS.
+    """
+    db_name = test_database_url.rsplit("/", 1)[-1]
+
+    marker_conn = await asyncpg.connect(test_database_url)
+    try:
+        await marker_conn.execute("create table marker_survives_the_call (x int)")
+    finally:
+        await marker_conn.close()
+
+    vault_out = tmp_path / "vault-out"
+    _generate_vault(vault_out)
+
+    await load(
+        vault_out=vault_out,
+        admin_url=test_database_url,
+        db_name=db_name,
+        app_role=f"mm_test_app_{secrets.token_hex(8)}",
+        token_count=2,
+        base_urls=["http://127.0.0.1:18080/mcp"],
+        context_out=tmp_path / "k6-context.json",
+        seed=_SEED,
+        with_chunks=True,
+        use_existing_database=True,
+    )
+
+    verify_conn = await asyncpg.connect(test_database_url)
+    try:
+        marker_still_there = await verify_conn.fetchval(
+            "select count(*) from marker_survives_the_call"
+        )
+        assert marker_still_there == 0  # table survived, just never populated
+        note_count = await verify_conn.fetchval("select count(*) from vault_notes")
+        assert note_count == _NOTES
+        chunk_count = await verify_conn.fetchval("select count(*) from chunks")
+        assert chunk_count > 0
+    finally:
+        await verify_conn.close()
+
+
+async def test_ensure_app_role_tolerates_a_membership_already_granted_without_admin_option(
+    admin_database_url: str,
+) -> None:
+    """The narrower regression test behind the one above: calling
+    `ensure_app_role` a second time, as a role that already holds the app
+    role's membership but no `ADMIN OPTION` on it, must not raise - the
+    exact permission error ("must have admin option on role") a plain,
+    unconditional `GRANT` used to hit here before this guard existed.
+    """
+    db_name = f"mm_test_nonsuper_{secrets.token_hex(8)}"
+    owner_role = f"mm_test_owner_{secrets.token_hex(8)}"
+    app_role = f"mm_test_app_{secrets.token_hex(8)}"
+    owner_password = secrets.token_urlsafe(16)
+
+    admin_conn = await asyncpg.connect(admin_database_url)
+    try:
+        await admin_conn.execute(
+            f"create role \"{owner_role}\" login password '{owner_password}' nosuperuser nocreatedb"
+        )
+        await admin_conn.execute(f'create database "{db_name}" owner "{owner_role}"')
+        await admin_conn.execute(f'create role "{app_role}" nologin nosuperuser nobypassrls')
+        await admin_conn.execute(f'grant "{app_role}" to "{owner_role}"')
+    finally:
+        await admin_conn.close()
+
+    try:
+        parsed = urlsplit(admin_database_url)
+        owner_url = urlunsplit(
+            (
+                parsed.scheme,
+                f"{owner_role}:{owner_password}@{parsed.hostname}:{parsed.port}",
+                f"/{db_name}",
+                "",
+                "",
+            )
+        )
+
+        # Already a member, with no admin option - calling this again must
+        # stay a no-op, not a permission error.
+        await ensure_app_role(owner_url, app_role)
+    finally:
+        admin_conn = await asyncpg.connect(admin_database_url)
+        try:
+            await admin_conn.execute(
+                "select pg_terminate_backend(pid) from pg_stat_activity "
+                "where datname = $1 and pid <> pg_backend_pid()",
+                db_name,
+            )
+            await admin_conn.execute(f'drop database if exists "{db_name}"')
+            await admin_conn.execute(f'drop role if exists "{owner_role}"')
+            await admin_conn.execute(f'drop role if exists "{app_role}"')
+        finally:
+            await admin_conn.close()

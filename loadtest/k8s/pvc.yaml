@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Shared storage between the generate+load Job and the embedding stub
+# (#270): the stub's own --queries argument needs the exact queries.jsonl
+# the Job's loadtest.generate run just produced (loadtest/embedding_stub.py's
+# own docstring), and the k6 Job needs that same vault-out/ plus the
+# k6-context.json loadtest.load writes - three Pods, one volume.
+#
+# ReadWriteOnce, not ReadWriteMany: every Pod that mounts this lands on a
+# single-node kind cluster's only node anyway (scripts/e2e-kind.sh's own
+# shape), so RWO is enough for the verification this chart's own
+# `Fertig wenn` asks for. A multi-node operator cluster (the target-size
+# run, #271 - explicitly not this task) needs either a storage class that
+# supports ReadWriteMany/ReadWriteOncePod across nodes, or the three Pods
+# below pinned to the same node - neither is solved here, only documented
+# as a known limitation of this manifest.
+#
+# The __LOADTEST_STORAGE_CLASS__ line is removed by scripts/
+# loadtest-cluster.sh (sed) when LOADTEST_STORAGE_CLASS is empty - the
+# field must be *absent*, not an empty string, for the cluster's own
+# DefaultStorageClass admission controller to assign one (kind's own
+# "standard", an operator's own default elsewhere); an explicit
+# `storageClassName: ""` opts *out* of that and means something else
+# entirely (only pre-provisioned, classless PVs).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mm-loadtest-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: __LOADTEST_PVC_SIZE__
+  storageClassName: __LOADTEST_STORAGE_CLASS__

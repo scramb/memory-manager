@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fails if deploy/ (and, once it exists, charts/) contain a hostname or
+# Fails if deploy/, charts/ or loadtest/k8s/ (#270) contain a hostname or
 # IPv4 address that is not a documented placeholder - this is a public
 # repository (CLAUDE.md: "no operator-specific values ... in code,
 # manifests, examples"), so deployment artefacts must stay generic.
@@ -10,7 +10,7 @@ fail=0
 err() { echo "ERROR: $*" >&2; fail=1; }
 
 dirs=()
-for d in deploy charts; do
+for d in deploy charts loadtest/k8s; do
   [[ -d "$d" ]] && dirs+=("$d")
 done
 if [[ ${#dirs[@]} -eq 0 ]]; then
@@ -36,6 +36,11 @@ allowed_suffixes=(
   # same category as cnpg.io above.
   cloudnative-pg.io
   py sh yaml yml md json toml lock txt cfg ini
+  # loadtest/k8s/ (#270) cross-references its own siblings under
+  # loadtest/ by name - the k6 scenario scripts, the generator's own
+  # queries side file, and the RLS migration's SQL file; same category
+  # as the extensions above, never a hostname's TLD.
+  js jsonl sql
 )
 
 # Exact, whole-token exceptions that happen to have the same dotted shape
@@ -53,6 +58,14 @@ allowed_tokens=(
   User.Read.All GroupMember.Read.All
   Application.ReadWrite.OwnedBy Application.ReadWrite.All
   Application.Read.All Directory.Read.All
+  # loadtest/k8s/ (#270): this project's own, fixed `python -m` module
+  # paths (loadtest/k8s/generate-load-job.yaml's and embedding-stub.yaml's
+  # own `command` args) - never an operator's own infrastructure, same
+  # category as the Entra/Graph names above. "loadtest.embedding" (not
+  # the real module's full "loadtest.embedding_stub") is this regex's
+  # own match for it - the underscore is not in its label charset, so it
+  # never matches past that point either.
+  loadtest.generate loadtest.load loadtest.embedding
 )
 
 is_allowed_host() {
