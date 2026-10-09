@@ -38,6 +38,12 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from memory_manager.account.delete import (
+    CONFIRM_FIELD_NAME,
+    CONFIRM_PHRASE,
+    CSRF_FORM_DELETE,
+    DELETE_PATH,
+)
 from memory_manager.account.export import CSRF_FORM_EXPORT, EXPORT_PATH
 from memory_manager.account.sessions import SessionInfo, csrf_token
 from memory_manager.account.templates import CSRF_FIELD_NAME
@@ -45,6 +51,7 @@ from memory_manager.db import rls
 
 __all__ = [
     "DEFAULT_SECTIONS",
+    "DELETE_SECTION",
     "EXPORT_SECTION",
     "OVERVIEW_SECTION",
     "Section",
@@ -162,9 +169,36 @@ async def _render_export(ctx: SectionContext) -> str:
 #: `STORAGE_BACKEND=git` deployment never shows this section at all (#230).
 EXPORT_SECTION = Section(name="export", enabled=_export_enabled, render=_render_export)
 
+
+def _delete_enabled(ctx: SectionContext) -> bool:
+    """Same gate as `_export_enabled`: there is no personal namespace to delete at
+    all otherwise (#232, `account.delete`'s own module docstring)."""
+    return ctx.is_postgres_backend and ctx.session.oid is not None
+
+
+async def _render_delete(ctx: SectionContext) -> str:
+    token = csrf_token(ctx.session_id, CSRF_FORM_DELETE)
+    phrase = html.escape(CONFIRM_PHRASE)
+    return (
+        "<section><h2>Delete my memory</h2>"
+        "<p>Permanently delete every note in your personal namespace, "
+        "archived notes included. This cannot be undone.</p>"
+        f'<form method="post" action="{html.escape(DELETE_PATH)}">'
+        f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{html.escape(token)}">'
+        f'<label>Type "<code>{phrase}</code>" to confirm:'
+        f'<input type="text" name="{CONFIRM_FIELD_NAME}" autocomplete="off"></label>'
+        '<button type="submit">Delete my memory</button>'
+        "</form></section>"
+    )
+
+
+#: Enterprise only (`_delete_enabled`) - a `password`/`oidc` session or a
+#: `STORAGE_BACKEND=git` deployment never shows this section at all (#232).
+DELETE_SECTION = Section(name="delete", enabled=_delete_enabled, render=_render_delete)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
-DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION, EXPORT_SECTION)
+DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION, EXPORT_SECTION, DELETE_SECTION)
 
 
 async def render_sections(
