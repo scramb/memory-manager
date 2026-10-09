@@ -19,7 +19,9 @@ login and Graph, several stateless replicas on shared Postgres with RLS,
 Valkey, the `/account` browser session and admin area, break-glass, erasure,
 quotas, a note-content blocklist, and the SIEM audit export.
 
-**Out of scope here:** a pen-test checklist (#273), compliance templates
+**Out of scope here:** running a pen test — [`pentest-checklist.md`](./pentest-checklist.md)
+(#273) turns every threat of severity medium or higher above into an
+executable test case — compliance templates
 (#274–#276 / 33c–33e), F-02 elements — Open WebUI identity, personal tokens,
 agent runtimes (tracked under [#203](https://github.com/scramb/memory-manager/issues/203),
 see "Out of scope / extension points" below) — and fixing any finding this

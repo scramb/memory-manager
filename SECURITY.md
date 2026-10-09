@@ -27,6 +27,11 @@ erasure, quotas, the SIEM audit export): one entry per trust boundary and
 STRIDE category, each with a mitigation pointer or an accepted residual risk.
 Update it alongside any change to a trust boundary it covers.
 
+[`docs/security/pentest-checklist.md`](./docs/security/pentest-checklist.md)
+turns every threat of medium or higher severity in the threat model above
+into an executable test case (preconditions, steps, expected result), for
+an operator to run before a release or to scope an external pen test.
+
 ## Security properties
 
 These are the non-negotiable properties this project is built to (see
