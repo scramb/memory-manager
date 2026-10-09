@@ -203,6 +203,19 @@ _CHUNK_VECTOR_DIMENSION = 1024
 #: Recorded on every synthetic chunk's own `model` column - distinguishes a
 #: loadtest-attached vector (`loadtest.vectors.synthetic_vector`) from one
 #: `index/indexer.py` would later write for a real embedding model.
+#:
+#: Default only (#291 rework): `search.py`'s `vector_search`/
+#: `_vector_search_legs` filter every leg on `c.model = $n`, bound to
+#: `EmbeddingProvider.model` - a query-time value the real server resolves
+#: from its own `EMBEDDING_MODEL` env var (`index/embeddings.py`), not this
+#: constant. `scripts/loadtest-smoke.sh` passing a mismatched value here
+#: (its own `EMBEDDING_MODEL=loadtest-stub`, this constant unchanged) made
+#: every vector leg filter on a `model` no stored chunk ever carried - a
+#: query that structurally finds nothing is fast for the wrong reason, not
+#: because the fix worked. `load`'s own `--embedding-model` (default: this
+#: constant, overridable by `$EMBEDDING_MODEL` or the flag itself) is the
+#: one place that value is chosen now; `loadtest-smoke.sh` passes the same
+#: value it exports to the server.
 _CHUNK_VECTOR_MODEL = "loadtest-synthetic"
 
 #: `namespaces.json`'s own `kind` vocabulary (`loadtest.generate`, "personal"/
@@ -545,13 +558,19 @@ def _escape_copy_text(value: str) -> str:
 
 
 async def _chunk_copy_lines(
-    rows: Sequence[_ChunkRow], *, batch_rows: int = 2000
+    rows: Sequence[_ChunkRow], *, model: str = _CHUNK_VECTOR_MODEL, batch_rows: int = 2000
 ) -> AsyncIterator[bytes]:
     """`rows` as `COPY ... (format text)` lines. `row.embedding_literal` is
     already computed (`build_chunk_rows`, possibly on a worker process via
     `build_chunk_rows_parallel`) - this only ever formats, never calls
     `synthetic_vector`/`format_vector` itself, so this step stays cheap
     regardless of how many chunk rows there are.
+
+    `model` (default `_CHUNK_VECTOR_MODEL`) is stamped onto every row's own
+    `model` column - `load_chunks_streaming`'s caller chooses it (#291,
+    `_CHUNK_VECTOR_MODEL`'s own docstring), so a `vector_search` query bound
+    to the real server's `EMBEDDING_MODEL` finds these rows instead of
+    filtering every one of them out.
     """
     buf: list[str] = []
     for row in rows:
@@ -564,7 +583,7 @@ async def _chunk_copy_lines(
             row.namespace,
             row.namespace_kind,
             row.embedding_literal,
-            _CHUNK_VECTOR_MODEL,
+            model,
             str(_CHUNK_VECTOR_DIMENSION),
         )
         buf.append(
@@ -583,7 +602,10 @@ def _parse_affected(status: str) -> int:
 
 
 async def load_chunks_streaming(
-    conn: asyncpg.Connection, shards: Iterable[Sequence[_ChunkRow]]
+    conn: asyncpg.Connection,
+    shards: Iterable[Sequence[_ChunkRow]],
+    *,
+    model: str = _CHUNK_VECTOR_MODEL,
 ) -> dict[str, int]:
     """`COPY` each of `shards` (e.g. `build_chunk_rows_parallel`'s own yield)
     into its matching ADR-0016 partition table
@@ -595,6 +617,10 @@ async def load_chunks_streaming(
     (one per shard per partition) are exactly as valid as one big one -
     Postgres has no notion of "still open" across them. Returns the row
     count actually copied, per partition table, summed across every shard.
+
+    `model` (#291) is passed straight through to `_chunk_copy_lines` - see
+    its own docstring for why this is no longer a module constant every
+    caller is stuck with.
     """
     counts: dict[str, int] = {}
     for shard in shards:
@@ -605,7 +631,7 @@ async def load_chunks_streaming(
             table = f"chunks_{kind}"
             status = await conn.copy_to_table(
                 table,
-                source=_chunk_copy_lines(subset),
+                source=_chunk_copy_lines(subset, model=model),
                 columns=list(_CHUNK_COPY_COLUMNS),
                 format="text",
             )
@@ -706,6 +732,7 @@ async def load_chunks_with_index(
     rows: Sequence[_Row],
     namespaces: Mapping[str, Any],
     *,
+    embedding_model: str = _CHUNK_VECTOR_MODEL,
     maintenance_work_mem: str | None = _DEFAULT_MAINTENANCE_WORK_MEM,
     max_parallel_maintenance_workers: int | None = None,
     chunk_workers: int | None = None,
@@ -718,6 +745,12 @@ async def load_chunks_with_index(
     `ProcessPoolExecutor`'s own default (`os.process_cpu_count()` as of
     Python 3.13, `os.cpu_count()` before - every core on the loader's own
     host).
+
+    `embedding_model` (#291, default `_CHUNK_VECTOR_MODEL`) is stamped onto
+    every chunk's own `model` column (`load_chunks_streaming`) - a caller
+    whose server queries with a different `EMBEDDING_MODEL` must pass that
+    same value here, or every vector leg filters every stored chunk out
+    (`_CHUNK_VECTOR_MODEL`'s own docstring).
 
     `database_url` must already be `backend="postgres"`-migrated
     (`load_vault(..., backend="postgres")`) - this never migrates on its
@@ -739,7 +772,7 @@ async def load_chunks_with_index(
         load_start = time.monotonic()
         await load_notes(conn, rows)
         shards = build_chunk_rows_parallel(rows, kinds, max_workers=chunk_workers)
-        partition_counts = await load_chunks_streaming(conn, shards)
+        partition_counts = await load_chunks_streaming(conn, shards, model=embedding_model)
         load_seconds = time.monotonic() - load_start
 
         hnsw_start = time.monotonic()
@@ -1099,6 +1132,7 @@ async def load(
     context_out: Path,
     seed: int,
     with_chunks: bool = False,
+    embedding_model: str = _CHUNK_VECTOR_MODEL,
     results_out: Path | None = None,
     maintenance_work_mem: str | None = _DEFAULT_MAINTENANCE_WORK_MEM,
     max_parallel_maintenance_workers: int | None = None,
@@ -1115,9 +1149,14 @@ async def load(
 
     `with_chunks` (#267) additionally fills `chunks` and builds the
     ADR-0016 vector index (`load_chunks_with_index`) - see this module's own
-    docstring. `results_out`, if given, gets that call's own JSON summary
-    (chunk counts, load throughput, HNSW build time/size); ignored when
-    `with_chunks` is `False`.
+    docstring. `embedding_model` (#291) is forwarded to it unchanged - the
+    `model` value every stored chunk carries, which must match whatever
+    `EMBEDDING_MODEL` the server this vault is loaded for actually queries
+    with, or every vector leg finds nothing (`_CHUNK_VECTOR_MODEL`'s own
+    docstring); ignored when `with_chunks` is `False`. `results_out`, if
+    given, gets that call's own JSON summary (chunk counts, load
+    throughput, HNSW build time/size); also ignored when `with_chunks` is
+    `False`.
     """
     vault_dir = vault_out / "vault"
     rows = build_rows(vault_dir)
@@ -1150,6 +1189,7 @@ async def load(
             database_url,
             rows,
             namespaces,
+            embedding_model=embedding_model,
             maintenance_work_mem=maintenance_work_mem,
             max_parallel_maintenance_workers=max_parallel_maintenance_workers,
             chunk_workers=chunk_workers,
@@ -1212,6 +1252,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also fill chunks and build the ADR-0016 HNSW index (#267)",
     )
     parser.add_argument(
+        "--embedding-model",
+        default=os.environ.get("EMBEDDING_MODEL", _CHUNK_VECTOR_MODEL),
+        help="'model' value stamped onto every --with-chunks chunk row (#291) - must match "
+        "whatever EMBEDDING_MODEL the server querying this vault uses, or vector_search's "
+        "model filter finds nothing; defaults to $EMBEDDING_MODEL, then "
+        f"{_CHUNK_VECTOR_MODEL!r}",
+    )
+    parser.add_argument(
         "--results-out",
         type=Path,
         default=None,
@@ -1261,6 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
             context_out=args.context_out,
             seed=args.seed,
             with_chunks=args.with_chunks,
+            embedding_model=args.embedding_model,
             results_out=args.results_out,
             maintenance_work_mem=args.maintenance_work_mem,
             max_parallel_maintenance_workers=args.max_parallel_maintenance_workers,

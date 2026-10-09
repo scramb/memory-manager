@@ -148,6 +148,31 @@ selective-filtered attempt comes back with zero rows, so "a frequent word
 or'd with a word nothing matches" still returns the frequent word's hits
 instead of an empty list.
 
+**Skipping the retry once the vector side already has enough (#291, dated
+addendum next to #117 in ADR-0007).** That retry is a second full statement
+execution - cheap against the small fixtures this module's own tests use,
+measured at ~135 ms against the WP-32 load-test vault (50k chunks/10k
+notes, `docs/benchmarks/vector-only-search.md`). A query engineered to have
+no lexical match at all (hybrid search's own `search_vector_only` load-test
+share, #266/#269) starves the selective attempt exactly like a
+frequent-word query does, so it always pays this retry - for a result the
+vector side, when it actually found something, was going to supply anyway.
+`_hybrid_search_impl` therefore runs its vector legs *before* the full-text
+side and passes `fulltext_search`'s `retry_unfiltered` parameter (default
+`True`, the behaviour above unchanged for every other caller) `vector_hit_
+count < limit` - `limit` being the final note count this call returns, not
+`candidates`'s own deeper per-side depth. This is deliberately an
+outcome-based condition, not "an embedding exists": an earlier version of
+this fix skipped the retry whenever `embedding is not None`, which silently
+hid #291's own actual regression (a `chunks.model` mismatch between the
+WP-32 load-test loader and the server made every vector leg return zero
+rows - "finds nothing" is fast for the wrong reason, not because any fix
+worked). A vector side that is itself starved - RLS hiding every row of
+every visible kind, a model/dimension mismatch, or genuinely nothing near
+the query - still gets the retry, exactly like a plain full-text-only call
+always did; only a vector side that already returned enough chunks skips
+it.
+
 Under RLS (WP-19, #116) the app role has no `select` on `chunks`, and
 Postgres hides a table's `pg_stats` rows from a role that cannot read the
 table - `mm_frequent_lexemes` being `security definer` is what lets the app
@@ -634,6 +659,7 @@ async def fulltext_search(
     tags: Sequence[str] | None = None,
     namespaces: Sequence[str] | None = None,
     valid_at: date | None = None,
+    retry_unfiltered: bool = True,
 ) -> list[ChunkHit]:
     """Rank chunks against `query` with Postgres full-text search.
 
@@ -645,6 +671,15 @@ async def fulltext_search(
     are any-of filters on the note; `tags` is all-of; `valid_at` excludes
     notes outside their `valid_from`/`valid_to` range (both unset means
     always valid). `None`/empty for any filter means "no filter".
+
+    `retry_unfiltered` (default `True`, unchanged behaviour for every
+    direct caller - CLI, tests, a plain-full-text `hybrid_search`): whether
+    an empty selective-filtered attempt (#117's own "every lexeme of every
+    branch is frequent" starvation case) is retried once, unfiltered but
+    still capped (see below). `_hybrid_search_impl` is the one caller that
+    passes `False`, and only once its own vector legs already returned at
+    least `limit` chunks (#291) - see the retry's own comment for why this
+    is an outcome-based condition, not just "an embedding exists".
     """
     if not query.strip():
         return []
@@ -661,13 +696,27 @@ async def fulltext_search(
     )
     with db_span("fulltext_search"):
         rows = await conn_or_pool.fetch(sql, *args)
-    if not rows:
+    if not rows and retry_unfiltered:
         # Selective filtering can legitimately starve the candidate stage
         # when every lexeme of every branch turned out to be frequent (#117)
         # - retry once, unfiltered but still capped, so that case still
         # returns the frequent term's own hits instead of an empty list.
-        # Harmless when the query simply matches nothing at all: that
-        # attempt is bounded by the same cap and was already fast.
+        #
+        # This retry is a second full statement execution - #291 measured
+        # it at ~135 ms on the WP-32 load-test vault (50k chunks, 10k
+        # notes), not "already fast" as this comment used to claim: that
+        # held at the small fixture sizes this module's own tests use, not
+        # at the scale this is actually meant to run at. A query engineered
+        # to have no lexical match at all (hybrid search's pure-vector
+        # queries, #266/#269's `search_vector_only`) starves the selective
+        # attempt the same way a frequent-word query does, pays this retry's
+        # full cost, and - since nothing lexical is there to find either way
+        # - gets nothing for it: `retry_unfiltered=False` is how
+        # `_hybrid_search_impl` skips exactly that waste, only once its own
+        # vector legs already returned enough chunks to make the retry
+        # moot - not merely because a vector leg ran at all (#291: a vector
+        # leg that ran but came back empty, e.g. a `chunks.model` mismatch,
+        # still needs this rescue exactly like a plain full-text call does).
         sql, args = _build_fulltext_query(
             query,
             include_archived=include_archived,
@@ -1018,23 +1067,18 @@ async def _hybrid_search_impl(
     # read-only transaction) apart from a connection already inside the
     # RLS request path's own transaction (#116, reused as-is).
     async with _search_connection(pool) as conn:
-        fulltext_hits = await fulltext_search(
-            conn,
-            query,
-            limit=candidates,
-            include_archived=filters.include_archived,
-            types=filters.types,
-            tags=filters.tags,
-            namespaces=filters.namespaces,
-            valid_at=filters.valid_at,
-        )
-
-        # One list per vector query (module docstring, "ADR-0016's per-kind
-        # vector search"): Git mode gives a single-element list, Postgres
-        # mode with the ADR-0016 layout gives one list per visible
-        # namespace kind - either way, every list below becomes its own
-        # RRF leg, fed into the same `rrf_fuse` call as the full-text side
-        # (ADR-0016 Decision: "no new fusion step, only more vector legs").
+        # Vector legs run *before* the full-text side (#291): whether
+        # `fulltext_search`'s own unfiltered retry (module docstring,
+        # "Bounding very frequent terms") is worth paying for now depends on
+        # what the vector side actually found, not merely on whether an
+        # embedding exists. An embedding that exists but whose legs come
+        # back starved (RLS hid every row of every visible kind, a `chunks.
+        # model`/dimension mismatch, or genuinely nothing near the query)
+        # leaves full-text's own rescue as the only chance at a real
+        # answer - skipping it unconditionally whenever `provider` is given
+        # would have hidden exactly that failure mode (#291's own root
+        # cause, a stub/server `model` mismatch that made every vector leg
+        # return zero rows silently).
         vector_legs: list[list[ChunkHit]] = []
         if embedding is not None:
             vector_legs = await _vector_search_legs(
@@ -1049,6 +1093,30 @@ async def _hybrid_search_impl(
                 namespaces=filters.namespaces,
                 valid_at=filters.valid_at,
             )
+        vector_hit_count = sum(len(leg) for leg in vector_legs)
+
+        fulltext_hits = await fulltext_search(
+            conn,
+            query,
+            limit=candidates,
+            include_archived=filters.include_archived,
+            types=filters.types,
+            tags=filters.tags,
+            namespaces=filters.namespaces,
+            valid_at=filters.valid_at,
+            # #291 (dated addendum next to #117 in ADR-0007): skip the
+            # unfiltered retry only once the vector side already returned
+            # at least `limit` chunks - `limit` is the final note count
+            # this call returns, not `candidates`'s own deeper per-side
+            # depth. "The vector side already has enough to work with" is a
+            # stronger, outcome-based condition than "an embedding exists"
+            # (#291's own root cause: an embedding existed, but every leg
+            # still came back empty for a reason unrelated to the query
+            # itself - a `chunks.model` mismatch). A vector side that is
+            # itself starved keeps the retry, the same as a plain
+            # full-text-only call always did.
+            retry_unfiltered=vector_hit_count < limit,
+        )
 
         if not fulltext_hits and not vector_legs:
             return []

@@ -442,6 +442,45 @@ async def test_with_chunks_fills_every_partition_with_full_dimension_vectors_and
     assert stored_vector == pytest.approx(expected_vector, rel=1e-2, abs=1e-3)
 
 
+async def test_with_chunks_default_model_is_not_what_a_real_server_queries_with(
+    tmp_path: Path, test_database_url: str
+) -> None:
+    """#291: the DoD above already proves every chunk gets a full-dimension
+    vector; this is the gap that slipped past it - `load_chunks_with_index`'s
+    *default* `embedding_model` (`loadtest-synthetic`) is never what a real
+    `memory-manager serve --http` replica's own `EMBEDDING_MODEL` would be
+    (`loadtest-stub`, in `scripts/loadtest-smoke.sh`'s `LOADTEST_EMBEDDINGS=
+    stub` mode). A `vector_search` bound to that mismatched model finds
+    nothing - not because the search is slow or broken, but because its own
+    `c.model = $n` filter excludes every row this loader wrote. Passing
+    `embedding_model` explicitly (what `loadtest.load`'s `--embedding-model`
+    now does, sourced from the same `$EMBEDDING_MODEL` the server reads) is
+    what makes the two agree.
+    """
+    out = tmp_path / "vault-out"
+    vault_dir, namespaces = _generate_chunk_vault(out)
+    rows = build_rows(vault_dir)
+
+    await load_vault(test_database_url, rows, backend="postgres")
+    results = await load_chunks_with_index(
+        test_database_url, rows, namespaces, embedding_model="loadtest-stub"
+    )
+    assert results["chunks"]
+
+    conn = await asyncpg.connect(test_database_url)
+    try:
+        mismatched = await conn.fetchval(
+            "select count(*) from chunks where model = $1", "loadtest-synthetic"
+        )
+        matching = await conn.fetchval(
+            "select count(*) from chunks where model = $1", "loadtest-stub"
+        )
+        assert mismatched == 0, "no chunk should carry the old hardcoded default once overridden"
+        assert matching == results["chunks"]
+    finally:
+        await conn.close()
+
+
 async def test_populate_registry_registers_project_namespaces_for_mm_namespace_kind(
     tmp_path: Path, test_database_url: str
 ) -> None:

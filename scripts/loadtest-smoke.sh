@@ -93,6 +93,16 @@ LOADTEST_KILL_AFTER="${LOADTEST_KILL_AFTER:-}"
 LOADTEST_SHARED_STATE="${LOADTEST_SHARED_STATE:-postgres}"
 LOADTEST_EMBEDDINGS="${LOADTEST_EMBEDDINGS:-none}"
 
+# One source for the embedding model name (#291): `loadtest.load
+# --with-chunks` stamps this onto every chunk's own `model` column, and the
+# `serve --http`/worker replicas below query with this same value as their
+# own `EMBEDDING_MODEL` - a mismatch between the two (as this script used to
+# have, loader hardcoded, server env independently set) makes every vector
+# leg filter on a `model` no stored chunk carries, finding nothing. Only
+# used when `LOADTEST_EMBEDDINGS=stub`, same as everywhere else it appears
+# below.
+EMBEDDING_MODEL_VALUE="loadtest-stub"
+
 case "$LOADTEST_RLS_VARIANT" in
   r2|r1) ;;
   *)
@@ -253,10 +263,26 @@ LOAD_ARGS=(
   --db-name "$DB_NAME"
   --app-role "$APP_ROLE"
   --context-out "${WORKDIR}/k6-context.json"
+  # `loadtest.load`'s own default (50 of 200 personal namespaces, #291
+  # rework round 2): too few of `queries.jsonl`'s own marker notes land in
+  # a namespace one of those 50 tokens can actually read (`loadtest.
+  # generate`'s Zipf-weighted namespace picker makes most personal
+  # namespaces own only a handful of notes each) to reliably draw >=50
+  # *visible* lexical and >=50 *visible* vector-only queries for `search.
+  # js`'s own deterministic correctness scenarios below - measured at only
+  # 28 visible vector-only queries out of 80 total with 50 tokens, against
+  # 77 with every personal namespace tokened. `200` (every personal
+  # namespace) makes every marker note's own namespace visible to *some*
+  # token, so visibility is a property of the vault, not of which 50
+  # aliases happened to get sampled.
+  --tokens 200
 )
 LOAD_ARGS+=("${BASE_URL_ARGS[@]}")
 if [[ "$LOADTEST_EMBEDDINGS" == "stub" ]]; then
-  LOAD_ARGS+=(--with-chunks --results-out "${WORKDIR}/chunk-results.json")
+  LOAD_ARGS+=(
+    --with-chunks --results-out "${WORKDIR}/chunk-results.json"
+    --embedding-model "$EMBEDDING_MODEL_VALUE"
+  )
 fi
 
 LOAD_START=$(date +%s.%N)
@@ -301,7 +327,7 @@ if [[ "$LOADTEST_EMBEDDINGS" == "stub" ]]; then
   EMBEDDING_ENV=(
     EMBEDDING_PROVIDER=openai
     EMBEDDING_URL="$EMBEDDING_URL_VALUE"
-    EMBEDDING_MODEL=loadtest-stub
+    EMBEDDING_MODEL="$EMBEDDING_MODEL_VALUE"
     EMBEDDING_DIMENSIONS=1024
   )
 
@@ -457,6 +483,16 @@ PODMAN_RUN_ARGS=(
   --env MM_QUERIES_FILE=/data/vault-out/queries.jsonl
   --env "MM_WARMUP_DURATION=${WARMUP_SECONDS}s"
   --env "MM_MEASURE_DURATION=${MM_MEASURE_DURATION:-60s}"
+  # `#291` rework round 2: `smoke.js` only enables the deterministic
+  # vector-only correctness scenario/gate (and its own `search_correctness_
+  # hit_rate{check:vector}`/`...samples{check:vector}` thresholds) when this
+  # is `stub` - `none` has no vector capability at all (`EMBEDDING_
+  # PROVIDER=none`), so a vector-only query structurally never matches and
+  # gating on it would fail every run regardless of search correctness,
+  # breaking this script's own "every switch is a no-op at its default"
+  # promise for `LOADTEST_EMBEDDINGS=none`. The lexical correctness
+  # scenario/gate runs unconditionally in both modes.
+  --env "MM_EMBEDDINGS_MODE=${LOADTEST_EMBEDDINGS}"
   --volume "$(pwd)/loadtest/k6:/scripts:ro,Z"
   --volume "${WORKDIR}:/data:ro,Z"
 )

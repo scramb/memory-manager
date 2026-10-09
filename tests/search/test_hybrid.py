@@ -414,6 +414,96 @@ class TestCustomPlans:
         assert row["custom_plans"] >= 6
 
 
+class TestFulltextRetrySkippedOnlyWhenVectorAlreadyHasEnough:
+    """#291: `_hybrid_search_impl` skips `fulltext_search`'s own unfiltered
+    retry (module docstring, "Skipping the retry once the vector side
+    already has enough") only once its own vector legs already returned at
+    least `limit` chunks - an *outcome*-based condition, not merely "an
+    embedding exists". An earlier version of this fix used the latter and
+    silently hid exactly #291's own regression: a `chunks.model` mismatch
+    between the WP-32 load-test loader and the server made every vector leg
+    return zero rows, and the retry-skip still fired anyway. The three
+    cases below are, respectively, that regression reproduced directly (a
+    provider whose own `model` does not match what `_NOTES` was indexed
+    under), the fix working as intended, and a plain full-text call's
+    unchanged baseline.
+
+    "car" (like `TestVectorOnlyMatch` above) has no lexical match anywhere
+    in `_NOTES`: the selective-filtered attempt always comes back empty, so
+    every case here counts `pg_prepared_statements.custom_plans` for the
+    full-text statement - one execution per attempt, regardless of how many
+    rows either returns - rather than asserting on hit counts that would be
+    `[]` either way.
+    """
+
+    async def _fulltext_custom_plans(self, pool: asyncpg.Pool) -> int:
+        row = await pool.fetchrow(
+            "select custom_plans from pg_prepared_statements where statement like '%' || $1 || '%'",
+            "mm_frequent_lexemes",
+        )
+        return 0 if row is None else int(row["custom_plans"])
+
+    async def test_vector_legs_starved_by_a_model_mismatch_still_get_the_retry(
+        self, seeded: asyncpg.Pool, generic_plan_pool: asyncpg.Pool
+    ) -> None:
+        # #291's own regression, reproduced directly: `seeded` indexed
+        # `_NOTES` under `provider.model` ("fake-bow", the `provider`
+        # fixture's own default) - a second provider whose `embed` returns
+        # the exact same vectors but claims a *different* model name is
+        # exactly what a loader/server `EMBEDDING_MODEL` mismatch looks
+        # like from `vector_search`'s own `c.model = $n` filter: every leg
+        # finds zero rows, not because nothing is near the query, but
+        # because nothing stored carries this model name at all.
+        mismatched_provider = FakeProvider(model="a-different-model-than-indexing-used")
+
+        before = await self._fulltext_custom_plans(generic_plan_pool)
+        hits = await hybrid_search(generic_plan_pool, "car", provider=mismatched_provider)
+        after = await self._fulltext_custom_plans(generic_plan_pool)
+
+        assert after - before == 2, (
+            "a vector side starved by its own model mismatch must still get the full-text "
+            "rescue - skipping it here would silently hide #291's own regression"
+        )
+        assert hits == []
+
+    async def test_vector_legs_with_enough_hits_skip_the_retry(
+        self, seeded: asyncpg.Pool, generic_plan_pool: asyncpg.Pool, provider: FakeProvider
+    ) -> None:
+        # `limit=1`: Git mode's flat `vector_search` ranks every chunk in
+        # `_NOTES` by cosine distance (no similarity cutoff of its own, see
+        # `search.py`'s module docstring) and returns up to `candidates`
+        # (default 50) of them, so a correctly-matched provider's vector
+        # legs return comfortably more than 1 chunk - `vector_hit_count <
+        # limit` is false, and the retry is skipped.
+        before = await self._fulltext_custom_plans(generic_plan_pool)
+        hits = await hybrid_search(generic_plan_pool, "car", provider=provider, limit=1)
+        after = await self._fulltext_custom_plans(generic_plan_pool)
+
+        assert after - before == 1, (
+            "hybrid_search must skip the retry once its own vector legs already have enough"
+        )
+        # The vector side still finds the synonym match - #291's fix only
+        # drops the full-text side's own wasted retry, not the search result.
+        assert "work/fact/automobile-industry.md" in {hit.path for hit in hits}
+
+    async def test_hybrid_search_without_a_provider_still_runs_the_retry(
+        self, seeded: asyncpg.Pool, generic_plan_pool: asyncpg.Pool
+    ) -> None:
+        # `hybrid_search` (not the bare `fulltext_search`) so both halves of
+        # this test go through `_hybrid_search_impl`'s own custom-plan
+        # connection (#120) the same way - a bare `fulltext_search` call on
+        # `generic_plan_pool` would inherit its connection-wide
+        # `force_generic_plan` setting instead and never show up as a
+        # `custom_plans` increment at all, which is not what this test is
+        # about.
+        before = await self._fulltext_custom_plans(generic_plan_pool)
+        hits = await hybrid_search(generic_plan_pool, "car")
+        after = await self._fulltext_custom_plans(generic_plan_pool)
+
+        assert after - before == 2, "fulltext-only hybrid_search must keep its own retry"
+        assert hits == []
+
+
 class TestRrfFuse:
     def test_matches_hand_computed_scores(self) -> None:
         scores = rrf_fuse([["a", "b", "c"], ["b", "c", "a"]], k=1)

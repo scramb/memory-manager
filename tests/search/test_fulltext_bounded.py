@@ -191,6 +191,20 @@ class TestBoundedCandidates:
         hits = await fulltext_search(seeded_conn, "note or zzznonexistentzzz", limit=5)
         assert hits
 
+    async def test_retry_unfiltered_false_skips_the_frequent_word_rescue(
+        self, seeded_conn: asyncpg.Connection
+    ) -> None:
+        # Same query as the test above, but `retry_unfiltered=False` - the
+        # flag `_hybrid_search_impl` passes once a vector leg is already
+        # covering the same query (#291, module docstring "Skipping the
+        # retry for a vector-covered query"). The selective-filtered first
+        # attempt still comes back empty (same reasoning as above); with no
+        # retry to rescue "note"'s own hits, the call returns nothing.
+        hits = await fulltext_search(
+            seeded_conn, "note or zzznonexistentzzz", limit=5, retry_unfiltered=False
+        )
+        assert hits == []
+
 
 class TestFrequentLexemesLookupIsBounded:
     """`lexemes`/`frequent`/`selective` must run once per search, not once per
