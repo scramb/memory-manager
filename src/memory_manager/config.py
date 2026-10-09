@@ -64,6 +64,18 @@ _DEFAULT_JOBS_POLL_SECONDS = 5.0
 # token".
 _DEFAULT_ENTRA_DELTA_SYNC_SECONDS = 300.0
 
+# `WorkerConfig.personal_retention_days` (#240, ADR-0008 "Deprovisioned
+# users": "hard-deleted after PERSONAL_RETENTION_DAYS (default 30)").
+_DEFAULT_PERSONAL_RETENTION_DAYS = 30
+
+# `WorkerConfig.retention_sweep_seconds` (#240): how often `worker.build_jobs`
+# schedules the `retention` job - once a day by default, unlike the
+# `entra_delta_sync` job's 5 min: a user crosses `personal_retention_days`
+# only once, on a day boundary that is itself never more precise than
+# `disabled_at`'s own timestamp, so there is nothing to gain from checking
+# more often than that.
+_DEFAULT_RETENTION_SWEEP_SECONDS = 24 * 60 * 60.0
+
 # Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
 # "burst" is the token bucket's capacity - how many calls a key can make
 # back-to-back before the per-minute rate takes over. See `ServerConfig`'s
@@ -774,6 +786,16 @@ class WorkerConfig:
     for this deployment; `build_jobs` is what decides whether to register the
     job at all (`auth.graph.GraphClient.from_env` returning `None` otherwise),
     this field only ever carries the interval to use once it does.
+
+    `personal_retention_days` (`PERSONAL_RETENTION_DAYS`, default 30) is
+    ADR-0008's "Deprovisioned users" horizon: `worker.build_jobs`'s own
+    `retention` job erases the personal namespace and identity of every user
+    disabled at least this many days ago (#240). `retention_sweep_seconds`
+    (`RETENTION_SWEEP_SECONDS`, default 86400s/1 day) is how often that job
+    runs - both always read, the same "registered unconditionally" shape
+    `_cleanup_job` already has, since a disabled user is a fact about `users`
+    this worker can check without any further deployment-specific
+    configuration (unlike `entra_delta_sync`, which needs a `GraphClient`).
     """
 
     host: str = _DEFAULT_WORKER_HOST
@@ -781,17 +803,20 @@ class WorkerConfig:
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
     jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS
     entra_delta_sync_seconds: float = _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
+    personal_retention_days: int = _DEFAULT_PERSONAL_RETENTION_DAYS
+    retention_sweep_seconds: float = _DEFAULT_RETENTION_SWEEP_SECONDS
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> WorkerConfig:
         """Build a `WorkerConfig` from `WORKER_HOST`/`WORKER_PORT`/
-        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
-        entries of `environ`.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`/
+        `PERSONAL_RETENTION_DAYS`/`RETENTION_SWEEP_SECONDS` entries of `environ`.
 
         Raises `WorkerConfigError` with a message naming the offending
         variable if `WORKER_PORT` is not a valid port number, or any of
-        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
-        is not a positive number.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`/
+        `PERSONAL_RETENTION_DAYS`/`RETENTION_SWEEP_SECONDS` is not a positive
+        number.
         """
         host = environ.get("WORKER_HOST", _DEFAULT_WORKER_HOST)
         try:
@@ -807,6 +832,12 @@ class WorkerConfig:
             entra_delta_sync_seconds = _parse_positive_float(
                 environ, "ENTRA_DELTA_SYNC_SECONDS", _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
             )
+            personal_retention_days = _parse_positive_int(
+                environ, "PERSONAL_RETENTION_DAYS", _DEFAULT_PERSONAL_RETENTION_DAYS
+            )
+            retention_sweep_seconds = _parse_positive_float(
+                environ, "RETENTION_SWEEP_SECONDS", _DEFAULT_RETENTION_SWEEP_SECONDS
+            )
         except ServerConfigError as exc:
             # `_parse_port`/`_parse_positive_int`/`_parse_positive_float` raise
             # `ServerConfigError` (shared with `ServerConfig`, which reuses all three) -
@@ -820,6 +851,8 @@ class WorkerConfig:
             shutdown_grace_seconds=shutdown_grace_seconds,
             jobs_poll_seconds=jobs_poll_seconds,
             entra_delta_sync_seconds=entra_delta_sync_seconds,
+            personal_retention_days=personal_retention_days,
+            retention_sweep_seconds=retention_sweep_seconds,
         )
 
 
