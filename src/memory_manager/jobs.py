@@ -55,6 +55,7 @@ __all__ = [
     "enqueue",
     "fail",
     "fail_or_retry",
+    "pending_stats",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -92,6 +93,15 @@ _Connectable = asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 _ENQUEUE_SQL = """
 insert into jobs (id, kind, payload, run_after, traceparent)
 values ($1, $2, $3::jsonb, coalesce($4, now()), $5)
+"""
+
+_PENDING_STATS_SQL = """
+select kind,
+       count(*) as pending,
+       extract(epoch from (now() - min(created_at))) as oldest_age_seconds
+from jobs
+where state = 'pending'
+group by kind
 """
 
 _CLAIM_SQL = """
@@ -191,6 +201,22 @@ async def claim(
         )
         for row in rows
     ]
+
+
+async def pending_stats(pool: asyncpg.Pool) -> dict[str, tuple[int, float]]:
+    """Per-kind count and oldest age in seconds of claimable `pending` jobs -
+    `worker.py`'s own periodic gauge refresh (`mm_jobs_pending`/
+    `mm_jobs_oldest_pending_age_seconds`, #261).
+
+    Filters on `state = 'pending'` alone, the same predicate
+    `jobs_claimable_idx` (migration `0011_jobs.sql`) already carries - cheap
+    even as `done`/`failed` history grows, for the identical reason that
+    index stays small. A `kind` with nothing currently pending is simply
+    absent from the result - the caller's job is to turn that into `0` for
+    every `kind` it still cares about, not this query's.
+    """
+    rows = await pool.fetch(_PENDING_STATS_SQL)
+    return {row["kind"]: (row["pending"], row["oldest_age_seconds"]) for row in rows}
 
 
 async def complete(pool: asyncpg.Pool, job_id: str) -> None:

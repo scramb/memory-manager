@@ -90,7 +90,10 @@ get values`/the release history in plaintext, see `templates/secret.yaml`'s own 
 | `httpRoute` → `enabled` | `true` | Gateway API `HTTPRoute`, same shape as `deploy/httproute.yaml` |
 | `ingress` → `enabled` | `false` | Classic `Ingress`, for clusters without Gateway API |
 | `networkPolicy` → `enabled` | `false` | Off by default, documented; ingress scoped to configurable selectors, egress allow-all-with-DNS by default (remote IPs are operator-specific and unknown to this chart). `storage` → `backend` `postgres` renders one policy per component instead of the single `git`-mode one (#255) - `prometheus`/`cnpgOperator` name the extra ingress sources those need |
-| `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed |
+| `serviceMonitor` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed. `storage` → `backend` `postgres` scrapes `api` and `worker` as two jobs, each labeled `component` (#264), and also renders a `PodMonitor` for the CNPG `Cluster`'s own instance pods instead of its own (soon-removed) `enablePodMonitor` flag (#265) - `git` keeps the single, unchanged endpoint and no `PodMonitor` |
+| `grafanaDashboard` → `enabled` | `false` | A `ConfigMap` carrying `dashboards/memory-manager.json`, labeled for a Grafana sidecar to pick up (#265); `sidecarLabel`/`sidecarLabelValue` default to the kube-prometheus-stack chart's own sidecar default (`grafana_dashboard: "1"`) |
+| `prometheusRule` → `enabled` | `false` | Needs the Prometheus Operator CRDs installed. Alerts for per-tool p95 latency budgets, error ratio, sustained rate-limit hits, embedding lag/jobs backlog age, and (`storage` → `backend` `postgres` only) too few ready `api` replicas and a failed CNPG backup (#265) |
+| `prometheusRule` → `thresholds` | see `values.yaml` | Every threshold the rules above compare against - tune per environment without forking the chart; defaults follow F-01's own latency/error budgets |
 
 See `values.yaml` itself for the full, commented reference - this table is the summary.
 
@@ -106,7 +109,14 @@ itself must already be installed in the cluster). Valkey shared state (#254) sta
 overlay instead for Valkey's sub-millisecond counters. `networkPolicy` → `enabled` is on, with
 per-component policies for `api`, `worker` and the CNPG `Cluster`'s own instances (#255) - set
 `networkPolicy` → `ingress`/`prometheus`/`cnpgOperator` to your own gateway/monitoring/CNPG-operator
-namespace in a further overlay; they default to "matches everywhere" until you do. It is a starting
+namespace in a further overlay; they default to "matches everywhere" until you do. `serviceMonitor` →
+`enabled` is on too, scraping `api` and `worker` as two separate jobs and the CNPG `Cluster`'s own
+instance pods via a `PodMonitor` (#264, #265). `grafanaDashboard` →
+`enabled` and `prometheusRule` → `enabled` are both on, adding the dashboard `ConfigMap` and the
+alert rules covering api replica count and CNPG backup failures on top of the always-available ones
+(#265) - the backup alert stays dormant until the CNPG operator itself is new enough to bridge the
+Barman Cloud plugin's own metrics onto the instance pod's metrics port (`docs/research/cnpg-backups.md`).
+It is a starting
 overlay, not a complete install - layer your own values on top for the pieces it does not cover yet:
 
 ```sh

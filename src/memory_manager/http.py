@@ -134,7 +134,8 @@ from memory_manager.config import (
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.server import build_server
 from memory_manager.observability.logging import RequestIdMiddleware
-from memory_manager.observability.metrics import metrics_endpoint
+from memory_manager.observability.metrics import metrics_endpoint, record_rate_limit_hit
+from memory_manager.observability.tracing import TracingMiddleware
 from memory_manager.quotas import QuotaChecker, StorageQuotaChecker
 from memory_manager.storage.postgres import PostgresBackend
 
@@ -581,7 +582,12 @@ def create_app(
         Mount("/", app=_McpMount())
     )
     middleware = [
-        # Outermost: every response, including a 429/413, carries a request id.
+        # Outermost of all: one OTel server span (no-op without the extra/
+        # endpoint, #262) wraps the complete request, including the request
+        # id and rate-limit middleware below - so that span's duration is the
+        # request's actual wall time, not just the part the router sees.
+        Middleware(TracingMiddleware),
+        # Every response, including a 429/413, carries a request id.
         Middleware(RequestIdMiddleware),
         # Outermost: reject an over-limit or oversized request before
         # Origin validation, routing or auth ever run (#39).
@@ -1003,7 +1009,7 @@ class _LimitsMiddleware:
     ) -> None:
         allowed, retry_after = await _allow_or_fail_open(limiter, key_of(scope))
         if not allowed:
-            await _send_rate_limited(scope, receive, send, retry_after)
+            await _send_rate_limited(scope, receive, send, retry_after, limiter_name=limiter.name)
             return
         await self._app(scope, receive, send)
 
@@ -1024,13 +1030,17 @@ class _LimitsMiddleware:
 
         allowed, retry_after = await _allow_or_fail_open(self._mcp_limiter, key)
         if not allowed:
-            await _send_rate_limited(scope, receive, send, retry_after)
+            await _send_rate_limited(
+                scope, receive, send, retry_after, limiter_name=self._mcp_limiter.name
+            )
             return
 
         if _is_write_tool_call(body):
             allowed, retry_after = await _allow_or_fail_open(self._write_limiter, key)
             if not allowed:
-                await _send_rate_limited(scope, receive, send, retry_after)
+                await _send_rate_limited(
+                    scope, receive, send, retry_after, limiter_name=self._write_limiter.name
+                )
                 return
 
         await self._app(scope, effective_receive, send)
@@ -1144,8 +1154,9 @@ def _is_write_tool_call(body: bytes) -> bool:
 
 
 async def _send_rate_limited(
-    scope: Scope, receive: Receive, send: Send, retry_after: float
+    scope: Scope, receive: Receive, send: Send, retry_after: float, *, limiter_name: str
 ) -> None:
+    record_rate_limit_hit(limiter_name)
     seconds = max(1, math.ceil(retry_after)) if math.isfinite(retry_after) else 1
     response = PlainTextResponse(
         "rate limit exceeded", status_code=429, headers={"Retry-After": str(seconds)}

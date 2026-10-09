@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default, same shape as templates/servicemonitor.yaml: Grafana
+# itself and its sidecar are an operator's own install, never this
+# chart's job. The sidecar the kube-prometheus-stack chart ships (and
+# every other common Grafana-sidecar setup) discovers a dashboard
+# ConfigMap by a label, not by name - grafanaDashboard's own
+# sidecarLabel/sidecarLabelValue default to that sidecar's own default
+# ("grafana_dashboard: \"1\""), settable for an operator whose sidecar
+# watches a different one. The dashboard JSON itself
+# (dashboards/memory-manager.json) is a static chart file, loaded with
+# Helm's own file-inclusion helper below rather than inlined here, so it
+# stays one file to edit and one file
+# tests/chart/test_monitoring_assets.py can also load directly.
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "memory-manager.fullname" . }}-dashboard
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+data:
+  memory-manager.json: |-
+{{ .Files.Get "dashboards/memory-manager.json" | indent 4 }}
+{{- end }}

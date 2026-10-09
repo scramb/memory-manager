@@ -16,19 +16,28 @@ from __future__ import annotations
 import io
 import json
 import logging
+import secrets
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlencode
 
 import httpx
 import httpx2
 import pytest
 from mcp import Client as McpClient
 from mcp.client.streamable_http import streamable_http_client
+from prometheus_client import generate_latest
 from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.types import Message, Scope
 
+from memory_manager import jobs as jobs_outbox
 from memory_manager.app import open_services
+from memory_manager.auth.login import LOGIN_PATH, PendingAuthorization
+from memory_manager.auth.login_password import PasswordAuthenticator, hash_password
+from memory_manager.auth.ratelimit import RateLimiter
 from memory_manager.auth.tokens import ALL_NAMESPACES, create_token
 from memory_manager.config import ServerConfig
 from memory_manager.http import METRICS_PATH, WEBHOOK_PATH, create_app
@@ -41,15 +50,23 @@ from memory_manager.observability.logging import (
 )
 from memory_manager.observability.metrics import (
     GIT_OPERATIONS_TOTAL,
+    JOBS_OLDEST_PENDING_AGE_SECONDS,
+    JOBS_PENDING,
     QUEUE_DEPTH,
     QUEUE_WRITES_TOTAL,
+    RATE_LIMIT_HITS_TOTAL,
     SEARCH_DURATION_SECONDS,
     TOOL_CALLS_TOTAL,
+    set_embedding_lag_seconds,
 )
+from memory_manager.worker import _embedding_provider_configured, _refresh_metrics
 
 _NOTE_PATH = "personal/fact/a.md"
 _WEBHOOK_SECRET = "s3cr3t"  # noqa: S105 - test fixture value, not a real secret
 _PUBLIC_URL = "https://mm.example.test"
+_PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
+_ADMIN_PASSWORD = "correct horse battery staple"  # noqa: S105 - a fake test credential
 
 
 def _note_content(body: str = "Body.\n") -> str:
@@ -84,6 +101,35 @@ async def _mcp_client(
 
 def _value(labels_fn: object) -> float:
     return cast(float, labels_fn._value.get())  # type: ignore[attr-defined]
+
+
+def _metric_text_value(body: str, name: str) -> float | None:
+    """The value of the one `name` sample line in `body` (a `/metrics` response
+    or `generate_latest()` output), or `None` if `name` is absent entirely -
+    `mm_embedding_lag_seconds` has no labels, so a plain `"<name> <value>"`
+    line prefix is enough, unlike `_value`'s labelled-metric lookup above.
+    """
+    prefix = f"{name} "
+    for line in body.splitlines():
+        if line.startswith(prefix):
+            return float(line[len(prefix) :])
+    return None
+
+
+def _seq_scans_on(node: object, table: str) -> list[dict[str, object]]:
+    """Every `Seq Scan` node on `table` anywhere in an `EXPLAIN (FORMAT JSON)` tree -
+    the same shape `tests/index/test_index_plans.py`'s own `_seq_scans` uses for
+    `notes`/`links`, scoped to one table name rather than a fixed set."""
+    found: list[dict[str, object]] = []
+    if isinstance(node, dict):
+        if node.get("Node Type") == "Seq Scan" and node.get("Relation Name") == table:
+            found.append(node)
+        for value in node.values():
+            found.extend(_seq_scans_on(value, table))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_seq_scans_on(item, table))
+    return found
 
 
 @asynccontextmanager
@@ -222,6 +268,431 @@ async def test_search_duration_is_recorded_with_a_database(
     assert result.structured_content is not None
     assert result.structured_content["mode"] == "fulltext"
     assert after >= before
+
+
+# --- Rate-limit / quota rejection metrics (#260) --------------------------------
+
+
+async def test_mcp_rate_limit_rejection_increments_its_limiter_label(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    config = ServerConfig(mcp_per_minute=1, mcp_burst=1, write_per_minute=600, write_burst=600)
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="mcp"))
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first = await client.post(config.mcp_path, json=_PING, headers=headers)
+            second = await client.post(config.mcp_path, json=_PING, headers=headers)
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="mcp"))
+
+    assert first.status_code != 429
+    assert second.status_code == 429
+    assert after - before == 1
+
+
+async def test_write_rate_limit_rejection_increments_its_limiter_label(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    config = ServerConfig(mcp_per_minute=600, mcp_burst=600, write_per_minute=1, write_burst=1)
+    write_call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "memory_write", "arguments": {}},
+    }
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="write"))
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first = await client.post(config.mcp_path, json=write_call, headers=headers)
+            second = await client.post(config.mcp_path, json=write_call, headers=headers)
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="write"))
+
+    assert first.status_code != 429
+    assert second.status_code == 429
+    assert after - before == 1
+
+
+async def test_oauth_rate_limit_rejection_increments_its_limiter_label(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    config = ServerConfig(public_url=_PUBLIC_URL, oauth_per_minute=1, oauth_burst=1)
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="oauth"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first = await client.post("/register", json={})
+            second = await client.post("/register", json={})
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="oauth"))
+
+    assert first.status_code != 429
+    assert second.status_code == 429
+    assert after - before == 1
+
+
+async def test_webhook_rate_limit_rejection_increments_its_limiter_label(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    config = ServerConfig(public_url=_PUBLIC_URL, webhook_per_minute=1, webhook_burst=1)
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="webhook"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            first = await client.post(WEBHOOK_PATH, content=b"{}")
+            second = await client.post(WEBHOOK_PATH, content=b"{}")
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="webhook"))
+
+    assert first.status_code != 429
+    assert second.status_code == 429
+    assert after - before == 1
+
+
+async def test_quota_namespace_rejection_increments_its_rate_limit_label(
+    bare_remote: Path, tmp_path: Path
+) -> None:
+    """`quotas.QuotaChecker`'s `namespace` scope (WP-27, #242) applies on both storage
+    backends with no principal/token needed - unlike `user`/`token`, it needs neither a
+    database nor a bearer token to exercise here."""
+    config = ServerConfig(quota_namespace_per_minute=1)
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="quota_namespace"))
+        async with _mcp_client(app, config) as client:
+            first = await client.call_tool(
+                "memory_write",
+                {"path": "personal/fact/a.md", "content": _note_content(), "if_version": "new"},
+            )
+            second = await client.call_tool(
+                "memory_write",
+                {"path": "personal/fact/b.md", "content": _note_content(), "if_version": "new"},
+            )
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="quota_namespace"))
+
+    assert first.is_error is False
+    assert second.is_error is True
+    assert after - before == 1
+
+
+async def test_storage_quota_rejection_increments_its_rate_limit_label(
+    test_database_url: str,
+) -> None:
+    """`quotas.StorageQuotaChecker`'s note-count budget (#243, Postgres mode only) -
+    exercised directly against a real `PostgresBackend`, the same way `tests/quotas/
+    test_storage_quotas.py` already does, rather than through the full HTTP app
+    (`StorageQuotaChecker` only applies once `services.storage` actually is a
+    `PostgresBackend`, i.e. `STORAGE_BACKEND=postgres` - more setup than this
+    metric's own call site needs to prove out).
+    """
+    import asyncpg
+    from storage.contract import note_bytes
+
+    from memory_manager.db.migrate import migrate
+    from memory_manager.quotas import StorageQuotaChecker, StorageQuotaExceeded
+    from memory_manager.storage.postgres import PostgresBackend
+
+    connection = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(connection)
+    finally:
+        await connection.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        backend = PostgresBackend(pool)
+        await backend.write(
+            "alice/fact/a.md",
+            note_bytes(),
+            if_version="new",
+            client="tester-client",
+            actor="tester",
+        )
+        checker = StorageQuotaChecker(storage=backend, max_notes_personal=1)
+
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="quota_storage_notes"))
+        with pytest.raises(StorageQuotaExceeded):
+            await checker.check_write(
+                op="write",
+                path="alice/fact/b.md",
+                namespace="alice",
+                namespace_kind="personal",
+                is_new_note=True,
+                final_size=len(note_bytes()),
+                actor="tester",
+                client="tester-client",
+            )
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="quota_storage_notes"))
+    finally:
+        await pool.close()
+
+    assert after - before == 1
+
+
+def _form_request(path: str, form: dict[str, str], *, client_ip: str = "9.9.9.9") -> Request:
+    """A minimal `starlette.requests.Request` carrying `form` as its urlencoded body -
+    just enough for `PasswordAuthenticator.handle` (`request.form()`/`request.client`),
+    without driving a real ASGI connection or the full `/authorize` -> `/login` dance
+    `tests/auth/test_login.py` exercises for the login flow itself."""
+    body = urlencode(form).encode("ascii")
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope: Scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+        "client": (client_ip, 12345),
+    }
+    return Request(scope, receive)
+
+
+async def test_login_brute_force_rejection_increments_its_rate_limit_label() -> None:
+    """`auth/login_password.py`'s brute-force window (ADR-0004), exercised directly
+    against `PasswordAuthenticator.handle` - the metric this adds is the only thing
+    under test here, not the full `/authorize` -> `/login` flow `tests/auth/
+    test_login.py`'s `test_password_login_blocks_the_sixth_attempt_even_with_the_
+    right_password` already covers end to end.
+    """
+    authenticator = PasswordAuthenticator(
+        password_hash=hash_password(_ADMIN_PASSWORD), namespaces=["*"]
+    )
+    pending = PendingAuthorization(
+        id="pending-1",
+        client_id="client",
+        client_name=None,
+        scopes=(),
+        resource=None,
+        redirect_uri="https://example.test/callback",
+    )
+
+    async def complete(subject: str, namespaces: object, principal: object = None) -> str | None:
+        raise AssertionError("a blocked attempt must never reach complete()")
+
+    for _ in range(5):
+        failed = await authenticator.handle(
+            _form_request(LOGIN_PATH, {"pending": pending.id, "password": "wrong"}),
+            pending,
+            complete,
+        )
+        assert failed.status_code == 401
+
+    before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="login"))
+    blocked = await authenticator.handle(
+        _form_request(LOGIN_PATH, {"pending": pending.id, "password": _ADMIN_PASSWORD}),
+        pending,
+        complete,
+    )
+    after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="login"))
+
+    assert blocked.status_code == 429
+    assert after - before == 1
+
+
+async def test_a_fail_open_rate_limit_backend_error_does_not_increment_the_hit_metric(
+    bare_remote: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`http._allow_or_fail_open` swallows a `SharedState` backend error and allows the
+    request through - `RateLimiter.allow` raising here stands in for that backend
+    outage, the same contract `tests/quotas/test_rate_quotas.py`'s own fail-open test
+    uses for `QuotaChecker`. Never reaching `_send_rate_limited` at all means
+    `mm_rate_limit_hits_total` is never touched - a backend outage must not look like
+    a wave of clients being rejected.
+    """
+
+    async def _raising_allow(self: RateLimiter, key: str) -> tuple[bool, float]:
+        raise RuntimeError("shared-state backend unavailable")
+
+    monkeypatch.setattr(RateLimiter, "allow", _raising_allow)
+
+    config = ServerConfig(mcp_per_minute=1, mcp_burst=1)
+    async with _running_app(_environ(bare_remote, tmp_path), config) as app:
+        before = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="mcp"))
+        transport = httpx.ASGITransport(app=app)
+        headers = {**_MCP_HEADERS, "Authorization": "Bearer same-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(config.mcp_path, json=_PING, headers=headers)
+        after = _value(RATE_LIMIT_HITS_TOTAL.labels(limiter="mcp"))
+
+    assert response.status_code != 429
+    assert after == before
+
+
+# --- Worker metrics refresh (#261) ----------------------------------------------
+
+
+def test_embedding_lag_feature_flag_reflects_the_embedding_provider_env() -> None:
+    """`worker._embedding_provider_configured` reads `EMBEDDING_PROVIDER`/`EMBEDDING_URL`
+    straight from an `environ` mapping - no database, no real provider construction."""
+    assert _embedding_provider_configured({}) is False
+    assert _embedding_provider_configured({"EMBEDDING_PROVIDER": "none"}) is False
+    assert (
+        _embedding_provider_configured(
+            {"EMBEDDING_PROVIDER": "ollama", "EMBEDDING_URL": "http://localhost:11434"}
+        )
+        is True
+    )
+    # An invalid configuration (missing `EMBEDDING_URL` for a real provider) is
+    # treated as "no provider", not raised through to the worker's own loop.
+    assert _embedding_provider_configured({"EMBEDDING_PROVIDER": "openai"}) is False
+
+
+async def test_jobs_pending_gauges_reflect_backlog_and_reset_once_processed(
+    test_database_url: str,
+) -> None:
+    """`worker._refresh_metrics` sets `mm_jobs_pending`/`mm_jobs_oldest_pending_age_
+    seconds` for every `kind` it is told about from a real `jobs` outbox query
+    (`jobs.pending_stats`) - and back to `0` once every row of that kind is `done`,
+    never left stuck at its last non-zero value."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    kind = f"wp31-probe-{secrets.token_hex(4)}"
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        job_ids = []
+        async with pool.acquire() as conn, conn.transaction():
+            for _ in range(2):
+                job_ids.append(await jobs_outbox.enqueue(conn, kind, {}))
+
+        await _refresh_metrics(pool, kinds=(kind,), embedding_lag_enabled=False)
+        assert _value(JOBS_PENDING.labels(kind=kind)) == 2
+        assert _value(JOBS_OLDEST_PENDING_AGE_SECONDS.labels(kind=kind)) >= 0.0
+
+        for job_id in job_ids:
+            await jobs_outbox.complete(pool, job_id)
+
+        await _refresh_metrics(pool, kinds=(kind,), embedding_lag_enabled=False)
+        assert _value(JOBS_PENDING.labels(kind=kind)) == 0
+        assert _value(JOBS_OLDEST_PENDING_AGE_SECONDS.labels(kind=kind)) == 0.0
+    finally:
+        await pool.close()
+
+
+async def test_jobs_pending_stats_query_never_plans_a_sequential_scan_on_jobs(
+    test_database_url: str,
+) -> None:
+    """`jobs.pending_stats` - the one query every #261 gauge is derived from, including
+    `mm_embedding_lag_seconds` (rework: no longer a `notes`/`chunks` join) - must use
+    `jobs_claimable_idx`'s partial index, never a sequential scan over `jobs`, even with
+    a large `done` backlog behind it. Same "assert via `EXPLAIN`, never via
+    `enable_seqscan` off" shape `tests/index/test_index_plans.py` already uses for
+    `notes`/`links`.
+    """
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+    from memory_manager.jobs import _PENDING_STATS_SQL
+
+    connection = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(connection)
+        # A large, already-`done` backlog - large enough that a sequential scan
+        # over `jobs` would be unmistakably worse than using the partial index
+        # in the planner's own cost estimate, after `ANALYZE`.
+        await connection.execute(
+            """
+            insert into jobs (id, kind, state, run_after, created_at)
+            select 'j' || lpad(i::text, 8, '0'), 'embed_note', 'done', now(), now()
+            from generate_series(1, 200000) as i
+            """
+        )
+        await connection.execute(
+            "insert into jobs (id, kind, state, run_after, created_at) values "
+            "('j-pending-1', 'embed_note', 'pending', now(), now() - interval '30 seconds')"
+        )
+        await connection.execute("analyze jobs")
+
+        rows = await connection.fetch(f"explain (format json) {_PENDING_STATS_SQL}")
+        raw_plan = rows[0]["QUERY PLAN"]
+        plan = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+        scans = _seq_scans_on(plan, "jobs")
+        assert not scans, f"sequential scan on jobs for pending_stats: {scans}"
+    finally:
+        await connection.close()
+
+
+async def test_embedding_lag_seconds_reflects_the_oldest_pending_embed_note_job(
+    test_database_url: str,
+) -> None:
+    """`worker._refresh_metrics` with `embedding_lag_enabled=True` sets
+    `mm_embedding_lag_seconds` to the age of the oldest still-pending `"embed_note"`
+    job (the `jobs` outbox, never a `notes`/`chunks` scan - #261 rework: that scan
+    has no supporting index and would run unbounded by backlog size on every
+    worker replica every round), and back to `0` (still exported, not absent - a
+    provider is configured in this branch) once that job is `complete`d."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            job_id = await jobs_outbox.enqueue(
+                conn, "embed_note", {"note_id": "n-1", "version": "h1"}
+            )
+
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=True)
+        body = generate_latest().decode()
+        lag = _metric_text_value(body, "mm_embedding_lag_seconds")
+        assert lag is not None
+        assert lag >= 0.0
+
+        await jobs_outbox.complete(pool, job_id)
+
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=True)
+        body_after = generate_latest().decode()
+        lag_after = _metric_text_value(body_after, "mm_embedding_lag_seconds")
+        assert lag_after == 0.0
+    finally:
+        await pool.close()
+
+
+async def test_embedding_lag_seconds_is_not_exported_without_an_embedding_provider(
+    test_database_url: str,
+) -> None:
+    """With `embedding_lag_enabled=False` (no embedding provider configured),
+    `mm_embedding_lag_seconds` is absent from `/metrics` altogether - even if an
+    earlier, provider-configured round of this same process already set it."""
+    import asyncpg
+
+    from memory_manager.db.migrate import migrate
+
+    migration_conn = await asyncpg.connect(test_database_url)
+    try:
+        await migrate(migration_conn)
+    finally:
+        await migration_conn.close()
+
+    pool = await asyncpg.create_pool(test_database_url)
+    try:
+        set_embedding_lag_seconds(123.0)
+        await _refresh_metrics(pool, kinds=(), embedding_lag_enabled=False)
+        body = generate_latest().decode()
+        assert _metric_text_value(body, "mm_embedding_lag_seconds") is None
+    finally:
+        set_embedding_lag_seconds(None)
+        await pool.close()
 
 
 # --- /metrics -----------------------------------------------------------------

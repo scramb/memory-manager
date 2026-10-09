@@ -3,7 +3,15 @@
 # Off by default, needs the Prometheus Operator's CRDs installed.
 # observability/metrics.py's own /metrics - no auth of its own, scraped
 # only from inside the cluster; restrict further with networkPolicy if
-# the Prometheus Operator is not in the same namespace.
+# the Prometheus Operator is not in the same namespace. storage's own
+# backend "postgres" selects both the api Service (templates/service.yaml)
+# and the worker Service (templates/worker-service.yaml) through one
+# common selector, then one endpoint per component filters itself to the
+# matching Service via its own "component" label and relabels that same
+# value onto the scraped series (#264) - two Prometheus jobs instead of
+# one, since api and worker are two independently-scaling Deployments.
+# storage's own backend "git" keeps the single, unchanged endpoint
+# selecting the one Service this chart has always rendered.
 {{- if .Values.serviceMonitor.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -19,7 +27,28 @@ spec:
     matchLabels:
       {{- include "memory-manager.selectorLabels" . | nindent 6 }}
   endpoints:
+{{- if eq .Values.storage.backend "postgres" }}
     - port: http
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          regex: api
+          action: keep
+        - targetLabel: component
+          replacement: api
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          regex: worker
+          action: keep
+        - targetLabel: component
+          replacement: worker
+{{- else }}
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}
 {{- end }}

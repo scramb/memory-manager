@@ -277,13 +277,29 @@ covered here.
 ## 9. Observability
 
 `/metrics` is on by default (`metrics.enabled`); turning on `serviceMonitor.enabled` needs the
-Prometheus Operator CRDs from the prerequisites table above. A Grafana dashboard and
-`PrometheusRule` alerts covering latency budgets, errors, rate limits and embedding lag are
-tracked separately (WP-31, #265) and not available yet — this guide stops at "metrics are being
-exported", not "here is what to alert on".
+Prometheus Operator CRDs from the prerequisites table above and also renders a `PodMonitor` for
+the CNPG `Cluster`'s own instance pods (#265) - not the `Cluster`'s own `monitoring.enablePodMonitor`
+flag, which the CNPG project itself has already started deprecating (`docs/research/cnpg-backups.md`
+records exactly which released patch).
+
+Turn `grafanaDashboard.enabled` and `prometheusRule.enabled` on for a Grafana dashboard and a
+`PrometheusRule` (#265, `charts/memory-manager/README.md`'s own "Values" table documents every
+key): per-tool call rate/error rate/p95 latency, search p95 by mode, rate-limit hits by limiter,
+the embedding job backlog/lag, and - this profile only - fewer than `prometheusRule.thresholds.minReadyApiReplicas`
+ready `api` pods and a failed CNPG object-store backup. Every threshold lives under
+`prometheusRule.thresholds`, tunable without forking the chart. The backup alert needs the CNPG
+operator itself on CNPG 1.27 or later to actually see the Barman Cloud plugin's own backup
+timestamps - it stays dormant, not wrong, on the CNPG 1.26 line this profile's own prerequisites
+table above still allows (`docs/research/cnpg-backups.md` has the verified source); every other
+alert works regardless of the operator's own version.
+
+`grafanaDashboard.enabled` only renders a `ConfigMap` carrying the dashboard JSON, labeled for a
+Grafana sidecar to pick up - Grafana and its sidecar are an operator's own install, same as
+Prometheus itself.
 
 ## Not included
 
 - The v0.2.0 upgrade guide (WP-34).
 - Compliance templates for data flow, records of processing and TOMs (WP-33).
-- The Grafana dashboard/`PrometheusRule` alert reference (WP-31, #265).
+- Alertmanager routing for the `PrometheusRule` alerts above (operator-specific, #265).
+- Installing Grafana, its sidecar, Prometheus or the Prometheus Operator itself.

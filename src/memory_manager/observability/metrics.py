@@ -27,8 +27,32 @@ What each metric answers:
 - `mm_quota_hits_total` (`scope`, `outcome`): every `quotas.QuotaChecker`
   write-quota check, labeled by scope (`user`/`namespace`/`token`) and
   `outcome` (`"allowed"`/`"rejected"`) - via `record_quota_hit`.
+- `mm_rate_limit_hits_total` (`limiter`): every request actually rejected by
+  a rate limiter or a quota check - never a fail-open backend error, which
+  every call site already treats as allowed before this is ever reached
+  (#260). Fixed `limiter` values: `"mcp"`/`"write"`/`"oauth"`/`"webhook"`
+  (`http.py`'s `_send_rate_limited` call sites, one per `RateLimiter`),
+  `"login"` (the password brute-force window, `auth/login_password.py`),
+  `"quota_user"`/`"quota_namespace"`/`"quota_token"` (WP-27's three
+  `quotas.QuotaChecker` scopes) and `"quota_storage_notes"`/
+  `"quota_storage_bytes"` (`quotas.StorageQuotaChecker`'s two resources,
+  #243) - via `record_rate_limit_hit`.
 - `mm_build_info` (`version`, `commit`): set once at import, same values
   `/healthz` already reports (ADR-0002 §13).
+- `mm_jobs_pending`/`mm_jobs_oldest_pending_age_seconds` (`kind`): the `jobs`
+  outbox's own backlog, by job kind - `worker.py`'s periodic metrics-refresh
+  loop (#261) sets both for every kind it knows how to handle (bounded
+  cardinality: today just `"embed_note"`), via `set_jobs_pending`. Every
+  known kind is refreshed every round, including back down to `0` once its
+  backlog is drained - never left stuck at whatever it last was.
+- `mm_embedding_lag_seconds`: age in seconds of the oldest still-pending (or
+  retrying) `"embed_note"` job in the `jobs` outbox - the same worker loop,
+  via `set_embedding_lag_seconds`, but only while an embedding provider is
+  actually configured (`worker._embedding_provider_configured`): without
+  one, no `"embed_note"` job is ever claimed, so this metric is absent from
+  `/metrics` altogether rather than reporting an ever-growing, misleading
+  number (`_EmbeddingLagCollector`, the one metric here that is not a plain
+  `Gauge` for exactly this reason).
 
 Never records a note's content or a token - every label here is a tool
 name, an `Op` literal, a git subcommand or a search mode: operational
@@ -44,7 +68,16 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mappin
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, TypeVar
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, Info, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    Counter,
+    Gauge,
+    Histogram,
+    Info,
+    generate_latest,
+)
+from prometheus_client.core import GaugeMetricFamily
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
@@ -54,10 +87,13 @@ __all__ = [
     "GIT_DURATION_SECONDS",
     "GIT_OPERATIONS_TOTAL",
     "INDEX_NOTES",
+    "JOBS_OLDEST_PENDING_AGE_SECONDS",
+    "JOBS_PENDING",
     "METRICS_ENABLED_ENV",
     "QUEUE_DEPTH",
     "QUEUE_WRITES_TOTAL",
     "QUOTA_HITS_TOTAL",
+    "RATE_LIMIT_HITS_TOTAL",
     "SEARCH_DURATION_SECONDS",
     "TOOL_CALLS_TOTAL",
     "TOOL_DURATION_SECONDS",
@@ -65,6 +101,9 @@ __all__ = [
     "metrics_endpoint",
     "record_queue_write",
     "record_quota_hit",
+    "record_rate_limit_hit",
+    "set_embedding_lag_seconds",
+    "set_jobs_pending",
     "track_git_operation",
     "track_search",
     "track_tool_call",
@@ -92,9 +131,50 @@ SEARCH_DURATION_SECONDS = Histogram(
 )
 INDEX_NOTES = Gauge("mm_index_notes", "Notes currently held in the Postgres index.")
 QUOTA_HITS_TOTAL = Counter("mm_quota_hits_total", "Write quota checks.", ["scope", "outcome"])
+RATE_LIMIT_HITS_TOTAL = Counter(
+    "mm_rate_limit_hits_total", "Requests rejected by a rate limiter or quota.", ["limiter"]
+)
+JOBS_PENDING = Gauge("mm_jobs_pending", "Jobs currently pending in the outbox, by kind.", ["kind"])
+JOBS_OLDEST_PENDING_AGE_SECONDS = Gauge(
+    "mm_jobs_oldest_pending_age_seconds",
+    "Age in seconds of the oldest pending job, by kind.",
+    ["kind"],
+)
 
 _BUILD_INFO = Info("mm_build", "The version and commit this process was built from.")
 _BUILD_INFO.info({"version": __version__, "commit": __commit__})
+
+
+class _EmbeddingLagCollector:
+    """Backs `mm_embedding_lag_seconds` (#261): a plain `Gauge` reports `0` from
+    the moment it is created, even before anything ever calls `.set()` - the
+    wrong default here, since "0 lag" and "no embedding provider configured
+    at all" must never look the same on `/metrics`. `collect()` yields no
+    sample at all while `_seconds` is `None` (the initial state, and
+    `set_embedding_lag_seconds(None)`'s own reset) - the one escape hatch a
+    plain `prometheus_client` metric type does not give a caller, which is
+    why this metric alone is a custom `Collector` rather than a `Gauge`.
+    """
+
+    def __init__(self) -> None:
+        self._seconds: float | None = None
+
+    def set(self, seconds: float | None) -> None:
+        self._seconds = seconds
+
+    def collect(self) -> Iterator[GaugeMetricFamily]:
+        if self._seconds is None:
+            return
+        family = GaugeMetricFamily(
+            "mm_embedding_lag_seconds",
+            "Age in seconds of the oldest note revision without a current embedding.",
+        )
+        family.add_metric([], self._seconds)
+        yield family
+
+
+_EMBEDDING_LAG_COLLECTOR = _EmbeddingLagCollector()
+REGISTRY.register(_EMBEDDING_LAG_COLLECTOR)
 
 _ToolFunc = TypeVar("_ToolFunc", bound=Callable[..., Awaitable[Any]])
 
@@ -164,6 +244,38 @@ def record_queue_write(op: str, outcome: str) -> None:
 def record_quota_hit(*, scope: str, outcome: str) -> None:
     """`mm_quota_hits_total`'s one call site: `quotas.QuotaChecker`'s own write check."""
     QUOTA_HITS_TOTAL.labels(scope=scope, outcome=outcome).inc()
+
+
+def record_rate_limit_hit(limiter: str) -> None:
+    """`mm_rate_limit_hits_total`'s one metric: a request actually rejected by
+    `limiter` - never a fail-open backend error (module docstring's list of
+    fixed `limiter` values). Called from `http.py`'s `_send_rate_limited`,
+    `auth/login_password.py`'s brute-force rejection, `quotas.QuotaChecker`'s
+    `_enforce` rejection branch and `quotas.StorageQuotaChecker`'s `_reject` -
+    each already past its own fail-open check by the time this runs, so a
+    transient backend outage never shows up here."""
+    RATE_LIMIT_HITS_TOTAL.labels(limiter=limiter).inc()
+
+
+def set_jobs_pending(kind: str, pending: int, oldest_age_seconds: float) -> None:
+    """`mm_jobs_pending`/`mm_jobs_oldest_pending_age_seconds`'s one call site:
+    `worker.py`'s own periodic metrics-refresh loop (#261), once per job
+    `kind` it knows how to handle - called every round for every such
+    `kind`, including with `pending=0` once its backlog is drained, so
+    neither gauge is ever left stuck at a stale, non-zero value.
+    """
+    JOBS_PENDING.labels(kind=kind).set(pending)
+    JOBS_OLDEST_PENDING_AGE_SECONDS.labels(kind=kind).set(oldest_age_seconds)
+
+
+def set_embedding_lag_seconds(seconds: float | None) -> None:
+    """`mm_embedding_lag_seconds`'s one call site: `worker.py`'s own periodic
+    metrics-refresh loop (#261). `None` - always passed while no embedding
+    provider is configured (`worker._embedding_provider_configured`) - clears
+    any previous value, so the metric is absent from `/metrics` altogether
+    rather than stuck at whatever it last was (`_EmbeddingLagCollector.collect`).
+    """
+    _EMBEDDING_LAG_COLLECTOR.set(seconds)
 
 
 def _git_op_name(args: Sequence[str]) -> str:

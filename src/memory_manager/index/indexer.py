@@ -46,13 +46,15 @@ acquisition, no second transaction - leaving the chunks it just wrote with
 `embedding` `NULL`, same as every other upsert. Embedding them is not this
 module's job to run inline any more (#219): on that same connection, still
 inside that same transaction, `index_on_connection` enqueues one
-`"embed_note"` job (`jobs.enqueue`, note id + `file_hash`) for the worker
-process to pick up once the write has committed - `jobs.enqueue`'s own
-`pg_notify` only ever fires on commit, so a rolled-back write never wakes a
-worker for a job that no longer exists either. `embed_note_job` is that
-job's handler (`worker.py`'s `build_job_handlers`): skips if the note's
-`file_hash` has already moved on (a newer write's own job will embed the
-current chunks instead), otherwise embeds whatever is still stale and lets
+`"embed_note"` job (`jobs.enqueue`, note id + `file_hash`, plus
+`observability.tracing.current_traceparent()` so a worker span can continue
+this request's own trace, #263 WP-31) for the worker process to pick up
+once the write has committed - `jobs.enqueue`'s own `pg_notify` only ever
+fires on commit, so a rolled-back write never wakes a worker for a job
+that no longer exists either. `embed_note_job` is that job's handler
+(`worker.py`'s `build_job_handlers`): skips if the note's `file_hash` has
+already moved on (a newer write's own job will embed the current chunks
+instead), otherwise embeds whatever is still stale and lets
 `EmbeddingError` propagate so the worker retries with backoff, rather than
 swallowing it the way the batch path's `_embed_note` does.
 
@@ -82,6 +84,7 @@ from memory_manager.db.migrate import POSTGRES_VECTOR_LAYOUT_VERSION
 from memory_manager.index.chunker import chunk_note
 from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
 from memory_manager.jobs import enqueue as enqueue_job
+from memory_manager.observability.tracing import current_traceparent
 from memory_manager.vault.links import (
     LinkRef,
     ResolvedLink,
@@ -390,7 +393,12 @@ class Indexer:
             conn, note.id, note_path.namespace, note_path.slug, note.aliases
         )
         if self._provider is not None:
-            await enqueue_job(conn, "embed_note", {"note_id": note.id, "version": file_hash})
+            await enqueue_job(
+                conn,
+                "embed_note",
+                {"note_id": note.id, "version": file_hash},
+                traceparent=current_traceparent(),
+            )
 
     async def schedule_embeddings(self, note_ids: Sequence[str]) -> None:
         """Embed `note_ids`' chunks in the background, never awaited by the caller.
@@ -682,7 +690,10 @@ class Indexer:
             )
             for row in rows:
                 await enqueue_job(
-                    conn, "embed_note", {"note_id": row["note_id"], "version": row["file_hash"]}
+                    conn,
+                    "embed_note",
+                    {"note_id": row["note_id"], "version": row["file_hash"]},
+                    traceparent=current_traceparent(),
                 )
         return len(rows)
 

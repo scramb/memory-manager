@@ -64,3 +64,19 @@ valkey:
 # gateway/Prometheus/CNPG-operator namespace in a further overlay.
 networkPolicy:
   enabled: true
+
+# Two Prometheus scrape jobs instead of one (#264, templates/
+# servicemonitor.yaml) - api and worker each get their own component
+# label, since they are two independently-scaling Deployments here.
+serviceMonitor:
+  enabled: true
+
+# A Grafana dashboard (sidecar-discovered ConfigMap) and a PrometheusRule
+# with alerts covering latency budgets, errors, rate limits, embedding
+# lag, api replica count and CNPG backup failures (#265) - both need
+# their own CRDs/sidecar already installed, same as serviceMonitor above.
+grafanaDashboard:
+  enabled: true
+
+prometheusRule:
+  enabled: true

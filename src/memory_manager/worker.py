@@ -85,6 +85,28 @@ so only a bug in the loop itself, not a failing job, could cause this) means
 this worker is no longer doing anything useful, the same "not ready" signal
 a database outage gives.
 
+A third, unrelated loop `create_worker_app` always starts alongside the
+above (`_metrics_refresh_loop`, #261): `mm_jobs_pending`/`mm_jobs_oldest_
+pending_age_seconds` (`observability.metrics.set_jobs_pending`, one call per
+`job_handlers` kind every round) and, only while an embedding provider is
+actually configured (`_embedding_provider_configured`, read directly from
+the environment the same way `observability.metrics.metrics_enabled`
+already does - cheaper than threading a new parameter through `cli.py`'s
+`_serve_worker` just for this), `mm_embedding_lag_seconds`
+(`observability.metrics.set_embedding_lag_seconds`) - both from the single
+`jobs.pending_stats` call `_refresh_metrics` makes each round, bounded by
+`jobs_claimable_idx`'s own partial index rather than by the size of `jobs`
+or `chunks`: the embedding lag is the age of the oldest still-pending
+`"embed_note"` job, the same backlog `mm_jobs_pending{kind="embed_note"}`
+already reports, not a separate `notes`/`chunks` scan. Unlike the
+singleton `Job`s above, this loop takes no advisory lock: every worker
+replica's own `/metrics` must reflect the current state on its own, not
+whichever replica happened to win a race this round. Deliberately left out
+of `app.state.tasks`/`/readyz`'s own `jobs_running` check - a worker with no
+registered `Job` and no `jobs` outbox handler is still "not ready" by that
+check's own existing contract (`tests/worker/test_singleton.py`), which this
+always-on loop must not change.
+
 Graceful shutdown (ADR-0009 §1/§5, mirrored from `http.py`'s own): on
 shutdown, `create_worker_app`'s `lifespan` stops every job loop from
 scheduling another run and waits up to `WorkerConfig.shutdown_grace_seconds`
@@ -103,6 +125,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -119,9 +142,20 @@ from memory_manager.auth import store
 from memory_manager.auth.graph import GraphClient, GraphDeltaExpired
 from memory_manager.auth.shared_state import PostgresSharedState
 from memory_manager.auth.users import disable_user, enable_user, get_user
-from memory_manager.config import ServerConfig, WorkerConfig, rate_limit_sweep_floor_seconds
+from memory_manager.config import (
+    EmbeddingConfig,
+    EmbeddingConfigError,
+    ServerConfig,
+    WorkerConfig,
+    rate_limit_sweep_floor_seconds,
+)
 from memory_manager.index.indexer import Indexer
-from memory_manager.observability.metrics import metrics_endpoint
+from memory_manager.observability.metrics import (
+    metrics_endpoint,
+    set_embedding_lag_seconds,
+    set_jobs_pending,
+)
+from memory_manager.observability.tracing import job_span
 
 __all__ = [
     "Job",
@@ -147,6 +181,14 @@ _SOURCE_URL = "https://github.com/scramb/memory-manager"
 #: run it, so a shorter interval would only cost extra skipped lock attempts,
 #: never duplicate work.
 _CLEANUP_INTERVAL_SECONDS = 60 * 60
+
+#: `_metrics_refresh_loop`'s own default interval (#261's "configurable,
+#: default 15 s") - a plain module constant, like `_CLEANUP_INTERVAL_SECONDS`
+#: above, rather than a new `WORKER_*` environment variable: `create_worker_
+#: app`'s own `metrics_refresh_seconds` parameter is the configuration seam
+#: (`cli.py`'s `_serve_worker` could thread a variable into it later without
+#: any further change here), this is only ever this module's own fallback.
+_METRICS_REFRESH_INTERVAL_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -216,6 +258,106 @@ async def _job_loop(pool: asyncpg.Pool, job: Job, stop: asyncio.Event) -> None:
             await _run_singleton(pool, job)
         except Exception:
             _logger.exception("worker job %r failed", job.name)
+
+
+# --- the metrics-refresh loop (#261) ----------------------------------------
+#
+# Unrelated to both loop shapes above: no advisory lock (module docstring -
+# every worker replica's own `/metrics` must reflect the current state on
+# its own), and no `jobs`-outbox claiming either. Just a plain interval loop
+# that re-runs one cheap read-only query (`jobs.pending_stats`, already
+# bounded by `jobs_claimable_idx`'s own partial-index predicate, not by the
+# size of `jobs` as a whole, let alone `chunks` - a first version of this
+# loop computed `mm_embedding_lag_seconds` from a `notes`/`chunks` join on
+# `embedding is null` instead; rejected in review (#261) for exactly that
+# reason - an unindexed predicate over a table that can hold millions of
+# rows, scanned by every worker replica every 15s) and pushes its result
+# into `observability.metrics`' gauges.
+
+#: The one `jobs.kind` `mm_embedding_lag_seconds` is derived from - the same
+#: literal `index.indexer.Indexer.index_on_connection`/`build_job_handlers`
+#: already use for this job kind, not re-exported as a shared constant
+#: there: this is the only place outside those two that needs to name it.
+_EMBED_NOTE_KIND = "embed_note"
+
+
+def _embedding_provider_configured(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether `EMBEDDING_PROVIDER` names a real provider, not `"none"`
+    (`config.EmbeddingConfig`'s own default) - read directly from the
+    environment, the same `environ: Mapping[str, str] | None = None` shape
+    `observability.metrics.metrics_enabled` already uses, rather than
+    threading a new parameter through `cli.py`'s `_serve_worker` just for
+    this one boolean (`EmbeddingConfig.from_env` reads a handful of
+    `EMBEDDING_*` variables already read there a second time - no network
+    call, nothing expensive to repeat here). An invalid configuration
+    (`EmbeddingConfigError` - `_serve_worker` itself already refuses to start
+    over the identical error) is treated as "no provider": this function
+    only ever decides whether `mm_embedding_lag_seconds` is worth computing
+    at all, never anything that should itself fail a worker round over a
+    config problem belonging to a different code path entirely.
+    """
+    raw = dict(environ) if environ is not None else dict(os.environ)
+    try:
+        return EmbeddingConfig.from_env(raw).provider != "none"
+    except EmbeddingConfigError:
+        return False
+
+
+async def _refresh_metrics(
+    pool: asyncpg.Pool, *, kinds: Sequence[str], embedding_lag_enabled: bool
+) -> None:
+    """One round of #261's metrics refresh - a single `jobs.pending_stats` call
+    (bounded by `jobs_claimable_idx`'s own partial index, never by `jobs`'s
+    total size) feeds both gauges:
+
+    - `mm_jobs_pending`/`mm_jobs_oldest_pending_age_seconds` for every `kinds`
+      entry, with `(0, 0.0)` for a `kind` the query no longer returns - the
+      backlog it just finished draining.
+    - `mm_embedding_lag_seconds`, iff `embedding_lag_enabled`: the same
+      `_EMBED_NOTE_KIND` entry `pending_stats` already computed - "how far
+      behind embeddings are" is exactly the age of the oldest still-pending
+      (or retrying; `jobs.fail_or_retry` keeps a retried job `'pending'`)
+      `"embed_note"` job, `0.0` once none is. Reset to absent
+      (`set_embedding_lag_seconds(None)`) while disabled instead - never left
+      at a stale value from an earlier round in the (production-impossible,
+      but test-observable) case this flag ever flips.
+    """
+    stats = await jobs.pending_stats(pool)
+    for kind in kinds:
+        pending, oldest_age_seconds = stats.get(kind, (0, 0.0))
+        set_jobs_pending(kind, pending, oldest_age_seconds)
+
+    if not embedding_lag_enabled:
+        set_embedding_lag_seconds(None)
+        return
+
+    _pending, oldest_age_seconds = stats.get(_EMBED_NOTE_KIND, (0, 0.0))
+    set_embedding_lag_seconds(oldest_age_seconds)
+
+
+async def _metrics_refresh_loop(
+    pool: asyncpg.Pool,
+    stop: asyncio.Event,
+    *,
+    interval_seconds: float,
+    kinds: Sequence[str],
+    embedding_lag_enabled: bool,
+) -> None:
+    """Run `_refresh_metrics` every `interval_seconds` until `stop` is set -
+    same scheduling shape as `_job_loop` (a failed round is logged and
+    retried next interval, never allowed to crash this loop), just without
+    `_run_singleton`'s advisory lock (module docstring).
+    """
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+            return
+        except TimeoutError:
+            pass
+        try:
+            await _refresh_metrics(pool, kinds=kinds, embedding_lag_enabled=embedding_lag_enabled)
+        except Exception:
+            _logger.exception("metrics refresh failed")
 
 
 async def _cleanup_job(pool: asyncpg.Pool, *, rate_limit_window_floor_seconds: float) -> None:
@@ -475,19 +617,27 @@ async def _dispatch_job(
     below, retried with backoff through `jobs.fail_or_retry`), an unknown kind
     can never succeed on a later attempt, so retrying it would only delay the
     same outcome.
+
+    The whole call runs inside `observability.tracing.job_span` (#263
+    WP-31): a CONSUMER span continuing `job.traceparent` (the enqueuing
+    request's own trace, `index/indexer.py`'s `current_traceparent()` call)
+    when it is set, or starting a fresh trace otherwise - a handler's own DB
+    statements (`db_span`, where they use it) nest under this span the same
+    way they nest under `TracingMiddleware`'s SERVER span on the request path.
     """
-    handler = handlers.get(job.kind)
-    if handler is None:
-        _logger.error("job %s: no handler registered for kind %r, failing", job.id, job.kind)
-        await jobs.fail(pool, job.id, error=f"unknown job kind {job.kind!r}")
-        return
-    try:
-        await handler(pool, job.payload)
-    except Exception as exc:
-        _logger.exception("job %s (kind=%r) failed", job.id, job.kind)
-        await jobs.fail_or_retry(pool, job.id, error=str(exc), max_attempts=max_attempts)
-    else:
-        await jobs.complete(pool, job.id)
+    with job_span(job.kind, job_id=job.id, attempt=job.attempts, traceparent=job.traceparent):
+        handler = handlers.get(job.kind)
+        if handler is None:
+            _logger.error("job %s: no handler registered for kind %r, failing", job.id, job.kind)
+            await jobs.fail(pool, job.id, error=f"unknown job kind {job.kind!r}")
+            return
+        try:
+            await handler(pool, job.payload)
+        except Exception as exc:
+            _logger.exception("job %s (kind=%r) failed", job.id, job.kind)
+            await jobs.fail_or_retry(pool, job.id, error=str(exc), max_attempts=max_attempts)
+        else:
+            await jobs.complete(pool, job.id)
 
 
 async def consume_jobs(
@@ -568,6 +718,7 @@ def create_worker_app(
     job_handlers: Mapping[str, JobHandler] | None = None,
     jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS,
     jobs_batch_size: int = _DEFAULT_JOBS_BATCH_SIZE,
+    metrics_refresh_seconds: float = _METRICS_REFRESH_INTERVAL_SECONDS,
 ) -> Starlette:
     """Build the worker's own minimal Starlette app: `/healthz`, `/readyz`,
     `/metrics`, plus a `lifespan` that runs one `_job_loop` per `jobs` entry,
@@ -601,14 +752,24 @@ def create_worker_app(
     that never finishes. `jobs_listen_conn` itself is never closed here - it
     was never opened here either (module docstring of `consume_jobs`); the
     caller that opened it closes it, same as `pool`.
+
+    Also always starts `_metrics_refresh_loop` (#261, module docstring) -
+    unlike every task above, its own task is never added to `app.state.
+    tasks`: `_readyz`'s `jobs_running` check must keep meaning exactly what
+    it already does (a registered `Job` or `jobs`-outbox handler actually
+    running), not "this app's lifespan has not yet torn every task down" -
+    `tests/worker/test_singleton.py`'s own `test_readyz_is_not_ready_without_
+    any_registered_job` pins a worker with neither as not ready, and this
+    always-on loop must not change that. Still started and joined on
+    shutdown exactly like the others, just outside that one check.
     """
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         stop = asyncio.Event()
+        handlers = job_handlers if job_handlers is not None else {}
         tasks = [asyncio.create_task(_job_loop(pool, job, stop)) for job in jobs]
         if jobs_listen_conn is not None:
-            handlers = job_handlers if job_handlers is not None else {}
             tasks.append(
                 asyncio.create_task(
                     consume_jobs(
@@ -623,12 +784,23 @@ def create_worker_app(
                 )
             )
         app.state.tasks = tasks
+
+        metrics_task = asyncio.create_task(
+            _metrics_refresh_loop(
+                pool,
+                stop,
+                interval_seconds=metrics_refresh_seconds,
+                kinds=tuple(handlers),
+                embedding_lag_enabled=_embedding_provider_configured(),
+            )
+        )
         try:
             yield
         finally:
             stop.set()
-            if tasks:
-                _done, pending = await asyncio.wait(tasks, timeout=shutdown_grace_seconds)
+            all_tasks = [*tasks, metrics_task]
+            if all_tasks:
+                _done, pending = await asyncio.wait(all_tasks, timeout=shutdown_grace_seconds)
                 for task in pending:
                     task.cancel()
                 for task in pending:

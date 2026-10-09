@@ -39,7 +39,10 @@ for that scope/window, so a deployment that sets none of the six
 warning - the same reasoning `http.py`'s `_allow_or_fail_open` gives: a
 transient Postgres/Valkey outage must not itself turn into "every write is
 rejected" on top of whatever else that outage already breaks. Every check,
-allowed or rejected, is counted in `observability.metrics.record_quota_hit`.
+allowed or rejected, is counted in `observability.metrics.record_quota_hit`;
+a rejection additionally increments `mm_rate_limit_hits_total{limiter=
+"quota_<scope>"}` (`record_rate_limit_hit`, #260) - never for a fail-open
+backend error, which returns before either counter is touched.
 
 A rejection is audited the same way a write that failed its own version or
 secret-scan check already is (`audit.AuditWriter.record`, `app.py`'s
@@ -74,7 +77,12 @@ make it precise even under concurrency. `check_write` is called only for
 `write`/`edit`/`supersede`/`promote` (never `archive`, which only ever frees a slot -
 CLAUDE.md "archived notes count toward size, not toward count" is exactly
 why a count check only ever applies to a *new* note, never to editing an
-existing one or to archiving it in place).
+existing one or to archiving it in place). A rejection increments
+`mm_rate_limit_hits_total{limiter="quota_storage_notes"|"quota_storage_bytes"}`
+(`observability.metrics.record_rate_limit_hit`, #260) - `namespace_kind` is
+never part of the label (CLAUDE.md: bounded label cardinality), same reason
+`QuotaChecker`'s own `quota_<scope>` labels never carry the key that was over
+budget either.
 """
 
 from __future__ import annotations
@@ -89,7 +97,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from memory_manager.audit import AuditWriter
 from memory_manager.auth.shared_state import SharedState
 from memory_manager.db.rls import current_principal
-from memory_manager.observability.metrics import record_quota_hit
+from memory_manager.observability.metrics import record_quota_hit, record_rate_limit_hit
 from memory_manager.storage import Op
 from memory_manager.storage.postgres import PostgresBackend
 
@@ -237,6 +245,7 @@ class QuotaChecker:
             record_quota_hit(scope=scope, outcome="allowed")
             return
         record_quota_hit(scope=scope, outcome="rejected")
+        record_rate_limit_hit(f"quota_{scope}")
         _logger.warning(
             "write quota exceeded: scope=%s window=%s limit=%g retry_after=%.1fs",
             scope,
@@ -447,6 +456,7 @@ class StorageQuotaChecker:
             limit,
             predicted,
         )
+        record_rate_limit_hit(f"quota_storage_{resource}")
         await self._audit_rejection(
             resource=resource,
             namespace_kind=namespace_kind,

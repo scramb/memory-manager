@@ -27,7 +27,9 @@ correct guess during an active brute-force run must not reset the clock for
 the attacker still trying. `handle` checks both windows with `window_peek`
 (no increment) *before* ever calling `_verify_password`, and only calls
 `window_hit` (the one that counts) for an actual wrong-password failure -
-never for a request already blocked, and never for a successful login.
+never for a request already blocked, and never for a successful login. A
+blocked attempt also increments `mm_rate_limit_hits_total{limiter="login"}`
+(`observability.metrics.record_rate_limit_hit`, #260).
 
 `POST /login` carries no rate limit of its own ahead of this (`http.py`'s
 `_LimitsMiddleware` only meters `mcp_path`/`webhook_path`/the OAuth AS
@@ -56,6 +58,7 @@ from memory_manager.auth.login import (
 from memory_manager.auth.shared_state import InMemorySharedState, SharedState
 from memory_manager.auth.templates import html_response, login_error_page, login_password_page
 from memory_manager.config import ServerConfigError
+from memory_manager.observability.metrics import record_rate_limit_hit
 
 __all__ = ["PasswordAuthenticator", "hash_password"]
 
@@ -69,6 +72,11 @@ _WINDOW_SECONDS = 10 * 60.0
 #: The global (not per-IP) brute-force window's `SharedState` key - there is only
 #: ever one, this mode has exactly one subject.
 _GLOBAL_FAILURE_KEY = "login:password:global"
+
+#: `observability.metrics.record_rate_limit_hit`'s `limiter` label value for a
+#: blocked attempt below - listed among the fixed values `metrics.py`'s module
+#: docstring documents (#260).
+_RATE_LIMIT_NAME = "login"
 
 _hasher = PasswordHasher()
 
@@ -150,6 +158,7 @@ class PasswordAuthenticator:
             _GLOBAL_FAILURE_KEY, window_seconds=_WINDOW_SECONDS
         )
         if ip_count >= _MAX_FAILURES or global_count >= _MAX_FAILURES:
+            record_rate_limit_hit(_RATE_LIMIT_NAME)
             return html_response(
                 login_password_page(
                     pending_id=pending.id,

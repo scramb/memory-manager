@@ -46,7 +46,10 @@ def _without_storage_backend_env(deployment: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def test_default_render_matches_golden_objects(render: Callable[..., _ChartRender]) -> None:
+def test_default_render_matches_golden_objects(
+    render: Callable[..., _ChartRender],
+    normalise_version_derived: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
     golden = [
         doc
         for doc in yaml.safe_load_all((FIXTURES / "golden-default-render.yaml").read_text())
@@ -62,7 +65,7 @@ def test_default_render_matches_golden_objects(render: Callable[..., _ChartRende
                 "value": "git",
             }
             after = _without_storage_backend_env(after)
-        assert after == before
+        assert normalise_version_derived(after) == normalise_version_derived(before)
 
 
 def test_git_backend_refuses_more_than_one_replica(render: Callable[..., _ChartRender]) -> None:

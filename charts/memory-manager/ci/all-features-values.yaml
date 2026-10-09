@@ -65,6 +65,12 @@ networkPolicy:
 serviceMonitor:
   enabled: true
 
+grafanaDashboard:
+  enabled: true
+
+prometheusRule:
+  enabled: true
+
 database:
   cnpg:
     backup:

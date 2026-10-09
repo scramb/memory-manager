@@ -209,6 +209,7 @@ import asyncpg.pool
 from memory_manager.db.migrate import POSTGRES_VECTOR_LAYOUT_VERSION
 from memory_manager.index.embeddings import EmbeddingError, EmbeddingProvider
 from memory_manager.observability.metrics import track_search
+from memory_manager.observability.tracing import db_span
 
 __all__ = [
     "ChunkHit",
@@ -658,7 +659,8 @@ async def fulltext_search(
         valid_at=valid_at,
         use_selective=True,
     )
-    rows = await conn_or_pool.fetch(sql, *args)
+    with db_span("fulltext_search"):
+        rows = await conn_or_pool.fetch(sql, *args)
     if not rows:
         # Selective filtering can legitimately starve the candidate stage
         # when every lexeme of every branch turned out to be frequent (#117)
@@ -676,7 +678,8 @@ async def fulltext_search(
             valid_at=valid_at,
             use_selective=False,
         )
-        rows = await conn_or_pool.fetch(sql, *args)
+        with db_span("fulltext_search"):
+            rows = await conn_or_pool.fetch(sql, *args)
     return [_row_to_chunk_hit(row) for row in rows]
 
 
@@ -788,18 +791,19 @@ async def _vector_search_legs(
     """
     if not await _uses_vector_layout(conn_or_pool):
         sql = _VECTOR_SQL_TEMPLATE.format(dim=dimension)
-        rows = await conn_or_pool.fetch(
-            sql,
-            _vector_literal(embedding),
-            model,
-            dimension,
-            include_archived,
-            list(types) if types else None,
-            list(tags) if tags else [],
-            list(namespaces) if namespaces else None,
-            valid_at,
-            limit,
-        )
+        with db_span("vector_search"):
+            rows = await conn_or_pool.fetch(
+                sql,
+                _vector_literal(embedding),
+                model,
+                dimension,
+                include_archived,
+                list(types) if types else None,
+                list(tags) if tags else [],
+                list(namespaces) if namespaces else None,
+                valid_at,
+                limit,
+            )
         return [[_row_to_chunk_hit(row) for row in rows]]
 
     legs: list[list[ChunkHit]] = []
@@ -876,7 +880,8 @@ async def _fetch_vector_kind_rows_on_connection(
     async with conn.transaction():
         for statement in settings:
             await conn.execute(statement)
-        return await conn.fetch(sql, *args)
+        with db_span("vector_search"):
+            return await conn.fetch(sql, *args)
 
 
 async def _uses_vector_layout(conn_or_pool: _Queryable) -> bool:
@@ -1138,12 +1143,14 @@ async def _fetch_notes(
 ) -> dict[str, asyncpg.Record]:
     if not note_ids:
         return {}
-    rows = await conn_or_pool.fetch(_NOTES_BY_ID_SQL, list(note_ids))
+    with db_span("fetch_notes"):
+        rows = await conn_or_pool.fetch(_NOTES_BY_ID_SQL, list(note_ids))
     return {row["id"]: row for row in rows}
 
 
 async def _headline(conn_or_pool: _Queryable, text: str, query: str) -> str:
-    result = await conn_or_pool.fetchval(_HEADLINE_SQL, text, query, _HEADLINE_OPTIONS)
+    with db_span("headline"):
+        result = await conn_or_pool.fetchval(_HEADLINE_SQL, text, query, _HEADLINE_OPTIONS)
     return str(result)
 
 
