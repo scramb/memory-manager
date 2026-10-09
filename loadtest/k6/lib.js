@@ -5,12 +5,12 @@
 // the server's stateless Streamable HTTP transport serves a bare `tools/call`
 // anyway (ADR-0009 §1, pinned server-side by `tests/test_stateless_transport.
 // py`) - plus the context side file `loadtest/load.py` writes: the server's
-// base URL and one synthetic principal per static token, each carrying its
-// own `alias` (its generator namespace alias), `namespaces` (its full
-// membership, for bookkeeping) and `read_paths` (a sample of its own
-// `me/...`/`org/...` paths - `memory_read` must never be driven by a ULID,
-// only a vault-relative path, and never a path this principal cannot
-// actually read under RLS).
+// base URLs (one per replica, #269) and one synthetic principal per static
+// token, each carrying its own `alias` (its generator namespace alias),
+// `namespaces` (its full membership, for bookkeeping) and `read_paths` (a
+// sample of its own `me/...`/`org/...` paths - `memory_read` must never be
+// driven by a ULID, only a vault-relative path, and never a path this
+// principal cannot actually read under RLS).
 //
 // `MCP_JSON_RESPONSE` defaults to true (`config.py`), so every response here
 // is a single JSON object, never an SSE stream - `toolsCall` always calls
@@ -29,11 +29,44 @@ if (!CONTEXT_FILE) {
 // across every VU via `SharedArray`, rather than re-parsing per VU.
 const context = JSON.parse(open(CONTEXT_FILE));
 
-export const BASE_URL = context.base_url;
+// One entry per server replica (#269, `scripts/loadtest-smoke.sh`'s own
+// `LOADTEST_REPLICAS`) - `toolsCall` spreads requests over them itself
+// (module docstring above: "no local load balancer is needed"), via
+// `pickBaseUrl` below.
+export const BASE_URLS = context.base_urls;
 
 export const TOKENS = new SharedArray('loadtest-tokens', function () {
   return context.tokens;
 });
+
+// Round-robin over `BASE_URLS`, per VU (module-level state here is a fresh
+// copy per VU, the same scoping `nextRequestId` below already relies on -
+// k6 runs each VU in its own JS VM instance, never sharing a `let` across
+// VUs) - so every VU's own requests still spread evenly across every
+// replica, even though no single counter is shared process-wide.
+//
+// `unhealthyBaseUrls` (#269) is this VU's own memory of a base URL that
+// already failed at the transport level (`response.status === 0`: refused
+// or reset, exactly what a `kill -9`'d replica produces) - once marked, this
+// VU never round-robins to it again for the rest of the run. Without this,
+// a killed replica would keep taking its full round-robin share of every
+// VU's requests for however long is left in the run, not just the handful
+// already in flight to it at the moment of the kill - the one thing
+// `scripts/loadtest-smoke.sh`'s own `LOADTEST_KILL_AFTER` scenario needs to
+// still clear the `http_req_failed{phase:measure}` rate<0.01 threshold.
+let nextBaseUrlIndex = 0;
+const unhealthyBaseUrls = new Set();
+
+function pickBaseUrl() {
+  const candidates = BASE_URLS.filter((url) => !unhealthyBaseUrls.has(url));
+  // Every base URL this VU has ever tried failed (should not happen outside
+  // a misconfigured run that kills more replicas than it starts) - fall
+  // back to the full list rather than pick from an empty one.
+  const pool = candidates.length > 0 ? candidates : BASE_URLS;
+  const url = pool[nextBaseUrlIndex % pool.length];
+  nextBaseUrlIndex += 1;
+  return url;
+}
 
 const REQUEST_HEADERS = {
   'Content-Type': 'application/json',
@@ -74,13 +107,14 @@ export function vuPrincipal() {
 // is `response.result` (its own shape depends on the tool - `toolsCall`
 // itself only validates the JSON-RPC envelope), `null` if any check failed.
 export function toolsCall(token, name, toolArguments) {
+  const url = pickBaseUrl();
   const body = JSON.stringify({
     jsonrpc: '2.0',
     id: nextRequestId++,
     method: 'tools/call',
     params: { name: name, arguments: toolArguments },
   });
-  const response = http.post(BASE_URL, body, {
+  const response = http.post(url, body, {
     headers: Object.assign({ Authorization: `Bearer ${token}` }, REQUEST_HEADERS),
     // `tool` tags every metric this request produces (http_req_duration,
     // http_req_failed, checks, ...) with the MCP tool name - `name` here is
@@ -89,6 +123,12 @@ export function toolsCall(token, name, toolArguments) {
     // the export (#109, WP-21).
     tags: { tool: name },
   });
+
+  if (response.status === 0) {
+    // No HTTP response at all (k6: connection refused/reset/timeout) -
+    // `url`'s replica is gone; see `unhealthyBaseUrls`'s own docstring above.
+    unhealthyBaseUrls.add(url);
+  }
 
   let payload = null;
   if (response.status === 200) {

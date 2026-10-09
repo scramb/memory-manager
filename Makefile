@@ -6,6 +6,10 @@ export MM_TEST_DATABASE_URL
 LOADTEST_NOTES ?= 10000
 LOADTEST_PORT ?= 18080
 K6_IMAGE ?= docker.io/grafana/k6:2.3.0
+LOADTEST_REPLICAS ?= 1
+LOADTEST_KILL_AFTER ?=
+LOADTEST_SHARED_STATE ?= postgres
+LOADTEST_EMBEDDINGS ?= none
 
 fmt:
 	uv run ruff format .
@@ -71,10 +75,17 @@ smoke: image
 	scripts/smoke-container.sh memory-manager:dev
 
 # Loads a synthetic LOADTEST_NOTES-note vault into the Postgres backend and
-# runs k6's search/read/write scenarios against one memory-manager replica
-# on LOADTEST_PORT (#108, WP-21) - see scripts/loadtest-smoke.sh.
+# runs k6's search/read/write scenarios against LOADTEST_REPLICAS memory-
+# manager replicas starting at LOADTEST_PORT (#108, #269, WP-21/WP-32) - see
+# scripts/loadtest-smoke.sh for LOADTEST_REPLICAS/LOADTEST_KILL_AFTER/
+# LOADTEST_SHARED_STATE/LOADTEST_EMBEDDINGS, all no-ops at their default
+# (one replica, no kill, Postgres shared state, no embeddings - today's
+# behaviour unchanged). LOADTEST_SHARED_STATE=valkey needs `make valkey-up`
+# run first (this target never starts mm-valkey itself, unlike db-up above).
 loadtest-smoke: db-up
 	LOADTEST_NOTES=$(LOADTEST_NOTES) LOADTEST_PORT=$(LOADTEST_PORT) K6_IMAGE=$(K6_IMAGE) \
+		LOADTEST_REPLICAS=$(LOADTEST_REPLICAS) LOADTEST_KILL_AFTER=$(LOADTEST_KILL_AFTER) \
+		LOADTEST_SHARED_STATE=$(LOADTEST_SHARED_STATE) LOADTEST_EMBEDDINGS=$(LOADTEST_EMBEDDINGS) \
 		scripts/loadtest-smoke.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the

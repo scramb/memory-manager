@@ -1095,7 +1095,7 @@ async def load(
     db_name: str,
     app_role: str,
     token_count: int,
-    base_url: str,
+    base_urls: Sequence[str],
     context_out: Path,
     seed: int,
     with_chunks: bool = False,
@@ -1107,6 +1107,11 @@ async def load(
     """Load `vault_out` (a `loadtest.generate` output directory) into `db_name`
     under RLS, with a registered principal per sampled token, and write
     `context_out`, the JSON side file `loadtest/k6/lib.js` reads.
+
+    `base_urls` (#269) is one MCP endpoint per server replica
+    `scripts/loadtest-smoke.sh` starts - written to `context_out` as
+    `base_urls`, a list even for the single-replica case, so `lib.js`'s own
+    round robin never special-cases "just one replica".
 
     `with_chunks` (#267) additionally fills `chunks` and builds the
     ADR-0016 vector index (`load_chunks_with_index`) - see this module's own
@@ -1135,7 +1140,7 @@ async def load(
     finally:
         await pool.close()
 
-    context = {"base_url": base_url, "tokens": tokens}
+    context = {"base_urls": list(base_urls), "tokens": tokens}
     context_out.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print(f"loaded {len(rows)} notes into {db_name!r}; wrote {len(tokens)} tokens to {context_out}")
@@ -1188,8 +1193,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        default=_DEFAULT_BASE_URL,
-        help="the MCP endpoint k6 should call, recorded in --context-out",
+        dest="base_urls",
+        action="append",
+        default=None,
+        help="an MCP endpoint k6 should call, recorded in --context-out's 'base_urls' list - "
+        "repeat once per server replica (#269); defaults to one entry "
+        f"({_DEFAULT_BASE_URL!r}) when omitted",
     )
     parser.add_argument(
         "--context-out", type=Path, required=True, help="where to write the k6 side file (JSON)"
@@ -1248,7 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
             db_name=args.db_name,
             app_role=args.app_role,
             token_count=args.tokens,
-            base_url=args.base_url,
+            base_urls=args.base_urls or [_DEFAULT_BASE_URL],
             context_out=args.context_out,
             seed=args.seed,
             with_chunks=args.with_chunks,
