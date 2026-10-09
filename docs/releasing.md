@@ -142,6 +142,10 @@ cosign verify \
   `git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1`. `release.yml`
   runs the same pipeline and marks the GitHub release `--prerelease`.
 
+Upgrading an existing `0.1.x` deployment to `0.2.0`?
+[`docs/guides/upgrade-0.2.md`](./guides/upgrade-0.2.md) covers what changes, staying on the Git
+backend, moving to Postgres and rolling back.
+
 Release-please's own commits (the "chore(release)" PR) and Dependabot's
 commits carry no `Signed-off-by:` trailer - `.github/workflows/dco.yml`
 exempts the `github-actions[bot]`, `release-please[bot]` and
