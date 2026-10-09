@@ -329,11 +329,11 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
 
-- [ ] #272 STRIDE threat model covers every trust boundary of the enterprise deployment ⛔ blocked by #232, #227, #230, #241, #233, #238, #239, #235, #243, #244, #245, #255
-- [ ] #273 Pen-test checklist turns the threat model into executable test cases ⛔ blocked by #272
-- [ ] #274 Compliance templates for data flow, records of processing and TOMs ⛔ blocked by #272, #263, #265
-- [ ] #275 Compliance templates for the deletion concept with backup horizon and roles and permissions ⛔ blocked by #274, #241, #233, #238, #239, #235, #243, #244, #245, #252
-- [ ] #276 Compliance templates for DPIA, employee transparency notice and Germany section ⛔ blocked by #274, #275
+- [x] #272 STRIDE threat model covers every trust boundary of the enterprise deployment ⛔ blocked by #232, #227, #230, #241, #233, #238, #239, #235, #243, #244, #245, #255
+- [x] #273 Pen-test checklist turns the threat model into executable test cases ⛔ blocked by #272
+- [x] #274 Compliance templates for data flow, records of processing and TOMs ⛔ blocked by #272, #263, #265
+- [x] #275 Compliance templates for the deletion concept with backup horizon and roles and permissions ⛔ blocked by #274, #241, #233, #238, #239, #235, #243, #244, #245, #252
+- [x] #276 Compliance templates for DPIA, employee transparency notice and Germany section ⛔ blocked by #274, #275
 
 ### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
 
