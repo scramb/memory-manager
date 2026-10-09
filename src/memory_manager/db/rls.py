@@ -114,6 +114,15 @@ _SELECT_ONLY_TABLES = ("schema_migrations",)
 # migration's own module comment), and `mm_break_glass_approve`
 # additionally re-checks the four-eyes rule independently of
 # `account/break_glass.py`'s own Python-side check.
+#
+# `mm_break_glass_notices`/`mm_break_glass_acknowledge`
+# (0023_break_glass_notice.sql, #239) are a second, distinct pair on the
+# same table: neither checks `Memory.Admin` at all, since the caller does
+# not need it here, only to be the person the grant is *about* - both
+# resolve that from `app.oid` the same way `mm_ensure_personal_ns` already
+# resolves the caller's own namespace, so a non-admin can see and
+# acknowledge their own notice without ever seeing anyone else's
+# (`account/break_glass_notice.py`'s own module docstring).
 _FUNCTIONS = (
     ("mm_readable_ns", "()"),
     ("mm_writable_ns", "()"),
@@ -131,6 +140,8 @@ _FUNCTIONS = (
     ("mm_break_glass_deny", "(bigint)"),
     ("mm_break_glass_revoke", "(bigint)"),
     ("mm_break_glass_list", "()"),
+    ("mm_break_glass_notices", "()"),
+    ("mm_break_glass_acknowledge", "(bigint)"),
 )
 
 

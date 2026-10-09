@@ -28,10 +28,11 @@ from urllib.parse import urlsplit, urlunsplit
 import asyncpg
 import pytest
 import pytest_asyncio
+from storage.contract import _FAKE_AWS_ACCESS_KEY_ID, AuditEntry, audit_recorder, note_bytes
 
 from memory_manager.db.migrate import migrate
 from memory_manager.db.rls import grant_app_role, request_identity
-from memory_manager.storage.base import NotFound
+from memory_manager.storage.base import NotFound, SecretRejected, WriteRequest, WriteResult
 from memory_manager.storage.erasure import erase_namespace, erase_note, erase_user
 from memory_manager.storage.postgres import PostgresBackend
 
@@ -562,5 +563,113 @@ class TestPostgresBackendEraseExportsToTheSiem:
             assert record["actor"] == "admin"
             assert record["detail"]["target_kind"] == "note"
             assert record["detail"]["target_ids"] == ["note-export"]
+        finally:
+            await pool.close()
+
+
+class TestWriteSystem:
+    """`PostgresBackend.write_system` (#239, ADR-0008 addendum "break-glass
+    notification"): the owner-connection split `write_system` shares with
+    `erase` above - same `erasure_db` fixture, no role switch, no `app.oid`
+    ever set on the connection it runs on."""
+
+    async def test_writes_with_no_author_oid_through_the_normal_write_path(
+        self, erasure_db: ErasureDb
+    ) -> None:
+        seed_conn = await _connect_as(erasure_db.owner_url)
+        try:
+            await _seed_namespace(seed_conn, "user", "oid-alice", "alice")
+        finally:
+            await seed_conn.close()
+
+        audit_log: list[AuditEntry] = []
+        pool = await asyncpg.create_pool(erasure_db.owner_url)
+        try:
+            backend = PostgresBackend(pool, app_role=erasure_db.app_role)
+            backend.add_audit_hook(audit_recorder(audit_log))
+            request = WriteRequest(
+                op="write",
+                path="alice/reference/break-glass-1.md",
+                client="account",
+                if_version="new",
+                content=note_bytes(type="reference", title="Break-glass access"),
+                actor="system",
+            )
+
+            result = await backend.write_system(request, reason="break-glass grant 1 approved")
+
+            assert isinstance(result, WriteResult)
+            assert result.path == request.path
+
+            row = await pool.fetchrow(
+                "select author_oid, author, client, message from vault_revisions where path = $1",
+                request.path,
+            )
+            assert row is not None
+            assert row["author_oid"] is None
+            assert row["author"] == "system"
+            assert row["client"] == "account"
+            assert row["message"] == "break-glass grant 1 approved"
+
+            # The normal write-path audit hook fired exactly once, for the system
+            # write - the same "audit log for every write" every request-serving
+            # write already goes through (`app.py`'s `_audit_write_hook`).
+            assert len(audit_log) == 1
+            audited_request, audited_result, audited_error = audit_log[0]
+            assert audited_request.path == request.path
+            assert audited_result == result
+            assert audited_error is None
+
+            # Alice's own identity can read the note straight back under the normal
+            # RLS-switched path: it landed in a namespace she can read, like any
+            # other note there - `write_system` bypassed RLS only to *write* it, not
+            # to make it invisible to the user it is about.
+            conn = await pool.acquire()
+            try:
+                async with request_identity(
+                    conn, role=erasure_db.app_role, oid="oid-alice"
+                ) as identified:
+                    visible = await identified.fetchval(
+                        "select count(*) from vault_notes where path = $1", request.path
+                    )
+                    assert visible == 1
+            finally:
+                await pool.release(conn)
+        finally:
+            await pool.close()
+
+    async def test_still_runs_the_secret_scan_and_writes_nothing(
+        self, erasure_db: ErasureDb
+    ) -> None:
+        seed_conn = await _connect_as(erasure_db.owner_url)
+        try:
+            await _seed_namespace(seed_conn, "user", "oid-alice", "alice")
+        finally:
+            await seed_conn.close()
+
+        audit_log: list[AuditEntry] = []
+        pool = await asyncpg.create_pool(erasure_db.owner_url)
+        try:
+            backend = PostgresBackend(pool, app_role=erasure_db.app_role)
+            backend.add_audit_hook(audit_recorder(audit_log))
+            request = WriteRequest(
+                op="write",
+                path="alice/reference/break-glass-2.md",
+                client="account",
+                if_version="new",
+                content=note_bytes(type="reference", body=f"AWS key: {_FAKE_AWS_ACCESS_KEY_ID}\n"),
+                actor="system",
+            )
+
+            with pytest.raises(SecretRejected):
+                await backend.write_system(request, reason="break-glass grant 2 approved")
+
+            count = await pool.fetchval(
+                "select count(*) from vault_notes where path = $1", request.path
+            )
+            assert count == 0
+            assert len(audit_log) == 1
+            assert audit_log[0][1] is None
+            assert isinstance(audit_log[0][2], SecretRejected)
         finally:
             await pool.close()

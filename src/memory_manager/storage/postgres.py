@@ -110,7 +110,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import asyncpg
@@ -134,7 +134,7 @@ from memory_manager.storage.base import (
     WriteResult,
 )
 from memory_manager.vault.note import parse, version
-from memory_manager.vault.paths import PathRejected, parse_note_path
+from memory_manager.vault.paths import NotePath, PathRejected, parse_note_path
 
 __all__ = ["NamespaceUsage", "PostgresBackend"]
 
@@ -465,7 +465,9 @@ class PostgresBackend:
         return result
 
     async def _write_or_edit_inner(self, request: WriteRequest) -> WriteResult:
-        """`write`/`edit`'s shared flow: validate, then one `READ COMMITTED` transaction.
+        """`write`/`edit`'s shared flow: validate, then one `READ COMMITTED` transaction,
+        on `_content_connection` (RLS-switched under `app_role`, a plain pool
+        connection otherwise - this class's own docstring).
 
         `WriteResult.commit` is `"<note id>@<revision>"` - a stable, unique
         string per revision of a note (not a Git sha; there is no commit
@@ -476,55 +478,9 @@ class PostgresBackend:
 
         try:
             async with self._content_connection() as conn:
-                current_row = await conn.fetchrow(_SELECT_CURRENT, request.path)
-                current = bytes(current_row["content"]) if current_row is not None else None
-                current_version = current_row["version"] if current_row is not None else None
-
-                rules.check_version(request, current_version, current)
-
-                final_bytes = rules.prepare_write_or_edit(
-                    request.op,
-                    request.path,
-                    request.content,
-                    request.old_str,
-                    request.new_str,
-                    current,
+                note_id, revision, new_version = await self._write_or_edit_in_conn(
+                    conn, note_path, request
                 )
-
-                if current is not None and final_bytes == current:
-                    raise WriteFailed("no changes")
-
-                new_version = version(final_bytes)
-                message = request.message or f"{request.op} {request.path}"
-
-                if current_row is None:
-                    note_id, revision = await self._insert_new(
-                        conn, note_path.namespace, request.path, final_bytes, new_version
-                    )
-                else:
-                    note_id, revision = await self._update_existing(
-                        conn,
-                        request.path,
-                        final_bytes,
-                        new_version,
-                        current_row["id"],
-                        current_row["current_revision"],
-                    )
-
-                await conn.execute(
-                    _INSERT_REVISION,
-                    note_id,
-                    revision,
-                    request.path,
-                    final_bytes,
-                    new_version,
-                    request.actor,
-                    request.client,
-                    message,
-                )
-
-                if self._index_hook is not None:
-                    await self._index_hook(conn, request.path, final_bytes)
         except asyncpg.UniqueViolationError as exc:
             raise InvalidNote(request.path, str(exc)) from exc
         except asyncpg.PostgresError as exc:
@@ -534,6 +490,147 @@ class PostgresBackend:
             await self._index_commit_hook((note_id,))
 
         return WriteResult(path=request.path, version=new_version, commit=f"{note_id}@{revision}")
+
+    async def _write_or_edit_in_conn(
+        self, conn: _Connectable, note_path: NotePath, request: WriteRequest
+    ) -> tuple[str, int, str]:
+        """The part of `write`/`edit` that is identical regardless of which connection
+        it runs on (#239, modelled on `erase`'s own owner-connection split): validation,
+        the secret scan and blocklist (`rules.prepare_write_or_edit`), the conditional
+        insert/update, the append-only revision row and the in-transaction index hook.
+
+        Shared verbatim by `_write_or_edit_inner` (a request-serving `write`/`edit`, on
+        `_content_connection`'s possibly RLS-switched connection, `app.oid` set to the
+        caller's own identity) and `write_system` (an owner connection straight from
+        `self._pool`, no role switch, no `app.oid` set at all - `vault_revisions.
+        author_oid` then falls back to its own `NULL` default, migration
+        `0009_namespace_resolution.sql`'s "system jobs may still write an explicit or
+        NULL author_oid").
+
+        Returns `(note_id, revision, new_version)`, the pieces a `WriteResult` is built
+        from - assembling one, and deciding when to await `self._index_commit_hook`
+        (always after the caller's own transaction has committed, never on a
+        rolled-back one), stays each caller's own job.
+        """
+        current_row = await conn.fetchrow(_SELECT_CURRENT, request.path)
+        current = bytes(current_row["content"]) if current_row is not None else None
+        current_version = current_row["version"] if current_row is not None else None
+
+        rules.check_version(request, current_version, current)
+
+        final_bytes = rules.prepare_write_or_edit(
+            request.op,
+            request.path,
+            request.content,
+            request.old_str,
+            request.new_str,
+            current,
+        )
+
+        if current is not None and final_bytes == current:
+            raise WriteFailed("no changes")
+
+        new_version = version(final_bytes)
+        message = request.message or f"{request.op} {request.path}"
+
+        if current_row is None:
+            note_id, revision = await self._insert_new(
+                conn, note_path.namespace, request.path, final_bytes, new_version
+            )
+        else:
+            note_id, revision = await self._update_existing(
+                conn,
+                request.path,
+                final_bytes,
+                new_version,
+                current_row["id"],
+                current_row["current_revision"],
+            )
+
+        await conn.execute(
+            _INSERT_REVISION,
+            note_id,
+            revision,
+            request.path,
+            final_bytes,
+            new_version,
+            request.actor,
+            request.client,
+            message,
+        )
+
+        if self._index_hook is not None:
+            await self._index_hook(conn, request.path, final_bytes)
+
+        return note_id, revision, new_version
+
+    async def write_system(self, request: WriteRequest, *, reason: str) -> WriteResult:
+        """Write `request` as the system identity, never a real principal's own
+        (#239, ADR-0008 addendum "break-glass notification": "written by the system
+        identity, audited, and is ordinary data, not an instruction").
+
+        Deliberately bypasses `_content_connection`/`app_role`, the same way `erase`
+        does (that method's own docstring): acquires a plain connection straight from
+        `self._pool`, regardless of whether this instance was built with an `app_role`
+        at all - never through `db.rls.request_connection`, which requires a request's
+        own principal in context and would set `app.oid` to it, defeating the point.
+        Without a role switch, the connection runs as the owner, which `migrations/
+        0005_rls.sql`'s owner-only `FORCE ROW LEVEL SECURITY` policy already lets
+        touch every content table (ADR-0008 addendum #100, "the owner role is the
+        system identity") - and with no `app.oid` ever set on it, `vault_revisions.
+        author_oid` resolves through its own column default to `NULL`
+        (`0009_namespace_resolution.sql`), never to anyone's own.
+
+        Reuses `_write_or_edit_in_conn`, the exact validation/secret-scan/blocklist/
+        index path `_write_or_edit_inner` runs for a real request - so a system write
+        is rejected by the same rules a user's own write would be, never a quieter
+        shortcut around them. Also reuses `_run_audit_hooks`, the same "audit log for
+        every write" (`CLAUDE.md`) every request-serving write already goes through -
+        `app.py`'s own `_audit_write_hook` records one `audit_log` row per call,
+        success or rejection alike, exactly as for `write`/`edit`.
+
+        `reason` becomes `request.message` when the caller did not set one of its own
+        - the one piece of context `erase`'s own `reason` parameter plays for erasure,
+        here recorded on the revision itself rather than a separate log table, since
+        a system write has no such table of its own. Not part of `StorageBackend`:
+        a system write is a separate, non-MCP, server-internal operation (no client
+        token ever selects `op="write_system"`), the same "not reachable from a
+        write" shape `erase` already has - `account/break_glass.py`'s approval route
+        is this method's first caller.
+
+        `GitBackend.write_system` always raises `SystemWriteUnsupported`: Git has no
+        owner-bypass concept and no `author_oid` column to leave `NULL` - a
+        system-authored note only exists with `STORAGE_BACKEND=postgres` (ADR-0008
+        addendum, "Postgres mode only, like every enterprise `/account` section").
+        """
+        effective = request if request.message is not None else replace(request, message=reason)
+        note_path = rules.parse_note_path_or_raise(effective.path, allow_archive=True)
+
+        async def _run() -> WriteResult:
+            try:
+                async with self._pool.acquire() as conn, conn.transaction():
+                    note_id, revision, new_version = await self._write_or_edit_in_conn(
+                        conn, note_path, effective
+                    )
+            except asyncpg.UniqueViolationError as exc:
+                raise InvalidNote(effective.path, str(exc)) from exc
+            except asyncpg.PostgresError as exc:
+                raise WriteFailed(str(exc)) from exc
+
+            if self._index_commit_hook is not None:
+                await self._index_commit_hook((note_id,))
+
+            return WriteResult(
+                path=effective.path, version=new_version, commit=f"{note_id}@{revision}"
+            )
+
+        try:
+            result = await _run()
+        except Exception as exc:
+            await self._run_audit_hooks(effective, None, exc)
+            raise
+        await self._run_audit_hooks(effective, result, None)
+        return result
 
     async def _insert_new(
         self,

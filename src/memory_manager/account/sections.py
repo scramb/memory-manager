@@ -41,6 +41,8 @@ import asyncpg
 from memory_manager.account.admin import ADMIN_ROLE, list_namespaces, render_admin_section
 from memory_manager.account.break_glass import list_grants as list_break_glass_grants
 from memory_manager.account.break_glass import render_break_glass_section
+from memory_manager.account.break_glass_notice import list_notices as list_break_glass_notices
+from memory_manager.account.break_glass_notice import render_break_glass_notice
 from memory_manager.account.break_glass_viewer import VIEW_PATH as BREAK_GLASS_VIEW_PATH
 from memory_manager.account.delete import (
     CONFIRM_FIELD_NAME,
@@ -132,6 +134,17 @@ async def _personal_note_count(ctx: SectionContext) -> int | None:
         return int(count) if count is not None else 0
 
 
+async def _break_glass_notice_html(ctx: SectionContext) -> str:
+    """The break-glass banner every affected user sees until they acknowledge it
+    (#239, `account.break_glass_notice`'s own module docstring) - the empty string
+    under the same conditions `_personal_note_count` returns `None` for: there is no
+    personal namespace, and so nothing to be notified about, without one."""
+    if not ctx.is_postgres_backend or ctx.session.oid is None or ctx.app_role is None:
+        return ""
+    rows = await list_break_glass_notices(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_break_glass_notice(rows, session_id=ctx.session_id)
+
+
 async def _render_overview(ctx: SectionContext) -> str:
     session = ctx.session
     rows = [
@@ -143,7 +156,8 @@ async def _render_overview(ctx: SectionContext) -> str:
     note_count = await _personal_note_count(ctx)
     if note_count is not None:
         rows.append(f"<dt>Notes in your personal namespace</dt><dd>{note_count}</dd>")
-    return f"<section><h2>Overview</h2><dl>{''.join(rows)}</dl></section>"
+    overview = f"<section><h2>Overview</h2><dl>{''.join(rows)}</dl></section>"
+    return overview + await _break_glass_notice_html(ctx)
 
 
 #: Always enabled - identity is shown regardless of login mode or storage backend;

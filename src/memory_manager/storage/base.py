@@ -43,6 +43,7 @@ __all__ = [
     "StorageBackend",
     "StorageChanges",
     "StoredNote",
+    "SystemWriteUnsupported",
     "VersionConflict",
     "WriteConflict",
     "WriteError",
@@ -332,6 +333,19 @@ class ErasureUnsupported(Exception):
     """
 
 
+class SystemWriteUnsupported(Exception):
+    """Raised by `GitBackend.write_system` (#239, ADR-0008 addendum "break-glass
+    notification"): a system-authored write only exists for the Postgres backend.
+
+    Git has no owner role that bypasses row security and no `author_oid` column a
+    write could ever leave `NULL` on - there is no connection shape on the Git side
+    that means "the system wrote this, not a person", so the Git backend refuses the
+    call outright rather than pretending to comply (same reasoning as `ErasureUnsupported`
+    above). Not a `WriteError`: `write_system` is a separate, non-MCP, server-internal
+    operation, never reachable from a client write.
+    """
+
+
 #: The three things `storage.erasure` can hard-delete (ADR-0007 §3 addendum
 #: 2026-10-08, #231): a single note (by its ULID `id`), every note in a
 #: namespace (by its alias), or a user and their personal namespace (by
@@ -535,6 +549,28 @@ class StorageBackend(Protocol):
         `GitBackend.erase` always raises `ErasureUnsupported`: Git is the
         source of truth there, and nothing about it can be provably
         erased from every clone and remote (ADR-0007 §3).
+        """
+        ...
+
+    async def write_system(self, request: WriteRequest, *, reason: str) -> WriteResult:
+        """Create or overwrite `request.path` as the system identity, not a real
+        principal's own (#239, ADR-0008 addendum "break-glass notification").
+
+        A separate, non-MCP, server-internal operation - never reachable from a
+        client write, the same "no MCP tool ever selects this op" shape `erase` has.
+        Runs the identical validation, secret scan, blocklist, size cap and audit
+        every `write`/`edit` enforces (this Protocol's own docstring) - a system
+        write is rejected by the same rules a user's own write would be, never a
+        quieter shortcut around them. Only the identity differs: the resulting
+        revision carries no author at all (`author_oid is NULL`), not the caller's
+        own, so a later reader can tell a system-written note apart from one a
+        person wrote. `reason` becomes `request.message` when the caller did not set
+        one of its own.
+
+        `GitBackend.write_system` always raises `SystemWriteUnsupported`: a
+        system-authored note only exists with `STORAGE_BACKEND=postgres`
+        (ADR-0008 addendum, "Postgres mode only, like every enterprise `/account`
+        section").
         """
         ...
 
