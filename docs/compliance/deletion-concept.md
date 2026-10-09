@@ -116,8 +116,10 @@ against the restored cluster:
 
 ## Not included
 
-- A Data Protection Impact Assessment, a transparency notice to data subjects, and a
-  Germany-specific section (#276).
+- A Data Protection Impact Assessment ([`dpia-template.md`](./dpia-template.md)), a transparency
+  notice to data subjects ([`transparency-notice.md`](./transparency-notice.md)), and a
+  Germany-specific section ([`germany.md`](./germany.md)) - this document's erasure scope and
+  backup horizon feed into all three, but is not a substitute for any of them.
 - Erasure or retention beyond what the code cited above actually implements - this document
   describes it, [WP-26](https://github.com/scramb/memory-manager/issues/231) builds it.
 - The deletion acceptance test across every target kind in full

@@ -15,6 +15,9 @@
 | [`toms.md`](./toms.md) | Art. 32 technical and organisational measures (TOMs), mapped one-to-one to a concrete control and its config key or code path, plus the Art. 25 data-protection-by-default defaults this server ships with. |
 | [`deletion-concept.md`](./deletion-concept.md) | How and when personal data is erased (Art. 17): the hard-delete/pseudonymization/audit-redaction scope per data category, the backup horizon, the `git`-backend limitation (no erasure of history), and the restore runbook for replaying `erasure_log` via `ERASURE_LOG_REPLAY_FILE`. |
 | [`roles-and-permissions.md`](./roles-and-permissions.md) | Who may read, write, curate or administer which memory: the role × namespace-kind matrix, how roles are assigned and removed, the break-glass procedure and its audit trail, and operator access to the database. |
+| [`dpia-template.md`](./dpia-template.md) | An Art. 35 Data Protection Impact Assessment: systematic description, necessity/proportionality, a risk table pre-filled from the threat model, the measures from `toms.md`, residual risk and sign-off fields. |
+| [`transparency-notice.md`](./transparency-notice.md) | An Art. 13/14 notice addressed to employees, in plain language: what is stored, why, who can see it (including break-glass), how long it is kept, and their export/delete rights on `/account`. |
+| [`germany.md`](./germany.md) | Optional: works-council co-determination under §87(1) no. 6 BetrVG (technical facilities suitable for monitoring performance or behaviour) and a works-agreement checklist. |
 
 Every document describes the architecture as it stands in this repository (default `git` storage
 backend, and the enterprise profile: `STORAGE_BACKEND=postgres` with Entra ID login, ADR-0006
@@ -38,11 +41,14 @@ server's omission; it is the part only the operator can answer.
 4. `deletion-concept.md` and `roles-and-permissions.md` build on `toms.md`'s own citations the
    same way: fill in the backup-retention value, the operator holding direct database access,
    and your own Git-backend erasure-request policy if you run that backend.
-5. None of the four templates substitutes for a Data Protection Impact Assessment or a
-   transparency notice to data subjects - those are tracked separately (#276) and are explicitly
-   out of scope here.
+5. `dpia-template.md` and `transparency-notice.md` build on the first four the same way: the DPIA
+   risk table re-frames the threat model's own findings by risk to the data subject, and the
+   transparency notice turns `data-flow.md`'s categories and `roles-and-permissions.md`'s
+   break-glass procedure into plain language for employees. `germany.md` is optional and layers on
+   top of both if your organisation has a works council.
 
 ## Not included
 
-- DPIA, transparency notice, a Germany-specific section (#276).
-- Legal review of any of the four templates.
+- Translations of any of the seven templates.
+- Legal review of any of the seven templates, or a determination of whether a DPIA is legally
+  required for your specific deployment.

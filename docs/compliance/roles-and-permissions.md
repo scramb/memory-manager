@@ -122,8 +122,10 @@ application, never a direct database session>`.
 
 ## Not included
 
-- A Data Protection Impact Assessment, a transparency notice and a Germany-specific section
-  (#276).
+- A Data Protection Impact Assessment ([`dpia-template.md`](./dpia-template.md)), a transparency
+  notice ([`transparency-notice.md`](./transparency-notice.md)) and a Germany-specific section
+  ([`germany.md`](./germany.md)) - this document's role matrix and break-glass procedure feed
+  into all three, but is not a substitute for any of them.
 - The `agent` principal kind ([ADR-0013](../adr/0013-agent-identity.md)) - not yet part of the
   role matrix above; this document covers `Memory.User`/`Memory.Curator`/`Memory.Admin` and the
   namespace kinds `user`/`group`/`project`/`org` only.
