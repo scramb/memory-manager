@@ -20,6 +20,13 @@ explicitly accepted with a rationale; re-run it (or review it again) before
 any release that touches `src/memory_manager/auth/`, `mcp/`, `vault/`, or
 `index/`.
 
+[`docs/security/threat-model.md`](./docs/security/threat-model.md) is the
+architecture-level STRIDE threat model for the enterprise deployment (Entra
+login, several replicas on shared Postgres with RLS, `/account`, break-glass,
+erasure, quotas, the SIEM audit export): one entry per trust boundary and
+STRIDE category, each with a mitigation pointer or an accepted residual risk.
+Update it alongside any change to a trust boundary it covers.
+
 ## Security properties
 
 These are the non-negotiable properties this project is built to (see
