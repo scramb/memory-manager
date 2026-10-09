@@ -67,6 +67,26 @@ reason is mandatory - free text, the same convention `disable_user`'s own
 `reason` parameter already follows - and the action is audited as one
 `admin.user.revoke` row (actor, target oid, reason, the revoked counts),
 metadata only, same as every other admin action above.
+
+"Erase" (#236) is a third shape again: unlike every action above, it never
+writes its own `AuditWriter.record` row at all. It calls one of `storage.
+erasure.erase_note`/`erase_namespace`/`erase_user` through `services.
+storage.erase` (`storage.base.StorageBackend.erase`'s own dispatch on
+`target_kind`) - the same primitive `account.delete`'s self-service flow
+already calls (that module's own docstring: "unlike a read (export), the
+erasure primitive's own audit row already is the complete, authoritative
+record of this write"), so a second, admin-scoped audit row here would only
+duplicate it. A note is identified by its vault path, not its ULID id - an
+admin never sees an id to type - so `_resolve_note_id` resolves it first,
+directly against the owner pool: an id is not content (CLAUDE.md "ids/
+paths/counts" is explicitly allowed), the same bypass of row-level security
+`PostgresBackend.erase` itself already makes. The typed confirmation is the
+target identifier itself (path, alias or oid), compared byte for byte
+against a separate `confirm` field - not a fixed phrase like `account.
+delete.CONFIRM_PHRASE`, since the issue's own Implementation checklist asks
+for "typed confirmation of the target". A mismatch, an empty `target` or an
+empty `reason` all return a clean `400` before `storage.erase` is ever
+called - nothing is deleted on any of those paths.
 """
 
 from __future__ import annotations
@@ -91,19 +111,23 @@ from memory_manager.app import Services
 from memory_manager.audit import AuditWriter
 from memory_manager.auth import users
 from memory_manager.db import rls
+from memory_manager.storage.base import ErasureTargetKind, NotFound
 from memory_manager.storage.postgres import PostgresBackend
 
 __all__ = [
     "ADD_MEMBER_PATH",
     "ADMIN_ROLE",
+    "CONFIRM_FIELD_NAME",
     "CREATABLE_KINDS",
     "CREATE_NAMESPACE_PATH",
     "CSRF_FORM_ADD_MEMBER",
     "CSRF_FORM_CREATE_NAMESPACE",
+    "CSRF_FORM_ERASE",
     "CSRF_FORM_REMOVE_MEMBER",
     "CSRF_FORM_RENAME_NAMESPACE",
     "CSRF_FORM_REVOKE_USER",
     "CSRF_FORM_UPDATE_SETTINGS",
+    "ERASE_PATH",
     "REMOVE_MEMBER_PATH",
     "RENAME_NAMESPACE_PATH",
     "REVOKE_USER_PATH",
@@ -129,6 +153,7 @@ ADD_MEMBER_PATH = "/account/admin/members"
 REMOVE_MEMBER_PATH = "/account/admin/members/remove"
 UPDATE_SETTINGS_PATH = "/account/admin/settings"
 REVOKE_USER_PATH = "/account/admin/users/revoke"
+ERASE_PATH = "/account/admin/erase"
 
 #: One distinct `account.sessions.csrf_token`/`verify_csrf` form label per
 #: admin form - same "every state-changing form gets its own label" shape
@@ -141,9 +166,21 @@ CSRF_FORM_ADD_MEMBER = "account-admin-add-member"
 CSRF_FORM_REMOVE_MEMBER = "account-admin-remove-member"
 CSRF_FORM_UPDATE_SETTINGS = "account-admin-update-settings"
 CSRF_FORM_REVOKE_USER = "account-admin-revoke-user"
+CSRF_FORM_ERASE = "account-admin-erase"
+
+#: The erase form's typed-confirmation field - same field name `account.delete.
+#: CONFIRM_FIELD_NAME` already uses for its own typed phrase, reused here for a
+#: typed *target* instead (the issue's own "typed confirmation of the target").
+CONFIRM_FIELD_NAME = "confirm"
 
 _ADMIN_CLIENT = "account"
 _ACCOUNT_PATH = "/account"
+
+#: `storage.base.ErasureTargetKind`'s own three literals, repeated as a
+#: `frozenset` so `target_kind not in _ERASURE_TARGET_KINDS` narrows a plain
+#: form string to that type for mypy - the same shape `storage.erasure_replay.
+#: _TARGET_KINDS` already uses for the same literal.
+_ERASURE_TARGET_KINDS: frozenset[ErasureTargetKind] = frozenset({"note", "namespace", "user"})
 
 # Same charset as a namespace path segment (`vault/paths.py`'s own
 # `_NAMESPACE_RE`, `migrate_git.py`'s own `_ALIAS_RE`) - an alias becomes a
@@ -307,6 +344,12 @@ class _Authorized:
     app_role: str
     session: SessionInfo
     form: FormData
+    #: `services.storage` itself - `_authorize_admin_form`'s own `isinstance`
+    #: check already narrowed it to `PostgresBackend`; `_erase` is the one
+    #: route that needs it directly, for `storage.erase` (`erase_namespace`/
+    #: `erase_user`/`erase_note`'s own entry point), rather than one more
+    #: `mm_admin_*` SQL function.
+    storage: PostgresBackend
 
 
 async def _authorize_admin_form(
@@ -329,6 +372,7 @@ async def _authorize_admin_form(
         return PlainTextResponse("Admin actions require a database.", status_code=503)
     if not isinstance(services.storage, PostgresBackend) or services.app_role is None:
         return PlainTextResponse("Admin actions require the Postgres backend.", status_code=403)
+    storage = services.storage
 
     session_id = request.cookies.get(session_cookie)
     if session_id is None:
@@ -344,7 +388,25 @@ async def _authorize_admin_form(
     if not sessions.verify_csrf(session_id, csrf_form, token):
         return PlainTextResponse("Invalid or missing CSRF token.", status_code=403)
 
-    return _Authorized(pool=pool, app_role=services.app_role, session=info, form=form)
+    return _Authorized(
+        pool=pool, app_role=services.app_role, session=info, form=form, storage=storage
+    )
+
+
+async def _resolve_note_id(pool: asyncpg.Pool, path: str) -> str | None:
+    """`vault_notes.id` for `path` - the ULID `storage.erasure.erase_note`
+    actually matches on, `path` itself being unique there (`0004_vault.sql`).
+
+    A direct, owner-level lookup, the same bypass of row-level security
+    `PostgresBackend.erase` itself already makes (`storage/postgres.py`'s own
+    docstring: "erasure always runs as the owner ... the app role holds no
+    grant at all") - `Memory.Admin` grants no content access (ADR-0008), but
+    an id is not content (CLAUDE.md: "admins never see content, only ids/
+    paths/counts"). `None` if nothing exists at that exact path - `_erase`
+    reports that as a clean `404` before ever calling `storage.erase`.
+    """
+    note_id = await pool.fetchval("select id from vault_notes where path = $1", path)
+    return str(note_id) if note_id is not None else None
 
 
 def admin_routes(session_cookie: str) -> list[Route]:
@@ -621,6 +683,53 @@ def admin_routes(session_cookie: str) -> list[Route]:
         )
         return RedirectResponse(_ACCOUNT_PATH, status_code=302)
 
+    async def _erase(request: Request) -> Response:
+        authorized = await _authorize_admin_form(
+            request, session_cookie=session_cookie, csrf_form=CSRF_FORM_ERASE
+        )
+        if isinstance(authorized, Response):
+            return authorized
+        pool, storage, session, form = (
+            authorized.pool,
+            authorized.storage,
+            authorized.session,
+            authorized.form,
+        )
+
+        target_kind = str(form.get("target_kind", ""))
+        target = str(form.get("target", "")).strip()
+        confirm = str(form.get(CONFIRM_FIELD_NAME, ""))
+        reason = str(form.get("reason", "")).strip()
+
+        if target_kind not in _ERASURE_TARGET_KINDS:
+            return PlainTextResponse(
+                f"target_kind must be one of {sorted(_ERASURE_TARGET_KINDS)}, got {target_kind!r}",
+                status_code=400,
+            )
+        if not target:
+            return PlainTextResponse("target must not be empty.", status_code=400)
+        if not reason:
+            return PlainTextResponse("reason must not be empty.", status_code=400)
+        if confirm != target:
+            return PlainTextResponse(
+                f'Confirmation did not match. Type "{target}" exactly to erase it.',
+                status_code=400,
+            )
+
+        target_id = target
+        if target_kind == "note":
+            resolved = await _resolve_note_id(pool, target)
+            if resolved is None:
+                return PlainTextResponse(f"No note found at path {target!r}.", status_code=404)
+            target_id = resolved
+
+        try:
+            await storage.erase(target_kind, target_id, actor=session.subject, reason=reason)
+        except NotFound:
+            return PlainTextResponse(f"{target_kind} {target!r} does not exist.", status_code=404)
+
+        return RedirectResponse(_ACCOUNT_PATH, status_code=302)
+
     return [
         Route(CREATE_NAMESPACE_PATH, endpoint=_create_namespace, methods=["POST"]),
         Route(RENAME_NAMESPACE_PATH, endpoint=_rename_namespace, methods=["POST"]),
@@ -628,6 +737,7 @@ def admin_routes(session_cookie: str) -> list[Route]:
         Route(REMOVE_MEMBER_PATH, endpoint=_remove_member, methods=["POST"]),
         Route(UPDATE_SETTINGS_PATH, endpoint=_update_settings, methods=["POST"]),
         Route(REVOKE_USER_PATH, endpoint=_revoke_user, methods=["POST"]),
+        Route(ERASE_PATH, endpoint=_erase, methods=["POST"]),
     ]
 
 
@@ -660,11 +770,15 @@ def render_admin_section(rows: list[NamespaceRow], *, session_id: str) -> str:
     remove_member_token = sessions.csrf_token(session_id, CSRF_FORM_REMOVE_MEMBER)
     settings_token = sessions.csrf_token(session_id, CSRF_FORM_UPDATE_SETTINGS)
     revoke_user_token = sessions.csrf_token(session_id, CSRF_FORM_REVOKE_USER)
+    erase_token = sessions.csrf_token(session_id, CSRF_FORM_ERASE)
 
     kind_options = "".join(
         f'<option value="{kind.value}">{kind.value}</option>' for kind in CREATABLE_KINDS
     )
     role_options = "".join(f'<option value="{role}">{role}</option>' for role in _PROJECT_ROLES)
+    erasure_target_options = "".join(
+        f'<option value="{kind}">{kind}</option>' for kind in sorted(_ERASURE_TARGET_KINDS)
+    )
 
     return (
         "<section><h2>Admin</h2>"
@@ -723,6 +837,17 @@ def render_admin_section(rows: list[NamespaceRow], *, session_id: str) -> str:
         '<label>Entra object id <input type="text" name="oid"></label>'
         '<label>Reason <input type="text" name="reason"></label>'
         '<button type="submit">Revoke access</button>'
+        "</form>"
+        "<h3>Erase a note, a namespace or a user</h3>"
+        f'<form method="post" action="{html.escape(ERASE_PATH)}">'
+        f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{html.escape(erase_token)}">'
+        f'<label>Target kind <select name="target_kind">{erasure_target_options}</select></label>'
+        "<label>Target (note path / namespace alias / user oid) "
+        '<input type="text" name="target"></label>'
+        '<label>Reason <input type="text" name="reason"></label>'
+        "<label>Type the target again to confirm "
+        f'<input type="text" name="{CONFIRM_FIELD_NAME}"></label>'
+        '<button type="submit">Erase</button>'
         "</form>"
         "</section>"
     )

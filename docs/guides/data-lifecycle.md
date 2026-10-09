@@ -48,12 +48,19 @@ and the note count shows `0` afterwards rather than ending the session.
 
 ## Admin erasure of a note, a namespace or a user
 
-Not yet built on this branch: an admin-triggered erasure of a note path, a
-namespace or a whole user's identity from `/account`, with a mandatory reason and
-a typed confirmation, is tracked as
-[#236](https://github.com/scramb/memory-manager/issues/236) (WP-26). Once built,
-it reuses the same `storage.erasure.erase_note`/`erase_namespace`/`erase_user`
-primitives self-service delete (#232) already calls.
+On `/account`, a `Memory.Admin` hard-deletes a note by its vault path, a
+namespace by its alias or a user by their Entra object id
+([#236](https://github.com/scramb/memory-manager/issues/236), WP-26), with a
+mandatory reason and a typed confirmation of the target identifier itself
+(not a fixed phrase, unlike self-service delete below). It reuses the same
+`storage.erasure.erase_note`/`erase_namespace`/`erase_user` primitives
+self-service delete (#232) already calls, through
+`storage.base.StorageBackend.erase` - never a new delete statement of its
+own. The admin never sees note content: a note is identified by path,
+resolved to its id directly against the owner connection (an id is not
+content). The erasure primitive's own `erasure_log`/`audit_log` row (actor,
+reason, target kind, target ids, row counts) is the complete record of the
+action; no separate admin-scoped audit row is added on top of it.
 
 ## Retention after deprovisioning
 
@@ -64,11 +71,10 @@ user as no identity), it is hard-deleted after `PERSONAL_RETENTION_DAYS` (defaul
 30) by a worker retention job, with `erasure_log`'s actor recorded as
 `system:retention`.
 
-> **Not yet in `config.py` as of this writing.** `PERSONAL_RETENTION_DAYS` and the
-> retention job itself are being built in
-> [#240](https://github.com/scramb/memory-manager/issues/240) (WP-26); this
-> section describes the decided default and behaviour from the ADR, not a
-> configuration key that exists in the code yet. Update this line once #240 lands.
+`PERSONAL_RETENTION_DAYS` and `RETENTION_SWEEP_SECONDS` (how often that job
+runs, default 86400s/1 day) are `memory-manager worker` environment
+variables (`config.py`'s `WorkerConfig`,
+[#240](https://github.com/scramb/memory-manager/issues/240)).
 
 ## Erasure-log replay after a restore
 
@@ -83,8 +89,7 @@ undo an erasure is backup retention (default 30 d) + 7 d.
 
 ## Not included
 
-- The admin erasure action itself (#236) - tracked above, not built yet.
-- The retention job and its `PERSONAL_RETENTION_DAYS` config key (#240) - tracked
-  above, not built yet.
+- The full deletion acceptance test across every target kind (#241).
+- Break-glass access to a deprovisioned user's personal namespace (#237-#239).
 - Handover of a deprovisioned user's personal namespace to a successor - opt-in,
   needs the break-glass approval flow ([ADR-0008](../adr/0008-namespace-permissions.md)), not covered here.
