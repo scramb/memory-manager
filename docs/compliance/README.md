@@ -13,8 +13,10 @@
 |---|---|
 | [`data-flow.md`](./data-flow.md) | Categories of personal data this server processes, the purpose of each, who/what receives them, a data-flow diagram, and an Art. 30 "record of processing activities" skeleton. |
 | [`toms.md`](./toms.md) | Art. 32 technical and organisational measures (TOMs), mapped one-to-one to a concrete control and its config key or code path, plus the Art. 25 data-protection-by-default defaults this server ships with. |
+| [`deletion-concept.md`](./deletion-concept.md) | How and when personal data is erased (Art. 17): the hard-delete/pseudonymization/audit-redaction scope per data category, the backup horizon, the `git`-backend limitation (no erasure of history), and the restore runbook for replaying `erasure_log` via `ERASURE_LOG_REPLAY_FILE`. |
+| [`roles-and-permissions.md`](./roles-and-permissions.md) | Who may read, write, curate or administer which memory: the role × namespace-kind matrix, how roles are assigned and removed, the break-glass procedure and its audit trail, and operator access to the database. |
 
-Both documents describe the architecture as it stands in this repository (default `git` storage
+Every document describes the architecture as it stands in this repository (default `git` storage
 backend, and the enterprise profile: `STORAGE_BACKEND=postgres` with Entra ID login, ADR-0006
 through ADR-0009). Everything that depends on an *operator's own* choice - which fields apply to
 their organisation, their retention policy, their sub-processors, their own data-protection
@@ -33,12 +35,14 @@ server's omission; it is the part only the operator can answer.
 3. Use `toms.md` as evidence for Art. 32 "appropriate technical and organisational measures" -
    each row names the actual control and where it lives in this codebase, so a reviewer can check
    it against the running deployment rather than trusting the paragraph alone.
-4. Neither template substitutes for a Data Protection Impact Assessment, a transparency notice to
-   data subjects, or a deletion/retention concept tailored to your organisation's roles - those
-   are tracked separately (issues #275, #276) and are explicitly out of scope here.
+4. `deletion-concept.md` and `roles-and-permissions.md` build on `toms.md`'s own citations the
+   same way: fill in the backup-retention value, the operator holding direct database access,
+   and your own Git-backend erasure-request policy if you run that backend.
+5. None of the four templates substitutes for a Data Protection Impact Assessment or a
+   transparency notice to data subjects - those are tracked separately (#276) and are explicitly
+   out of scope here.
 
 ## Not included
 
-- Deletion concept, roles and permissions beyond what `toms.md` cites as existing controls (#275).
 - DPIA, transparency notice, a Germany-specific section (#276).
-- Legal review of either template.
+- Legal review of any of the four templates.

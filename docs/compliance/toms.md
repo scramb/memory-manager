@@ -47,7 +47,7 @@ trade-off and why it was accepted rather than closed further.
 |---|---|---|
 | Scheduled backups (enterprise) | Daily `ScheduledBackup` via the Barman Cloud CNPG-I plugin, 30-day `ObjectStore` retention policy by default | `database.cnpg.backup`, `docs/guides/enterprise-operations.md` "Backups and restore drill" |
 | Restore procedure (enterprise) | CloudNativePG recovers into a new `Cluster` bootstrapped from the same `ObjectStore` | `docs/guides/enterprise-operations.md` "Restoring from a backup" - **not yet exercised in this repository's own CI** (documented there as a known gap) |
-| Erasure survives a restore (enterprise) | Every erasure is also exported through the audit/SIEM pipeline (`AUDIT_EXPORT`), so a restore that rolls back `erasure_log` itself does not resurrect erased data once the exported copy is replayed | `ERASURE_LOG_REPLAY_FILE`, ADR-0007 §3 addendum, `docs/guides/audit-export.md` "Erasure records and restores" - **landing with WP-26, not yet merged to `main` as of this document** |
+| Erasure survives a restore (enterprise) | Every erasure is also exported through the audit/SIEM pipeline (`AUDIT_EXPORT`), so a restore that rolls back `erasure_log` itself does not resurrect erased data once the exported copy is replayed | `ERASURE_LOG_REPLAY_FILE` (`config.py::erasure_log_replay_file`), ADR-0007 §3 addendum, `docs/guides/audit-export.md` "Erasure records and restores", `storage/erasure.py::_export_erasure`, `storage/erasure_replay.py::replay` and `http.py`'s `lifespan` holding `/readyz` until replay finishes **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)** |
 | Index is fully rebuildable from source (git backend) | `reindex --full` rebuilds the derived Postgres index from the vault; nothing lives only in the database that is not derivable from Git | CLAUDE.md "Postgres must be fully rebuildable from the vault" |
 
 ## Art. 32(1)(d) - Regular testing, assessing and evaluating effectiveness
@@ -65,22 +65,26 @@ trade-off and why it was accepted rather than closed further.
   written only when the caller names it explicitly and has write access there (ADR-0008
   "Default write target is `me`").
 - **`Memory.Admin` grants no content access by itself.** The admin role manages namespaces and
-  ACLs; reading a user's personal memory is meant to require a separate, audited break-glass
-  grant with a reason, by default a second admin's approval, a 1-hour expiry, and a read-only
-  viewer that is never reachable from the MCP surface - so a grant can never be used from Claude
-  or any other MCP client. This is ADR-0008's decision ("Break-glass" and its 2026-10-08
-  addendum) and the approver count and config key it names there are not yet an implemented
-  control - the request/approval/viewer workflow and its config key **land with #237-#239
-  (ADR-0008) and are not committed code as of this document**. The RLS column it will rely on,
-  `app.break_glass`, already exists on `main` (`db/rls.py`).
+  ACLs; reading a user's personal memory requires a separate, audited break-glass grant with a
+  reason, by default (`BREAK_GLASS_APPROVERS=2`, `config.py::break_glass_approvers_from_env`) a
+  second admin's approval, a 1-hour expiry, and a read-only viewer that is never reachable from
+  the MCP surface - so a grant can never be used from Claude or any other MCP client. This is
+  ADR-0008's decision ("Break-glass" and its 2026-10-08 addendum): request/approve/deny/revoke
+  run through the `mm_break_glass_*` `SECURITY DEFINER` functions
+  (`db/migrations/0021_break_glass_workflow.sql`), gated in Python first by
+  `account/break_glass.py::_authorize_break_glass_form`; reading under an approved grant happens
+  only through `account/break_glass_viewer.py`'s two `GET`-only routes (`VIEW_PATH`/`NOTE_PATH`);
+  the user is shown a banner and a `reference` note by `account/break_glass_notice.py`
+  **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)**. The RLS column these
+  rely on, `app.break_glass`, already exists on `main` (`db/rls.py`).
 - **No MCP tool hard-deletes a note.** Every "delete" a client can trigger moves the note to
   `_archive/`; it is never gone (CLAUDE.md "No MCP tool hard-deletes notes"). Erasure (true
   deletion, GDPR Art. 17) is a separate, non-MCP, audited operation (`/account` self-service,
   the admin area, and the retention job) - never reachable from a write.
 - **Deprovisioned users' personal data does not linger indefinitely.** A disabled or departed
   user's personal namespace is frozen and hard-deleted after `PERSONAL_RETENTION_DAYS` (default
-  30 days) - **this retention job is implemented in WP-26, not yet merged to `main` as of this
-  document** (ADR-0008 "Deprovisioned users").
+  30 days) by `worker.py::_retention_job`, running as the `system:retention` actor (ADR-0008
+  "Deprovisioned users") **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)**.
 - **Erasing a user removes personal data, not shared knowledge the team owns.** The personal
   namespace, every revision, chunk and job, and the user's identity rows are hard-deleted; notes
   the user authored in a *shared* namespace stay, with the authorship field redacted to
@@ -107,9 +111,10 @@ A removed Entra app role takes effect only at the user's **next Entra login**, b
 `docs/security/threat-model.md` Flow 4 "E"). Operators must align `ENTRA_MAX_SESSION` with their
 own tenant's Conditional Access sign-in frequency policy. When a role or a user's access must be
 cut off **immediately**, rather than waiting for the next login, a `Memory.Admin` can revoke that
-user's sessions and tokens right away from the admin area on `/account` (`account/admin.py`'s
-"revoke access" action - **implemented on `wp/26-admin-erasure`, not yet merged to `main` as of
-this document**) - this is the server's mitigation for the Conditional-Access/role-removal lag,
+user's sessions and tokens right away from the admin area on `/account`
+(`account/admin.py::_revoke_user`, `REVOKE_USER_PATH = "/account/admin/users/revoke"`)
+**(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)** - this is the server's
+mitigation for the Conditional-Access/role-removal lag,
 not a substitute for it. **(Residual risk, accepted - see the threat model's Flow 4 "E" and
 "Explicit residual risks" for the full reasoning.)**
 
