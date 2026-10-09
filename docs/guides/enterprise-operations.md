@@ -255,6 +255,17 @@ Documented at backup retention (default 30 d, `database.cnpg.backup.retentionPol
 ([ADR-0007](../adr/0007-storage-backend.md) §3) — an erasure older than that horizon can no
 longer be un-done by a restore from this profile's own default retention window.
 
+### Retention of deprovisioned users
+
+The `worker` Deployment's own `retention` job ([#240](https://github.com/scramb/memory-manager/issues/240),
+[ADR-0008](../adr/0008-namespace-permissions.md) "Deprovisioned users") erases the personal
+namespace and identity of every user the Entra delta sync has disabled for at least
+`PERSONAL_RETENTION_DAYS` (default 30) — the same hard-delete `erase_user` already performs for
+an admin-triggered erasure, with actor `system:retention` in `erasure_log`/the SIEM export. Set
+`PERSONAL_RETENTION_DAYS` on the `worker` Deployment to change the horizon, and
+`RETENTION_SWEEP_SECONDS` (default 86400s/1 day) to change how often the job checks for a user
+past it. A user re-enabled in Entra before the horizon passes is never erased.
+
 ## 8. Upgrades
 
 `deploy/flux/enterprise/helmrelease.yaml` pins the chart to a semver range
