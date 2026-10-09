@@ -141,9 +141,8 @@ in, not for employees.*
   - "Break-glass" paragraph: [`roles-and-permissions.md`](./roles-and-permissions.md)
     "Break-glass: an admin reading a user's personal namespace" (request, four-eyes approval by
     default, 1-hour expiry, read-only viewer never reachable from MCP, audited, user notified via
-    banner + `reference` note) - **implemented on `wp/26-admin-erasure`, not yet merged to
-    `main`**; re-verify this paragraph once merged, the same way the threat model and the other
-    three templates flag it.
+    banner + `reference` note) - implemented on `main` (WP-26); see that document and the threat
+    model's Flow 8 "I" row for the residual risk on how the approver count reaches SQL.
   - "If you leave or are deprovisioned": [`deletion-concept.md`](./deletion-concept.md)
     "Erasure scope" and "Deprovisioning via Graph delta sync" (`PERSONAL_RETENTION_DAYS`, default
     30 days).

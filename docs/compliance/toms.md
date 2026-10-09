@@ -47,7 +47,7 @@ trade-off and why it was accepted rather than closed further.
 |---|---|---|
 | Scheduled backups (enterprise) | Daily `ScheduledBackup` via the Barman Cloud CNPG-I plugin, 30-day `ObjectStore` retention policy by default | `database.cnpg.backup`, `docs/guides/enterprise-operations.md` "Backups and restore drill" |
 | Restore procedure (enterprise) | CloudNativePG recovers into a new `Cluster` bootstrapped from the same `ObjectStore` | `docs/guides/enterprise-operations.md` "Restoring from a backup" - **not yet exercised in this repository's own CI** (documented there as a known gap) |
-| Erasure survives a restore (enterprise) | Every erasure is also exported through the audit/SIEM pipeline (`AUDIT_EXPORT`), so a restore that rolls back `erasure_log` itself does not resurrect erased data once the exported copy is replayed | `ERASURE_LOG_REPLAY_FILE` (`config.py::erasure_log_replay_file`), ADR-0007 §3 addendum, `docs/guides/audit-export.md` "Erasure records and restores", `storage/erasure.py::_export_erasure`, `storage/erasure_replay.py::replay` and `http.py`'s `lifespan` holding `/readyz` until replay finishes **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)** |
+| Erasure survives a restore (enterprise) | Every erasure is also exported through the audit/SIEM pipeline (`AUDIT_EXPORT`), so a restore that rolls back `erasure_log` itself does not resurrect erased data once the exported copy is replayed | `ERASURE_LOG_REPLAY_FILE` (`config.py::erasure_log_replay_file`), ADR-0007 §3 addendum, `docs/guides/audit-export.md` "Erasure records and restores", `storage/erasure.py::_export_erasure`, `storage/erasure_replay.py::replay` and `http.py`'s `lifespan` holding `/readyz` until replay finishes (WP-26, on `main`) |
 | Index is fully rebuildable from source (git backend) | `reindex --full` rebuilds the derived Postgres index from the vault; nothing lives only in the database that is not derivable from Git | CLAUDE.md "Postgres must be fully rebuildable from the vault" |
 
 ## Art. 32(1)(d) - Regular testing, assessing and evaluating effectiveness
@@ -75,8 +75,11 @@ trade-off and why it was accepted rather than closed further.
   `account/break_glass.py::_authorize_break_glass_form`; reading under an approved grant happens
   only through `account/break_glass_viewer.py`'s two `GET`-only routes (`VIEW_PATH`/`NOTE_PATH`);
   the user is shown a banner and a `reference` note by `account/break_glass_notice.py`
-  **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)**. The RLS column these
-  rely on, `app.break_glass`, already exists on `main` (`db/rls.py`).
+  (WP-26, on `main`). The RLS session variable these rely on, `app.break_glass`
+  (`db/rls.py::request_identity`), is also on `main`. **Residual risk:** the approver count
+  `mm_break_glass_approve` enforces the self-approval refusal against is the value the app
+  passes in (`BREAK_GLASS_APPROVERS`), not one SQL reads independently - see the threat model's
+  Flow 8 "I" row.
 - **No MCP tool hard-deletes a note.** Every "delete" a client can trigger moves the note to
   `_archive/`; it is never gone (CLAUDE.md "No MCP tool hard-deletes notes"). Erasure (true
   deletion, GDPR Art. 17) is a separate, non-MCP, audited operation (`/account` self-service,
@@ -84,7 +87,7 @@ trade-off and why it was accepted rather than closed further.
 - **Deprovisioned users' personal data does not linger indefinitely.** A disabled or departed
   user's personal namespace is frozen and hard-deleted after `PERSONAL_RETENTION_DAYS` (default
   30 days) by `worker.py::_retention_job`, running as the `system:retention` actor (ADR-0008
-  "Deprovisioned users") **(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)**.
+  "Deprovisioned users") (WP-26, on `main`).
 - **Erasing a user removes personal data, not shared knowledge the team owns.** The personal
   namespace, every revision, chunk and job, and the user's identity rows are hard-deleted; notes
   the user authored in a *shared* namespace stay, with the authorship field redacted to
@@ -113,7 +116,7 @@ own tenant's Conditional Access sign-in frequency policy. When a role or a user'
 cut off **immediately**, rather than waiting for the next login, a `Memory.Admin` can revoke that
 user's sessions and tokens right away from the admin area on `/account`
 (`account/admin.py::_revoke_user`, `REVOKE_USER_PATH = "/account/admin/users/revoke"`)
-**(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)** - this is the server's
+(WP-26, on `main`) - this is the server's
 mitigation for the Conditional-Access/role-removal lag,
 not a substitute for it. **(Residual risk, accepted - see the threat model's Flow 4 "E" and
 "Explicit residual risks" for the full reasoning.)**

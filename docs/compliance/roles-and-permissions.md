@@ -65,18 +65,24 @@ no content access by itself").
 ## Break-glass: an admin reading a user's personal namespace
 
 The **only** path for a `Memory.Admin` to read another user's `me` namespace, implemented on
-`wp/26-admin-erasure` **(WP-26, PR open, not yet merged to `main`)**:
+`main` (WP-26):
 
 1. **Request**: an admin names the target user's Entra `oid` and a reason
    (`account/break_glass.py`'s `REQUEST_PATH`, backed by `mm_break_glass_request` -
    `db/migrations/0021_break_glass_workflow.sql` - which resolves the `oid` to a personal
    namespace itself and refuses if the person has never used `memory-manager` at all).
 2. **Approval (four-eyes by default)**: a **second**, different `Memory.Admin` approves
-   (`APPROVE_PATH`, `mm_break_glass_approve`); the approver count
-   (`BREAK_GLASS_APPROVERS`, default 2, `config.py::break_glass_approvers_from_env`) is checked
-   independently in Python (`_authorize_break_glass_form`, before any database call) and again by
-   the SQL function itself, so a bug in either alone cannot let a self-approval through. An
-   operator may lower `BREAK_GLASS_APPROVERS` to 1.
+   (`APPROVE_PATH`, `mm_break_glass_approve`). The approver count
+   (`BREAK_GLASS_APPROVERS`, default 2, `config.py::break_glass_approvers_from_env`) is read once,
+   in Python, by `account/break_glass.py`'s route handler, which refuses a same-admin approval
+   itself (`_approve`, before calling into the database) and then passes the identical count to
+   `mm_break_glass_approve` as its `p_approver_count` argument; the SQL function re-checks the
+   self-approval rule against that count, so a bug in the Python-side refusal alone would not let
+   a same-admin approval through. **Residual risk:** SQL does not read `BREAK_GLASS_APPROVERS`
+   independently of the app - it trusts the count it is given, so a bug or compromise upstream of
+   that argument (not just in the refusal check) would defeat four-eyes despite the SQL-side
+   re-check still running (see `docs/security/threat-model.md` Flow 8 "I"). An operator may lower
+   `BREAK_GLASS_APPROVERS` to 1.
 3. **Expiry**: an approved grant is valid for **1 hour** from approval
    (`break_glass_grants.expires_at`); after that, every read is refused the same as a revoked or
    denied one.
@@ -100,11 +106,10 @@ The **only** path for a `Memory.Admin` to read another user's `me` namespace, im
 7. **Revocation**: any admin can end a live grant early (`REVOKE_PATH`, `mm_break_glass_revoke`),
    audited the same way.
 
-The RLS column these functions key off, `app.break_glass`, already exists on `main`
-(`db/rls.py:166,219-220`); the request/approval/viewer/notification workflow itself must be
-re-verified against the merged implementation once `wp/26-admin-erasure` lands
-(cross-reference: [`docs/security/pentest-checklist.md`](../security/pentest-checklist.md) area E,
-cases BG-1 through BG-5).
+The RLS session variable these functions key off, `app.break_glass`, is set by
+`db/rls.py::request_identity` (`break_glass` parameter L228, `set_config` call L257-259), also on
+`main` (cross-reference: [`docs/security/pentest-checklist.md`](../security/pentest-checklist.md)
+area E, cases BG-1 through BG-5).
 
 ## Operator access to the database
 

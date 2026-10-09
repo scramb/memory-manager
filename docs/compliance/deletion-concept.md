@@ -112,7 +112,7 @@ against the restored cluster:
 (Restore runbook and replay mechanism: ADR-0007 §3 addendum; `docs/guides/enterprise-operations.md`
 "Erasure-log replay after a restore"/"Deletion horizon" (committed on `main`);
 `storage/erasure_replay.py`, `http.py`'s `lifespan` readiness gate and `config.py::erasure_log_replay_file`
-**(WP-26, on branch `wp/26-admin-erasure`, not yet merged to `main`)**.)
+(WP-26, on `main`).)
 
 ## Not included
 
