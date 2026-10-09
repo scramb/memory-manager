@@ -342,6 +342,7 @@ class TestEraseUser:
             await _seed_namespace(conn, "user", "oid-carol", "carol")
             await _seed_namespace(conn, "group", "grp-1", "payments")
             await _seed_user(conn, "oid-carol", "Carol")
+            await _seed_user(conn, "oid-erin", "Erin")
             await _seed_note(conn, "note-personal", "carol", author_oid="oid-carol")
             shared_path = await _seed_note(
                 conn, "note-shared", "payments", author_oid="oid-carol", namespace_kind="group"
@@ -364,6 +365,20 @@ class TestEraseUser:
                 "values ('th-1', 'access', 'client-1', 'oid-carol', '{}', '{}', 'fam-1', "
                 "'cli', now() + interval '1 hour', 'oid-carol')"
             )
+            await conn.execute(
+                "insert into account_sessions "
+                "(session_hash, subject, oid, roles, login_mode, created_at, "
+                "last_seen_at, expires_at) "
+                "values ('sh-carol', 'oid-carol', 'oid-carol', '{}', 'entra', "
+                "now(), now(), now() + interval '8 hours')"
+            )
+            await conn.execute(
+                "insert into account_sessions "
+                "(session_hash, subject, oid, roles, login_mode, created_at, "
+                "last_seen_at, expires_at) "
+                "values ('sh-erin', 'oid-erin', 'oid-erin', '{}', 'entra', "
+                "now(), now(), now() + interval '8 hours')"
+            )
 
             result = await erase_user(conn, "oid-carol", actor="admin", reason="gdpr-erasure")
 
@@ -373,9 +388,19 @@ class TestEraseUser:
             assert result.row_counts["user_groups"] == 1
             assert result.row_counts["static_tokens"] == 1
             assert result.row_counts["oauth_tokens"] == 1
+            assert result.row_counts["account_sessions"] == 1
             assert result.row_counts["users"] == 1
             assert result.row_counts["namespaces"] == 1
             assert result.row_counts["vault_revisions_pseudonymized"] == 1
+
+            carol_session_remaining = await conn.fetchval(
+                "select count(*) from account_sessions where oid = 'oid-carol'"
+            )
+            assert carol_session_remaining == 0
+            erin_session_remaining = await conn.fetchval(
+                "select count(*) from account_sessions where oid = 'oid-erin'"
+            )
+            assert erin_session_remaining == 1
 
             personal_remaining = await conn.fetchval(
                 "select count(*) from vault_notes where namespace = 'carol'"

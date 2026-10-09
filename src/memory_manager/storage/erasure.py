@@ -414,6 +414,9 @@ async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -
         user_groups_rows = await conn.fetch(
             "delete from user_groups where oid = $1 returning group_id", oid
         )
+        account_sessions_rows = await conn.fetch(
+            "delete from account_sessions where oid = $1 returning session_hash", oid
+        )
         users_rows = await conn.fetch("delete from users where oid = $1 returning oid", oid)
 
         row_counts = counts.as_dict()
@@ -424,6 +427,7 @@ async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -
         row_counts["oauth_tokens"] = len(oauth_tokens_rows)
         row_counts["static_tokens"] = len(static_tokens_rows)
         row_counts["user_groups"] = len(user_groups_rows)
+        row_counts["account_sessions"] = len(account_sessions_rows)
         row_counts["users"] = len(users_rows)
 
         log_id = await _write_erasure_log(
