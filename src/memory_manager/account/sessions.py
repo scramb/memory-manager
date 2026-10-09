@@ -61,6 +61,7 @@ __all__ = [
     "csrf_token",
     "lookup",
     "revoke",
+    "revoke_all_for_oid",
     "verify_csrf",
 ]
 
@@ -205,6 +206,23 @@ async def revoke(pool: asyncpg.Pool, session_id: str) -> bool:
         "delete from account_sessions where session_hash = $1", _hash_session_id(session_id)
     )
     return result != "DELETE 0"
+
+
+async def revoke_all_for_oid(pool: asyncpg.Pool, oid: str) -> int:
+    """Hard-delete every `account_sessions` row for `oid`. Returns how many rows
+    were actually removed.
+
+    `account.admin`'s "revoke access" action (#235) calls this, by `oid` rather
+    than one plaintext session id, the same `oid`-keyed delete `storage.erasure.
+    erase_user` already performs when erasing a user's identity rows outright -
+    the only other caller that ever removes an `account_sessions` row by `oid`
+    instead of by the single session a browser presents on logout (`revoke`
+    above).
+    """
+    rows = await pool.fetch(
+        "delete from account_sessions where oid = $1 returning session_hash", oid
+    )
+    return len(rows)
 
 
 def csrf_token(session_id: str, form: str) -> str:

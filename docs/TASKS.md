@@ -254,17 +254,17 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 ### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
 
-- [ ] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
-- [ ] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
-- [ ] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
-- [ ] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229
-- [ ] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222
-- [ ] #236 Admins erase a note, a namespace or a user on `/account` with a recorded reason ⛔ blocked by #231, #234
-- [ ] #237 Break-glass grants need a second admin's approval and expire after one hour ⛔ blocked by #234
-- [ ] #238 Admins read a break-glass namespace in a read-only, audited viewer on `/account` ⛔ blocked by #237
-- [ ] #239 Users see a break-glass banner and a reference note in `me` until they acknowledge it ⛔ blocked by #237
-- [ ] #240 Personal memories of deprovisioned users are erased after `PERSONAL_RETENTION_DAYS` ⛔ blocked by #231, #219, #223
-- [ ] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
+- [x] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
+- [x] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
+- [x] #233 After a restore the server replays the erasure log from `ERASURE_LOG_REPLAY_FILE` before `/readyz` turns 200 ⛔ blocked by #231, #245
+- [x] #234 Admins manage namespaces, project members and namespace settings on `/account` ⛔ blocked by #229
+- [x] #235 Admins revoke all sessions and tokens of a user immediately on `/account` ⛔ blocked by #234, #222
+- [x] #236 Admins erase a note, a namespace or a user on `/account` with a recorded reason ⛔ blocked by #231, #234
+- [x] #237 Break-glass grants need a second admin's approval and expire after one hour ⛔ blocked by #234
+- [x] #238 Admins read a break-glass namespace in a read-only, audited viewer on `/account` ⛔ blocked by #237
+- [x] #239 Users see a break-glass banner and a reference note in `me` until they acknowledge it ⛔ blocked by #237
+- [x] #240 Personal memories of deprovisioned users are erased after `PERSONAL_RETENTION_DAYS` ⛔ blocked by #231, #219, #223
+- [x] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
 
 ### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
 

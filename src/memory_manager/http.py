@@ -137,6 +137,7 @@ from memory_manager.observability.logging import RequestIdMiddleware
 from memory_manager.observability.metrics import metrics_endpoint, record_rate_limit_hit
 from memory_manager.observability.tracing import TracingMiddleware
 from memory_manager.quotas import QuotaChecker, StorageQuotaChecker
+from memory_manager.storage.erasure_replay import ReplayRecord, parse_replay_file, replay
 from memory_manager.storage.postgres import PostgresBackend
 
 __all__ = ["GracefulShutdownServer", "ServicesFactory", "build_authenticator", "create_app"]
@@ -438,6 +439,32 @@ def create_app(
             app.state.mcp_app = mcp_app
             app.state.oauth_authorization_server_enabled = oauth_provider is not None
 
+            # `erasure_replay_ready` (#233, ADR-0007 §3 addendum) gates `_readyz`
+            # until a configured `ERASURE_LOG_REPLAY_FILE` has replayed - set
+            # immediately (nothing to wait for) unless this is a `"postgres"`
+            # backend with one configured. Parsing happens here, synchronously,
+            # before the background task below (or anything else in this
+            # `lifespan`) ever runs: a malformed file's `ErasureReplayFormatError`
+            # propagates straight out of this `async with services_factory()`
+            # block, refusing startup outright (`storage.erasure_replay`'s own
+            # module docstring) rather than only failing once the task runs.
+            app.state.erasure_replay_ready = asyncio.Event()
+            erasure_replay_task: asyncio.Task[None] | None = None
+            if (
+                isinstance(services.storage, PostgresBackend)
+                and config.erasure_log_replay_file is not None
+            ):
+                if services.pool is None:  # pragma: no cover - defensive
+                    raise RuntimeError("PostgresBackend services without a pool")
+                replay_records = parse_replay_file(config.erasure_log_replay_file)
+                erasure_replay_task = asyncio.create_task(
+                    _run_erasure_replay(
+                        services.pool, replay_records, app.state.erasure_replay_ready
+                    )
+                )
+            else:
+                app.state.erasure_replay_ready.set()
+
             # Runs whenever there is anything to sweep: an OAuth authorization
             # server (`auth.store.cleanup`) or a `PostgresSharedState` backend
             # (`PostgresSharedState.sweep_expired_windows`) - either on its own is
@@ -477,6 +504,10 @@ def create_app(
                     cleanup_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await cleanup_task
+                if erasure_replay_task is not None:
+                    erasure_replay_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await erasure_replay_task
                 if isinstance(authenticator, (OidcAuthenticator, EntraAuthenticator)):
                     # Closes the `httpx.AsyncClient` `__init__` creates itself when no
                     # `http_client` is given (production; tests always pass their own
@@ -906,6 +937,32 @@ async def _cleanup_loop(
             )
         except Exception:
             _logger.exception("cleanup sweep failed")
+
+
+async def _run_erasure_replay(
+    pool: asyncpg.Pool, records: list[ReplayRecord], ready: asyncio.Event
+) -> None:
+    """Run `storage.erasure_replay.replay` in the background and set `ready` once it
+    finishes (#233) - `_readyz` stays 503 until then.
+
+    Unlike `_cleanup_loop`'s "log and retry next interval": this is a one-shot
+    run, never retried, and a failure deliberately leaves `ready` unset rather
+    than logging and moving on - a half-replayed erasure log must keep this
+    replica out of rotation, not quietly report healthy next time someone
+    happens to poll `/readyz`.
+    """
+    try:
+        stats = await replay(pool, records)
+    except Exception:
+        _logger.exception("erasure log replay failed - /readyz stays unready until restarted")
+        return
+    _logger.info(
+        "erasure log replay: applied=%d skipped=%d total=%d",
+        stats.applied,
+        stats.skipped,
+        stats.total,
+    )
+    ready.set()
 
 
 class _McpMount:
@@ -1338,8 +1395,9 @@ async def _healthz(_request: Request) -> Response:
 
 async def _readyz(request: Request) -> Response:
     """503 when draining (ADR-0009 §5), the vault clone is missing, a configured
-    database is unreachable, or (`LOGIN_MODE=entra`) Entra discovery has never
-    succeeded.
+    database is unreachable, (`LOGIN_MODE=entra`) Entra discovery has never
+    succeeded, or a configured `ERASURE_LOG_REPLAY_FILE` has not finished
+    replaying yet (#233, ADR-0007 §3 addendum).
 
     The draining check runs first and skips the database round trip entirely -
     once `GracefulShutdownServer.handle_exit` has set `app.state.draining`, this
@@ -1383,6 +1441,13 @@ async def _readyz(request: Request) -> Response:
         entra_discovery_ready = await authenticator.discovery_reachable()
         body["entra_discovery"] = entra_discovery_ready
         ready = ready and entra_discovery_ready
+        body["ready"] = ready
+
+    config: ServerConfig = request.app.state.config
+    if config.erasure_log_replay_file is not None:
+        erasure_replay_ready = request.app.state.erasure_replay_ready.is_set()
+        body["erasure_replay"] = erasure_replay_ready
+        ready = ready and erasure_replay_ready
         body["ready"] = ready
 
     return JSONResponse(body, status_code=200 if ready else 503)

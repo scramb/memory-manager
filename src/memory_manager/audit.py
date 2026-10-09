@@ -32,6 +32,19 @@ database outage must not also silence the SIEM copy, and a SIEM outage
 `request_id` is read fresh for every record from `observability.logging.
 current_request_id` - `None` outside an HTTP request (stdio mode, the poll
 loop's own sync) - never threaded through by a caller.
+
+`DETAIL_ALLOWLIST` is this module's own account of every key any caller in
+this codebase ever puts into `detail` today (`app.py`'s `_audit_outcome`,
+`quotas.py`, `migrate_git.py`, `exporter.py`) *minus* the two that are
+shaped like a path rather than a scalar fact (`WriteConflict`'s
+`conflict_path`, and `VersionConflict`'s/`EditMismatch`'s own never-stored
+`current_content`) - dropped defensively even though no caller actually
+writes either key into a Postgres-mode `audit_log` row today.
+`storage.erasure` (#231, ADR-0007 §3 addendum: "audit rows keep only
+metadata") is its one consumer so far, filtering a redacted row's `detail`
+down to this set; nothing in `AuditWriter`/`record` itself reads or
+enforces it - every call site above is still the one place that rule is
+actually kept.
 """
 
 from __future__ import annotations
@@ -47,9 +60,27 @@ import asyncpg
 from memory_manager.observability.audit_export import AuditExporter
 from memory_manager.observability.logging import current_request_id
 
-__all__ = ["AuditWriter"]
+__all__ = ["DETAIL_ALLOWLIST", "AuditWriter"]
 
 _logger = logging.getLogger(__name__)
+
+#: See the module docstring's last paragraph.
+DETAIL_ALLOWLIST = (
+    "version",
+    "current_version",
+    "error",
+    "category",
+    "scope",
+    "window",
+    "limit",
+    "retry_after",
+    "resource",
+    "namespace_kind",
+    "predicted",
+    "reason",
+    "revisions",
+    "namespace",
+)
 
 _INSERT = """
 insert into audit_log (actor, client, op, path, commit_sha, outcome, detail)

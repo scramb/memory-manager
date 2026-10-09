@@ -97,12 +97,51 @@ _SELECT_ONLY_TABLES = ("schema_migrations",)
 # database `db.migrate.migrate` migrated with `backend="postgres"` - the
 # loop below checks each function exists before granting on it, so a
 # `backend="git"` database (every pre-existing caller/test) is unaffected.
+#
+# The six `mm_admin_*` functions (0020_admin_namespaces.sql, #234) are the
+# app role's only access to `namespaces`/`project_members`/
+# `namespace_settings` at all - same "no general INSERT on namespaces"
+# reasoning `mm_ensure_personal_ns` already carries, now extended to every
+# admin mutation `account/admin.py` performs. Each re-checks `Memory.Admin`
+# itself (that migration's own module docstring), so granting `EXECUTE` here
+# is not, on its own, a content-access grant to anyone who merely holds the
+# app role.
+#
+# The five `mm_break_glass_*` functions (0021_break_glass_workflow.sql,
+# #237) are the app role's only access to `break_glass_grants` - same
+# reasoning, now extended to `account/break_glass.py`'s request/approve/
+# deny/revoke/list routes. Each re-checks `Memory.Admin` itself (that
+# migration's own module comment), and `mm_break_glass_approve`
+# additionally re-checks the four-eyes rule independently of
+# `account/break_glass.py`'s own Python-side check.
+#
+# `mm_break_glass_notices`/`mm_break_glass_acknowledge`
+# (0023_break_glass_notice.sql, #239) are a second, distinct pair on the
+# same table: neither checks `Memory.Admin` at all, since the caller does
+# not need it here, only to be the person the grant is *about* - both
+# resolve that from `app.oid` the same way `mm_ensure_personal_ns` already
+# resolves the caller's own namespace, so a non-admin can see and
+# acknowledge their own notice without ever seeing anyone else's
+# (`account/break_glass_notice.py`'s own module docstring).
 _FUNCTIONS = (
     ("mm_readable_ns", "()"),
     ("mm_writable_ns", "()"),
     ("mm_ensure_personal_ns", "()"),
     ("mm_principal_namespaces", "(text[])"),
     ("mm_namespace_kind", "(text)"),
+    ("mm_admin_create_namespace", "(text, text, text)"),
+    ("mm_admin_rename_namespace_alias", "(text, text)"),
+    ("mm_admin_add_project_member", "(text, text, text, text)"),
+    ("mm_admin_remove_project_member", "(text, text, text)"),
+    ("mm_admin_update_namespace_settings", "(text, text, text)"),
+    ("mm_admin_list_namespaces", "()"),
+    ("mm_break_glass_request", "(text, text)"),
+    ("mm_break_glass_approve", "(bigint, integer)"),
+    ("mm_break_glass_deny", "(bigint)"),
+    ("mm_break_glass_revoke", "(bigint)"),
+    ("mm_break_glass_list", "()"),
+    ("mm_break_glass_notices", "()"),
+    ("mm_break_glass_acknowledge", "(bigint)"),
 )
 
 

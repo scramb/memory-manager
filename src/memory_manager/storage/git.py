@@ -25,7 +25,16 @@ import asyncio
 from pathlib import Path
 
 from memory_manager.queue import WriteQueue
-from memory_manager.storage.base import StorageChanges, StoredNote, WriteRequest, WriteResult
+from memory_manager.storage.base import (
+    ErasureResult,
+    ErasureTargetKind,
+    ErasureUnsupported,
+    StorageChanges,
+    StoredNote,
+    SystemWriteUnsupported,
+    WriteRequest,
+    WriteResult,
+)
 from memory_manager.vault.note import version
 from memory_manager.vault.paths import PathRejected, iter_md_files, parse_note_path
 from memory_manager.vault.repo import Repo
@@ -195,6 +204,34 @@ class GitBackend:
                 message=message,
                 actor=actor,
             )
+        )
+
+    async def erase(
+        self,
+        target_kind: ErasureTargetKind,
+        target_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> ErasureResult:
+        """Always raises `ErasureUnsupported` (ADR-0007 §3, CLAUDE.md:
+        "erasure exists only with the postgres backend")."""
+        raise ErasureUnsupported(
+            "erasure is not supported by the git backend - git is the source of truth there "
+            "and nothing can be provably hard-deleted from every clone and remote (ADR-0007 §3)"
+        )
+
+    async def write_system(self, request: WriteRequest, *, reason: str) -> WriteResult:
+        """Always raises `SystemWriteUnsupported` (#239, ADR-0008 addendum
+        "break-glass notification": "Postgres mode only, like every enterprise
+        `/account` section"). Git has no owner role that bypasses row security and
+        no `author_oid` column a write could ever leave `NULL` on, so there is no
+        connection shape here that means "the system wrote this, not a person"."""
+        _ = (request, reason)
+        raise SystemWriteUnsupported(
+            "a system-authored write is not supported by the git backend - there is "
+            "no owner-bypass concept and no author_oid column to leave NULL (ADR-0008 "
+            "addendum)"
         )
 
     async def changes_since(self, cursor: str | None) -> StorageChanges:

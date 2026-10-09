@@ -48,6 +48,9 @@ class TestMigrate:
             "0013_vault_notes_namespace_idx",
             "0014_entra_delta_cursor",
             "0016_account_sessions",
+            "0020_admin_namespaces",
+            "0021_break_glass_workflow",
+            "0023_break_glass_notice",
         ]
         tables = {
             row["table_name"]
@@ -101,6 +104,9 @@ class TestMigrate:
             "0013_vault_notes_namespace_idx",
             "0014_entra_delta_cursor",
             "0016_account_sessions",
+            "0020_admin_namespaces",
+            "0021_break_glass_workflow",
+            "0023_break_glass_notice",
         ]
         assert second == []
 
@@ -130,6 +136,9 @@ class TestMigrate:
             "0013_vault_notes_namespace_idx",
             "0014_entra_delta_cursor",
             "0016_account_sessions",
+            "0020_admin_namespaces",
+            "0021_break_glass_workflow",
+            "0023_break_glass_notice",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -197,6 +206,9 @@ class TestMigrate:
                 "0013_vault_notes_namespace_idx",
                 "0014_entra_delta_cursor",
                 "0016_account_sessions",
+                "0020_admin_namespaces",
+                "0021_break_glass_workflow",
+                "0023_break_glass_notice",
             ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
@@ -286,6 +298,10 @@ class TestMigrateBackendPostgres:
             "0013_vault_notes_namespace_idx",
             "0014_entra_delta_cursor",
             "0016_account_sessions",
+            "0018_erasure_log",
+            "0020_admin_namespaces",
+            "0021_break_glass_workflow",
+            "0023_break_glass_notice",
         ]
         tables = {
             row["table_name"]
@@ -300,18 +316,26 @@ class TestMigrateBackendPostgres:
             "chunks_project",
             "chunks_org",
             "embedding_dimension",
+            "erasure_log",
         } <= tables
 
     async def test_backend_git_default_never_applies_it(self, conn: asyncpg.Connection) -> None:
         applied = await migrate(conn)
 
         assert "0012_vector_layout" not in applied
+        assert "0018_erasure_log" not in applied
 
         exists = await conn.fetchval(
             "select exists(select 1 from information_schema.tables "
             "where table_schema = 'public' and table_name = 'embedding_dimension')"
         )
         assert exists is False
+
+        erasure_log_exists = await conn.fetchval(
+            "select exists(select 1 from information_schema.tables "
+            "where table_schema = 'public' and table_name = 'erasure_log')"
+        )
+        assert erasure_log_exists is False
 
     async def test_an_unknown_backend_is_refused(self, conn: asyncpg.Connection) -> None:
         with pytest.raises(ValueError, match="backend"):

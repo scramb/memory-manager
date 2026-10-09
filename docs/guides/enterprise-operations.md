@@ -230,20 +230,41 @@ migrates forward on its own at process start, same as every other rollout
 
 ### Erasure-log replay after a restore
 
-**Lands with #233 — not built yet.** [ADR-0007](../adr/0007-storage-backend.md)'s addendum
-2026-10-08 documents the target shape: a restore or PITR rolls `erasure_log` back along with the
-rest of the data, so every erasure is also emitted through the audit/SIEM export; after a
-restore, the operator exports the `erasure` records since the backup point and passes them as a
-JSONL file in `ERASURE_LOG_REPLAY_FILE`, and the server replays them before `/readyz` turns true.
-Until #233 ships this environment variable does not exist — a restore today needs a manual,
-out-of-band replay of any erasures that happened after the backup being restored from, before the
-restored deployment is handed back to users.
+A restore or PITR rolls `erasure_log` back along with the rest of the data — any erasure that
+happened after the backup being restored from comes back too, since every `erase_note`/
+`erase_namespace`/`erase_user` call is also emitted through the audit/SIEM export (`detail`
+carries only the IDs, `docs/guides/audit-export.md`'s own "Erasure records and restores"
+section). After pointing `DATABASE_URL`/`database.url` at the restored cluster (previous
+section), before rolling `api` out against it:
+
+1. From the SIEM, extract every `erasure` record since the backup's point in time into a JSONL
+   file, one exported record per line.
+2. Set `ERASURE_LOG_REPLAY_FILE` on the `api` deployment to that file's path (a mounted
+   `Secret`/`ConfigMap`, not a literal value in the chart's own values — public-repository rule,
+   no operator-specific paths in this guide).
+3. Roll `api` out. Each replica replays the file under a Postgres advisory lock before it reports
+   ready (ADR-0007 §3 addendum) — `/readyz` stays 503 until replay finishes, and a malformed file
+   refuses startup outright rather than serving traffic against a half-restored erasure state.
+4. Once every replica is ready, unset `ERASURE_LOG_REPLAY_FILE` again (or drop it from the next
+   rollout) — replay is idempotent, but there is nothing left for it to do once this restore's
+   replicas have all gone through it once.
 
 ### Deletion horizon
 
 Documented at backup retention (default 30 d, `database.cnpg.backup.retentionPolicy`) + 7 d
 ([ADR-0007](../adr/0007-storage-backend.md) §3) — an erasure older than that horizon can no
 longer be un-done by a restore from this profile's own default retention window.
+
+### Retention of deprovisioned users
+
+The `worker` Deployment's own `retention` job ([#240](https://github.com/scramb/memory-manager/issues/240),
+[ADR-0008](../adr/0008-namespace-permissions.md) "Deprovisioned users") erases the personal
+namespace and identity of every user the Entra delta sync has disabled for at least
+`PERSONAL_RETENTION_DAYS` (default 30) — the same hard-delete `erase_user` already performs for
+an admin-triggered erasure, with actor `system:retention` in `erasure_log`/the SIEM export. Set
+`PERSONAL_RETENTION_DAYS` on the `worker` Deployment to change the horizon, and
+`RETENTION_SWEEP_SECONDS` (default 86400s/1 day) to change how often the job checks for a user
+past it. A user re-enabled in Entra before the horizon passes is never erased.
 
 ## 8. Upgrades
 
@@ -296,6 +317,13 @@ alert works regardless of the operator's own version.
 `grafanaDashboard.enabled` only renders a `ConfigMap` carrying the dashboard JSON, labeled for a
 Grafana sidecar to pick up - Grafana and its sidecar are an operator's own install, same as
 Prometheus itself.
+
+## See also
+
+[`data-lifecycle.md`](./data-lifecycle.md) covers the account-level operator
+questions this guide does not: what happens (and how fast) when a role is removed
+in Entra, the admin "revoke access" remedy, self-service and admin erasure, and
+retention after deprovisioning.
 
 ## Not included
 

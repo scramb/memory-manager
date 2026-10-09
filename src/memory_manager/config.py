@@ -28,8 +28,10 @@ __all__ = [
     "WorkerConfigError",
     "audit_export_targets_from_env",
     "blocklist_file_from_env",
+    "break_glass_approvers_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
+    "erasure_log_replay_file_from_env",
     "rate_limit_sweep_floor_seconds",
     "storage_backend_from_env",
 ]
@@ -62,6 +64,18 @@ _DEFAULT_JOBS_POLL_SECONDS = 5.0
 # query every 5 min (configurable), worst case bounded by the 15-min access
 # token".
 _DEFAULT_ENTRA_DELTA_SYNC_SECONDS = 300.0
+
+# `WorkerConfig.personal_retention_days` (#240, ADR-0008 "Deprovisioned
+# users": "hard-deleted after PERSONAL_RETENTION_DAYS (default 30)").
+_DEFAULT_PERSONAL_RETENTION_DAYS = 30
+
+# `WorkerConfig.retention_sweep_seconds` (#240): how often `worker.build_jobs`
+# schedules the `retention` job - once a day by default, unlike the
+# `entra_delta_sync` job's 5 min: a user crosses `personal_retention_days`
+# only once, on a day boundary that is itself never more precise than
+# `disabled_at`'s own timestamp, so there is nothing to gain from checking
+# more often than that.
+_DEFAULT_RETENTION_SWEEP_SECONDS = 24 * 60 * 60.0
 
 # Rate-limit/body-size defaults (#39). Per-minute figures are refill rates;
 # "burst" is the token bucket's capacity - how many calls a key can make
@@ -230,6 +244,47 @@ def database_app_role_from_env(environ: dict[str, str]) -> str | None:
     return role
 
 
+#: ADR-0008 "Break-glass": "By default (`BREAK_GLASS_APPROVERS=2`) a second admin
+#: must approve; operators may lower it to 1." No other value makes sense - a
+#: count of 0 would mean "never approvable" (not what disabling four-eyes means)
+#: and anything above 2 is not a requirement this ADR makes.
+_DEFAULT_BREAK_GLASS_APPROVERS = 2
+_BREAK_GLASS_APPROVER_COUNTS = frozenset({1, 2})
+
+
+def break_glass_approvers_from_env(environ: dict[str, str]) -> int:
+    """How many distinct `Memory.Admin`s a break-glass grant needs
+    (`BREAK_GLASS_APPROVERS`, default 2, ADR-0008 "Break-glass").
+
+    1 means the requester may approve their own request too (ADR-0008:
+    "operators may lower it to 1" names no second admin at all for that
+    case); 2 (the default) requires an approver who is not the requester.
+    `account.break_glass` checks this in Python before ever calling
+    `mm_break_glass_approve`, which takes the same configured count as its
+    own `p_approver_count` argument and refuses a same-admin approval
+    again, independently - the "two independent computations" shape every
+    other ADR-0008 permission check in this codebase already follows.
+
+    Raises `StorageConfigError` for anything other than `1` or `2`, before
+    anything is started - the same "fails before anything is started"
+    contract `database_app_role_from_env` already gives `DATABASE_APP_ROLE`.
+    Read regardless of `STORAGE_BACKEND`: unlike `DATABASE_APP_ROLE`, a
+    misconfigured value costs nothing to reject even for `"git"`, which
+    simply never reaches a code path that reads it (there is no admin area,
+    let alone break-glass, without the Postgres backend).
+    """
+    raw = environ.get("BREAK_GLASS_APPROVERS", str(_DEFAULT_BREAK_GLASS_APPROVERS)).strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count not in _BREAK_GLASS_APPROVER_COUNTS:
+        raise StorageConfigError(
+            f"BREAK_GLASS_APPROVERS must be 1 or 2 (ADR-0008 'Break-glass'), got {raw!r}"
+        )
+    return count
+
+
 def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
     """The configured operator blocklist file (`BLOCKLIST_FILE`), or `None`.
 
@@ -242,6 +297,25 @@ def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
     `open_services`) so a malformed file refuses startup there, not here.
     """
     value = environ.get("BLOCKLIST_FILE")
+    return Path(value) if value else None
+
+
+def erasure_log_replay_file_from_env(environ: dict[str, str]) -> Path | None:
+    """The configured erasure-log replay file (`ERASURE_LOG_REPLAY_FILE`), or `None`.
+
+    `None` - the default, nothing set - means no replay at all: `http.py`'s
+    `lifespan` skips it entirely, same "off unless an operator opts in"
+    behaviour `blocklist_file_from_env` above has. Unlike that one, there is
+    nothing to validate here beyond "is a value set" either - whether the
+    file at that path actually exists and parses into the exported `erasure`
+    audit record shape (ADR-0007 §3 addendum, #233) is `storage.
+    erasure_replay.parse_replay_file`'s job, called eagerly at startup
+    (`http.py`'s `lifespan`, before the server ever starts serving) so a
+    malformed file refuses startup there, not here - an operator only ever
+    sets this right after a backup restore or PITR, to replay the `erasure_log`
+    rows that restore rolled back.
+    """
+    value = environ.get("ERASURE_LOG_REPLAY_FILE")
     return Path(value) if value else None
 
 
@@ -500,6 +574,14 @@ class ServerConfig:
     caller's own namespace, "shared" every group/project/org namespace - see
     `quotas.StorageQuotaChecker`'s own docstring for exactly what counts
     toward each and why archived notes count toward size but not count.
+
+    `erasure_log_replay_file` (`ERASURE_LOG_REPLAY_FILE`, #233, ADR-0007 §3
+    addendum) names the exported `erasure` audit records an operator
+    extracted after a backup restore or PITR - unset (the default) means no
+    replay at all. Only meaningful for `STORAGE_BACKEND=postgres` (the only
+    backend with an `erasure_log` table at all); `http.py`'s `lifespan` is
+    the only reader, running the replay in the background and gating
+    `/readyz` on it finishing.
     """
 
     host: str = _DEFAULT_HOST
@@ -534,6 +616,7 @@ class ServerConfig:
     quota_max_bytes_personal: int = _DEFAULT_QUOTA_MAX_BYTES
     quota_max_notes_shared: int = _DEFAULT_QUOTA_MAX_NOTES
     quota_max_bytes_shared: int = _DEFAULT_QUOTA_MAX_BYTES
+    erasure_log_replay_file: Path | None = None
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -566,7 +649,7 @@ class ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
         `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`/
-        `QUOTA_MAX_*` entries of `environ`.
+        `QUOTA_MAX_*`/`ERASURE_LOG_REPLAY_FILE` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
         variable if `PORT` is not a valid port number, any size/rate limit is
@@ -639,6 +722,7 @@ class ServerConfig:
         quota_max_bytes_shared = _parse_nonnegative_int(
             environ, "QUOTA_MAX_BYTES_SHARED", _DEFAULT_QUOTA_MAX_BYTES
         )
+        erasure_log_replay_file = erasure_log_replay_file_from_env(environ)
 
         return cls(
             host=host,
@@ -673,6 +757,7 @@ class ServerConfig:
             quota_max_bytes_personal=quota_max_bytes_personal,
             quota_max_notes_shared=quota_max_notes_shared,
             quota_max_bytes_shared=quota_max_bytes_shared,
+            erasure_log_replay_file=erasure_log_replay_file,
         )
 
 
@@ -743,6 +828,16 @@ class WorkerConfig:
     for this deployment; `build_jobs` is what decides whether to register the
     job at all (`auth.graph.GraphClient.from_env` returning `None` otherwise),
     this field only ever carries the interval to use once it does.
+
+    `personal_retention_days` (`PERSONAL_RETENTION_DAYS`, default 30) is
+    ADR-0008's "Deprovisioned users" horizon: `worker.build_jobs`'s own
+    `retention` job erases the personal namespace and identity of every user
+    disabled at least this many days ago (#240). `retention_sweep_seconds`
+    (`RETENTION_SWEEP_SECONDS`, default 86400s/1 day) is how often that job
+    runs - both always read, the same "registered unconditionally" shape
+    `_cleanup_job` already has, since a disabled user is a fact about `users`
+    this worker can check without any further deployment-specific
+    configuration (unlike `entra_delta_sync`, which needs a `GraphClient`).
     """
 
     host: str = _DEFAULT_WORKER_HOST
@@ -750,17 +845,20 @@ class WorkerConfig:
     shutdown_grace_seconds: int = _DEFAULT_SHUTDOWN_GRACE_SECONDS
     jobs_poll_seconds: float = _DEFAULT_JOBS_POLL_SECONDS
     entra_delta_sync_seconds: float = _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
+    personal_retention_days: int = _DEFAULT_PERSONAL_RETENTION_DAYS
+    retention_sweep_seconds: float = _DEFAULT_RETENTION_SWEEP_SECONDS
 
     @classmethod
     def from_env(cls, environ: dict[str, str]) -> WorkerConfig:
         """Build a `WorkerConfig` from `WORKER_HOST`/`WORKER_PORT`/
-        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
-        entries of `environ`.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`/
+        `PERSONAL_RETENTION_DAYS`/`RETENTION_SWEEP_SECONDS` entries of `environ`.
 
         Raises `WorkerConfigError` with a message naming the offending
         variable if `WORKER_PORT` is not a valid port number, or any of
-        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`
-        is not a positive number.
+        `SHUTDOWN_GRACE_SECONDS`/`JOBS_POLL_SECONDS`/`ENTRA_DELTA_SYNC_SECONDS`/
+        `PERSONAL_RETENTION_DAYS`/`RETENTION_SWEEP_SECONDS` is not a positive
+        number.
         """
         host = environ.get("WORKER_HOST", _DEFAULT_WORKER_HOST)
         try:
@@ -776,6 +874,12 @@ class WorkerConfig:
             entra_delta_sync_seconds = _parse_positive_float(
                 environ, "ENTRA_DELTA_SYNC_SECONDS", _DEFAULT_ENTRA_DELTA_SYNC_SECONDS
             )
+            personal_retention_days = _parse_positive_int(
+                environ, "PERSONAL_RETENTION_DAYS", _DEFAULT_PERSONAL_RETENTION_DAYS
+            )
+            retention_sweep_seconds = _parse_positive_float(
+                environ, "RETENTION_SWEEP_SECONDS", _DEFAULT_RETENTION_SWEEP_SECONDS
+            )
         except ServerConfigError as exc:
             # `_parse_port`/`_parse_positive_int`/`_parse_positive_float` raise
             # `ServerConfigError` (shared with `ServerConfig`, which reuses all three) -
@@ -789,6 +893,8 @@ class WorkerConfig:
             shutdown_grace_seconds=shutdown_grace_seconds,
             jobs_poll_seconds=jobs_poll_seconds,
             entra_delta_sync_seconds=entra_delta_sync_seconds,
+            personal_retention_days=personal_retention_days,
+            retention_sweep_seconds=retention_sweep_seconds,
         )
 
 

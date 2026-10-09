@@ -39,11 +39,20 @@ full-text chunks and enqueues this job rather than embedding inline, so
 `memory_search` already finds a fresh note through full text before its
 embedding exists; `_embed_note_job` below is the handler, and
 `enqueue_pending_embeddings` is this process's startup catch-up for any
-chunk a lost job, a provider outage or a model change left stale. Retention
-(WP-26) is still open.
+chunk a lost job, a provider outage or a model change left stale.
+
+`build_jobs` also registers `retention` (#240, ADR-0008 "Deprovisioned
+users") as a second periodic singleton job, next to `_cleanup_job` -
+unconditionally, every `WorkerConfig.personal_retention_days`/
+`retention_sweep_seconds` (defaults 30 days / once a day): `_retention_job`
+below erases the personal namespace and identity of every user still
+disabled at or past that horizon, through `storage.postgres.PostgresBackend.
+erase` (`storage/erasure.py`'s own `erase_user`) with actor
+`"system:retention"` - the same erasure primitive #231's admin-triggered
+path already uses, so `erasure_log` and the SIEM export happen identically.
 
 `build_jobs` also registers `entra_delta_sync` (#223, ADR-0006 §6) as a
-second periodic singleton job, next to `_cleanup_job` - but only when
+third periodic singleton job, next to `_cleanup_job`/`retention` - but only when
 `graph_client` is given (`cli.py`'s `_serve_worker` passes `auth.graph.
 GraphClient.from_env(os.environ)`, `None` for a deployment that never
 configured Entra at all): one Graph `users/delta` round per
@@ -130,6 +139,7 @@ import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 from starlette.applications import Starlette
@@ -156,6 +166,7 @@ from memory_manager.observability.metrics import (
     set_jobs_pending,
 )
 from memory_manager.observability.tracing import job_span
+from memory_manager.storage.postgres import PostgresBackend
 
 __all__ = [
     "Job",
@@ -477,18 +488,84 @@ async def _entra_delta_sync_job(pool: asyncpg.Pool, graph: GraphClient) -> None:
     await _save_entra_delta_cursor(pool, result.delta_link)
 
 
+#: `Job.name` for the retention sweep below (#240, ADR-0008 "Deprovisioned
+#: users") - a module-level constant, same reason `_ENTRA_DELTA_SYNC_JOB_NAME`
+#: above has one: a test derives `_lock_key` from it without hardcoding the
+#: string twice.
+_RETENTION_JOB_NAME = "retention"
+
+#: `erasure_log`/`audit_log` actor for every erasure this job performs - never
+#: a real `oid` (CLAUDE.md "audit log for every write"): this is the system,
+#: not the user, choosing to erase, on a schedule the user has no part in.
+_RETENTION_ACTOR = "system:retention"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+async def _users_disabled_before(pool: asyncpg.Pool, cutoff: datetime) -> list[str]:
+    """Every `users.oid` still disabled, with `disabled_at` at or before `cutoff`.
+
+    A user `auth.users.enable_user` re-enabled in the meantime has
+    `disabled_at = null` again (that function's own docstring) and is
+    therefore never selected here - the same "disabled state read live, never
+    cached" rule `auth.users.get_user`'s own docstring gives for
+    `mm_readable_ns()`/`mm_writable_ns()`.
+    """
+    rows = await pool.fetch(
+        "select oid from users where disabled_at is not null and disabled_at <= $1", cutoff
+    )
+    return [row["oid"] for row in rows]
+
+
+async def _retention_job(
+    pool: asyncpg.Pool, *, retention_days: int, clock: Callable[[], datetime] = _utc_now
+) -> None:
+    """Erase the personal memory of every user disabled at least `retention_days`
+    ago (#240, ADR-0008 "Deprovisioned users": "the personal namespace is
+    frozen. It is hard-deleted after `PERSONAL_RETENTION_DAYS`").
+
+    `clock` stands in for `datetime.now(UTC)` the same way `storage.postgres.
+    PostgresBackend.__init__`'s own `clock` parameter does - a test freezes
+    it to place a disabled user on either side of the retention cutoff
+    without ever sleeping `retention_days` days for real.
+
+    Each erasure goes through `storage.postgres.PostgresBackend.erase`
+    (`storage/erasure.py`'s own `erase_user`, ADR-0007 §3 addendum) - the one
+    primitive every other erasure caller already uses, so `erasure_log` and
+    the configured `AUDIT_EXPORT`/SIEM export happen exactly as they would
+    for an admin-triggered erasure (#231), with `_RETENTION_ACTOR` the only
+    difference from one. Idempotent: an oid a previous round (or another
+    worker replica, had it won this round's advisory lock instead) already
+    erased no longer has a `users` row at all, so it is simply not selected
+    again - two replicas racing for `_lock_key(_RETENTION_JOB_NAME)` can
+    therefore never erase the same user twice, the same guarantee
+    `_run_singleton` already gives every other job here.
+    """
+    cutoff = clock() - timedelta(days=retention_days)
+    oids = await _users_disabled_before(pool, cutoff)
+    if not oids:
+        return
+    backend = PostgresBackend(pool)
+    reason = f"retention: disabled at least {retention_days} day(s) ago (PERSONAL_RETENTION_DAYS)"
+    for oid in oids:
+        await backend.erase("user", oid, actor=_RETENTION_ACTOR, reason=reason)
+
+
 def build_jobs(
     config: ServerConfig,
     *,
     worker_config: WorkerConfig | None = None,
     graph_client: GraphClient | None = None,
 ) -> list[Job]:
-    """This worker's job registry: `_cleanup_job` always, plus `_entra_delta_sync_job`
-    (#223) when `graph_client` is given - `cli.py`'s `_serve_worker` is the one
-    production caller that passes `auth.graph.GraphClient.from_env(os.environ)`,
-    `None` for a deployment that never configured Entra (`GraphClient.from_env`'s
-    own docstring); every existing test of this function omits both new
-    parameters and gets exactly the one job it always has.
+    """This worker's job registry: `_cleanup_job` and `_retention_job` (#240) always,
+    plus `_entra_delta_sync_job` (#223) when `graph_client` is given - `cli.py`'s
+    `_serve_worker` is the one production caller that passes `auth.graph.
+    GraphClient.from_env(os.environ)`, `None` for a deployment that never
+    configured Entra (`GraphClient.from_env`'s own docstring); every existing
+    test of this function omits both `graph_client` and `worker_config` and
+    gets exactly the two jobs it always has.
 
     `config` is read only for its `RATE_LIMIT_*`/`mcp_path`-independent fields
     (`config.rate_limit_sweep_floor_seconds`, shared with `http.py`'s own
@@ -496,9 +573,11 @@ def build_jobs(
     environ)` builds one without requiring `PUBLIC_URL` or anything else
     HTTP-transport-specific to be set, since `resource_url()` (the one method
     that does require it) is never called here. `worker_config` supplies the
-    interval for the Entra job alone (`WorkerConfig.entra_delta_sync_seconds`,
-    default 300s) - defaulted to a bare `WorkerConfig()`'s own value when
-    omitted, same default `cli.py`'s own `WorkerConfig.from_env` would give.
+    interval for the Entra job (`WorkerConfig.entra_delta_sync_seconds`,
+    default 300s) and the retention job's own `personal_retention_days`/
+    `retention_sweep_seconds` (defaults 30 days / once a day) - defaulted to a
+    bare `WorkerConfig()`'s own values when omitted, same defaults `cli.py`'s
+    own `WorkerConfig.from_env` would give.
     """
     floor_seconds = rate_limit_sweep_floor_seconds(config)
 
@@ -506,6 +585,28 @@ def build_jobs(
         await _cleanup_job(pool, rate_limit_window_floor_seconds=floor_seconds)
 
     jobs_list = [Job(name="cleanup", interval_seconds=_CLEANUP_INTERVAL_SECONDS, run=run_cleanup)]
+
+    retention_days = (
+        worker_config.personal_retention_days
+        if worker_config is not None
+        else WorkerConfig().personal_retention_days
+    )
+    retention_interval_seconds = (
+        worker_config.retention_sweep_seconds
+        if worker_config is not None
+        else WorkerConfig().retention_sweep_seconds
+    )
+
+    async def run_retention(pool: asyncpg.Pool) -> None:
+        await _retention_job(pool, retention_days=retention_days)
+
+    jobs_list.append(
+        Job(
+            name=_RETENTION_JOB_NAME,
+            interval_seconds=retention_interval_seconds,
+            run=run_retention,
+        )
+    )
 
     if graph_client is not None:
         interval_seconds = (

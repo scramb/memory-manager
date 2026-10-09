@@ -38,13 +38,28 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from memory_manager.account.admin import ADMIN_ROLE, list_namespaces, render_admin_section
+from memory_manager.account.break_glass import list_grants as list_break_glass_grants
+from memory_manager.account.break_glass import render_break_glass_section
+from memory_manager.account.break_glass_notice import list_notices as list_break_glass_notices
+from memory_manager.account.break_glass_notice import render_break_glass_notice
+from memory_manager.account.break_glass_viewer import VIEW_PATH as BREAK_GLASS_VIEW_PATH
+from memory_manager.account.delete import (
+    CONFIRM_FIELD_NAME,
+    CONFIRM_PHRASE,
+    CSRF_FORM_DELETE,
+    DELETE_PATH,
+)
 from memory_manager.account.export import CSRF_FORM_EXPORT, EXPORT_PATH
 from memory_manager.account.sessions import SessionInfo, csrf_token
 from memory_manager.account.templates import CSRF_FIELD_NAME
 from memory_manager.db import rls
 
 __all__ = [
+    "ADMIN_SECTION",
+    "BREAK_GLASS_SECTION",
     "DEFAULT_SECTIONS",
+    "DELETE_SECTION",
     "EXPORT_SECTION",
     "OVERVIEW_SECTION",
     "Section",
@@ -69,8 +84,9 @@ class SectionContext:
     pool: asyncpg.Pool
     is_postgres_backend: bool
     #: `services.app_role` (`None` for `STORAGE_BACKEND=git`, ADR-0008 addendum) -
-    #: required to call `mm_ensure_personal_ns()` under the identity switch
-    #: `db.rls.request_identity` performs; `OVERVIEW_SECTION` is the only reader today.
+    #: required to call `mm_ensure_personal_ns()`/an `mm_admin_*` function under the
+    #: identity switch `db.rls.request_identity` performs; `OVERVIEW_SECTION` and
+    #: `ADMIN_SECTION` are its only two readers today.
     app_role: str | None
     #: The raw (plaintext) session cookie value - needed only to mint a per-form
     #: CSRF token (`account.sessions.csrf_token`, keyed by the raw id, never the
@@ -118,6 +134,17 @@ async def _personal_note_count(ctx: SectionContext) -> int | None:
         return int(count) if count is not None else 0
 
 
+async def _break_glass_notice_html(ctx: SectionContext) -> str:
+    """The break-glass banner every affected user sees until they acknowledge it
+    (#239, `account.break_glass_notice`'s own module docstring) - the empty string
+    under the same conditions `_personal_note_count` returns `None` for: there is no
+    personal namespace, and so nothing to be notified about, without one."""
+    if not ctx.is_postgres_backend or ctx.session.oid is None or ctx.app_role is None:
+        return ""
+    rows = await list_break_glass_notices(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_break_glass_notice(rows, session_id=ctx.session_id)
+
+
 async def _render_overview(ctx: SectionContext) -> str:
     session = ctx.session
     rows = [
@@ -129,7 +156,8 @@ async def _render_overview(ctx: SectionContext) -> str:
     note_count = await _personal_note_count(ctx)
     if note_count is not None:
         rows.append(f"<dt>Notes in your personal namespace</dt><dd>{note_count}</dd>")
-    return f"<section><h2>Overview</h2><dl>{''.join(rows)}</dl></section>"
+    overview = f"<section><h2>Overview</h2><dl>{''.join(rows)}</dl></section>"
+    return overview + await _break_glass_notice_html(ctx)
 
 
 #: Always enabled - identity is shown regardless of login mode or storage backend;
@@ -162,9 +190,95 @@ async def _render_export(ctx: SectionContext) -> str:
 #: `STORAGE_BACKEND=git` deployment never shows this section at all (#230).
 EXPORT_SECTION = Section(name="export", enabled=_export_enabled, render=_render_export)
 
+
+def _delete_enabled(ctx: SectionContext) -> bool:
+    """Same gate as `_export_enabled`: there is no personal namespace to delete at
+    all otherwise (#232, `account.delete`'s own module docstring)."""
+    return ctx.is_postgres_backend and ctx.session.oid is not None
+
+
+async def _render_delete(ctx: SectionContext) -> str:
+    token = csrf_token(ctx.session_id, CSRF_FORM_DELETE)
+    phrase = html.escape(CONFIRM_PHRASE)
+    return (
+        "<section><h2>Delete my memory</h2>"
+        "<p>Permanently delete every note in your personal namespace, "
+        "archived notes included. This cannot be undone.</p>"
+        f'<form method="post" action="{html.escape(DELETE_PATH)}">'
+        f'<input type="hidden" name="{CSRF_FIELD_NAME}" value="{html.escape(token)}">'
+        f'<label>Type "<code>{phrase}</code>" to confirm:'
+        f'<input type="text" name="{CONFIRM_FIELD_NAME}" autocomplete="off"></label>'
+        '<button type="submit">Delete my memory</button>'
+        "</form></section>"
+    )
+
+
+#: Enterprise only (`_delete_enabled`) - a `password`/`oidc` session or a
+#: `STORAGE_BACKEND=git` deployment never shows this section at all (#232).
+DELETE_SECTION = Section(name="delete", enabled=_delete_enabled, render=_render_delete)
+
+
+def _admin_enabled(ctx: SectionContext) -> bool:
+    """`STORAGE_BACKEND=postgres` plus an Entra `oid` plus `Memory.Admin` in the
+    session's own roles (#234, ADR-0008 "`Memory.Admin` manages namespaces and
+    ACLs"). `Memory.Admin` is only ever granted to a real Entra principal, so the
+    `oid` check is never the binding one here - kept for the same "degenerate
+    empty-oid case never reaches the database" reasoning `_export_enabled`/
+    `_delete_enabled` already follow."""
+    return (
+        ctx.is_postgres_backend and ctx.session.oid is not None and ADMIN_ROLE in ctx.session.roles
+    )
+
+
+async def _render_admin(ctx: SectionContext) -> str:
+    if ctx.app_role is None:  # pragma: no cover - defensive, `open_services` always sets it
+        # alongside a `PostgresBackend` (`app.py`'s own docstring) - `_admin_enabled`
+        # already required `is_postgres_backend`.
+        return ""
+    rows = await list_namespaces(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_admin_section(rows, session_id=ctx.session_id)
+
+
+#: Admin-only (`_admin_enabled`) - absent for every non-admin session and for
+#: `STORAGE_BACKEND=git` regardless of role (#234).
+ADMIN_SECTION = Section(name="admin", enabled=_admin_enabled, render=_render_admin)
+
+
+def _break_glass_enabled(ctx: SectionContext) -> bool:
+    """Same gate as `_admin_enabled` (#237, ADR-0008 "Break-glass") - a
+    break-glass grant is itself an admin action, never available to anyone
+    without `Memory.Admin`."""
+    return (
+        ctx.is_postgres_backend and ctx.session.oid is not None and ADMIN_ROLE in ctx.session.roles
+    )
+
+
+async def _render_break_glass(ctx: SectionContext) -> str:
+    if ctx.app_role is None:  # pragma: no cover - defensive, `open_services` always sets it
+        # alongside a `PostgresBackend` (`app.py`'s own docstring) -
+        # `_break_glass_enabled` already required `is_postgres_backend`.
+        return ""
+    rows = await list_break_glass_grants(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_break_glass_section(
+        rows, session_id=ctx.session_id, view_path=BREAK_GLASS_VIEW_PATH
+    )
+
+
+#: Admin-only (`_break_glass_enabled`) - absent for every non-admin session and for
+#: `STORAGE_BACKEND=git` regardless of role (#237).
+BREAK_GLASS_SECTION = Section(
+    name="break_glass", enabled=_break_glass_enabled, render=_render_break_glass
+)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
-DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION, EXPORT_SECTION)
+DEFAULT_SECTIONS: tuple[Section, ...] = (
+    OVERVIEW_SECTION,
+    EXPORT_SECTION,
+    DELETE_SECTION,
+    ADMIN_SECTION,
+    BREAK_GLASS_SECTION,
+)
 
 
 async def render_sections(
