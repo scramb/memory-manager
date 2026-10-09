@@ -30,6 +30,7 @@ __all__ = [
     "blocklist_file_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
+    "erasure_log_replay_file_from_env",
     "rate_limit_sweep_floor_seconds",
     "storage_backend_from_env",
 ]
@@ -242,6 +243,25 @@ def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
     `open_services`) so a malformed file refuses startup there, not here.
     """
     value = environ.get("BLOCKLIST_FILE")
+    return Path(value) if value else None
+
+
+def erasure_log_replay_file_from_env(environ: dict[str, str]) -> Path | None:
+    """The configured erasure-log replay file (`ERASURE_LOG_REPLAY_FILE`), or `None`.
+
+    `None` - the default, nothing set - means no replay at all: `http.py`'s
+    `lifespan` skips it entirely, same "off unless an operator opts in"
+    behaviour `blocklist_file_from_env` above has. Unlike that one, there is
+    nothing to validate here beyond "is a value set" either - whether the
+    file at that path actually exists and parses into the exported `erasure`
+    audit record shape (ADR-0007 §3 addendum, #233) is `storage.
+    erasure_replay.parse_replay_file`'s job, called eagerly at startup
+    (`http.py`'s `lifespan`, before the server ever starts serving) so a
+    malformed file refuses startup there, not here - an operator only ever
+    sets this right after a backup restore or PITR, to replay the `erasure_log`
+    rows that restore rolled back.
+    """
+    value = environ.get("ERASURE_LOG_REPLAY_FILE")
     return Path(value) if value else None
 
 
@@ -500,6 +520,14 @@ class ServerConfig:
     caller's own namespace, "shared" every group/project/org namespace - see
     `quotas.StorageQuotaChecker`'s own docstring for exactly what counts
     toward each and why archived notes count toward size but not count.
+
+    `erasure_log_replay_file` (`ERASURE_LOG_REPLAY_FILE`, #233, ADR-0007 §3
+    addendum) names the exported `erasure` audit records an operator
+    extracted after a backup restore or PITR - unset (the default) means no
+    replay at all. Only meaningful for `STORAGE_BACKEND=postgres` (the only
+    backend with an `erasure_log` table at all); `http.py`'s `lifespan` is
+    the only reader, running the replay in the background and gating
+    `/readyz` on it finishing.
     """
 
     host: str = _DEFAULT_HOST
@@ -534,6 +562,7 @@ class ServerConfig:
     quota_max_bytes_personal: int = _DEFAULT_QUOTA_MAX_BYTES
     quota_max_notes_shared: int = _DEFAULT_QUOTA_MAX_NOTES
     quota_max_bytes_shared: int = _DEFAULT_QUOTA_MAX_BYTES
+    erasure_log_replay_file: Path | None = None
 
     def resource_url(self) -> str:
         """The MCP server's own canonical URL (RFC 8707 "resource"), for
@@ -566,7 +595,7 @@ class ServerConfig:
         """Build a `ServerConfig` from `HOST`/`PORT`/`PUBLIC_URL`/`MCP_PATH`/
         `ALLOWED_ORIGINS`/`VAULT_WEBHOOK_SECRET`/`MCP_JSON_RESPONSE`/`MAX_REQUEST_BYTES`/
         `RATE_LIMIT_*`/`FORWARDED_ALLOW_IPS`/`SHUTDOWN_GRACE_SECONDS`/`QUOTA_WRITES_*`/
-        `QUOTA_MAX_*` entries of `environ`.
+        `QUOTA_MAX_*`/`ERASURE_LOG_REPLAY_FILE` entries of `environ`.
 
         Raises `ServerConfigError` with a message naming the offending
         variable if `PORT` is not a valid port number, any size/rate limit is
@@ -639,6 +668,7 @@ class ServerConfig:
         quota_max_bytes_shared = _parse_nonnegative_int(
             environ, "QUOTA_MAX_BYTES_SHARED", _DEFAULT_QUOTA_MAX_BYTES
         )
+        erasure_log_replay_file = erasure_log_replay_file_from_env(environ)
 
         return cls(
             host=host,
@@ -673,6 +703,7 @@ class ServerConfig:
             quota_max_bytes_personal=quota_max_bytes_personal,
             quota_max_notes_shared=quota_max_notes_shared,
             quota_max_bytes_shared=quota_max_bytes_shared,
+            erasure_log_replay_file=erasure_log_replay_file,
         )
 
 

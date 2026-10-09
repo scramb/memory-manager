@@ -230,14 +230,24 @@ migrates forward on its own at process start, same as every other rollout
 
 ### Erasure-log replay after a restore
 
-**Lands with #233 — not built yet.** [ADR-0007](../adr/0007-storage-backend.md)'s addendum
-2026-10-08 documents the target shape: a restore or PITR rolls `erasure_log` back along with the
-rest of the data, so every erasure is also emitted through the audit/SIEM export; after a
-restore, the operator exports the `erasure` records since the backup point and passes them as a
-JSONL file in `ERASURE_LOG_REPLAY_FILE`, and the server replays them before `/readyz` turns true.
-Until #233 ships this environment variable does not exist — a restore today needs a manual,
-out-of-band replay of any erasures that happened after the backup being restored from, before the
-restored deployment is handed back to users.
+A restore or PITR rolls `erasure_log` back along with the rest of the data — any erasure that
+happened after the backup being restored from comes back too, since every `erase_note`/
+`erase_namespace`/`erase_user` call is also emitted through the audit/SIEM export (`detail`
+carries only the IDs, `docs/guides/audit-export.md`'s own "Erasure records and restores"
+section). After pointing `DATABASE_URL`/`database.url` at the restored cluster (previous
+section), before rolling `api` out against it:
+
+1. From the SIEM, extract every `erasure` record since the backup's point in time into a JSONL
+   file, one exported record per line.
+2. Set `ERASURE_LOG_REPLAY_FILE` on the `api` deployment to that file's path (a mounted
+   `Secret`/`ConfigMap`, not a literal value in the chart's own values — public-repository rule,
+   no operator-specific paths in this guide).
+3. Roll `api` out. Each replica replays the file under a Postgres advisory lock before it reports
+   ready (ADR-0007 §3 addendum) — `/readyz` stays 503 until replay finishes, and a malformed file
+   refuses startup outright rather than serving traffic against a half-restored erasure state.
+4. Once every replica is ready, unset `ERASURE_LOG_REPLAY_FILE` again (or drop it from the next
+   rollout) — replay is idempotent, but there is nothing left for it to do once this restore's
+   replicas have all gone through it once.
 
 ### Deletion horizon
 
