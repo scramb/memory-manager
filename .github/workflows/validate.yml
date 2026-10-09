@@ -85,6 +85,28 @@ jobs:
             | kubeconform -strict -summary \
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      - name: Check the PrometheusRule's own rules with promtool (#265)
+        run: |
+          # `spec.groups` dedented into a bare `groups:` rule file -
+          # promtool's rulefmt does a strict unmarshal and rejects the
+          # PrometheusRule's own apiVersion/kind/metadata/spec wrapper
+          # (verified locally: "field apiVersion not found in type
+          # rulefmt.RuleGroups"). "spec:"'s own children are always
+          # indented exactly 2 spaces (helm template's fixed YAML
+          # encoding), so stripping that prefix from every line after it
+          # is enough - no YAML library needed for this.
+          helm template t charts/memory-manager --set prometheusRule.enabled=true \
+              --show-only templates/prometheusrule.yaml \
+            | awk '/^spec:/{flag=1; next} flag' | sed 's/^  //' > /tmp/mm-rules-git.yaml
+          helm template t charts/memory-manager -f charts/memory-manager/values-enterprise.yaml \
+              --show-only templates/prometheusrule.yaml \
+            | awk '/^spec:/{flag=1; next} flag' | sed 's/^  //' > /tmp/mm-rules-enterprise.yaml
+          podman run --rm --entrypoint /bin/promtool \
+            -v /tmp/mm-rules-git.yaml:/rules.yaml:Z \
+            docker.io/prom/prometheus:v3.15.0 check rules /rules.yaml
+          podman run --rm --entrypoint /bin/promtool \
+            -v /tmp/mm-rules-enterprise.yaml:/rules.yaml:Z \
+            docker.io/prom/prometheus:v3.15.0 check rules /rules.yaml
       - name: No operator-specific hostnames or IPs
         run: scripts/check-deploy-placeholders.sh
       - uses: astral-sh/setup-uv@v10.2.0

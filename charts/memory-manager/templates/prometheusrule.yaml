@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default, same shape as templates/servicemonitor.yaml: needs the
+# Prometheus Operator CRDs installed, and an actual Prometheus that
+# selects this PrometheusRule (operator-specific, not this chart's job -
+# CLAUDE.md's "Not included": Alertmanager routing). Every mm_* metric
+# below exists in observability/metrics.py's own registry
+# (tests/chart/test_monitoring_assets.py enforces it); thresholds come
+# from prometheusRule's own "thresholds" sub-block (values.yaml), not
+# hardcoded here, so an operator can tune them without forking the
+# chart - defaults follow F-01's own latency budgets (search p95 <
+# 300 ms, read p95 < 100 ms, write p95 < 200 ms, < 1 % failed calls).
+#
+# storage's own backend "postgres" only: the api replica-count alert (the
+# "git" Deployment is a single writer, never meant to run more than one
+# replica - ADR-0009 §6) and the CNPG backup alert, the latter further
+# gated on the database block's own cnpg sub-block's own backup sub-block's
+# own enabled flag (no ObjectStore, no backup to ever fail). The backup
+# alert's own metric names
+# (barman_cloud_cloudnative_pg_io_last_failed_backup_timestamp/
+# _last_available_backup_timestamp) come from the Barman Cloud plugin
+# itself, not CNPG's own deprecated cnpg_collector_last_failed_backup_
+# timestamp (that field is never set for plugin-based backups, per the
+# CNPG Cluster CRD's own Status fields) - see docs/research/
+# cnpg-backups.md for the verified source. Both are bridged into the
+# same instance-manager "metrics" port templates/cnpg-podmonitor.yaml
+# scrapes - no separate plugin sidecar port exists - but only once the
+# CNPG core itself is new enough to run that bridge (verified absent
+# from every patch release in the 1.26 line, present from 1.27.0 on,
+# docs/research/cnpg-backups.md again): this alert simply stays
+# dormant, not wrong, against an operator still on the 1.26 line.
+{{- if .Values.prometheusRule.enabled }}
+{{- $t := .Values.prometheusRule.thresholds }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "memory-manager.fullname" . }}
+  labels:
+    {{- include "memory-manager.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: memory-manager-rules
+      rules:
+        - alert: MemoryManagerSearchLatencyHigh
+          expr: histogram_quantile(0.95, sum(rate(mm_tool_duration_seconds_bucket{tool="memory_search"}[5m])) by (le)) > {{ $t.searchP95Seconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: memory_search p95 latency exceeds its budget
+            description: "{{ printf "memory_search p95 duration has been above %gs for 10 minutes (F-01 budget: %gs)." $t.searchP95Seconds $t.searchP95Seconds }}"
+        - alert: MemoryManagerReadLatencyHigh
+          expr: histogram_quantile(0.95, sum(rate(mm_tool_duration_seconds_bucket{tool=~"memory_read|memory_index"}[5m])) by (le)) > {{ $t.readP95Seconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Read tool p95 latency exceeds its budget
+            description: "{{ printf "memory_read/memory_index p95 duration has been above %gs for 10 minutes (F-01 budget: %gs)." $t.readP95Seconds $t.readP95Seconds }}"
+        - alert: MemoryManagerWriteLatencyHigh
+          expr: histogram_quantile(0.95, sum(rate(mm_tool_duration_seconds_bucket{tool=~"memory_write|memory_edit|memory_supersede|memory_promote|memory_archive"}[5m])) by (le)) > {{ $t.writeP95Seconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Write tool p95 latency exceeds its budget
+            description: "{{ printf "memory_write/memory_edit/memory_supersede/memory_promote/memory_archive p95 duration has been above %gs for 10 minutes (F-01 budget: %gs)." $t.writeP95Seconds $t.writeP95Seconds }}"
+        - alert: MemoryManagerErrorRatioHigh
+          expr: (sum(rate(mm_tool_calls_total{outcome="error"}[5m])) / sum(rate(mm_tool_calls_total[5m]))) > {{ $t.errorRatio }} and sum(rate(mm_tool_calls_total[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Tool call error ratio exceeds its budget
+            description: "{{ printf "The share of MCP tool calls returning an error has been above %g%% for 10 minutes (F-01 budget: < 1%%)." (mulf $t.errorRatio 100.0) }}"
+        - alert: MemoryManagerRateLimitHitsSustained
+          expr: sum(rate(mm_rate_limit_hits_total[5m])) by (limiter) > {{ $t.rateLimitHitsPerSecond }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Sustained rate-limit/quota rejections
+            description: "{{ printf "A limiter has rejected more than %g requests/s for 10 minutes - see the alert's own 'limiter' label for which one." $t.rateLimitHitsPerSecond }}"
+        - alert: MemoryManagerEmbeddingLagHigh
+          expr: mm_embedding_lag_seconds > {{ $t.embeddingLagSeconds }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Embedding lag exceeds its budget
+            description: "{{ printf "The oldest pending embed_note job is more than %gs old (threshold: %gs)." $t.embeddingLagSeconds $t.embeddingLagSeconds }}"
+        - alert: MemoryManagerJobsBacklogStuck
+          expr: mm_jobs_oldest_pending_age_seconds{kind="embed_note"} > {{ $t.jobsOldestPendingAgeSeconds }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: The embed_note job backlog is stuck
+            description: "{{ printf "The oldest pending embed_note outbox job is more than %gs old (threshold: %gs) - the worker may not be draining it." $t.jobsOldestPendingAgeSeconds $t.jobsOldestPendingAgeSeconds }}"
+{{- if eq .Values.storage.backend "postgres" }}
+        - alert: MemoryManagerApiReplicasLow
+          expr: kube_deployment_status_replicas_ready{namespace="{{ .Release.Namespace }}", deployment="{{ include "memory-manager.fullname" . }}-api"} < {{ $t.minReadyApiReplicas }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Fewer than the expected number of api replicas are ready
+            description: "{{ printf "Fewer than %g api replicas have been ready for 5 minutes (ADR-0009 §4/§5)." $t.minReadyApiReplicas }}"
+{{- if .Values.database.cnpg.backup.enabled }}
+        - alert: MemoryManagerCnpgBackupFailed
+          expr: barman_cloud_cloudnative_pg_io_last_failed_backup_timestamp > barman_cloud_cloudnative_pg_io_last_available_backup_timestamp
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The last CNPG object-store backup attempt failed
+            description: A more recent Barman Cloud plugin backup attempt failed than the last one that succeeded (docs/research/cnpg-backups.md).
+{{- end }}
+{{- end }}
+{{- end }}

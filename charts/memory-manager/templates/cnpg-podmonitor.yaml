@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Off by default, reusing serviceMonitor's own enabled flag rather than a
+# dedicated one (#265) - it already means "the Prometheus Operator CRDs
+# are installed and this chart should scrape itself", and a CNPG Cluster
+# needs the same CRDs scraped the same way. storage's own backend
+# "postgres" only (ADR-0009 §6: the "git" Cluster is a derived, single-
+# instance index with no useful replication lag/backup state to alert
+# on), and only once the database block's own cnpg sub-block actually
+# renders a Cluster.
+#
+# A manually-defined PodMonitor, not the Cluster's own monitoring
+# sub-block's own enablePodMonitor flag - verified directly against the
+# Cluster CRD's own Go type at every patch release in the 1.26 line
+# (docs/research/cnpg-backups.md records the diff): enablePodMonitor
+# still works, undeprecated, at the first one (1.26.1, the version
+# docs/research/kind-e2e.md pins for the kind E2E), but gained a
+# "Deprecated: this feature will be removed in an upcoming release" doc
+# comment starting at the very next patch, 1.26.2 - so rendering this
+# chart's own PodMonitor instead (the exact shape CNPG's own monitoring
+# guide documents under "To deploy a PodMonitor for a specific Cluster
+# manually") stays correct across the whole 1.26 line and whatever
+# comes after enablePodMonitor is actually removed, rather than
+# depending on a flag already on its way out.
+#
+# Selector matches cnpg.io/cluster alone (CNPG's own sample PodMonitor,
+# not narrowed to cnpg.io/podRole: instance) - this chart's own
+# PrometheusRule only alerts on gauges (replication lag, the Barman
+# Cloud plugin's own backup timestamps below) a short-lived job pod
+# never reports anyway, so scraping it too for the few seconds it runs
+# is harmless.
+{{- if and .Values.serviceMonitor.enabled (eq .Values.storage.backend "postgres") .Values.database.cnpg.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "memory-manager.cnpgClusterName" . }}
+  labels:
+    {{- include "memory-manager.componentLabels" (dict "context" . "component" "cnpg") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/cluster: {{ include "memory-manager.cnpgClusterName" . }}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

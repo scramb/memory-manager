@@ -446,8 +446,42 @@ networkPolicy:
 
 # Prometheus Operator ServiceMonitor (observability/metrics.py's own
 # /metrics) - off by default, needs the Prometheus Operator CRDs
-# installed.
+# installed. storage's own backend "postgres" also reuses this same
+# enabled flag for a PodMonitor targeting the CNPG Cluster's own
+# instance pods (templates/cnpg-podmonitor.yaml, #265) - a manually
+# defined one rather than the Cluster's own monitoring sub-block's own
+# enablePodMonitor flag, which is on its way out (docs/research/
+# cnpg-backups.md records the source).
 serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
+
+# Grafana dashboard ConfigMap (dashboards/memory-manager.json, #265) -
+# off by default. A Grafana sidecar (the kube-prometheus-stack chart's
+# own default) discovers it by the label below; sidecarLabel/Value are
+# both settable since an operator's sidecar may watch a different one.
+grafanaDashboard:
+  enabled: false
+  sidecarLabel: grafana_dashboard
+  sidecarLabelValue: "1"
+
+# Prometheus Operator PrometheusRule (#265) - off by default, needs the
+# Prometheus Operator CRDs installed, same as serviceMonitor above.
+# Thresholds are values, not hardcoded in the rule expressions, so an
+# operator can tune them without forking the chart; defaults follow
+# F-01's own latency budgets (search p95 < 300 ms, read p95 < 100 ms,
+# write p95 < 200 ms, < 1 % failed calls) and ADR-0009 §4/§5 (2 of the
+# api Deployment's 3 replicas must stay ready).
+prometheusRule:
+  enabled: false
+  labels: {}
+  thresholds:
+    searchP95Seconds: 0.3
+    readP95Seconds: 0.1
+    writeP95Seconds: 0.2
+    errorRatio: 0.01
+    rateLimitHitsPerSecond: 1
+    embeddingLagSeconds: 600
+    jobsOldestPendingAgeSeconds: 900
+    minReadyApiReplicas: 2
