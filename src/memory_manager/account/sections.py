@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 import asyncpg
 
+from memory_manager.account.admin import ADMIN_ROLE, list_namespaces, render_admin_section
 from memory_manager.account.delete import (
     CONFIRM_FIELD_NAME,
     CONFIRM_PHRASE,
@@ -50,6 +51,7 @@ from memory_manager.account.templates import CSRF_FIELD_NAME
 from memory_manager.db import rls
 
 __all__ = [
+    "ADMIN_SECTION",
     "DEFAULT_SECTIONS",
     "DELETE_SECTION",
     "EXPORT_SECTION",
@@ -76,8 +78,9 @@ class SectionContext:
     pool: asyncpg.Pool
     is_postgres_backend: bool
     #: `services.app_role` (`None` for `STORAGE_BACKEND=git`, ADR-0008 addendum) -
-    #: required to call `mm_ensure_personal_ns()` under the identity switch
-    #: `db.rls.request_identity` performs; `OVERVIEW_SECTION` is the only reader today.
+    #: required to call `mm_ensure_personal_ns()`/an `mm_admin_*` function under the
+    #: identity switch `db.rls.request_identity` performs; `OVERVIEW_SECTION` and
+    #: `ADMIN_SECTION` are its only two readers today.
     app_role: str | None
     #: The raw (plaintext) session cookie value - needed only to mint a per-form
     #: CSRF token (`account.sessions.csrf_token`, keyed by the raw id, never the
@@ -196,9 +199,40 @@ async def _render_delete(ctx: SectionContext) -> str:
 #: `STORAGE_BACKEND=git` deployment never shows this section at all (#232).
 DELETE_SECTION = Section(name="delete", enabled=_delete_enabled, render=_render_delete)
 
+
+def _admin_enabled(ctx: SectionContext) -> bool:
+    """`STORAGE_BACKEND=postgres` plus an Entra `oid` plus `Memory.Admin` in the
+    session's own roles (#234, ADR-0008 "`Memory.Admin` manages namespaces and
+    ACLs"). `Memory.Admin` is only ever granted to a real Entra principal, so the
+    `oid` check is never the binding one here - kept for the same "degenerate
+    empty-oid case never reaches the database" reasoning `_export_enabled`/
+    `_delete_enabled` already follow."""
+    return (
+        ctx.is_postgres_backend and ctx.session.oid is not None and ADMIN_ROLE in ctx.session.roles
+    )
+
+
+async def _render_admin(ctx: SectionContext) -> str:
+    if ctx.app_role is None:  # pragma: no cover - defensive, `open_services` always sets it
+        # alongside a `PostgresBackend` (`app.py`'s own docstring) - `_admin_enabled`
+        # already required `is_postgres_backend`.
+        return ""
+    rows = await list_namespaces(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_admin_section(rows, session_id=ctx.session_id)
+
+
+#: Admin-only (`_admin_enabled`) - absent for every non-admin session and for
+#: `STORAGE_BACKEND=git` regardless of role (#234).
+ADMIN_SECTION = Section(name="admin", enabled=_admin_enabled, render=_render_admin)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
-DEFAULT_SECTIONS: tuple[Section, ...] = (OVERVIEW_SECTION, EXPORT_SECTION, DELETE_SECTION)
+DEFAULT_SECTIONS: tuple[Section, ...] = (
+    OVERVIEW_SECTION,
+    EXPORT_SECTION,
+    DELETE_SECTION,
+    ADMIN_SECTION,
+)
 
 
 async def render_sections(

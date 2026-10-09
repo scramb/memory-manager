@@ -97,12 +97,27 @@ _SELECT_ONLY_TABLES = ("schema_migrations",)
 # database `db.migrate.migrate` migrated with `backend="postgres"` - the
 # loop below checks each function exists before granting on it, so a
 # `backend="git"` database (every pre-existing caller/test) is unaffected.
+#
+# The six `mm_admin_*` functions (0020_admin_namespaces.sql, #234) are the
+# app role's only access to `namespaces`/`project_members`/
+# `namespace_settings` at all - same "no general INSERT on namespaces"
+# reasoning `mm_ensure_personal_ns` already carries, now extended to every
+# admin mutation `account/admin.py` performs. Each re-checks `Memory.Admin`
+# itself (that migration's own module docstring), so granting `EXECUTE` here
+# is not, on its own, a content-access grant to anyone who merely holds the
+# app role.
 _FUNCTIONS = (
     ("mm_readable_ns", "()"),
     ("mm_writable_ns", "()"),
     ("mm_ensure_personal_ns", "()"),
     ("mm_principal_namespaces", "(text[])"),
     ("mm_namespace_kind", "(text)"),
+    ("mm_admin_create_namespace", "(text, text, text)"),
+    ("mm_admin_rename_namespace_alias", "(text, text)"),
+    ("mm_admin_add_project_member", "(text, text, text, text)"),
+    ("mm_admin_remove_project_member", "(text, text, text)"),
+    ("mm_admin_update_namespace_settings", "(text, text, text)"),
+    ("mm_admin_list_namespaces", "()"),
 )
 
 
