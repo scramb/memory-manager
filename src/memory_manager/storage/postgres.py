@@ -107,6 +107,7 @@ reoccupied within this very window), absent means `deleted`.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -115,6 +116,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from memory_manager.db import rls
+from memory_manager.observability.audit_export import AuditExporter
 from memory_manager.storage import erasure, rules
 from memory_manager.storage.base import (
     AuditHook,
@@ -266,6 +268,7 @@ class PostgresBackend:
         index_hook: IndexHook | None = None,
         index_commit_hook: IndexCommitHook | None = None,
         app_role: str | None = None,
+        audit_exporter: AuditExporter | None = None,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -280,6 +283,19 @@ class PostgresBackend:
         # `PostgresBackend(pool)` call keeps running exactly as before - only
         # `app.py`'s `open_services` passes one, for the request-serving process.
         self._app_role = app_role
+        # `audit_exporter` (#233 fix for #231): `erase`'s own SIEM-export leg,
+        # same "build from env once, injectable for tests" shape `audit.
+        # AuditWriter.__init__` already uses for its own `AuditExporter` - built
+        # once per backend instance, not once per `erase()` call, so an `otlp`
+        # target's `LoggerProvider`/`BatchLogRecordProcessor` is never spun up
+        # more than once per process. Every existing `PostgresBackend(pool)` call
+        # (most tests) keeps exporting nothing, the same `AUDIT_EXPORT=off`
+        # default `AuditWriter` falls back to.
+        self._audit_exporter = (
+            audit_exporter
+            if audit_exporter is not None
+            else AuditExporter.from_env(dict(os.environ))
+        )
 
     @asynccontextmanager
     async def _content_connection(self) -> AsyncIterator[_Connectable]:
@@ -1061,6 +1077,12 @@ class PostgresBackend:
         to a role the app role (`storage/erasure.py`'s own module docstring:
         no grant at all on the tables erasure touches) could never carry
         this out as anyway.
+
+        Passes `self._audit_exporter` into `erase_fn` (#233 fix for #231), so
+        every real erasure - however it eventually gets called, #231's own
+        "Callers: 25f, 26d, 26h" included - exports its `erasure` audit
+        record once its own transaction has committed, the same `AuditExporter`
+        every other audit record already goes through.
         """
         erase_fn = {
             "note": erasure.erase_note,
@@ -1068,4 +1090,6 @@ class PostgresBackend:
             "user": erasure.erase_user,
         }[target_kind]
         async with self._pool.acquire() as conn:
-            return await erase_fn(conn, target_id, actor=actor, reason=reason)
+            return await erase_fn(
+                conn, target_id, actor=actor, reason=reason, audit_export=self._audit_exporter
+            )

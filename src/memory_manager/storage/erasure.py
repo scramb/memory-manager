@@ -50,16 +50,34 @@ cascade`), so a group/project namespace's membership and write-policy rows
 disappear with it too - correct for "erase this namespace", wrong only if
 this were erasing a user's *shared* membership elsewhere, which it never
 does (a user target only ever resolves their own personal namespace's row).
+
+`audit_export` (#233 fix for #231): each `erase_*` call optionally exports the
+same `erasure` `audit_log` row through an `observability.audit_export.
+AuditExporter`, once its own transaction has committed - `docs/guides/
+audit-export.md`'s "Erasure records and restores" already documented this as
+the off-database copy `storage.erasure_replay` reads back after a restore;
+until this fix the row only ever reached Postgres itself, via the raw SQL
+insert below, never the configured `AUDIT_EXPORT` target. `storage.postgres.
+PostgresBackend.erase` - the one caller today - passes its own `_audit_exporter`
+(built the same "once per backend, injectable for tests" way `audit.
+AuditWriter` already builds its own), so every real erasure, however it
+eventually gets invoked (#231's own "Callers: 25f, 26d, 26h"), exports.
+`None` stays the default for every direct call in this package's own tests,
+which do not care about the export leg at all.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 import asyncpg
 
 from memory_manager.audit import DETAIL_ALLOWLIST
+from memory_manager.observability.audit_export import AuditExporter
+from memory_manager.observability.logging import current_request_id
 from memory_manager.storage.base import ErasureResult, ErasureTargetKind, NotFound
 
 __all__ = ["erase_namespace", "erase_note", "erase_user"]
@@ -244,7 +262,11 @@ async def _write_erasure_log(
     target_kind: ErasureTargetKind,
     target_ids: list[str],
     row_counts: dict[str, int],
-) -> int:
+) -> tuple[int, dict[str, Any]]:
+    """Insert the `erasure_log`/`audit_log` row pair and return `(log_id, detail)` -
+    `detail` is the exact dict `audit_log.detail` was given, kept unserialized so
+    `_export_erasure` (called once the enclosing transaction has actually committed,
+    #233 fix for #231) can reuse it verbatim instead of re-building or re-parsing it."""
     log_id = await conn.fetchval(
         _INSERT_ERASURE_LOG,
         actor,
@@ -253,22 +275,55 @@ async def _write_erasure_log(
         target_ids,
         json.dumps(row_counts),
     )
-    await conn.execute(
-        _INSERT_AUDIT_ERASURE,
-        actor,
-        json.dumps(
-            {
-                "erasure_log_id": log_id,
-                "target_kind": target_kind,
-                "target_ids": target_ids,
-                "row_counts": row_counts,
-            }
-        ),
+    detail = {
+        "erasure_log_id": log_id,
+        "target_kind": target_kind,
+        "target_ids": target_ids,
+        "row_counts": row_counts,
+    }
+    await conn.execute(_INSERT_AUDIT_ERASURE, actor, json.dumps(detail))
+    return int(log_id), detail
+
+
+def _export_erasure(
+    audit_export: AuditExporter | None, *, actor: str, detail: dict[str, Any]
+) -> None:
+    """Export the `erasure` audit record `_write_erasure_log` already inserted,
+    through the same `AuditExporter` every other audit record goes through
+    (#233 fix for #231, `audit-export.md`'s "Erasure records and restores").
+
+    A no-op when `audit_export` is `None` (every caller that does not pass one,
+    unchanged default) - callers that do must only call this once the
+    transaction `_write_erasure_log` ran in has actually committed, never from
+    inside it: `AuditExporter.export` never raises, but it also never rolls
+    back, so exporting before a commit could report an erasure that a later
+    failure in the same transaction then undoes. Carries no more than
+    `audit_log.detail` itself does - IDs and counts, never content.
+    """
+    if audit_export is None:
+        return
+    audit_export.export(
+        {
+            "at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "actor": actor,
+            "client": "erasure",
+            "op": "erasure",
+            "path": None,
+            "outcome": "ok",
+            "detail": detail,
+            "request_id": current_request_id(),
+        }
     )
-    return int(log_id)
 
 
-async def erase_note(conn: _Connectable, note_id: str, *, actor: str, reason: str) -> ErasureResult:
+async def erase_note(
+    conn: _Connectable,
+    note_id: str,
+    *,
+    actor: str,
+    reason: str,
+    audit_export: AuditExporter | None = None,
+) -> ErasureResult:
     """Hard-delete one note everywhere it lives, in one transaction.
 
     Raises `NotFound` if `note_id` exists in neither `vault_notes` nor
@@ -277,6 +332,11 @@ async def erase_note(conn: _Connectable, note_id: str, *, actor: str, reason: st
     `vault_revisions` ever recorded for this note (including an archived
     move), not by namespace - a single note's erasure must never touch
     another note's audit trail.
+
+    `audit_export`, given, exports the `erasure` audit record once this call's
+    own transaction has committed (`_export_erasure`'s own docstring, #233 fix
+    for #231) - `None` (the default, every existing caller) keeps this a
+    no-op, same as before that fix.
     """
     async with conn.transaction():
         revision_paths = [
@@ -314,7 +374,7 @@ async def erase_note(conn: _Connectable, note_id: str, *, actor: str, reason: st
             "jobs": len(jobs_rows),
             "audit_log": audit_redacted,
         }
-        log_id = await _write_erasure_log(
+        log_id, detail = await _write_erasure_log(
             conn,
             actor=actor,
             reason=reason,
@@ -323,6 +383,7 @@ async def erase_note(conn: _Connectable, note_id: str, *, actor: str, reason: st
             row_counts=row_counts,
         )
 
+    _export_erasure(audit_export, actor=actor, detail=detail)
     return ErasureResult(
         target_kind="note",
         target_ids=(note_id,),
@@ -332,7 +393,12 @@ async def erase_note(conn: _Connectable, note_id: str, *, actor: str, reason: st
 
 
 async def erase_namespace(
-    conn: _Connectable, namespace: str, *, actor: str, reason: str
+    conn: _Connectable,
+    namespace: str,
+    *,
+    actor: str,
+    reason: str,
+    audit_export: AuditExporter | None = None,
 ) -> ErasureResult:
     """Hard-delete every note in `namespace`, archived included, plus the
     `namespaces` registry row itself, in one transaction.
@@ -341,6 +407,8 @@ async def erase_namespace(
     all revisions, chunks and jobs"; its own registry row too, module
     docstring's last paragraph) - content first, the row itself last, since
     nothing in between keys off `namespaces.id`.
+
+    `audit_export` - see `erase_note`'s own docstring.
     """
     async with conn.transaction():
         counts = await _erase_namespace_content(conn, namespace)
@@ -351,7 +419,7 @@ async def erase_namespace(
         row_counts["audit_log"] = audit_redacted
         row_counts["namespaces"] = namespaces_deleted
 
-        log_id = await _write_erasure_log(
+        log_id, detail = await _write_erasure_log(
             conn,
             actor=actor,
             reason=reason,
@@ -360,6 +428,7 @@ async def erase_namespace(
             row_counts=row_counts,
         )
 
+    _export_erasure(audit_export, actor=actor, detail=detail)
     return ErasureResult(
         target_kind="namespace",
         target_ids=(namespace,),
@@ -368,7 +437,14 @@ async def erase_namespace(
     )
 
 
-async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -> ErasureResult:
+async def erase_user(
+    conn: _Connectable,
+    oid: str,
+    *,
+    actor: str,
+    reason: str,
+    audit_export: AuditExporter | None = None,
+) -> ErasureResult:
     """Hard-delete `oid`'s personal namespace and identity, in one transaction.
 
     Owner decision 2026-10-08 (ADR-0007 §3 addendum): "the personal
@@ -384,6 +460,8 @@ async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -
     author-based"). A user with no personal namespace yet
     (`mm_ensure_personal_ns()` lazily creates one on first write, #101) is
     not an error - every content/namespace count is simply zero.
+
+    `audit_export` - see `erase_note`'s own docstring.
     """
     async with conn.transaction():
         alias = await conn.fetchval(_SELECT_PERSONAL_ALIAS, oid)
@@ -430,7 +508,7 @@ async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -
         row_counts["account_sessions"] = len(account_sessions_rows)
         row_counts["users"] = len(users_rows)
 
-        log_id = await _write_erasure_log(
+        log_id, detail = await _write_erasure_log(
             conn,
             actor=actor,
             reason=reason,
@@ -439,6 +517,7 @@ async def erase_user(conn: _Connectable, oid: str, *, actor: str, reason: str) -
             row_counts=row_counts,
         )
 
+    _export_erasure(audit_export, actor=actor, detail=detail)
     return ErasureResult(
         target_kind="user",
         target_ids=(oid,),

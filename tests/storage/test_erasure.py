@@ -33,6 +33,7 @@ from memory_manager.db.migrate import migrate
 from memory_manager.db.rls import grant_app_role, request_identity
 from memory_manager.storage.base import NotFound
 from memory_manager.storage.erasure import erase_namespace, erase_note, erase_user
+from memory_manager.storage.postgres import PostgresBackend
 
 _SENTINEL = "zzsentinelzz"
 
@@ -521,3 +522,45 @@ class TestAppRoleCannotCallIt:
                     await erase_note(conn, "note-1", actor="oid-alice", reason="self-service")
         finally:
             await conn.close()
+
+
+class TestPostgresBackendEraseExportsToTheSiem:
+    async def test_erase_with_audit_export_stdout_emits_exactly_one_erasure_line(
+        self,
+        erasure_db: ErasureDb,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Production wiring (#233 fix for #231): `PostgresBackend.__init__`'s own
+        default `AuditExporter.from_env(dict(os.environ))` (same shape `audit.
+        AuditWriter` already uses) means a deployment with `AUDIT_EXPORT=stdout`
+        gets the `erasure` record exported with no extra wiring anywhere else -
+        checked here against `os.environ`, not an injected `AuditExporter`, so
+        this exercises exactly that default, not a test-only seam."""
+        monkeypatch.setenv("AUDIT_EXPORT", "stdout")
+        seed_conn = await _connect_as(erasure_db.owner_url)
+        try:
+            await _seed_namespace(seed_conn, "user", "oid-greg", "greg")
+            await _seed_note(seed_conn, "note-export", "greg", author_oid="oid-greg")
+        finally:
+            await seed_conn.close()
+
+        pool = await asyncpg.create_pool(erasure_db.owner_url)
+        try:
+            backend = PostgresBackend(pool)
+            capsys.readouterr()  # discard anything buffered before this point
+
+            result = await backend.erase(
+                "note", "note-export", actor="admin", reason="gdpr-request"
+            )
+
+            assert result.target_kind == "note"
+            lines = [line for line in capsys.readouterr().err.strip().splitlines() if line.strip()]
+            assert len(lines) == 1
+            record = json.loads(lines[0])
+            assert record["op"] == "erasure"
+            assert record["actor"] == "admin"
+            assert record["detail"]["target_kind"] == "note"
+            assert record["detail"]["target_ids"] == ["note-export"]
+        finally:
+            await pool.close()
