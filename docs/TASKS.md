@@ -340,7 +340,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 
 ### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
 
-- [ ] #277 Upgrade smoke test proves 0.1.x → 0.2.0 incl. migration and export rollback ⛔ blocked by #248
+- [x] #277 Upgrade smoke test proves 0.1.x → 0.2.0 incl. migration and export rollback ⛔ blocked by #248
 - [ ] #278 Upgrade guide 0.1.x → 0.2.0 incl. git-to-postgres migration and export rollback ⛔ blocked by #277, #259
 - [ ] #279 README enterprise section with links to guides, benchmark and compliance ⛔ blocked by #278, #271, #276
 - [ ] #280 v0.2.0 released with cosign-verified image and Helm chart ⛔ blocked by #224, #225, #273, #279
