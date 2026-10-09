@@ -59,6 +59,14 @@ LOADTEST_NOTES=10000 LOADTEST_KILL_AFTER=30 scripts/loadtest-cluster.sh
 `KEEP_CLUSTER=1` leaves the kind cluster and registry running afterwards
 (the same escape hatch `scripts/e2e-kind.sh` has) for inspecting a failure.
 
+The k6 latency thresholds stay at the F-01 targets here too, and a kind
+cluster nested in rootful podman on one 8-vCPU node sits close to them:
+of four runs after #293, three exited 0 and one failed only on
+`http_req_duration{scenario:search_vector_only}` (p95 309 ms against
+300 ms), with both correctness checks at 100 %. A single red run on kind
+is worth repeating before reading anything into it; the target-size
+numbers come from #271's report, not from this smoke.
+
 ## Running against an operator's own cluster
 
 Set `KUBE_CONTEXT` to an existing context and `LOADTEST_REGISTRY` to a

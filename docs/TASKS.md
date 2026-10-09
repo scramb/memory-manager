@@ -326,7 +326,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 - [x] #269 Local load test runs 3 replicas with a replica kill on Postgres or Valkey shared state ⛔ blocked by #267, #268
 - [x] #291 Vector-only searches meet the F-01 search latency budget ⛔ blocked by #269
 - [x] #293 Vector-only search finds its target on the Helm deployment as on a single process ⛔ blocked by #291
-- [ ] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
+- [x] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
 - [ ] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
 
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
