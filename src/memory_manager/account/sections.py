@@ -41,6 +41,7 @@ import asyncpg
 from memory_manager.account.admin import ADMIN_ROLE, list_namespaces, render_admin_section
 from memory_manager.account.break_glass import list_grants as list_break_glass_grants
 from memory_manager.account.break_glass import render_break_glass_section
+from memory_manager.account.break_glass_viewer import VIEW_PATH as BREAK_GLASS_VIEW_PATH
 from memory_manager.account.delete import (
     CONFIRM_FIELD_NAME,
     CONFIRM_PHRASE,
@@ -244,7 +245,9 @@ async def _render_break_glass(ctx: SectionContext) -> str:
         # `_break_glass_enabled` already required `is_postgres_backend`.
         return ""
     rows = await list_break_glass_grants(ctx.pool, app_role=ctx.app_role, session=ctx.session)
-    return render_break_glass_section(rows, session_id=ctx.session_id)
+    return render_break_glass_section(
+        rows, session_id=ctx.session_id, view_path=BREAK_GLASS_VIEW_PATH
+    )
 
 
 #: Admin-only (`_break_glass_enabled`) - absent for every non-admin session and for

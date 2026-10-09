@@ -466,7 +466,12 @@ def _hidden_csrf(token: str) -> str:
 
 
 def _render_grants_table(
-    rows: list[GrantRow], *, approve_token: str, deny_token: str, revoke_token: str
+    rows: list[GrantRow],
+    *,
+    approve_token: str,
+    deny_token: str,
+    revoke_token: str,
+    view_path: str | None,
 ) -> str:
     if not rows:
         return "<p>No break-glass grants yet.</p>"
@@ -485,7 +490,20 @@ def _render_grants_table(
                 '<button type="submit">Deny</button></form>'
             )
         elif status == "approved":
+            # `view_path` is `account.break_glass_viewer.VIEW_PATH`, passed
+            # in by `account.sections._render_break_glass` rather than
+            # imported directly - that module already imports `GrantRow`/
+            # `list_grants` from here, so importing it back would cycle.
+            # `None` (every existing caller/test that builds this table
+            # without it) renders no link at all; the viewer enforces
+            # expiry on its own regardless of whether this link is shown.
+            view_link = (
+                f'<a href="{html.escape(view_path)}?grant_id={row.id}">View</a> '
+                if view_path is not None
+                else ""
+            )
             action = (
+                f"{view_link}"
                 f'<form method="post" action="{html.escape(REVOKE_PATH)}">'
                 f"{_hidden_csrf(revoke_token)}"
                 f'<input type="hidden" name="grant_id" value="{row.id}">'
@@ -512,17 +530,26 @@ def _render_grants_table(
     )
 
 
-def render_break_glass_section(rows: list[GrantRow], *, session_id: str) -> str:
+def render_break_glass_section(
+    rows: list[GrantRow], *, session_id: str, view_path: str | None = None
+) -> str:
     """The break-glass section's own markup: the grant table plus the request
     form - called by `account.sections._render_break_glass`, which owns the
     `<section>` gating (`_break_glass_enabled`) this module does not decide
-    on its own."""
+    on its own. `view_path` is `account.break_glass_viewer.VIEW_PATH`
+    (`None` - the default - renders an approved grant's row with no "View"
+    link at all); see `_render_grants_table`'s own docstring for why it
+    travels as a plain parameter rather than an import."""
     request_token = sessions.csrf_token(session_id, CSRF_FORM_REQUEST)
     approve_token = sessions.csrf_token(session_id, CSRF_FORM_APPROVE)
     deny_token = sessions.csrf_token(session_id, CSRF_FORM_DENY)
     revoke_token = sessions.csrf_token(session_id, CSRF_FORM_REVOKE)
     table = _render_grants_table(
-        rows, approve_token=approve_token, deny_token=deny_token, revoke_token=revoke_token
+        rows,
+        approve_token=approve_token,
+        deny_token=deny_token,
+        revoke_token=revoke_token,
+        view_path=view_path,
     )
 
     return (
