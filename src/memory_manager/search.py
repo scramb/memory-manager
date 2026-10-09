@@ -522,7 +522,55 @@ where c.namespace_kind = $2
     -- migration's own B-tree (`chunks_namespace_idx`) exists to serve -
     -- filtering the joined column instead would never let the planner use
     -- it, no matter how selective `$8` is.
-    and ($8::text[] is null or c.namespace = any($8))
+    --
+    -- Without a caller-supplied `$8`, this used to add no predicate at all -
+    -- the only restriction left on `chunks_user` (no HNSW, #296/#271) was
+    -- `chunks_select`'s own `exists (... mm_readable_ns() ...)`, which gives
+    -- the planner nothing indexable on `chunks` itself, so an unfiltered
+    -- `order by ... limit` had to compute the exact distance for, and sort,
+    -- every row of the partition. Narrowing to `mm_readable_ns()` in that
+    -- case instead gives it `chunks_namespace_idx` to use - a pure
+    -- narrowing, not a relaxation: RLS's own `chunks_select` still applies
+    -- underneath exactly as before, and `mm_readable_ns()` already folds in
+    -- break-glass grants (its own `break_glass` CTE, `0005_rls.sql`), so
+    -- this predicate is never narrower than what RLS already allows the app
+    -- role. `(select ...)` makes this one evaluation per statement (a
+    -- `STABLE` function with no correlation to any row here) rather than
+    -- once per `chunks` row - the same `InitPlan` shape the RLS policy's
+    -- own `(select mm_readable_ns())` already relies on.
+    --
+    -- An explicit `$8` is always honoured as-is, identity or not - this is
+    -- the caller's own filter (`SearchFilters.namespaces`), not an RLS
+    -- concern. Only the "no `$8`" branch falls back to `mm_readable_ns()`,
+    -- and only when `app.oid` is actually set (the same empty-string check
+    -- `mm_readable_ns()` itself makes of that setting): a system/owner
+    -- connection with no identity at all - `chunks_owner_access` bypasses
+    -- the namespace checks entirely for it, by design (the comment on that
+    -- policy in `migrations/postgres/0012_vector_layout.sql`) - would
+    -- otherwise have this predicate
+    -- collapse to `mm_readable_ns()`'s own "no identity" result (an empty
+    -- array), matching zero rows instead of leaving the owner's
+    -- unrestricted read alone. An app-role connection always has `app.oid`
+    -- set (`rls.request_identity`, the only way a request reaches this
+    -- query under RLS, #116/ADR-0008 addendum), so this never weakens the
+    -- narrowing for the case the predicate exists to help.
+    --
+    -- `mm_readable_ns()`'s call is wrapped in its own `coalesce(..., array[])`
+    -- rather than passed to `any(...)` bare: Postgres's grammar treats
+    -- `x = any(<parenthesised subquery>)` as an `ANY`-sublink (row-by-row
+    -- comparison against the subquery's result set) unless the argument is
+    -- unambiguously an array *value* - `coalesce` forces that, the same way
+    -- `$8::text[]` elsewhere forces its own parameter's type. Without it,
+    -- Postgres raised `operator does not exist: text = text[]` trying to
+    -- compare `c.namespace` against `mm_readable_ns()`'s single returned
+    -- row (itself a `text[]`) rather than unnesting it.
+    and (
+        ($8::text[] is not null and c.namespace = any($8::text[]))
+        or ($8::text[] is null and (
+            coalesce(nullif(current_setting('app.oid', true), ''), '') = ''
+            or c.namespace = any(coalesce((select mm_readable_ns()), array[]::text[]))
+        ))
+    )
     and ($9::date is null or (
         (n.valid_from is null or n.valid_from <= $9)
         and (n.valid_to is null or n.valid_to >= $9)
