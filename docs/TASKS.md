@@ -264,7 +264,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 - [x] #238 Admins read a break-glass namespace in a read-only, audited viewer on `/account` ⛔ blocked by #237
 - [x] #239 Users see a break-glass banner and a reference note in `me` until they acknowledge it ⛔ blocked by #237
 - [x] #240 Personal memories of deprovisioned users are erased after `PERSONAL_RETENTION_DAYS` ⛔ blocked by #231, #219, #223
-- [ ] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
+- [x] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
 
 ### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
 
