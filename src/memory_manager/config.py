@@ -28,6 +28,7 @@ __all__ = [
     "WorkerConfigError",
     "audit_export_targets_from_env",
     "blocklist_file_from_env",
+    "break_glass_approvers_from_env",
     "canonical_resource_url",
     "database_app_role_from_env",
     "erasure_log_replay_file_from_env",
@@ -241,6 +242,47 @@ def database_app_role_from_env(environ: dict[str, str]) -> str | None:
             "before touching a row-level-security-protected content table"
         )
     return role
+
+
+#: ADR-0008 "Break-glass": "By default (`BREAK_GLASS_APPROVERS=2`) a second admin
+#: must approve; operators may lower it to 1." No other value makes sense - a
+#: count of 0 would mean "never approvable" (not what disabling four-eyes means)
+#: and anything above 2 is not a requirement this ADR makes.
+_DEFAULT_BREAK_GLASS_APPROVERS = 2
+_BREAK_GLASS_APPROVER_COUNTS = frozenset({1, 2})
+
+
+def break_glass_approvers_from_env(environ: dict[str, str]) -> int:
+    """How many distinct `Memory.Admin`s a break-glass grant needs
+    (`BREAK_GLASS_APPROVERS`, default 2, ADR-0008 "Break-glass").
+
+    1 means the requester may approve their own request too (ADR-0008:
+    "operators may lower it to 1" names no second admin at all for that
+    case); 2 (the default) requires an approver who is not the requester.
+    `account.break_glass` checks this in Python before ever calling
+    `mm_break_glass_approve`, which takes the same configured count as its
+    own `p_approver_count` argument and refuses a same-admin approval
+    again, independently - the "two independent computations" shape every
+    other ADR-0008 permission check in this codebase already follows.
+
+    Raises `StorageConfigError` for anything other than `1` or `2`, before
+    anything is started - the same "fails before anything is started"
+    contract `database_app_role_from_env` already gives `DATABASE_APP_ROLE`.
+    Read regardless of `STORAGE_BACKEND`: unlike `DATABASE_APP_ROLE`, a
+    misconfigured value costs nothing to reject even for `"git"`, which
+    simply never reaches a code path that reads it (there is no admin area,
+    let alone break-glass, without the Postgres backend).
+    """
+    raw = environ.get("BREAK_GLASS_APPROVERS", str(_DEFAULT_BREAK_GLASS_APPROVERS)).strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        count = -1
+    if count not in _BREAK_GLASS_APPROVER_COUNTS:
+        raise StorageConfigError(
+            f"BREAK_GLASS_APPROVERS must be 1 or 2 (ADR-0008 'Break-glass'), got {raw!r}"
+        )
+    return count
 
 
 def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:

@@ -39,6 +39,8 @@ from dataclasses import dataclass
 import asyncpg
 
 from memory_manager.account.admin import ADMIN_ROLE, list_namespaces, render_admin_section
+from memory_manager.account.break_glass import list_grants as list_break_glass_grants
+from memory_manager.account.break_glass import render_break_glass_section
 from memory_manager.account.delete import (
     CONFIRM_FIELD_NAME,
     CONFIRM_PHRASE,
@@ -52,6 +54,7 @@ from memory_manager.db import rls
 
 __all__ = [
     "ADMIN_SECTION",
+    "BREAK_GLASS_SECTION",
     "DEFAULT_SECTIONS",
     "DELETE_SECTION",
     "EXPORT_SECTION",
@@ -225,6 +228,31 @@ async def _render_admin(ctx: SectionContext) -> str:
 #: `STORAGE_BACKEND=git` regardless of role (#234).
 ADMIN_SECTION = Section(name="admin", enabled=_admin_enabled, render=_render_admin)
 
+
+def _break_glass_enabled(ctx: SectionContext) -> bool:
+    """Same gate as `_admin_enabled` (#237, ADR-0008 "Break-glass") - a
+    break-glass grant is itself an admin action, never available to anyone
+    without `Memory.Admin`."""
+    return (
+        ctx.is_postgres_backend and ctx.session.oid is not None and ADMIN_ROLE in ctx.session.roles
+    )
+
+
+async def _render_break_glass(ctx: SectionContext) -> str:
+    if ctx.app_role is None:  # pragma: no cover - defensive, `open_services` always sets it
+        # alongside a `PostgresBackend` (`app.py`'s own docstring) -
+        # `_break_glass_enabled` already required `is_postgres_backend`.
+        return ""
+    rows = await list_break_glass_grants(ctx.pool, app_role=ctx.app_role, session=ctx.session)
+    return render_break_glass_section(rows, session_id=ctx.session_id)
+
+
+#: Admin-only (`_break_glass_enabled`) - absent for every non-admin session and for
+#: `STORAGE_BACKEND=git` regardless of role (#237).
+BREAK_GLASS_SECTION = Section(
+    name="break_glass", enabled=_break_glass_enabled, render=_render_break_glass
+)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
 DEFAULT_SECTIONS: tuple[Section, ...] = (
@@ -232,6 +260,7 @@ DEFAULT_SECTIONS: tuple[Section, ...] = (
     EXPORT_SECTION,
     DELETE_SECTION,
     ADMIN_SECTION,
+    BREAK_GLASS_SECTION,
 )
 
 

@@ -49,6 +49,7 @@ class TestMigrate:
             "0014_entra_delta_cursor",
             "0016_account_sessions",
             "0020_admin_namespaces",
+            "0021_break_glass_workflow",
         ]
         tables = {
             row["table_name"]
@@ -103,6 +104,7 @@ class TestMigrate:
             "0014_entra_delta_cursor",
             "0016_account_sessions",
             "0020_admin_namespaces",
+            "0021_break_glass_workflow",
         ]
         assert second == []
 
@@ -133,6 +135,7 @@ class TestMigrate:
             "0014_entra_delta_cursor",
             "0016_account_sessions",
             "0020_admin_namespaces",
+            "0021_break_glass_workflow",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -201,6 +204,7 @@ class TestMigrate:
                 "0014_entra_delta_cursor",
                 "0016_account_sessions",
                 "0020_admin_namespaces",
+                "0021_break_glass_workflow",
             ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
@@ -292,6 +296,7 @@ class TestMigrateBackendPostgres:
             "0016_account_sessions",
             "0018_erasure_log",
             "0020_admin_namespaces",
+            "0021_break_glass_workflow",
         ]
         tables = {
             row["table_name"]

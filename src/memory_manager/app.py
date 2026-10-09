@@ -66,6 +66,7 @@ from memory_manager.config import (
     EmbeddingConfig,
     VaultConfig,
     blocklist_file_from_env,
+    break_glass_approvers_from_env,
     database_app_role_from_env,
     storage_backend_from_env,
 )
@@ -120,6 +121,12 @@ class Services:
     `db.rls.request_connection` (set) or the plain owner pool (`None`) - the
     same switch `storage.postgres.PostgresBackend` itself already made via its
     own `app_role` constructor argument, built with the identical value.
+
+    `break_glass_approvers` (`BREAK_GLASS_APPROVERS`, ADR-0008 "Break-glass",
+    #237) is read and validated the same way regardless of backend
+    (`config.break_glass_approvers_from_env` always returns a value, default
+    2) - `account.break_glass`'s approve route is its one reader, and only
+    ever reaches it from a `"postgres"`-backend admin session.
     """
 
     repo: Repo | None
@@ -131,6 +138,7 @@ class Services:
     storage: StorageBackend
     trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
     app_role: str | None = None
+    break_glass_approvers: int = 2
 
 
 @dataclass
@@ -336,7 +344,10 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     here too (`database_app_role_from_env`, `None` for `"git"`, required and
     validated before anything else starts for `"postgres"`) and threaded
     through `_open_backend` into `PostgresBackend` and `Services.app_role`
-    alike. `BLOCKLIST_FILE` is loaded eagerly here too (`vault.blocklist.
+    alike. `BREAK_GLASS_APPROVERS` (`config.break_glass_approvers_from_env`,
+    ADR-0008 "Break-glass", #237) is read and validated the same way,
+    regardless of backend, into `Services.break_glass_approvers`.
+    `BLOCKLIST_FILE` is loaded eagerly here too (`vault.blocklist.
     load_rules`), same "fails before anything is started" contract as the
     rest of this list (#244).
     """
@@ -345,6 +356,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     vault_config = VaultConfig.from_env(dict(environ)) if storage_backend_name == "git" else None
     embedding_config = EmbeddingConfig.from_env(dict(environ))
     app_role = database_app_role_from_env(dict(environ))
+    break_glass_approvers = break_glass_approvers_from_env(dict(environ))
     blocklist.load_rules(blocklist_file_from_env(dict(environ)))
 
     async with _open_backend(
@@ -403,6 +415,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                     storage=handle.storage,
                     trigger_sync=trigger_sync,
                     app_role=app_role,
+                    break_glass_approvers=break_glass_approvers,
                 )
             finally:
                 if poll_task is not None:

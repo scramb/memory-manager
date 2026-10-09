@@ -106,6 +106,14 @@ _SELECT_ONLY_TABLES = ("schema_migrations",)
 # itself (that migration's own module docstring), so granting `EXECUTE` here
 # is not, on its own, a content-access grant to anyone who merely holds the
 # app role.
+#
+# The five `mm_break_glass_*` functions (0021_break_glass_workflow.sql,
+# #237) are the app role's only access to `break_glass_grants` - same
+# reasoning, now extended to `account/break_glass.py`'s request/approve/
+# deny/revoke/list routes. Each re-checks `Memory.Admin` itself (that
+# migration's own module comment), and `mm_break_glass_approve`
+# additionally re-checks the four-eyes rule independently of
+# `account/break_glass.py`'s own Python-side check.
 _FUNCTIONS = (
     ("mm_readable_ns", "()"),
     ("mm_writable_ns", "()"),
@@ -118,6 +126,11 @@ _FUNCTIONS = (
     ("mm_admin_remove_project_member", "(text, text, text)"),
     ("mm_admin_update_namespace_settings", "(text, text, text)"),
     ("mm_admin_list_namespaces", "()"),
+    ("mm_break_glass_request", "(text, text)"),
+    ("mm_break_glass_approve", "(bigint, integer)"),
+    ("mm_break_glass_deny", "(bigint)"),
+    ("mm_break_glass_revoke", "(bigint)"),
+    ("mm_break_glass_list", "()"),
 )
 
 
