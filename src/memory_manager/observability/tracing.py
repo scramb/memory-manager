@@ -25,6 +25,17 @@ unwrapped - whenever the endpoint is unset or the SDK import fails:
   `db.operation` only, never SQL text or bound parameters (CLAUDE.md: note
   content is data, never a command or a log/trace payload - the same rule
   extends to query parameters here).
+- `current_traceparent()`/`job_span(kind, ...)`: the `jobs` outbox's own pair
+  (#263 WP-31). `index/indexer.py`'s `Indexer.index_on_connection` calls
+  `current_traceparent()` right before `jobs.enqueue`, so the row carries the
+  enqueuing request's own `traceparent` (or `None` when no span is active -
+  `enqueue_stale_embeddings`' own worker-startup catch-up, which never runs
+  inside a request). `worker.py`'s `_dispatch_job` wraps every claimed job in
+  `job_span`, a CONSUMER span continuing that stored `traceparent` when
+  present, or starting a fresh trace when it is `None` - the messaging
+  counterpart to `TracingMiddleware`'s incoming-`traceparent` continuation
+  above, `opentelemetry.propagate.extract`/`inject` on a plain
+  `{"traceparent": ...}` carrier rather than real HTTP headers.
 
 Span nesting across all three follows the ambient OTel context
 (`contextvars`, not a value threaded through every call): as long as a
@@ -50,7 +61,7 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["TracingMiddleware", "db_span", "trace_tool_call"]
+__all__ = ["TracingMiddleware", "current_traceparent", "db_span", "job_span", "trace_tool_call"]
 
 _logger = logging.getLogger(__name__)
 
@@ -153,6 +164,87 @@ def db_span(op: str) -> Iterator[None]:
         return
     with tracer.start_as_current_span(
         op, attributes={"db.system": "postgresql", "db.operation": op}
+    ):
+        yield
+
+
+def current_traceparent() -> str | None:
+    """The currently active span's W3C `traceparent`, or `None` under the same
+    conditions `trace_tool_call`'s docstring describes, or simply because no
+    span is active right now (#263 WP-31).
+
+    `opentelemetry.propagate.inject` into a fresh carrier leaves the
+    `"traceparent"` key out entirely when there is no active span to encode
+    (verified by reading the installed SDK, same as the module docstring's
+    other claims) - so this needs no separate "is a span active" check of its
+    own beyond `_active_tracer()`'s existing one. `index/indexer.py`'s
+    `Indexer.index_on_connection` is this function's one caller, right before
+    `jobs.enqueue`, so a job row carries the enqueuing request's own trace
+    (or `None`, e.g. the worker's own startup catch-up, which runs with no
+    span active at all).
+    """
+    tracer = _active_tracer()
+    if tracer is None:
+        return None
+
+    from opentelemetry import propagate
+
+    carrier: dict[str, str] = {}
+    propagate.inject(carrier)
+    return carrier.get("traceparent")
+
+
+@contextmanager
+def job_span(kind: str, *, job_id: str, attempt: int, traceparent: str | None) -> Iterator[None]:
+    """Wrap one worker-claimed `jobs` row in a CONSUMER span (#263 WP-31) - a
+    no-op context manager under the same conditions `trace_tool_call` is
+    (module docstring). `worker.py`'s `_dispatch_job` is this function's one
+    caller, around the whole claimed job (handler call plus the
+    `jobs.complete`/`fail`/`fail_or_retry` that follows it).
+
+    Continues `traceparent` (`jobs.ClaimedJob.traceparent`, the column
+    `current_traceparent()` filled at enqueue time) via
+    `opentelemetry.propagate.extract` on a plain `{"traceparent": ...}`
+    carrier - the same extractor `TracingMiddleware` already uses on real
+    HTTP headers - when it is not `None`; a job enqueued with no span active
+    (`traceparent is None`) instead starts a fresh trace, the ambient-context
+    default `start_as_current_span` already falls back to when no `context`
+    is passed in.
+
+    Span name and attributes follow the OTel messaging semantic
+    conventions (`opentelemetry-semantic-conventions` 0.66b1, the version
+    pinned transitively by `otel`'s own `opentelemetry-sdk>=1.45.1`, read
+    directly rather than assumed - `SpanAttributes.MESSAGING_OPERATION` etc.
+    resolve to the plain attribute names used here) for a "process" span:
+    `"{kind} process"`, `messaging.system` (`"postgresql"` - the `jobs`
+    outbox has no separate broker), `messaging.destination.name` (`kind`),
+    `messaging.operation` (`"process"`). `job.kind`/`job.id`/`job.attempt`
+    are this project's own addition, on top of those - IDs and a count only,
+    never a job's own `payload` (CLAUDE.md: note content is data, never a
+    log/trace payload; `jobs.py`'s own module docstring: payloads carry IDs
+    only in the first place).
+    """
+    tracer = _active_tracer()
+    if tracer is None:
+        yield
+        return
+
+    from opentelemetry import propagate
+    from opentelemetry.trace import SpanKind
+
+    context = propagate.extract({"traceparent": traceparent}) if traceparent else None
+    with tracer.start_as_current_span(
+        f"{kind} process",
+        context=context,
+        kind=SpanKind.CONSUMER,
+        attributes={
+            "messaging.system": "postgresql",
+            "messaging.destination.name": kind,
+            "messaging.operation": "process",
+            "job.kind": kind,
+            "job.id": job_id,
+            "job.attempt": attempt,
+        },
     ):
         yield
 

@@ -155,6 +155,7 @@ from memory_manager.observability.metrics import (
     set_embedding_lag_seconds,
     set_jobs_pending,
 )
+from memory_manager.observability.tracing import job_span
 
 __all__ = [
     "Job",
@@ -616,19 +617,27 @@ async def _dispatch_job(
     below, retried with backoff through `jobs.fail_or_retry`), an unknown kind
     can never succeed on a later attempt, so retrying it would only delay the
     same outcome.
+
+    The whole call runs inside `observability.tracing.job_span` (#263
+    WP-31): a CONSUMER span continuing `job.traceparent` (the enqueuing
+    request's own trace, `index/indexer.py`'s `current_traceparent()` call)
+    when it is set, or starting a fresh trace otherwise - a handler's own DB
+    statements (`db_span`, where they use it) nest under this span the same
+    way they nest under `TracingMiddleware`'s SERVER span on the request path.
     """
-    handler = handlers.get(job.kind)
-    if handler is None:
-        _logger.error("job %s: no handler registered for kind %r, failing", job.id, job.kind)
-        await jobs.fail(pool, job.id, error=f"unknown job kind {job.kind!r}")
-        return
-    try:
-        await handler(pool, job.payload)
-    except Exception as exc:
-        _logger.exception("job %s (kind=%r) failed", job.id, job.kind)
-        await jobs.fail_or_retry(pool, job.id, error=str(exc), max_attempts=max_attempts)
-    else:
-        await jobs.complete(pool, job.id)
+    with job_span(job.kind, job_id=job.id, attempt=job.attempts, traceparent=job.traceparent):
+        handler = handlers.get(job.kind)
+        if handler is None:
+            _logger.error("job %s: no handler registered for kind %r, failing", job.id, job.kind)
+            await jobs.fail(pool, job.id, error=f"unknown job kind {job.kind!r}")
+            return
+        try:
+            await handler(pool, job.payload)
+        except Exception as exc:
+            _logger.exception("job %s (kind=%r) failed", job.id, job.kind)
+            await jobs.fail_or_retry(pool, job.id, error=str(exc), max_attempts=max_attempts)
+        else:
+            await jobs.complete(pool, job.id)
 
 
 async def consume_jobs(
