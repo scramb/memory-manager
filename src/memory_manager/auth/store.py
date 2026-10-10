@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncpg
+import asyncpg.pool
 from cryptography.fernet import Fernet, InvalidToken
 
 __all__ = [
@@ -85,6 +86,17 @@ _TOKEN_CLEANUP_GRACE = timedelta(days=7)
 #: the gap between `/register` and the first `/token` call (a user working through the
 #: consent screen) must never look like an abandoned client.
 _CLIENT_CLEANUP_AGE = timedelta(days=30)
+
+#: A pool or a caller-held connection (including one already inside a transaction) -
+#: both expose the same `execute`/`fetchrow`/`fetchval` methods, the same `_Queryable`
+#: idiom `memory_manager.search`/`memory_manager.auth.users` already use. `revoke_token_row`
+#: and `save_token` take this (#310): `auth.provider.exchange_refresh_token` runs both
+#: inside one transaction for the winner of a concurrent refresh, so the row lock the
+#: conditional `UPDATE` holds on the old refresh token spans until the new pair is
+#: actually committed - otherwise a losing concurrent caller could run `revoke_family`
+#: in the gap between the winner's rotation and its insert, and miss the new pair
+#: entirely, defeating "the whole grant is distrusted" (ADR-0004).
+_Queryable = asyncpg.Pool | asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 
 def _hash(value: str) -> str:
@@ -380,7 +392,7 @@ async def take_code(pool: asyncpg.Pool, code: str) -> bool:
 
 
 async def save_token(
-    pool: asyncpg.Pool,
+    conn_or_pool: _Queryable,
     token: str,
     *,
     kind: str,
@@ -401,7 +413,7 @@ async def save_token(
     token, unchanged. `auth.provider._issue` sets `family_started_at` once, on the
     first token of a family, and carries that same value, unmodified, through every
     later rotation of it."""
-    await pool.execute(
+    await conn_or_pool.execute(
         """
         insert into oauth_tokens (
             token_hash, kind, client_id, subject, namespaces, scopes, resource,
@@ -461,14 +473,33 @@ async def get_token(
     )
 
 
-async def revoke_token_row(pool: asyncpg.Pool, token: str, kind: str) -> None:
-    """Soft-revoke one token row - used when rotating a refresh token (ADR-0004)."""
-    await pool.execute(
+async def revoke_token_row(conn_or_pool: _Queryable, token: str, kind: str) -> bool:
+    """Soft-revoke one token row - used when rotating a refresh token (ADR-0004).
+
+    The `revoked_at is null` guard and the `returning` clause together make this call
+    atomic and conditional at the database level (#310): of two concurrent rotations of
+    the same refresh token, exactly one `UPDATE` finds the row still unrevoked, flips it
+    and gets a row back; the other finds nothing left to update and gets `False`. This
+    holds across replicas without any in-process lock - Postgres' own row-level locking
+    during the `UPDATE` serializes the two: the loser's statement blocks until the
+    winner's transaction commits or rolls back, then re-evaluates `revoked_at is null`
+    against the now-current row. The caller uses the return value to tell its own
+    rotation ("I won, issue the new pair") apart from a lost race ("someone already
+    rotated this token"), which `auth.provider.exchange_refresh_token` treats exactly
+    like a replay - passing its own transaction's connection as `conn_or_pool` (not the
+    bare pool) is what keeps the row lock held until that same transaction's `save_token`
+    calls for the new pair have committed too, so a losing caller's blocked statement
+    only ever unblocks once the winner's new pair already exists to be caught by
+    `revoke_family`.
+    """
+    row = await conn_or_pool.fetchrow(
         "update oauth_tokens set revoked_at = now() "
-        "where token_hash = $1 and kind = $2 and revoked_at is null",
+        "where token_hash = $1 and kind = $2 and revoked_at is null "
+        "returning token_hash",
         _hash(token),
         kind,
     )
+    return row is not None
 
 
 async def revoke_family(pool: asyncpg.Pool, family_id: str) -> None:

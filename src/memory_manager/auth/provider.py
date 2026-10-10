@@ -31,7 +31,12 @@ deletes) a refresh token on its first use, so a second presentation of the
 exact same token is recognized here as a replay - not a "token not found" -
 and revokes the whole `family_id` (every access and refresh token the grant
 has ever produced), per ADR-0004's "rotating refresh with family
-revocation".
+revocation". This also covers two concurrent presentations of the same
+token (#310): `revoke_token_row`'s `UPDATE ... WHERE revoked_at IS NULL`
+is the actual decision point, not the `token.revoked` flag read earlier at
+`load_refresh_token` time, so exactly one of the two concurrent callers gets
+`True` back and issues the new pair; the other gets `False` and is treated
+here exactly like a replay, including the family revocation.
 
 `get_client` also carries CIMD (#38): when `cimd_fetcher` is given and
 `client_id` is an https URL, the SDK's registered-client lookup
@@ -66,6 +71,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import asyncpg
+import asyncpg.pool
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
@@ -93,6 +99,13 @@ _logger = logging.getLogger(__name__)
 
 _REFRESH_TOKEN_PREFIX = "mmr_"  # noqa: S105 - a format marker, not a credential
 _TOKEN_ENTROPY_BYTES = 32
+
+#: A pool or a caller-held connection - the same `_Queryable` idiom `auth.store`/
+#: `memory_manager.search` already use. `_issue`'s own `conn` parameter below takes
+#: this: `exchange_refresh_token` passes the connection of its own transaction (#310),
+#: everyone else (the authorization-code exchange, which has no analogous race) just
+#: lets it default to `self._pool`.
+_Queryable = asyncpg.Pool | asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 _DEFAULT_SCOPES = (READ_SCOPE, WRITE_SCOPE)
 
@@ -581,20 +594,42 @@ class MemoryManagerOAuthProvider(
                         error="invalid_grant", error_description=ENTRA_GRAPH_UNAVAILABLE_MARKER
                     )
 
-        await store.revoke_token_row(self._pool, token.token, "refresh")
-        return await self._issue(
-            client_id=client.client_id,
-            subject=token.subject,
-            namespaces=token.namespaces,
-            scopes=scopes or token.scopes,
-            resource=token.resource,
-            family_id=token.family_id,
-            client_label=token.client_label,
-            user_oid=token.user_oid,
-            roles=token.roles,
-            # Carried forward unchanged, never recomputed - the family's session start
-            # (ADR-0006 §5's `ENTRA_MAX_SESSION`, #216) must survive every rotation.
-            family_started_at=token.family_started_at,
+        # #310: rotation and issuance of the new pair share one transaction, so the row
+        # lock `revoke_token_row`'s `UPDATE` takes on the old refresh token is held until
+        # the new pair's `save_token` calls below have committed too - not just until the
+        # `UPDATE` itself returns. A concurrent loser's own `revoke_token_row` call blocks
+        # on that same row and only unblocks once this transaction commits or rolls back,
+        # so by the time it falls through to `revoke_family` below, the winner's new pair
+        # already exists to be caught by it (see `store.revoke_token_row`'s docstring).
+        async with self._pool.acquire() as conn, conn.transaction():
+            won = await store.revoke_token_row(conn, token.token, "refresh")
+            if won:
+                return await self._issue(
+                    client_id=client.client_id,
+                    subject=token.subject,
+                    namespaces=token.namespaces,
+                    scopes=scopes or token.scopes,
+                    resource=token.resource,
+                    family_id=token.family_id,
+                    client_label=token.client_label,
+                    user_oid=token.user_oid,
+                    roles=token.roles,
+                    # Carried forward unchanged, never recomputed - the family's session
+                    # start (ADR-0006 §5's `ENTRA_MAX_SESSION`, #216) must survive every
+                    # rotation.
+                    family_started_at=token.family_started_at,
+                    conn=conn,
+                )
+        # Lost the race against a concurrent refresh of this same token - it was revoked
+        # between our `load_refresh_token` and this conditional `UPDATE` (`token.revoked`
+        # above was still `False` when we loaded it: `revoke_token_row`'s `revoked_at is
+        # null` guard is the only thing that actually decides a winner, at the database
+        # level). Treated exactly like a replay: the whole family is now distrusted,
+        # including the pair the winner's transaction just committed.
+        await store.revoke_family(self._pool, token.family_id)
+        raise TokenError(
+            error="invalid_grant",
+            error_description="refresh token was already used; the grant has been revoked",
         )
 
     # ---- access -------------------------------------------------------------
@@ -628,7 +663,13 @@ class MemoryManagerOAuthProvider(
         user_oid: str | None = None,
         roles: list[str] | None = None,
         family_started_at: datetime | None = None,
+        conn: _Queryable | None = None,
     ) -> OAuthToken:
+        """`conn` defaults to `self._pool` - `exchange_refresh_token` passes its own
+        transaction's connection instead (#310), so these `save_token` calls land in the
+        same transaction as the `revoke_token_row` that decided this caller won the race,
+        keeping that row's lock held until the new pair is committed too."""
+        conn_or_pool = conn if conn is not None else self._pool
         access = OAUTH_ACCESS_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         refresh = _REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         # ADR-0006 §5, #216: "Entra mode only" - a token with no `user_oid` is a
@@ -640,7 +681,7 @@ class MemoryManagerOAuthProvider(
             (refresh, "refresh", _REFRESH_TOKEN_TTL),
         ):
             await store.save_token(
-                self._pool,
+                conn_or_pool,
                 token,
                 kind=kind,
                 client_id=client_id,

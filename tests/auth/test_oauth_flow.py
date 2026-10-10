@@ -16,6 +16,7 @@ over an in-process ASGI app.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -32,12 +33,16 @@ import pytest
 import pytest_asyncio
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.auth.provider import TokenError
+from mcp.shared.auth import OAuthToken
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse, Response
 
 from memory_manager.app import open_services
+from memory_manager.auth import store
 from memory_manager.auth.login import BoundCompleter, PendingAuthorization
+from memory_manager.auth.provider import MemoryManagerOAuthProvider
 from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_bearer_token
 from memory_manager.config import ServerConfig, ServerConfigError, canonical_resource_url
 from memory_manager.db.migrate import migrate
@@ -305,6 +310,86 @@ async def test_refresh_rotates_and_replay_revokes_the_whole_family(
         with pytest.raises(Exception):  # noqa: B017 - raised by the SDK client's own session
             async with _authed_mcp_client(app, config, new_access) as mcp_client:
                 await mcp_client.call_tool("memory_index", {})
+
+
+# --- Two concurrent refreshes of the same token: exactly one winner (#310) ------
+
+
+async def test_concurrent_refresh_with_the_same_token_exactly_one_succeeds(
+    bare_remote: Path,
+    tmp_path: Path,
+    test_database_url: str,
+    pool: asyncpg.Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closes the TOCTOU #310 describes: two refreshes of the same token both pass
+    `load_refresh_token`'s `token.revoked` check (it was `False` for both, read before
+    either rotated anything), so only `auth.store.revoke_token_row`'s conditional
+    `UPDATE ... WHERE revoked_at IS NULL` is left to decide a winner.
+
+    `asyncio.Barrier` only forces both calls to arrive at that `UPDATE` at the same
+    moment, deterministically - it does not decide who wins, so this is not a timing
+    gamble. The actual decision is Postgres' own row lock, exercised for real against
+    `test_database_url` through a second `asyncpg.Pool` (the `pool` fixture) distinct
+    from the one `_running_app`'s server uses - the same situation as two different
+    replicas racing each other, which is exactly what #310 requires this to hold under.
+    """
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=FakeAuthenticator()) as (_app, client):
+        client_id = await _register_client(client)
+        code_verifier, code_challenge = _pkce_pair()
+        tokens = await _complete_full_login(
+            client, client_id=client_id, code_verifier=code_verifier, code_challenge=code_challenge
+        )
+    old_refresh = tokens["refresh_token"]
+
+    provider = MemoryManagerOAuthProvider(
+        pool,
+        resource=_RESOURCE,
+        issuer=canonical_resource_url(_PUBLIC_URL, ""),
+        client_secret_key=_CLIENT_SECRET_KEY,
+    )
+    client_info = await provider.get_client(client_id)
+    assert client_info is not None
+
+    # Both loads happen before either rotates anything - the exact window a real
+    # concurrent refresh opens: `revoked` reads `False` on both.
+    token_a = await provider.load_refresh_token(client_info, old_refresh)
+    token_b = await provider.load_refresh_token(client_info, old_refresh)
+    assert token_a is not None
+    assert token_b is not None
+    assert token_a.revoked is False
+    assert token_b.revoked is False
+
+    barrier = asyncio.Barrier(2)
+    real_revoke_token_row = store.revoke_token_row
+
+    async def _revoke_once_both_have_arrived(pool_arg: asyncpg.Pool, token: str, kind: str) -> bool:
+        await barrier.wait()
+        return await real_revoke_token_row(pool_arg, token, kind)
+
+    monkeypatch.setattr(store, "revoke_token_row", _revoke_once_both_have_arrived)
+
+    results = await asyncio.gather(
+        provider.exchange_refresh_token(client_info, token_a, []),
+        provider.exchange_refresh_token(client_info, token_b, []),
+        return_exceptions=True,
+    )
+
+    successes = [result for result in results if isinstance(result, OAuthToken)]
+    failures = [result for result in results if isinstance(result, TokenError)]
+    assert len(successes) == 1, results
+    assert len(failures) == 1, results
+    assert failures[0].error == "invalid_grant"
+
+    # The whole family - including the winner's freshly issued pair - ends up revoked:
+    # the loser is treated exactly like a replay, same as the sequential case above.
+    family_rows = await pool.fetch(
+        "select revoked_at from oauth_tokens where family_id = $1", token_a.family_id
+    )
+    assert len(family_rows) >= 4, family_rows  # the old pair plus the winner's new pair
+    assert all(row["revoked_at"] is not None for row in family_rows)
 
 
 # --- Revocation -----------------------------------------------------------------
