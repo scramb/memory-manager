@@ -84,8 +84,8 @@ _resolved_var: ContextVar[str] = ContextVar("mm_resolved_profile", default=DEFAU
 class UndeliverableProfile(NotImplementedError):
     """`resolve_profile` picked a profile whose `delivery_mode` has no implementation yet.
 
-    Only `"full"` is implemented today; `"descriptions"` is #132, `"short"` is #306. No
-    profile registered in `compat/profiles.py` uses either mode right now, so this should
+    `"full"` and `"descriptions"` are implemented (#131, #132); `"short"` is #306. No
+    profile registered in `compat/profiles.py` uses `"short"` right now, so this should
     never actually fire - it exists so that registering such a profile later fails loudly
     at the point it is first resolved for a real request, rather than silently serving
     the wrong (or no) usage-rules content.
@@ -95,14 +95,14 @@ class UndeliverableProfile(NotImplementedError):
 def require_deliverable(profile: Profile) -> Profile:
     """`profile`, unchanged, if its `delivery_mode` is implemented - raises otherwise.
 
-    The one place that enforces "only `full` is deliverable" (Ergebnis of this work
-    package): every call to `resolve_profile` below runs through this, so a caller never
-    has to check `delivery_mode` itself.
+    The one place that enforces "only `full`/`descriptions` are deliverable" (#132's
+    addition to this work package's own Ergebnis): every call to `resolve_profile` below
+    runs through this, so a caller never has to check `delivery_mode` itself.
     """
-    if profile.delivery_mode != "full":
+    if profile.delivery_mode not in ("full", "descriptions"):
         raise UndeliverableProfile(
             f"profile {profile.name!r} uses delivery_mode {profile.delivery_mode!r}, "
-            "which is not implemented yet (#132 for 'descriptions', #306 for 'short')"
+            "which is not implemented yet (#306 for 'short')"
         )
     return profile
 

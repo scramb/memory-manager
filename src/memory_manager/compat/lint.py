@@ -36,10 +36,17 @@ Rules checked, one profile x one tool at a time unless noted:
     keywords. A parameter literally named `type` is therefore never a violation; a
     genuine `type` keyword still is, wherever it appears.
 (e) **tool count** - `len(tools)` against `max_tools`, once per profile. Skipped when `None`.
+(f) **annotations present** (#132, ADR-0010) - `tool.annotations` must be set, with all
+    four of `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint` not `None`.
+    Profile-independent like rule (a): every tool's contract carries the same
+    `ToolAnnotations`, regardless of which profile is checked, so this is reported once
+    per profile too, the same report shape as every other rule here.
 
-Not checked here (#133's own "not included"): `readOnlyHint`/other annotations (#132 - no
-tool has any yet), Codex's concrete charset/length/prefix values (#163, #166, #169),
-`output_schema`, and linting a tool *call result* rather than its declared contract.
+Not checked here (#133's own "not included"): the concrete *values* `mcp/server.py` sets
+for `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint` (only that they are
+present, rule (f) above - `tests/mcp/test_instructions.py` asserts the exact values
+instead), Codex's concrete charset/length/prefix values (#163, #166, #169), `output_schema`,
+and linting a tool *call result* rather than its declared contract.
 """
 
 from __future__ import annotations
@@ -151,6 +158,7 @@ def check_tools(tools: Sequence[mcp_types.Tool], profiles: Sequence[Profile]) ->
             violations.extend(_check_name_length(tool, profile))
             violations.extend(_check_description_length(tool, profile))
             violations.extend(_check_schema_keywords(tool, profile))
+            violations.extend(_check_annotations_present(tool, profile))
     return violations
 
 
@@ -158,6 +166,18 @@ def _check_name_charset(tool: mcp_types.Tool, profile: Profile) -> list[Violatio
     if _TOOL_NAME_PATTERN.match(tool.name):
         return []
     return [Violation(profile.name, tool.name, "name_charset", tool.name)]
+
+
+def _check_annotations_present(tool: mcp_types.Tool, profile: Profile) -> list[Violation]:
+    annotations = tool.annotations
+    if annotations is not None and (
+        annotations.read_only_hint is not None
+        and annotations.destructive_hint is not None
+        and annotations.idempotent_hint is not None
+        and annotations.open_world_hint is not None
+    ):
+        return []
+    return [Violation(profile.name, tool.name, "annotations_present", "missing")]
 
 
 def _check_name_length(tool: mcp_types.Tool, profile: Profile) -> list[Violation]:

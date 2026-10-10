@@ -99,11 +99,21 @@ def test_every_registered_profile_is_deliverable_today(name: str) -> None:
     require_deliverable(get_profile(name))
 
 
-def test_require_deliverable_rejects_a_non_full_delivery_mode() -> None:
+def test_require_deliverable_accepts_the_descriptions_delivery_mode() -> None:
     from dataclasses import replace
 
     from memory_manager.compat.profiles import get_profile
 
     descriptions_mode_profile = replace(get_profile(DEFAULT_PROFILE), delivery_mode="descriptions")
+    assert require_deliverable(descriptions_mode_profile) is descriptions_mode_profile
+
+
+def test_require_deliverable_rejects_the_short_delivery_mode() -> None:
+    from dataclasses import replace
+
+    from memory_manager.compat.profiles import get_profile
+
+    # #306: `short` has no implementation yet, unlike `descriptions` above (#132).
+    short_mode_profile = replace(get_profile(DEFAULT_PROFILE), delivery_mode="short")
     with pytest.raises(UndeliverableProfile):
-        require_deliverable(descriptions_mode_profile)
+        require_deliverable(short_mode_profile)

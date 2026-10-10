@@ -83,6 +83,11 @@ _EXPECTED_TOOL_NAMES = frozenset(
     }
 )
 
+# #132, ADR-0010: the subset of `_EXPECTED_TOOL_NAMES` that never modifies the vault -
+# `tool.annotations.read_only_hint` must be `True` for exactly these, `False` for
+# every other expected tool name.
+_READ_TOOL_NAMES = frozenset({"memory_index", "memory_read", "memory_search"})
+
 _SEEDED_PATH = "personal/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
 
@@ -295,6 +300,9 @@ async def test_handshake_and_tool_surface(
         for tool in listing.tools:
             assert tool.description
             assert tool.input_schema["type"] == "object"
+            assert tool.annotations is not None, tool.name
+            expected_read_only = tool.name in _READ_TOOL_NAMES
+            assert tool.annotations.read_only_hint is expected_read_only, tool.name
 
         prompts = await client.list_prompts()
         assert any(prompt.name == "memory_guide" for prompt in prompts.prompts)

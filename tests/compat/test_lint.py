@@ -18,12 +18,24 @@ from memory_manager import cli
 from memory_manager.compat.lint import check_tools
 from memory_manager.compat.profiles import Profile
 
+# A complete, valid `ToolAnnotations` - every helper below gets one by default (the shape
+# `mcp/server.py`'s own `_READ_TOOL_ANNOTATIONS`/`_WRITE_TOOL_ANNOTATIONS` have), so a test
+# that wants rule (f)'s violation passes `annotations=None` explicitly rather than every
+# other test having to opt into a complete one.
+_FULL_ANNOTATIONS = mcp_types.ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
 
 def _tool(
     *,
     name: str = "ok_tool",
     description: str | None = None,
     input_schema: dict[str, Any] | None = None,
+    annotations: mcp_types.ToolAnnotations | None = _FULL_ANNOTATIONS,
 ) -> mcp_types.Tool:
     return mcp_types.Tool(
         name=name,
@@ -31,6 +43,7 @@ def _tool(
         input_schema=input_schema
         if input_schema is not None
         else {"type": "object", "properties": {}},
+        annotations=annotations,
     )
 
 
@@ -131,6 +144,19 @@ def test_tool_count_violation_is_reported(capsys: pytest.CaptureFixture[str]) ->
     assert exit_code == 1
     assert "synthetic" in out
     assert "tool_count" in out
+
+
+def test_missing_annotations_violation_is_reported(capsys: pytest.CaptureFixture[str]) -> None:
+    tool = _tool(annotations=None)
+    profile = _profile()
+
+    exit_code = cli._run_compat_lint_command(tools=[tool], profiles=[profile])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "synthetic" in out
+    assert tool.name in out
+    assert "annotations_present" in out
 
 
 def test_disallowed_schema_keyword_at_a_keyword_position_is_a_violation() -> None:

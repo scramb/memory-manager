@@ -79,7 +79,7 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp_types import CallToolResult, TextContent
+from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
 from memory_manager.app import Services
 from memory_manager.compat.profiles import get_profile
@@ -309,13 +309,25 @@ class _ProfileMiddleware:
     `build_server`, for `serve --stdio --profile`) - whichever of the two a given process
     could ever have set.
 
-    For the only delivery mode implemented today (`"full"`, `compat.select.
-    require_deliverable`), this middleware changes nothing about the request or the
-    result it produces - `ctx` goes into `call_next` unchanged and whatever it returns
-    comes straight back - so `default`'s behaviour stays byte-for-byte what it always was
-    (conformance's own guarantee, not just this docstring's claim). It only ever sets
-    `compat.select`'s *resolved-profile* contextvar, for `observability/metrics.py`'s
-    `track_tool_call` to read, for the duration of `call_next`.
+    For `"full"` (`compat.select.require_deliverable`'s other deliverable mode, and the
+    only one any profile registered in `compat/profiles.py` actually uses today), this
+    middleware changes nothing about the request or the result it produces - `ctx` goes
+    into `call_next` unchanged and whatever it returns comes straight back - so
+    `default`'s behaviour stays byte-for-byte what it always was (conformance's own
+    guarantee, not just this docstring's claim). It only ever sets `compat.select`'s
+    *resolved-profile* contextvar, for `observability/metrics.py`'s `track_tool_call` to
+    read, for the duration of `call_next`.
+
+    For `"descriptions"` (#132: the usage rules folded into tool descriptions instead,
+    for a client that drops `instructions` - no profile registered today uses it, the
+    same "no behaviour change yet" as every other profile-shaped seam in this work
+    package until one is), this middleware drops the `instructions` key from the result
+    of exactly two methods: `initialize` (2025-11-25) and `server/discover` (2026-07-28)
+    - the only two that carry one at all. By the time `call_next` returns, `runner.py`
+    has already serialized either into a plain `dict` (`runner.py:202,223`), never the
+    typed `InitializeResult`/`DiscoverResult` model, so `_without_instructions` below
+    only ever has to drop a dict key, with nothing to re-validate afterwards. Every other
+    method's result is untouched, the same as `"full"`.
 
     !!! warning
         Per `ServerMiddleware`'s own docstring: `initialize` is handled inline, with the
@@ -325,6 +337,11 @@ class _ProfileMiddleware:
         actually arises here, but any future addition to this class must keep it that
         way.
     """
+
+    #: The only two methods whose result ever carries `instructions` (module
+    #: docstring's `"descriptions"` paragraph) - `server/discover`'s own 2026-07-28 RPC
+    #: name, not a method this server defines itself.
+    _INSTRUCTIONS_METHODS = frozenset({"initialize", "server/discover"})
 
     def __init__(self, *, stdio_profile: str | None = None) -> None:
         if stdio_profile is not None:
@@ -343,9 +360,26 @@ class _ProfileMiddleware:
         profile = resolve_profile(client_info_name, override=override)
         token = set_resolved_profile(profile.name)
         try:
-            return await call_next(ctx)
+            result = await call_next(ctx)
         finally:
             reset_resolved_profile(token)
+        if profile.delivery_mode == "descriptions" and ctx.method in self._INSTRUCTIONS_METHODS:
+            return self._without_instructions(result)
+        return result
+
+    @staticmethod
+    def _without_instructions(result: HandlerResult) -> HandlerResult:
+        """`result` with its `instructions` key removed, for the `"descriptions"`
+        delivery mode (#132) - a no-op for anything but the plain `dict` `_inner` already
+        produced (module docstring's `"descriptions"` paragraph) and for a dict that
+        carries no `instructions` key at all (never reached today: both `initialize` and
+        `server/discover` always set one, `build_server`'s own `instructions=INSTRUCTIONS`
+        and `mcp`'s own `DiscoverResult.instructions` - kept anyway so this never raises on
+        a `KeyError` if that ever changes).
+        """
+        if not isinstance(result, dict) or "instructions" not in result:
+            return result
+        return {key: value for key, value in result.items() if key != "instructions"}
 
     @staticmethod
     def _client_info_name(ctx: ServerRequestContext[Any, Any]) -> str | None:
@@ -390,6 +424,45 @@ def current_actor() -> str:
         return token.subject
     return token.client_id.removeprefix(_STATIC_CLIENT_ID_PREFIX)
 
+
+# Every tool's `ToolAnnotations` (#132, ADR-0010): the spec's four hints are identical
+# across both protocol revisions this server speaks (schema/2025-11-25/schema.ts and
+# schema/2026-07-28/schema.ts, docs/research/mcp-auth-and-connectors.md §1, retrieved
+# 2026-10-10), so one pair of constants covers every tool below - never a code path that
+# changes behaviour (ADR-0010 "profiles are data, not code that reaches into tool
+# handlers" applies the same way to annotations: they describe the contract, they do not
+# branch on it).
+#
+# Read tools (`memory_index`/`memory_read`/`memory_search`) never modify the vault at
+# all: `readOnlyHint=True` makes `destructiveHint`/`idempotentHint` not meaningful per the
+# spec's own note, set here anyway so every tool below carries all four explicitly rather
+# than leaving two to the spec's own (different) defaults. `openWorldHint=False`: this
+# tool's domain is the vault these notes live in, never an open world of external
+# entities (the spec's own "a memory tool is not" example).
+_READ_TOOL_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+# Write tools (`memory_write`/`memory_edit`/`memory_supersede`/`memory_archive`/
+# `memory_promote`) do modify the vault - `readOnlyHint=False`, explicit rather than left
+# to the spec's own default of `False` - but never destructively: `memory_archive` moves
+# a note to `_archive/`, never deletes it (CLAUDE.md "Never hard-delete notes"), and every
+# other write tool here only ever adds a revision, so `destructiveHint=False`.
+# `idempotentHint=True`: every one of these five tools requires `if_version`
+# (`storage/rules.py:53-65`'s `check_version`) - an identical repeat of a call that
+# already succeeded sees a version/path that no longer matches ("new" no longer means "it
+# does not exist yet" once it does) and raises `VersionConflict`/`NotFound` instead,
+# with no additional effect on the vault, exactly what `idempotentHint` promises.
+# `openWorldHint=False`, same reasoning as the read tools above.
+_WRITE_TOOL_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
 
 # Each tool's description is built from `TOOL_DATA_SENTENCE` rather than repeating the
 # sentence as a second hardcoded copy, so the one rule every tool carries can never drift
@@ -888,7 +961,7 @@ def build_server(
         """The long-form usage guide: workflow, examples, and what never to store."""
         return GUIDE
 
-    @mcp.tool(description=_MEMORY_INDEX_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_INDEX_DESCRIPTION, annotations=_READ_TOOL_ANNOTATIONS)
     @instrument_tool("memory_index")
     async def memory_index(
         namespace: str | None = None,
@@ -924,7 +997,7 @@ def build_server(
             entries = [_rewrite_index_entry(entry, resolved) for entry in entries]
         return entries
 
-    @mcp.tool(description=_MEMORY_READ_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_READ_DESCRIPTION, annotations=_READ_TOOL_ANNOTATIONS)
     @instrument_tool("memory_read")
     async def memory_read(items: list[str], ctx: Context | None = None) -> list[MemoryReadItem]:
         """Read one or more notes by vault path or id."""
@@ -937,7 +1010,7 @@ def build_server(
         readable = _effective_readable(resolved, ctx)
         return await _read_items(services.storage, items, readable=readable, resolved=resolved)
 
-    @mcp.tool(description=_MEMORY_SEARCH_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_SEARCH_DESCRIPTION, annotations=_READ_TOOL_ANNOTATIONS)
     @instrument_tool("memory_search")
     async def memory_search(
         query: str,
@@ -1037,7 +1110,7 @@ def build_server(
             results = [_rewrite_search_result(result, resolved) for result in results]
         return {"results": results, "mode": mode}
 
-    @mcp.tool(description=_MEMORY_WRITE_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_WRITE_DESCRIPTION, annotations=_WRITE_TOOL_ANNOTATIONS)
     @instrument_tool("memory_write")
     async def memory_write(
         path: str,
@@ -1107,7 +1180,7 @@ def build_server(
             }
         )
 
-    @mcp.tool(description=_MEMORY_EDIT_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_EDIT_DESCRIPTION, annotations=_WRITE_TOOL_ANNOTATIONS)
     @instrument_tool("memory_edit")
     async def memory_edit(
         path: str,
@@ -1188,7 +1261,7 @@ def build_server(
             }
         )
 
-    @mcp.tool(description=_MEMORY_SUPERSEDE_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_SUPERSEDE_DESCRIPTION, annotations=_WRITE_TOOL_ANNOTATIONS)
     @instrument_tool("memory_supersede")
     async def memory_supersede(
         old: str,
@@ -1287,7 +1360,7 @@ def build_server(
             }
         )
 
-    @mcp.tool(description=_MEMORY_PROMOTE_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_PROMOTE_DESCRIPTION, annotations=_WRITE_TOOL_ANNOTATIONS)
     @instrument_tool("memory_promote")
     async def memory_promote(
         path: str,
@@ -1385,7 +1458,7 @@ def build_server(
             }
         )
 
-    @mcp.tool(description=_MEMORY_ARCHIVE_DESCRIPTION)
+    @mcp.tool(description=_MEMORY_ARCHIVE_DESCRIPTION, annotations=_WRITE_TOOL_ANNOTATIONS)
     @instrument_tool("memory_archive")
     async def memory_archive(
         path: str,

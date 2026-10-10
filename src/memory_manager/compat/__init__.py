@@ -6,8 +6,8 @@ immutable registry: a delivery mode for the usage rules plus the client's docume
 limits. `select.py` picks a profile for an incoming request (#131, ADR-0010): an
 override (`?profile=`, `MM-Client-Profile`, or `serve --stdio --profile`) wins outright,
 otherwise the connecting client's `clientInfo.name` is mapped if known, otherwise
-`profiles.DEFAULT_PROFILE`; today only the `full` delivery mode is actually deliverable
-(`select.require_deliverable`) - `descriptions` is #132, `short` is #306. Enforcing that
+`profiles.DEFAULT_PROFILE`; today the `full` and `descriptions` delivery modes are
+deliverable (`select.require_deliverable`, #131/#132) - `short` is #306. Enforcing that
 the tool contract fits every profile's limits is the schema linter, `lint.py` (#133).
 
 `profiles.py` and `select.py` deliberately do not import from `memory_manager.mcp` or
