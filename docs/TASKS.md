@@ -342,7 +342,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 
 - [x] #277 Upgrade smoke test proves 0.1.x → 0.2.0 incl. migration and export rollback ⛔ blocked by #248
 - [x] #278 Upgrade guide 0.1.x → 0.2.0 incl. git-to-postgres migration and export rollback ⛔ blocked by #277, #259
-- [ ] #279 README enterprise section with links to guides, benchmark and compliance ⛔ blocked by #278, #271, #276
+- [x] #279 README enterprise section with links to guides, benchmark and compliance ⛔ blocked by #278, #271, #276
 - [ ] #280 v0.2.0 released with cosign-verified image and Helm chart ⛔ blocked by #224, #225, #273, #279
 
 ---
