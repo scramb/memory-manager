@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.0](https://github.com/scramb/memory-manager/compare/v0.1.4...v0.2.0) (2026-10-10)
+
+
+### Features
+
+* **auth:** add quotas, an operator blocklist and SIEM audit export ([#286](https://github.com/scramb/memory-manager/issues/286)) ([4a0c62a](https://github.com/scramb/memory-manager/commit/4a0c62a4af37da524805a6b35cb9796eb63879c0))
+* **auth:** deprovision Entra users through a Graph delta sync and revoke their credentials ([#290](https://github.com/scramb/memory-manager/issues/290)) ([57b600a](https://github.com/scramb/memory-manager/commit/57b600aefd621ec788887932133378895ec4a33a))
+* **auth:** sign users in through Entra ID with roles, groups and refresh re-checks ([#284](https://github.com/scramb/memory-manager/issues/284)) ([70d0987](https://github.com/scramb/memory-manager/commit/70d0987431c39893cebb786932159c5b04147caf))
+* **cli:** migrate a Git vault to Postgres and export it back ([#285](https://github.com/scramb/memory-manager/issues/285)) ([ae2f335](https://github.com/scramb/memory-manager/commit/ae2f33504b150be22c5ef6b9fcea4c0c4827339c))
+* **deploy:** add the Entra OpenTofu module, a Flux enterprise example and a kind E2E ([#288](https://github.com/scramb/memory-manager/issues/288)) ([528d0f8](https://github.com/scramb/memory-manager/commit/528d0f8e58f217b2763075ffdf0659e195d8f6c7))
+* **deploy:** add the Helm enterprise profile for the postgres backend ([#282](https://github.com/scramb/memory-manager/issues/282)) ([09e6ace](https://github.com/scramb/memory-manager/commit/09e6ace336ec42b96c6ac9a56ddb06fa0b025ad3))
+* **index:** add the worker, a jobs outbox and the ADR-0016 vector layout ([#287](https://github.com/scramb/memory-manager/issues/287)) ([aeebea8](https://github.com/scramb/memory-manager/commit/aeebea8f2543a1b2c9df0b13d2aabb763bcff871))
+* **mcp:** add memory_promote and the /account self-service page ([#289](https://github.com/scramb/memory-manager/issues/289)) ([67a69dd](https://github.com/scramb/memory-manager/commit/67a69dd4c9508ace104950c6fbec157a32431423))
+* **observability:** trace requests into worker jobs and ship metrics, dashboards and alerts ([#292](https://github.com/scramb/memory-manager/issues/292)) ([219b9cd](https://github.com/scramb/memory-manager/commit/219b9cd03e7d38f4bef38a06b06777056515d356))
+* **vault:** add erasure, retention, the admin area and break-glass access ([#294](https://github.com/scramb/memory-manager/issues/294)) ([2e65a5e](https://github.com/scramb/memory-manager/commit/2e65a5e733cbd8f05e1d308e665ba1956bc38c7e))
+
+
+### Documentation
+
+* cut F-01 M8–M11 into issues and record the owner decisions ([#281](https://github.com/scramb/memory-manager/issues/281)) ([1c9079a](https://github.com/scramb/memory-manager/commit/1c9079aede47505feef6b7b1fc89641a3133dd81)), closes [#125](https://github.com/scramb/memory-manager/issues/125)
+* **docs:** add the 0.2 upgrade path and the README enterprise section ([#299](https://github.com/scramb/memory-manager/issues/299)) ([d04051a](https://github.com/scramb/memory-manager/commit/d04051a4d1b5557cd4c8edced244e17615b85da1))
+* **docs:** add the threat model, pentest checklist and compliance pack ([#295](https://github.com/scramb/memory-manager/issues/295)) ([d1904d4](https://github.com/scramb/memory-manager/commit/d1904d4dd27f5429ce0972cf0d2de6482f6ef216))
+* plan F-02 Client Integrations and accept its decisions ([#210](https://github.com/scramb/memory-manager/issues/210)) ([dd3ed9c](https://github.com/scramb/memory-manager/commit/dd3ed9c9c13ab9742dd2fb387b3574e4038c320c)), closes [#126](https://github.com/scramb/memory-manager/issues/126) [#159](https://github.com/scramb/memory-manager/issues/159) [#190](https://github.com/scramb/memory-manager/issues/190) [#196](https://github.com/scramb/memory-manager/issues/196) [#205](https://github.com/scramb/memory-manager/issues/205)
+
 ## [0.1.4](https://github.com/scramb/memory-manager/compare/v0.1.3...v0.1.4) (2026-10-08)
 
 
