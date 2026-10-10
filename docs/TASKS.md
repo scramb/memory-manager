@@ -356,7 +356,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 - [x] #126 Client integration decisions are recorded as accepted ADRs with research and the F-02 plan
 - [x] #159 The client support matrix is approved by the owner
 
-### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: open
+### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: #307
 
 - [x] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
 - [x] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones
