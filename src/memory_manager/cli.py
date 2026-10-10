@@ -20,6 +20,10 @@ token that does not meet that rule;
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
+`connect claude-code`/`connect claude-ai` merge the memory-manager server into Claude Code's
+own config, or print the claude.ai custom-connector setup steps, without clobbering what is
+already there (#137, `clients/connect.py`).
+
 `instructions generate [--check]` renders `mcp/instructions_generated.py` from
 `docs/memory-guide.md`, the single source for the server `instructions`, the `memory_guide`
 prompt and every client's instruction file (#127, #128, `guide/generate.py`,
@@ -89,6 +93,11 @@ from memory_manager.auth.tokens import (
     owners_not_in_users,
     revoke_token,
 )
+from memory_manager.clients import REGISTRY as CLIENT_REGISTRY
+from memory_manager.clients.connect import run_claude_ai, run_claude_code
+from memory_manager.clients.doctor import render_text as render_client_doctor_report
+from memory_manager.clients.doctor import run_client_doctor
+from memory_manager.clients.doctor import to_json as client_doctor_to_json
 from memory_manager.compat import lint as compat_lint
 from memory_manager.compat.profiles import Profile, get_profile, profile_names
 from memory_manager.config import (
@@ -168,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
+        if args.client is not None:
+            return asyncio.run(_run_doctor_client_command(args))
         return _run_doctor_command(args.vault)
 
     if args.command == "compat":
@@ -179,6 +190,22 @@ def main(argv: list[str] | None = None) -> int:
         # always a mistake, never a valid no-op call.
         parser.print_help()
         return 2
+    if args.command == "connect":
+        if args.connect_target == "claude-code":
+            return run_claude_code(
+                scope=args.scope,
+                transport=args.transport,
+                url=args.url,
+                token_env=args.token_env,
+                inline_token=args.inline_token,
+                with_instructions=args.with_instructions,
+                dry_run=args.dry_run,
+                project_dir=args.project_dir,
+            )
+        if args.connect_target == "claude-ai":
+            return run_claude_ai(url=args.url)
+        parser.print_help()
+        return 1
 
     if args.command == "eval":
         return _run_eval_command(
@@ -359,6 +386,82 @@ def _build_parser() -> argparse.ArgumentParser:
         "--vault",
         default=os.environ.get("VAULT_DIR"),
         help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    doctor_parser.add_argument(
+        "--client",
+        choices=sorted(CLIENT_REGISTRY),
+        default=None,
+        help="check this client's own configured connection instead of the vault "
+        "(--vault/$VAULT_DIR are ignored)",
+    )
+    doctor_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="with --client: skip the memory_write/memory_read/memory_edit/memory_archive "
+        "round trip, only prove memory_index works",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="with --client: print the report as JSON instead of text",
+    )
+    doctor_parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path(),
+        help="with --client: project directory its project/local scope config applies to "
+        "(default: cwd)",
+    )
+    connect_parser = subparsers.add_parser(
+        "connect", help="add the memory-manager server to a client's own config"
+    )
+    connect_subparsers = connect_parser.add_subparsers(dest="connect_target")
+    connect_claude_code_parser = connect_subparsers.add_parser(
+        "claude-code", help="merge the server into Claude Code's own config"
+    )
+    connect_claude_code_parser.add_argument(
+        "--scope", choices=["user", "project"], default="user", help="which config to merge into"
+    )
+    connect_claude_code_parser.add_argument(
+        "--transport", choices=["http", "stdio"], default="http", help="how Claude Code reaches it"
+    )
+    connect_claude_code_parser.add_argument(
+        "--url", default=None, help="the server's URL (required for --transport http)"
+    )
+    connect_claude_code_parser.add_argument(
+        "--token-env",
+        nargs="?",
+        const="MEMORY_MANAGER_TOKEN",
+        default=None,
+        metavar="VAR",
+        help="env var Claude Code reads the bearer token from (default when given bare: "
+        "MEMORY_MANAGER_TOKEN); omit for OAuth instead of a static token",
+    )
+    connect_claude_code_parser.add_argument(
+        "--inline-token",
+        action="store_true",
+        help="insert --token-env's current value instead of the usual ${VAR} placeholder "
+        "(not allowed with --scope project)",
+    )
+    connect_claude_code_parser.add_argument(
+        "--with-instructions",
+        action="store_true",
+        help="also write the generated .claude/rules/memory-manager.md usage-rules file",
+    )
+    connect_claude_code_parser.add_argument(
+        "--dry-run", action="store_true", help="show the diff but write nothing"
+    )
+    connect_claude_code_parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path(),
+        help="project directory --scope project/--with-instructions apply to (default: cwd)",
+    )
+    connect_claude_ai_parser = connect_subparsers.add_parser(
+        "claude-ai", help="print the claude.ai custom-connector setup steps"
+    )
+    connect_claude_ai_parser.add_argument(
+        "--url", required=True, help="the server's URL, shown in the setup steps"
     )
     eval_parser = subparsers.add_parser(
         "eval", help="score retrieval quality against the golden query set"
@@ -726,6 +829,27 @@ def _run_doctor_command(vault: str | None) -> int:
     report = run_doctor(Path(vault))
     _print_doctor_report(report)
     return 1 if report.errors else 0
+
+
+async def _run_doctor_client_command(args: argparse.Namespace) -> int:
+    """`memory-manager doctor --client <name>` (#138): check that client's own configured
+    connection, not the vault - `_run_doctor_command` above stays untouched for every call
+    without `--client`."""
+    adapter = CLIENT_REGISTRY[args.client]
+    env = dict(os.environ)
+    home = Path(env.get("HOME") or str(Path.home()))
+    report = await run_client_doctor(
+        adapter,
+        home=home,
+        project_dir=args.project_dir.resolve(),
+        env=env,
+        read_only=args.read_only,
+    )
+    if args.json:
+        print(json.dumps(client_doctor_to_json(report), indent=2))
+    else:
+        print(render_client_doctor_report(report))
+    return 0 if report.ok else 1
 
 
 def _print_doctor_report(report: DoctorReport) -> None:

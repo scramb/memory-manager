@@ -383,10 +383,10 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 - [x] #136 The conformance suite runs the full tool set and its error cases once per profile
 
-### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
+### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: #312
 
-- [ ] #137 `connect claude-code` merges the server into Claude Code's config, and `connect claude-ai` prints the setup steps
-- [ ] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace ⛔ blocked by #137
+- [x] #137 `connect claude-code` merges the server into Claude Code's config, and `connect claude-ai` prints the setup steps
+- [x] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace
 
 ---
 
