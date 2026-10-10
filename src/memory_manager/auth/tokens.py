@@ -50,6 +50,15 @@ former is this module's own account of who ran `create_token` (an audit
 trail, CLAUDE.md "audit log for every write" - `cli.py` passes a fixed
 marker, never personal data), the latter is free text for a human to tell
 their own tokens apart.
+
+`list_personal_tokens` and `revoke_token`'s `owner_oid`/`kind` keyword
+filters (ADR-0012, #135) are this module's self-service surface:
+`/account`'s own token section (`account.tokens`) is their one caller,
+scoping both a listing and a revoke to the signed-in user's own
+`KIND_PERSONAL` tokens, in SQL - never a Python-side filter over a broader
+result. `cli.py`'s `token list`/`token revoke` keep calling `list_tokens`/
+`revoke_token` with neither, unchanged: an operator still sees and revokes
+every token, by name, regardless of owner or kind.
 """
 
 from __future__ import annotations
@@ -76,6 +85,7 @@ __all__ = [
     "TokenInfo",
     "create_token",
     "enterprise_violations",
+    "list_personal_tokens",
     "list_tokens",
     "owners_not_in_users",
     "revoke_token",
@@ -369,6 +379,26 @@ async def list_tokens(pool: asyncpg.Pool) -> list[TokenInfo]:
     return [_row_to_info(row) for row in rows]
 
 
+async def list_personal_tokens(pool: asyncpg.Pool, owner_oid: str) -> list[TokenInfo]:
+    """Every `KIND_PERSONAL` token owned by `owner_oid`, newest first - never the
+    plaintext or its hash, same as `list_tokens`.
+
+    `/account`'s own token section (ADR-0012, #135) is the one caller: a signed-in
+    user must only ever see their own tokens, never another owner's or a
+    `KIND_SERVICE`/`KIND_AGENT` one - both filters are applied here, in SQL, rather
+    than left to the caller to narrow a broader `list_tokens()` result down (CLAUDE.md
+    "token hashes only" extends to "never return a row the caller did not ask to see
+    either").
+    """
+    rows = await pool.fetch(
+        f"select {_SELECT_COLUMNS} from static_tokens "  # noqa: S608
+        "where owner_oid = $1 and kind = $2 order by created_at desc",
+        owner_oid,
+        KIND_PERSONAL,
+    )
+    return [_row_to_info(row) for row in rows]
+
+
 def enterprise_violations(
     info: TokenInfo, *, max_expires_days: int = DEFAULT_MAX_EXPIRES_DAYS
 ) -> tuple[str, ...]:
@@ -408,17 +438,43 @@ async def owners_not_in_users(pool: asyncpg.Pool, owner_oids: Sequence[str]) -> 
     return frozenset(oid for oid in unique if oid not in known)
 
 
-async def revoke_token(pool: asyncpg.Pool, name: str, *, actor: str | None = None) -> bool:
+async def revoke_token(
+    pool: asyncpg.Pool,
+    name: str,
+    *,
+    actor: str | None = None,
+    owner_oid: str | None = None,
+    kind: str | None = None,
+) -> bool:
     """Mark the token `name` revoked. Returns whether a not-yet-revoked token was found.
+
+    `owner_oid`/`kind` narrow the `update` itself, in SQL - not an extra check run
+    after a plain by-name lookup - so a name that exists but belongs to a different
+    owner or a different `kind` revokes nothing at all and is indistinguishable from
+    an unknown name (ADR-0012, #135: `/account`'s own token section passes both,
+    so a user can never revoke anyone else's token, or a `KIND_SERVICE`/`KIND_AGENT`
+    one, by guessing or being handed its name). `cli.py`'s `token revoke` passes
+    neither - an operator may still revoke any token by name, unchanged.
 
     Writes one `audit_log` entry (CLAUDE.md "audit log for every write") only when a
     row was actually revoked - a call that found nothing to revoke made no write, so
     there is nothing to audit. `actor` is `name` itself when not given, the same
     fallback `create_token` uses for its own audit entry.
     """
+    conditions = ["name = $1", "revoked_at is null"]
+    params: list[object] = [name]
+    if owner_oid is not None:
+        params.append(owner_oid)
+        conditions.append(f"owner_oid = ${len(params)}")
+    if kind is not None:
+        params.append(kind)
+        conditions.append(f"kind = ${len(params)}")
     result = await pool.execute(
-        "update static_tokens set revoked_at = now() where name = $1 and revoked_at is null",
-        name,
+        # Every piece of `conditions` is one of this function's own fixed literals
+        # above, never caller input - not the string-built-from-a-request-parameter
+        # pattern S608 looks for (`create_token`'s own `_SELECT_COLUMNS` comment).
+        f"update static_tokens set revoked_at = now() where {' and '.join(conditions)}",  # noqa: S608
+        *params,
     )
     revoked = result != "UPDATE 0"
     if revoked:

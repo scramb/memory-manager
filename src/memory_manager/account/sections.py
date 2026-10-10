@@ -53,6 +53,8 @@ from memory_manager.account.delete import (
 from memory_manager.account.export import CSRF_FORM_EXPORT, EXPORT_PATH
 from memory_manager.account.sessions import SessionInfo, csrf_token
 from memory_manager.account.templates import CSRF_FIELD_NAME
+from memory_manager.account.tokens import list_tokens_for_owner, render_tokens_section
+from memory_manager.auth.owner_rights import OwnerRightsResolver
 from memory_manager.db import rls
 
 __all__ = [
@@ -62,6 +64,7 @@ __all__ = [
     "DELETE_SECTION",
     "EXPORT_SECTION",
     "OVERVIEW_SECTION",
+    "TOKENS_SECTION",
     "Section",
     "SectionContext",
     "render_sections",
@@ -92,6 +95,17 @@ class SectionContext:
     #: CSRF token (`account.sessions.csrf_token`, keyed by the raw id, never the
     #: stored hash); `EXPORT_SECTION`'s own form is the only reader today.
     session_id: str
+    #: `services.owner_rights_resolver` (ADR-0012, #134/#135) - `None` only for a
+    #: hand-built `Services` that skips `app.open_services` entirely (every real
+    #: deployment, and every test driving `/account` over HTTP, has one).
+    #: `TOKENS_SECTION` is the one reader, for the namespaces it offers a
+    #: `"git"`-backend owner (`account.tokens`'s own module docstring).
+    owner_rights_resolver: OwnerRightsResolver | None
+    #: `services.personal_token_max_days`/`static_token_max_days` (ADR-0012, #135) -
+    #: `TOKENS_SECTION`'s own expiry ceiling, the smaller of the two once
+    #: `is_postgres_backend` (`account.tokens._effective_max_days`).
+    personal_token_max_days: int
+    static_token_max_days: int
 
 
 @dataclass(frozen=True)
@@ -270,6 +284,43 @@ BREAK_GLASS_SECTION = Section(
     name="break_glass", enabled=_break_glass_enabled, render=_render_break_glass
 )
 
+
+def _tokens_enabled(ctx: SectionContext) -> bool:
+    """Visible whenever the embedded authorization server runs at all (ADR-0012,
+    #135) - wider than every other enterprise-only section above: a `"git"`-backend
+    `password`/`oidc` session has no personal namespace but can still hold a personal
+    token (`account.tokens`'s own module docstring). The one case this still excludes
+    is a `"postgres"`-backend session with no `oid`, which does not occur in
+    practice (every `Authenticator` that can reach that backend sets one) - kept for
+    the same "the degenerate case never reaches the database" reasoning
+    `_export_enabled`/`_delete_enabled` already follow."""
+    return not ctx.is_postgres_backend or ctx.session.oid is not None
+
+
+async def _render_tokens(ctx: SectionContext) -> str:
+    if ctx.owner_rights_resolver is None:  # pragma: no cover - open_services always sets one
+        return ""
+    tokens = await list_tokens_for_owner(ctx.pool, ctx.session)
+    owner = ctx.session.oid if ctx.session.oid is not None else ctx.session.subject
+    owner_rights = await ctx.owner_rights_resolver.resolve(owner)
+    max_days = (
+        min(ctx.static_token_max_days, ctx.personal_token_max_days)
+        if ctx.is_postgres_backend
+        else ctx.personal_token_max_days
+    )
+    return render_tokens_section(
+        tokens,
+        session_id=ctx.session_id,
+        is_postgres_backend=ctx.is_postgres_backend,
+        owner_namespaces=owner_rights.namespaces,
+        max_days=max_days,
+    )
+
+
+#: Wider gate than every enterprise-only section above (`_tokens_enabled`) - see
+#: that function's own docstring (#135).
+TOKENS_SECTION = Section(name="tokens", enabled=_tokens_enabled, render=_render_tokens)
+
 #: `routes.py` renders exactly these, in order - a later work package appends its own
 #: `Section` here (this module's own docstring).
 DEFAULT_SECTIONS: tuple[Section, ...] = (
@@ -278,6 +329,7 @@ DEFAULT_SECTIONS: tuple[Section, ...] = (
     DELETE_SECTION,
     ADMIN_SECTION,
     BREAK_GLASS_SECTION,
+    TOKENS_SECTION,
 )
 
 

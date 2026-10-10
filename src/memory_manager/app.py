@@ -70,6 +70,8 @@ from memory_manager.config import (
     blocklist_file_from_env,
     break_glass_approvers_from_env,
     database_app_role_from_env,
+    personal_token_max_days_from_env,
+    static_token_max_days_from_env,
     storage_backend_from_env,
 )
 from memory_manager.db import rls
@@ -144,7 +146,21 @@ class Services:
     so a malformed value fails at startup like every other `*_from_env` call
     here) - `http.py` threads it into `StaticTokenVerifier`/
     `MemoryManagerOAuthProvider`, both of which only ever consult it for a
-    `kind="personal"` static token (`auth.owner_rights`).
+    `kind="personal"` static token (`auth.owner_rights`); `account.tokens`'s
+    own self-service create route (ADR-0012, #135) is the other reader, for
+    the namespaces it offers a `"git"`-backend owner.
+
+    `static_token_max_days`/`personal_token_max_days` (`STATIC_TOKEN_MAX_DAYS`/
+    `PERSONAL_TOKEN_MAX_DAYS`, `config.static_token_max_days_from_env`/
+    `personal_token_max_days_from_env`, defaults 90/90) are read and validated
+    eagerly here too, regardless of backend - same "fails before anything is
+    started" contract every other `*_from_env` call in this function already
+    has. `cli.py`'s `token create`/`token list` read the identical two
+    variables themselves, for the CLI's own `enterprise=True` path;
+    `account.tokens`'s create route (#135) is this field's one reader, to
+    bound a personal token's expiry the same way - the smaller of the two
+    once `STORAGE_BACKEND=postgres`, `personal_token_max_days` alone
+    otherwise (`auth.tokens.create_token`'s own docstring).
     """
 
     repo: Repo | None
@@ -158,6 +174,8 @@ class Services:
     app_role: str | None = None
     owner_rights_resolver: OwnerRightsResolver | None = None
     break_glass_approvers: int = 2
+    static_token_max_days: int = 90
+    personal_token_max_days: int = 90
 
 
 @dataclass
@@ -372,6 +390,9 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     read the same way, regardless of backend, into `Services.
     owner_rights_resolver` (ADR-0012, #134) - a `kind="personal"` static
     token's own bound on every verification (`auth.owner_rights`).
+    `STATIC_TOKEN_MAX_DAYS`/`PERSONAL_TOKEN_MAX_DAYS` are read the same way
+    too, into `Services.static_token_max_days`/`personal_token_max_days`
+    (ADR-0012, #135) - see `Services`'s own docstring for who reads them.
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
@@ -379,6 +400,8 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     embedding_config = EmbeddingConfig.from_env(dict(environ))
     app_role = database_app_role_from_env(dict(environ))
     break_glass_approvers = break_glass_approvers_from_env(dict(environ))
+    static_token_max_days = static_token_max_days_from_env(dict(environ))
+    personal_token_max_days = personal_token_max_days_from_env(dict(environ))
     blocklist.load_rules(blocklist_file_from_env(dict(environ)))
     # ADR-0012, #134: local import, not a module-level one - `memory_manager.auth`'s own
     # package `__init__` imports `auth.prm`, which imports `Services` straight back from
@@ -457,6 +480,8 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                     app_role=app_role,
                     owner_rights_resolver=owner_rights_resolver,
                     break_glass_approvers=break_glass_approvers,
+                    static_token_max_days=static_token_max_days,
+                    personal_token_max_days=personal_token_max_days,
                 )
             finally:
                 if poll_task is not None:

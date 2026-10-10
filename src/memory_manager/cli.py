@@ -79,8 +79,6 @@ from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.owner_rights import intersect_namespaces
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
-    DEFAULT_MAX_EXPIRES_DAYS,
-    DEFAULT_PERSONAL_MAX_EXPIRES_DAYS,
     KIND_PERSONAL,
     KIND_SERVICE,
     MEMORY_ROLES,
@@ -102,6 +100,8 @@ from memory_manager.config import (
     VaultConfigError,
     WorkerConfig,
     WorkerConfigError,
+    personal_token_max_days_from_env,
+    static_token_max_days_from_env,
     storage_backend_from_env,
 )
 from memory_manager.db.migrate import migrate
@@ -259,8 +259,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 storage_backend = storage_backend_from_env(dict(os.environ))
                 enterprise = storage_backend == "postgres"
-                max_expires_days = _static_token_max_days()
-                personal_max_days = _personal_token_max_days()
+                max_expires_days = static_token_max_days_from_env(dict(os.environ))
+                personal_max_days = personal_token_max_days_from_env(dict(os.environ))
             except (StorageConfigError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
@@ -1600,55 +1600,6 @@ def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise _MissingEnvironment(f"{name} is required but not set")
-    return value
-
-
-_STATIC_TOKEN_MAX_DAYS_ENV = "STATIC_TOKEN_MAX_DAYS"  # noqa: S105 - an env var name, not a credential
-
-
-def _static_token_max_days() -> int:
-    """The enterprise static-token expiry ceiling (`STATIC_TOKEN_MAX_DAYS`,
-    ADR-0006 §7, #224), default `tokens.DEFAULT_MAX_EXPIRES_DAYS` (90 days).
-
-    `token create`/`token list` read this once in `main()` regardless of
-    `STORAGE_BACKEND`, since computing it is cheap and free of side effects -
-    only `enterprise=True` (`STORAGE_BACKEND=postgres`) callers ever act on
-    the result. Raises `ValueError` naming the variable if it is set but not
-    a positive integer.
-    """
-    raw = os.environ.get(_STATIC_TOKEN_MAX_DAYS_ENV)
-    if raw is None:
-        return DEFAULT_MAX_EXPIRES_DAYS
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be an integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be positive, got {value}")
-    return value
-
-
-_PERSONAL_TOKEN_MAX_DAYS_ENV = "PERSONAL_TOKEN_MAX_DAYS"  # noqa: S105 - an env var name
-
-
-def _personal_token_max_days() -> int:
-    """The personal-token expiry ceiling (`PERSONAL_TOKEN_MAX_DAYS`, ADR-0012, #134),
-    default `tokens.DEFAULT_PERSONAL_MAX_EXPIRES_DAYS` (90 days) - the same shape
-    `_static_token_max_days` above already has for the unrelated enterprise ceiling.
-    In enterprise mode both apply to the same `expires_at` (`create_token`'s own
-    docstring), so the effective maximum for a personal token there is whichever of
-    the two is smaller. Raises `ValueError` naming the variable if it is set but not a
-    positive integer.
-    """
-    raw = os.environ.get(_PERSONAL_TOKEN_MAX_DAYS_ENV)
-    if raw is None:
-        return DEFAULT_PERSONAL_MAX_EXPIRES_DAYS
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_PERSONAL_TOKEN_MAX_DAYS_ENV} must be an integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ValueError(f"{_PERSONAL_TOKEN_MAX_DAYS_ENV} must be positive, got {value}")
     return value
 
 

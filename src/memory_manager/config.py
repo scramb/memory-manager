@@ -32,7 +32,9 @@ __all__ = [
     "canonical_resource_url",
     "database_app_role_from_env",
     "erasure_log_replay_file_from_env",
+    "personal_token_max_days_from_env",
     "rate_limit_sweep_floor_seconds",
+    "static_token_max_days_from_env",
     "storage_backend_from_env",
 ]
 
@@ -283,6 +285,71 @@ def break_glass_approvers_from_env(environ: dict[str, str]) -> int:
             f"BREAK_GLASS_APPROVERS must be 1 or 2 (ADR-0008 'Break-glass'), got {raw!r}"
         )
     return count
+
+
+#: ADR-0006 §7's default maximum lifetime for an enterprise static token
+#: (`auth.tokens.DEFAULT_MAX_EXPIRES_DAYS`) - duplicated here rather than
+#: imported: `auth.tokens` is reached only through `memory_manager.auth`'s own
+#: package `__init__`, which imports `auth.prm`, which imports `Services` from
+#: `app.py`, which imports this module (`app.py`'s own `TYPE_CHECKING` comment
+#: gives the identical reason for its own deferred `OwnerRightsResolver`
+#: import) - a module-level import of `auth.tokens` here would try to resolve
+#: `config` before this module has finished defining it.
+_DEFAULT_STATIC_TOKEN_MAX_DAYS = 90
+
+#: ADR-0012's default maximum lifetime for a personal token
+#: (`auth.tokens.DEFAULT_PERSONAL_MAX_EXPIRES_DAYS`) - duplicated for the same
+#: reason as `_DEFAULT_STATIC_TOKEN_MAX_DAYS` above.
+_DEFAULT_PERSONAL_TOKEN_MAX_DAYS = 90
+
+
+def static_token_max_days_from_env(environ: dict[str, str]) -> int:
+    """The enterprise static-token expiry ceiling (`STATIC_TOKEN_MAX_DAYS`,
+    ADR-0006 §7, #224), default 90 days.
+
+    `cli.py`'s `token create`/`token list` and `app.open_services` (ADR-0012,
+    #135: `/account`'s own token section needs the same ceiling to bound a
+    personal token's expiry) both read this regardless of `STORAGE_BACKEND` -
+    only an `enterprise=True` (`STORAGE_BACKEND=postgres`) `create_token` call
+    ever acts on the result. Raises `ValueError` naming the variable if it is
+    set but not a positive integer - the same message/exit-2 contract
+    `cli.py`'s own (now removed) `_static_token_max_days` had.
+    """
+    raw = environ.get("STATIC_TOKEN_MAX_DAYS")
+    if raw is None:
+        return _DEFAULT_STATIC_TOKEN_MAX_DAYS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"STATIC_TOKEN_MAX_DAYS must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"STATIC_TOKEN_MAX_DAYS must be positive, got {value}")
+    return value
+
+
+def personal_token_max_days_from_env(environ: dict[str, str]) -> int:
+    """The personal-token expiry ceiling (`PERSONAL_TOKEN_MAX_DAYS`, ADR-0012,
+    #134), default 90 days - the same shape `static_token_max_days_from_env`
+    above has for the unrelated enterprise ceiling.
+
+    `cli.py`'s `token create` and `app.open_services` (#135) both read this
+    regardless of `STORAGE_BACKEND`. In enterprise mode both ceilings apply to
+    the same `expires_at` (`auth.tokens.create_token`'s own docstring), so the
+    effective maximum for a personal token there is whichever of the two is
+    smaller. Raises `ValueError` naming the variable if it is set but not a
+    positive integer - same message/exit-2 contract `cli.py`'s own (now
+    removed) `_personal_token_max_days` had.
+    """
+    raw = environ.get("PERSONAL_TOKEN_MAX_DAYS")
+    if raw is None:
+        return _DEFAULT_PERSONAL_TOKEN_MAX_DAYS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"PERSONAL_TOKEN_MAX_DAYS must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"PERSONAL_TOKEN_MAX_DAYS must be positive, got {value}")
+    return value
 
 
 def blocklist_file_from_env(environ: dict[str, str]) -> Path | None:
