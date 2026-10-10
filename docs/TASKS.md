@@ -403,7 +403,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [x] #310 A refresh token presented twice concurrently is treated as a replay
 - [x] #313 The Open WebUI stack starts per backend with a mock IdP and two real subjects
 - [x] #314 Open WebUI runs a scripted MCP tool call on behalf of the signed-in user
-- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP
+- [x] #144 Two Open WebUI users write and read only their own memory over native MCP
 
 ### WP-43 — Open WebUI profile · F-02 · Branch: `wp/43-openwebui-profile` · PR: open
 

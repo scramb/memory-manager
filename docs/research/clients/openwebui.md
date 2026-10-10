@@ -447,6 +447,52 @@ distinct `oauth_tokens.subject` rows for memory-manager's own embedded AS:
   polling loop is what actually decides pass/fail, never that command's
   exit status.
 
+### #144: `scripted_model.py`'s turn index never reaches 2 under the
+### Responses-API tool loop - one tool call per chat, not several in a row
+
+Driven live against both overlays (`tests/e2e/clients/test_openwebui.py`,
+`-k isolation`), scripting two tool calls in one chat (`memory_write` then
+`memory_search`, as the module docstring's original shape had it) reliably
+reproduced a `500` from `POST /api/chat/completions`, every time, both
+backends:
+
+- `scripted_model.py`'s `_turn_index` counts `role == "assistant"` entries
+  in the request's own `messages` list - the shape #314's own *single*
+  scripted tool call never exercised past one round trip. Live inspection
+  of `messages` on each successive call (a throwaway `print`, reverted,
+  never shipped) showed Open WebUI 0.11.4's Responses-API tool loop
+  (`utils/middleware.py`'s `while tool_calls: ...`) appending exactly one
+  `"assistant"` entry for the *whole* turn, then one `"tool"` entry per
+  executed call, on every iteration - never a second `"assistant"` entry.
+  `_turn_index` therefore gets stuck at `1` forever once a script has more
+  than one tool-call turn: the stub keeps replaying script index 1 (the
+  *second* scripted turn) instead of ever reaching the final `{"content":
+  ...}` turn that would end the loop.
+- Open WebUI's own loop has no backoff between iterations (`tool_call_
+  iterations`, apparently unbounded here) - it re-dials `connect_mcp_server`
+  and re-issues the same `tools/call` roughly every 28ms. `RATE_LIMIT_
+  MCP_BURST` (default 30, `config.py`) is what actually stops it live,
+  with a `429` on the 31st `POST /mcp` - which Open WebUI's own request
+  task then answers with a plain `500` (`asyncio.exceptions.CancelledError`
+  inside `streaming_chat_response_handler`), not any clean per-item error
+  shape a caller could branch on. `RATE_LIMIT_OAUTH_BURST` (already raised
+  by both overlays) is a different limiter and does not help here.
+- **Fix, within this task's own scope:** one tool call per chat, never
+  two in a row - `tests/e2e/clients/test_openwebui.py`'s own `_run_single_
+  tool_call` opens a fresh chat (fresh `messages`, `turn_index` starts at
+  `0` again) for every scripted tool call, confirmed live to pass for both
+  backends. `scripted_model.py` itself is unchanged - its own `_turn_index`
+  scheme is still correct for the one-tool-call-per-chat shape #314 already
+  proved, and fixing the counter to track something Open WebUI actually
+  increments (if that exists at all for this code path) is **not** this
+  task's own Blast-Radius.
+- **Relevant for #146/#150/#156:** any future script driving *more than
+  one* tool-calling round through Open WebUI 0.11.4's current code must
+  either stay one-tool-call-per-chat (this task's own workaround) or give
+  `scripted_model.py` a different turn-tracking signal first - scripting
+  two-plus rounds in one chat will reproduce the same stuck-at-1 loop,
+  not a model/version-specific flake.
+
 ## Open questions
 
 None of the following blocks WP-42 … WP-46: ADR-0011 already picked
