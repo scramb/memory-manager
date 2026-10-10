@@ -62,6 +62,7 @@ from pathlib import Path
 import asyncpg
 
 from memory_manager.audit import AuditWriter
+from memory_manager.compat.select import current_resolved_profile
 from memory_manager.config import (
     EmbeddingConfig,
     VaultConfig,
@@ -488,13 +489,28 @@ def _audit_write_hook(audit: AuditWriter) -> AuditHook:
     `detail` is built here, from op-level metadata only - never from
     `request.content`/`old_str`/`new_str` or an error's `current_content`
     (`AuditWriter`'s docstring: that is the one place a note's text could
-    leak into the audit log).
+    leak into the audit log). Also records `detail["profile"]`, the
+    compatibility profile (`compat.select`, ADR-0010) the request that
+    triggered this write ran under (#305) - read here, not inside
+    `AuditWriter.record`, because this hook is the one place in the audit
+    path that is specifically about a write; `AuditWriter.record`'s ~25
+    other callers (rate limits, `migrate_git`, ...) have no request of
+    their own to attribute a profile to, and reading it there would give
+    every one of them a misleading `"default"` instead of simply omitting
+    the key. `WriteQueue` runs this hook under the submitting request's own
+    `contextvars.Context` snapshot (`queue.py`'s module docstring) on the
+    `"git"` backend, so `current_resolved_profile()` here reports that
+    request's profile even though the hook itself executes on the write
+    queue's own long-lived consumer task; `storage.postgres.PostgresBackend`
+    runs its audit hook inline in the request's own task, where that is
+    already true without any snapshot.
     """
 
     async def hook(
         request: WriteRequest, result: WriteResult | None, error: Exception | None
     ) -> None:
         outcome, detail = _audit_outcome(request.op, result, error)
+        detail["profile"] = current_resolved_profile()
         await audit.record(
             actor=request.actor,
             client=request.client,

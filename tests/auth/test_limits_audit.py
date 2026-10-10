@@ -679,7 +679,8 @@ async def test_audit_row_recorded_for_a_successful_write(
     assert row["commit_sha"] is not None
     assert row["outcome"] == "ok"
     detail = json.loads(row["detail"])
-    assert set(detail) == {"version"}
+    assert set(detail) == {"version", "profile"}
+    assert detail["profile"] == "default"
 
 
 async def test_audit_row_recorded_for_a_version_conflict_without_note_content(
@@ -750,7 +751,7 @@ async def test_audit_row_recorded_for_a_secret_rejected_write_without_the_secret
     assert row is not None
     assert row["outcome"] == "rejected"
     detail = json.loads(row["detail"])
-    assert detail == {"error": "SecretRejected"}
+    assert detail == {"error": "SecretRejected", "profile": "default"}
     assert _FAKE_AWS_ACCESS_KEY_ID not in str(dict(row))
 
 
@@ -790,7 +791,11 @@ async def test_audit_row_recorded_for_a_blocklist_rejected_write_without_the_mat
     assert row is not None
     assert row["outcome"] == "rejected"
     detail = json.loads(row["detail"])
-    assert detail == {"error": "BlocklistRejected", "category": "example-confidential"}
+    assert detail == {
+        "error": "BlocklistRejected",
+        "category": "example-confidential",
+        "profile": "default",
+    }
     assert flagged_body not in str(dict(row))
 
 

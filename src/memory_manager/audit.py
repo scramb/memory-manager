@@ -31,15 +31,23 @@ database outage must not also silence the SIEM copy, and a SIEM outage
 (`AuditExporter.export` never raises) must never fail or undo the DB row.
 `request_id` is read fresh for every record from `observability.logging.
 current_request_id` - `None` outside an HTTP request (stdio mode, the poll
-loop's own sync) - never threaded through by a caller.
+loop's own sync) - never threaded through by a caller. This now resolves
+correctly for a queued `"git"`-backend write too (#305): `WriteQueue` runs
+its audit hook under a snapshot of the submitting request's own
+`contextvars.Context`, so this still reads that request's id even though
+the hook itself executes on the write queue's own consumer task, not the
+request's.
 
 `DETAIL_ALLOWLIST` is this module's own account of every key any caller in
-this codebase ever puts into `detail` today (`app.py`'s `_audit_outcome`,
-`quotas.py`, `migrate_git.py`, `exporter.py`) *minus* the two that are
+this codebase ever puts into `detail` today (`app.py`'s `_audit_write_hook`/
+`_audit_outcome`, `quotas.py`, `migrate_git.py`, `exporter.py`) *minus* the two that are
 shaped like a path rather than a scalar fact (`WriteConflict`'s
 `conflict_path`, and `VersionConflict`'s/`EditMismatch`'s own never-stored
 `current_content`) - dropped defensively even though no caller actually
-writes either key into a Postgres-mode `audit_log` row today.
+writes either key into a Postgres-mode `audit_log` row today. `"profile"`
+(#305) is a `compat.profiles` registry identifier every write's `detail`
+now carries - never a free-form or personal value, so it needs no
+redaction of its own.
 `storage.erasure` (#231, ADR-0007 §3 addendum: "audit rows keep only
 metadata") is its one consumer so far, filtering a redacted row's `detail`
 down to this set; nothing in `AuditWriter`/`record` itself reads or
@@ -80,6 +88,7 @@ DETAIL_ALLOWLIST = (
     "reason",
     "revisions",
     "namespace",
+    "profile",
 )
 
 _INSERT = """

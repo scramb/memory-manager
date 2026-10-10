@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 from conftest import human_commit
 
+from memory_manager.compat.select import (
+    current_resolved_profile,
+    reset_resolved_profile,
+    set_resolved_profile,
+)
 from memory_manager.config import VaultConfig
+from memory_manager.observability.logging import current_request_id, request_id_var
 from memory_manager.queue import (
     EditMismatch,
     InvalidNote,
@@ -603,6 +609,142 @@ class TestHooks:
             )
         )
         assert isinstance(result, WriteResult)
+
+
+class TestAuditHookContext:
+    """`WriteQueue.submit()`'s `contextvars.Context` snapshot (#305, `queue.py`'s
+    module docstring): the audit hooks it runs must see the *submitting* request's
+    own `compat.select` resolved profile and `observability.logging` request id,
+    not whatever happens to be ambient on the consumer's own long-lived task.
+    """
+
+    async def test_audit_hook_sees_the_submitters_profile_and_request_id(
+        self, queue: WriteQueue
+    ) -> None:
+        seen: list[tuple[str, str | None]] = []
+
+        async def audit_hook(
+            request: WriteRequest, result: WriteResult | None, error: Exception | None
+        ) -> None:
+            seen.append((current_resolved_profile(), current_request_id()))
+
+        queue.add_audit_hook(audit_hook)
+
+        profile_token = set_resolved_profile("claude-code")
+        request_id_token = request_id_var.set("req-1")
+        try:
+            await queue.submit(
+                WriteRequest(
+                    op="write",
+                    path="personal/fact/a.md",
+                    client="human",
+                    if_version="new",
+                    content=_note_bytes(),
+                )
+            )
+        finally:
+            reset_resolved_profile(profile_token)
+            request_id_var.reset(request_id_token)
+
+        assert seen == [("claude-code", "req-1")]
+
+    async def test_submit_with_no_resolved_profile_in_scope_audits_as_default(
+        self, queue: WriteQueue
+    ) -> None:
+        seen: list[str] = []
+
+        async def audit_hook(
+            request: WriteRequest, result: WriteResult | None, error: Exception | None
+        ) -> None:
+            seen.append(current_resolved_profile())
+
+        queue.add_audit_hook(audit_hook)
+
+        await queue.submit(
+            WriteRequest(
+                op="write",
+                path="personal/fact/a.md",
+                client="human",
+                if_version="new",
+                content=_note_bytes(),
+            )
+        )
+
+        assert seen == ["default"]
+
+    async def test_concurrent_submits_with_different_profiles_keep_their_own(
+        self, queue: WriteQueue
+    ) -> None:
+        seen: dict[str, str] = {}
+
+        async def audit_hook(
+            request: WriteRequest, result: WriteResult | None, error: Exception | None
+        ) -> None:
+            seen[request.path] = current_resolved_profile()
+
+        queue.add_audit_hook(audit_hook)
+
+        async def submit_under(profile: str, path: str, title: str) -> None:
+            token = set_resolved_profile(profile)
+            try:
+                await queue.submit(
+                    WriteRequest(
+                        op="write",
+                        path=path,
+                        client="human",
+                        if_version="new",
+                        content=_note_bytes(id=new_ulid(_CREATED), title=title),
+                    )
+                )
+            finally:
+                reset_resolved_profile(token)
+
+        await asyncio.gather(
+            submit_under("claude-code", "personal/fact/a.md", "A"),
+            submit_under("default", "personal/fact/b.md", "B"),
+        )
+
+        assert seen == {
+            "personal/fact/a.md": "claude-code",
+            "personal/fact/b.md": "default",
+        }
+
+    async def test_a_profile_set_inside_a_hook_does_not_leak_to_the_next_write(
+        self, queue: WriteQueue
+    ) -> None:
+        seen: list[str] = []
+
+        async def leaky_hook(
+            request: WriteRequest, result: WriteResult | None, error: Exception | None
+        ) -> None:
+            seen.append(current_resolved_profile())
+            # Deliberately never reset - proves the queue's own context snapshot,
+            # not hook discipline, is what keeps this from leaking into the next
+            # write's audit hook run.
+            set_resolved_profile("claude-code")
+
+        queue.add_audit_hook(leaky_hook)
+
+        await queue.submit(
+            WriteRequest(
+                op="write",
+                path="personal/fact/a.md",
+                client="human",
+                if_version="new",
+                content=_note_bytes(),
+            )
+        )
+        await queue.submit(
+            WriteRequest(
+                op="write",
+                path="personal/fact/b.md",
+                client="human",
+                if_version="new",
+                content=_note_bytes(id=new_ulid(_CREATED), title="B"),
+            )
+        )
+
+        assert seen == ["default", "default"]
 
 
 class TestSync:
