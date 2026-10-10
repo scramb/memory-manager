@@ -21,9 +21,12 @@ L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
 `instructions generate [--check]` renders `mcp/instructions_generated.py` from
-`docs/memory-guide.md`, the single source for the server `instructions` and the
-`memory_guide` prompt (#127, `guide/generate.py`); `--check` exits 1 instead of
-writing when the committed file is stale, and is what `make lint`/CI run.
+`docs/memory-guide.md`, the single source for the server `instructions`, the `memory_guide`
+prompt and every client's instruction file (#127, #128, `guide/generate.py`,
+`guide/targets.py`); `--client <name>` additionally renders that one client's file (choices
+from `guide.targets.TARGETS`), `--all` renders every client's file - the module itself is
+always rendered/checked regardless. `--check` exits 1 instead of writing when any of the
+rendered files is stale, and is what `make lint`/CI run.
 
 `worker` runs `worker.py`'s periodic singleton jobs, plus the `jobs` outbox
 consumer (#218, `worker.consume_jobs`), as a separate process (#217,
@@ -90,7 +93,8 @@ from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_postgres, export_vault
 from memory_manager.guide import GuideFormatError
-from memory_manager.guide.generate import build as build_instructions_module
+from memory_manager.guide.generate import parse_guide, render_module
+from memory_manager.guide.targets import TARGETS, render_target
 from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
@@ -209,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "instructions":
         if args.instructions_target == "generate":
-            return _run_instructions_generate(args.check, args.guide, args.out)
+            return _run_instructions_generate(
+                args.check, args.guide, args.out, args.client, args.all_clients
+            )
         parser.print_help()
         return 1
 
@@ -462,16 +468,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     instructions_parser = subparsers.add_parser(
-        "instructions", help="render mcp/instructions_generated.py from docs/memory-guide.md"
+        "instructions",
+        help="render mcp/instructions_generated.py and client instruction files from "
+        "docs/memory-guide.md",
     )
     instructions_subparsers = instructions_parser.add_subparsers(dest="instructions_target")
     instructions_generate_parser = instructions_subparsers.add_parser(
-        "generate", help="render the generated module from the Markdown source (#127)"
+        "generate", help="render the generated module and client files from the Markdown source"
     )
     instructions_generate_parser.add_argument(
         "--check",
         action="store_true",
-        help="exit 1 if --out is stale instead of writing it (no file is touched)",
+        help="exit 1 if any rendered file is stale instead of writing it (no file is touched)",
     )
     instructions_generate_parser.add_argument(
         "--guide", type=Path, default=_DEFAULT_GUIDE, help="path to the Markdown source"
@@ -480,7 +488,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         type=Path,
         default=_DEFAULT_INSTRUCTIONS_OUT,
-        help="path to the generated Python module",
+        help="path to the generated Python module (unaffected by --client/--all)",
+    )
+    instructions_target_group = instructions_generate_parser.add_mutually_exclusive_group()
+    instructions_target_group.add_argument(
+        "--client",
+        choices=sorted(TARGETS),
+        help="additionally render this one client's instruction file",
+    )
+    instructions_target_group.add_argument(
+        "--all",
+        dest="all_clients",
+        action="store_true",
+        help="additionally render every client's instruction file",
     )
 
     serve_parser = subparsers.add_parser("serve", help="run the MCP server")
@@ -571,25 +591,46 @@ def _run_hash_password() -> int:
     return 0
 
 
-def _run_instructions_generate(check: bool, guide: Path, out: Path) -> int:
+def _run_instructions_generate(
+    check: bool, guide: Path, out: Path, client: str | None, all_clients: bool
+) -> int:
     try:
-        module_source = build_instructions_module(guide)
+        guide_text = guide.read_text(encoding="utf-8")
     except FileNotFoundError:
         print(f"{guide} does not exist", file=sys.stderr)
         return 2
+    try:
+        sections = parse_guide(guide_text)
     except GuideFormatError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    if check:
-        current = out.read_text(encoding="utf-8") if out.exists() else None
-        if current == module_source:
-            return 0
-        print(f"{out} is stale; run `memory-manager instructions generate`", file=sys.stderr)
-        return 1
+    # The module is always rendered/checked; --client/--all add client files on top of it.
+    rendered: list[tuple[Path, str]] = [(out, render_module(sections))]
+    client_names = sorted(TARGETS) if all_clients else [client] if client else []
+    for name in client_names:
+        target = TARGETS[name]
+        rendered.append((Path(target.output), render_target(target, sections)))
 
-    out.write_text(module_source, encoding="utf-8")
+    if check:
+        stale = [path for path, content in rendered if not _file_matches(path, content)]
+        if stale:
+            for path in stale:
+                print(
+                    f"{path} is stale; run `memory-manager instructions generate --all`",
+                    file=sys.stderr,
+                )
+            return 1
+        return 0
+
+    for path, content in rendered:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     return 0
+
+
+def _file_matches(path: Path, content: str) -> bool:
+    return path.exists() and path.read_text(encoding="utf-8") == content
 
 
 def _run_doctor_command(vault: str | None) -> int:

@@ -359,7 +359,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: open
 
 - [x] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
-- [ ] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones
+- [x] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones
 
 ### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: #304
 

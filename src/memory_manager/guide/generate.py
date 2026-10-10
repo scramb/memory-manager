@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Parses `docs/memory-guide.md` into named sections and renders the generated module text
-for `src/memory_manager/mcp/instructions_generated.py` (#127).
+for `src/memory_manager/mcp/instructions_generated.py` (#127), plus the short form it carries
+for client instruction files (#128).
 
 A section is a pair of HTML comment markers, each on its own line: `<!-- name -->` opens it,
-`<!-- /name -->` closes it. `docs/memory-guide.md` carries three today (`core`,
-`instructions`, `long`); the format allows more later (`short`, #128) without a parser
-change - only `_REQUIRED_SECTIONS` below is specific to what this module renders.
+`<!-- /name -->` closes it. `docs/memory-guide.md` carries four today (`core`,
+`instructions`, `long`, `short`); the format allows more later without a parser change - only
+`_REQUIRED_SECTIONS` below is specific to what this module renders.
 
 Trailing-newline rule: a closing marker always sits on its own line, so there is always at
 least one newline between a section's last content line and its marker - that one is
@@ -23,8 +24,8 @@ __all__ = ["GuideFormatError", "build", "is_current", "parse_guide", "render_mod
 
 _MARKER = re.compile(r"\A<!--\s*(?P<slash>/?)(?P<name>[a-z][a-z0-9_-]*)\s*-->\Z")
 
-# What `render_module` needs to exist; the format itself allows other section names too (#128).
-_REQUIRED_SECTIONS = ("core", "instructions", "long")
+# What `render_module` and the client instruction files need to exist.
+_REQUIRED_SECTIONS = ("core", "instructions", "long", "short")
 
 _MODULE_HEADER = '''\
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -34,7 +35,7 @@ do not edit by hand. Edit docs/memory-guide.md and regenerate instead.
 
 from __future__ import annotations
 
-__all__ = ["GUIDE", "INSTRUCTIONS", "TOOL_DATA_SENTENCE"]
+__all__ = ["GUIDE", "INSTRUCTIONS", "SHORT", "TOOL_DATA_SENTENCE"]
 
 '''
 
@@ -47,7 +48,7 @@ def parse_guide(text: str) -> dict[str, str]:
     """Split `text` into its named sections, keyed by section name.
 
     Raises `GuideFormatError` for a missing, duplicate or unclosed section, or for a
-    `core` whose value does not appear verbatim inside `instructions` and `long`.
+    `core` whose value does not appear verbatim inside `instructions`, `long` and `short`.
     """
     lines = text.splitlines(keepends=True)
     sections: dict[str, str] = {}
@@ -83,6 +84,8 @@ def parse_guide(text: str) -> dict[str, str]:
         raise GuideFormatError("'core' does not appear verbatim inside 'instructions'")
     if core not in sections["long"]:
         raise GuideFormatError("'core' does not appear verbatim inside 'long'")
+    if core not in sections["short"]:
+        raise GuideFormatError("'core' does not appear verbatim inside 'short'")
     return sections
 
 
@@ -96,6 +99,7 @@ def render_module(sections: dict[str, str]) -> str:
         ("TOOL_DATA_SENTENCE", sections["core"]),
         ("INSTRUCTIONS", sections["instructions"]),
         ("GUIDE", sections["long"]),
+        ("SHORT", sections["short"]),
     )
     body = "\n\n".join(f"{name} = {value!r}" for name, value in assignments)
     return _MODULE_HEADER + body + "\n"

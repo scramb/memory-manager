@@ -15,8 +15,9 @@ import pytest
 
 from memory_manager.cli import main
 from memory_manager.guide import GuideFormatError, is_current, parse_guide
+from memory_manager.guide.targets import TARGETS, render_target
 from memory_manager.mcp import instructions_generated
-from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, SHORT, TOOL_DATA_SENTENCE
 
 _ROOT = Path(__file__).resolve().parents[2]
 _GUIDE_PATH = _ROOT / "docs" / "memory-guide.md"
@@ -57,6 +58,27 @@ def test_checked_in_generated_file_is_current() -> None:
     )
 
 
+def test_short_form_is_at_most_600_chars_and_contains_core_verbatim() -> None:
+    sections = parse_guide(_GUIDE_PATH.read_text(encoding="utf-8"))
+    assert len(sections["short"]) <= 600
+    assert sections["core"] in sections["short"]
+
+
+def test_generated_short_constant_matches_the_committed_guide() -> None:
+    sections = parse_guide(_GUIDE_PATH.read_text(encoding="utf-8"))
+    assert sections["short"] == instructions_generated.SHORT
+    assert sections["short"] == SHORT
+
+
+def test_checked_in_client_files_are_current_and_carry_the_generated_header() -> None:
+    sections = parse_guide(_GUIDE_PATH.read_text(encoding="utf-8"))
+    for target in TARGETS.values():
+        path = _ROOT / target.output
+        text = path.read_text(encoding="utf-8")
+        assert text == render_target(target, sections)
+        assert text.splitlines()[0].startswith("<!-- generated from docs/memory-guide.md")
+
+
 class TestParseGuideErrors:
     def test_missing_section_raises(self) -> None:
         text = "<!-- core -->\nx\n<!-- /core -->\n"
@@ -88,6 +110,17 @@ class TestParseGuideErrors:
             "<!-- core -->\nthe core sentence\n<!-- /core -->\n"
             "<!-- instructions -->\nsomething else entirely\n<!-- /instructions -->\n"
             "<!-- long -->\nthe core sentence\n<!-- /long -->\n"
+            "<!-- short -->\nthe core sentence\n<!-- /short -->\n"
+        )
+        with pytest.raises(GuideFormatError, match="verbatim"):
+            parse_guide(text)
+
+    def test_core_not_verbatim_in_short_raises(self) -> None:
+        text = (
+            "<!-- core -->\nthe core sentence\n<!-- /core -->\n"
+            "<!-- instructions -->\nthe core sentence\n<!-- /instructions -->\n"
+            "<!-- long -->\nthe core sentence\n<!-- /long -->\n"
+            "<!-- short -->\nsomething else entirely\n<!-- /short -->\n"
         )
         with pytest.raises(GuideFormatError, match="verbatim"):
             parse_guide(text)
@@ -97,7 +130,8 @@ def _write_minimal_guide(path: Path) -> None:
     path.write_text(
         "<!-- core -->\ncore\n<!-- /core -->\n"
         "<!-- instructions -->\ncore\n<!-- /instructions -->\n"
-        "<!-- long -->\ncore\n<!-- /long -->\n",
+        "<!-- long -->\ncore\n<!-- /long -->\n"
+        "<!-- short -->\ncore\n<!-- /short -->\n",
         encoding="utf-8",
     )
 
@@ -147,3 +181,148 @@ class TestInstructionsGenerateCli:
 
         assert exit_code == 2
         assert not out.exists()
+
+    def test_unknown_client_exits_2(self, tmp_path: Path) -> None:
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                [
+                    "instructions",
+                    "generate",
+                    "--client",
+                    "no-such-client",
+                    "--guide",
+                    str(guide),
+                    "--out",
+                    str(out),
+                ]
+            )
+        assert excinfo.value.code == 2
+
+
+class TestInstructionsGenerateAllClients:
+    """`--all`/`--client` write client files relative to the current directory, same as
+    `tests/test_export.py` does for `export`'s own relative defaults."""
+
+    def test_all_writes_the_module_and_every_client_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+
+        exit_code = main(
+            ["instructions", "generate", "--all", "--guide", str(guide), "--out", str(out)]
+        )
+
+        assert exit_code == 0
+        assert out.exists()
+        for target in TARGETS.values():
+            assert (tmp_path / target.output).exists()
+
+    def test_all_then_all_check_exits_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+        assert (
+            main(["instructions", "generate", "--all", "--guide", str(guide), "--out", str(out)])
+            == 0
+        )
+
+        exit_code = main(
+            [
+                "instructions",
+                "generate",
+                "--all",
+                "--check",
+                "--guide",
+                str(guide),
+                "--out",
+                str(out),
+            ]
+        )
+        assert exit_code == 0
+
+    def test_two_all_runs_are_byte_identical(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+        args = ["instructions", "generate", "--all", "--guide", str(guide), "--out", str(out)]
+
+        assert main(args) == 0
+        first = {name: (tmp_path / t.output).read_bytes() for name, t in TARGETS.items()}
+        first_module = out.read_bytes()
+
+        assert main(args) == 0
+        second = {name: (tmp_path / t.output).read_bytes() for name, t in TARGETS.items()}
+        second_module = out.read_bytes()
+
+        assert first == second
+        assert first_module == second_module
+
+    def test_hand_edited_client_file_fails_check_and_is_left_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+        assert (
+            main(["instructions", "generate", "--all", "--guide", str(guide), "--out", str(out)])
+            == 0
+        )
+
+        edited = tmp_path / TARGETS["claude-code"].output
+        hand_edited_text = edited.read_text(encoding="utf-8") + "hand edit\n"
+        edited.write_text(hand_edited_text, encoding="utf-8")
+
+        exit_code = main(
+            [
+                "instructions",
+                "generate",
+                "--all",
+                "--check",
+                "--guide",
+                str(guide),
+                "--out",
+                str(out),
+            ]
+        )
+
+        assert exit_code == 1
+        assert edited.read_text(encoding="utf-8") == hand_edited_text
+
+    def test_client_check_detects_a_missing_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        guide = tmp_path / "guide.md"
+        out = tmp_path / "out.py"
+        _write_minimal_guide(guide)
+
+        exit_code = main(
+            [
+                "instructions",
+                "generate",
+                "--client",
+                "generic",
+                "--check",
+                "--guide",
+                str(guide),
+                "--out",
+                str(out),
+            ]
+        )
+
+        assert exit_code == 1
+        assert not (tmp_path / TARGETS["generic"].output).exists()

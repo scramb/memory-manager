@@ -18,6 +18,9 @@ Both are plain module constants and both are Markdown-friendly plain text - so a
 Code skill / `CLAUDE.md` snippet (#22) can quote or embed them directly instead of re-deriving
 the same rules.
 
+`SHORT` is the condensed form client instruction files embed (`guide/targets.py`, #128) -
+re-exported here for completeness only; the MCP server itself never sends it (#306).
+
 `TOOL_DATA_SENTENCE` is the one rule every tool description in `server.py` repeats verbatim,
 pulled out here so `INSTRUCTIONS`, `GUIDE` and all six tool descriptions never drift from each
 other on its exact wording.
@@ -25,6 +28,11 @@ other on its exact wording.
 
 from __future__ import annotations
 
-from memory_manager.mcp.instructions_generated import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions_generated import (
+    GUIDE,
+    INSTRUCTIONS,
+    SHORT,
+    TOOL_DATA_SENTENCE,
+)
 
-__all__ = ["GUIDE", "INSTRUCTIONS", "TOOL_DATA_SENTENCE"]
+__all__ = ["GUIDE", "INSTRUCTIONS", "SHORT", "TOOL_DATA_SENTENCE"]

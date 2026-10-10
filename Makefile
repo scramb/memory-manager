@@ -16,7 +16,7 @@ fmt:
 	uv run ruff check --fix .
 
 lint:
-	uv run memory-manager instructions generate --check
+	uv run memory-manager instructions generate --all --check
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run mypy
