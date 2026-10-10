@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -26,6 +26,17 @@ lint:
 # remote needed, `compat/lint.py` builds an inert `Services` itself.
 compat-lint:
 	uv run memory-manager compat lint
+
+# Conformance suite per profile (#136, ADR-0010): every registered profile, run over
+# every transport/backend combination that exists, against golden transcripts
+# (`tests/conformance/profiles/golden/`) - needs a reachable `MM_TEST_DATABASE_URL`,
+# no `db-up` dependency here (CI uses its own service container instead, see
+# .github/workflows/validate.yml).
+conformance:
+	uv run pytest tests/conformance
+
+conformance-golden:
+	MM_CONFORMANCE_UPDATE=1 uv run pytest tests/conformance/profiles
 
 test:
 ifdef PKG

@@ -127,6 +127,32 @@ jobs:
       - name: Schema linter against every registered client profile (#133, ADR-0010)
         run: make compat-lint
 
+  conformance:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: mm
+          POSTGRES_PASSWORD: mm
+          POSTGRES_DB: mm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mm -d mm"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      MM_TEST_DATABASE_URL: postgresql://mm:mm@localhost:5432/mm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - name: Conformance suite per profile (#136, ADR-0010)
+        run: make conformance
+
   python:
     runs-on: ubuntu-latest
     services:

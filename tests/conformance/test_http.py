@@ -44,8 +44,6 @@ reuses for the parametrised `"postgres"` case.
 
 from __future__ import annotations
 
-import re
-import secrets
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -57,6 +55,13 @@ import httpx
 import httpx2
 import pytest
 import pytest_asyncio
+from conformance_fixtures import (
+    create_app_role,
+    drop_app_role,
+    seed_personal_namespace,
+    seed_postgres_notes,
+    tool_calls_total,
+)
 from git_fixtures import seed_notes
 from http_fixtures import Server as _Server
 from http_fixtures import run_http_server
@@ -67,10 +72,8 @@ from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
 from memory_manager.auth.tokens import ALL_NAMESPACES, MEMORY_ROLES, create_token
 from memory_manager.compat.profiles import profile_names
-from memory_manager.db.migrate import migrate
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.mcp.instructions import INSTRUCTIONS
-from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -148,89 +151,6 @@ def _seeded_note(now: datetime, body: str) -> Note:
     )
 
 
-async def _seed_postgres_note(database_url: str, content: bytes) -> None:
-    """Migrate `database_url`, then write `content` at `_SEEDED_PATH` through
-    `PostgresBackend` directly - the `"postgres"` backend's counterpart to
-    `git_fixtures.seed_notes`'s commit onto the bare remote (see
-    `tests/conformance/test_stdio.py`'s identical twin).
-
-    No `app_role` (ADR-0008 addendum, #116): this connects, and writes, as
-    the migrating owner - the one identity every content table's
-    owner-only policy always lets through regardless of namespace, exactly
-    like Git-mode indexing or `reindex --full` would.
-    """
-    migration_conn = await asyncpg.connect(database_url)
-    try:
-        await migrate(migration_conn)
-    finally:
-        await migration_conn.close()
-
-    pool = await asyncpg.create_pool(database_url)
-    try:
-        await PostgresBackend(pool).write(
-            _SEEDED_PATH, content, if_version="new", client="conformance-seed"
-        )
-    finally:
-        await pool.close()
-
-
-async def _seed_personal_namespace(database_url: str, *, oid: str, alias: str) -> None:
-    """Seed `namespaces`/`users` rows so `oid`'s own namespace `alias` is
-    readable/writable under RLS (`mm_readable_ns`/`mm_writable_ns`,
-    `migrations/0005_rls.sql`) - connects as the owner, which carries no RLS
-    on these two membership tables at all.
-    """
-    conn = await asyncpg.connect(database_url)
-    try:
-        await conn.execute(
-            "insert into users (oid, tid, display_name) values ($1, 'tenant-conformance', $1)",
-            oid,
-        )
-        await conn.execute(
-            "insert into namespaces (kind, external_key, alias) values ('user', $1, $2)",
-            oid,
-            alias,
-        )
-    finally:
-        await conn.close()
-
-
-async def _create_app_role(admin_database_url: str) -> str:
-    """A disposable, non-owner, non-superuser role for the RLS request path
-    (ADR-0008 addendum, #116). Roles are cluster-wide - created against
-    `admin_database_url`, not the per-test database - and never granted here:
-    the subprocess's own `open_services` does that at startup
-    (`db.rls.grant_app_role`), once `DATABASE_APP_ROLE` names it.
-    """
-    role = f"mm_test_app_{secrets.token_hex(8)}"
-    conn = await asyncpg.connect(admin_database_url)
-    try:
-        await conn.execute(f'create role "{role}" nologin nosuperuser nobypassrls')
-    finally:
-        await conn.close()
-    return role
-
-
-async def _drop_app_role(admin_database_url: str, database_url: str, role: str) -> None:
-    """Undo `_create_app_role`, in the order that avoids `DependentObjectsStillExistError`
-    (see `tests/test_app.py`'s identical `app_role` fixture for why)."""
-    owned_conn: asyncpg.Connection | None
-    try:
-        owned_conn = await asyncpg.connect(database_url)
-    except asyncpg.PostgresError:
-        owned_conn = None
-    if owned_conn is not None:
-        try:
-            await owned_conn.execute(f'drop owned by "{role}"')
-        finally:
-            await owned_conn.close()
-    admin_conn = await asyncpg.connect(admin_database_url)
-    try:
-        await admin_conn.execute(f'drop role if exists "{role}"')
-    finally:
-        await admin_conn.close()
-
-
 @pytest_asyncio.fixture(params=["git", "postgres"], ids=["git", "postgres"])
 async def http_env(
     request: pytest.FixtureRequest,
@@ -263,9 +183,9 @@ async def http_env(
     content = serialize(note)
 
     if request.param == "postgres":
-        await _seed_postgres_note(test_database_url, content)
-        await _seed_personal_namespace(test_database_url, oid=_OWNER_OID, alias="me")
-        role = await _create_app_role(admin_database_url)
+        await seed_postgres_notes(test_database_url, {_SEEDED_PATH: content})
+        await seed_personal_namespace(test_database_url, oid=_OWNER_OID, alias="me")
+        role = await create_app_role(admin_database_url)
         try:
             yield {
                 "STORAGE_BACKEND": "postgres",
@@ -274,7 +194,7 @@ async def http_env(
                 "DATABASE_APP_ROLE": role,
             }
         finally:
-            await _drop_app_role(admin_database_url, test_database_url, role)
+            await drop_app_role(admin_database_url, test_database_url, role)
         return
 
     seed_notes(bare_remote, {_SEEDED_PATH: content})
@@ -492,31 +412,6 @@ async def test_handshake_and_tool_surface(
 
 # --- Client profile (#131, ADR-0010): override, clientInfo mapping, deliverability --
 
-_METRIC_LINE_RE = re.compile(r"^(?P<name>\w+)\{(?P<labels>[^}]*)\}\s+(?P<value>\S+)$")
-_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
-
-
-def _counter_value(text: str, name: str, **labels: str) -> float:
-    """The sample value of `name{labels...}` in a Prometheus text-exposition `text`,
-    or `0.0` if that exact label set never appeared - the same "absent means zero"
-    reading a fresh `Counter` already has before its first `.inc()`.
-    """
-    for line in text.splitlines():
-        match = _METRIC_LINE_RE.match(line)
-        if match is None or match["name"] != name:
-            continue
-        if dict(_LABEL_RE.findall(match["labels"])) == labels:
-            return float(match["value"])
-    return 0.0
-
-
-async def _tool_calls_total(server: _Server, *, profile: str) -> float:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"{server.base_url}/metrics")
-    return _counter_value(
-        response.text, "mm_tool_calls_total", tool="memory_index", outcome="ok", profile=profile
-    )
-
 
 async def test_default_profile_is_unchanged_without_an_override(
     http_server: _Server, http_headers: dict[str, str]
@@ -596,14 +491,14 @@ async def test_override_wins_over_a_mapped_client_info_name_on_the_modern_protoc
             result = await client.call_tool("memory_index", {})
             assert result.is_error is False
 
-    before_mapped = await _tool_calls_total(http_server, profile="claude-code")
+    before_mapped = await tool_calls_total(http_server, profile="claude-code")
     await call(http_server.mcp_url)
-    after_mapped = await _tool_calls_total(http_server, profile="claude-code")
+    after_mapped = await tool_calls_total(http_server, profile="claude-code")
     assert after_mapped - before_mapped == 1
 
-    before_default = await _tool_calls_total(http_server, profile="default")
+    before_default = await tool_calls_total(http_server, profile="default")
     await call(f"{http_server.mcp_url}?profile=default")
-    after_default = await _tool_calls_total(http_server, profile="default")
+    after_default = await tool_calls_total(http_server, profile="default")
     assert after_default - before_default == 1
 
 
@@ -624,14 +519,14 @@ async def test_override_wins_over_default_on_the_legacy_protocol(
             result = await client.call_tool("memory_index", {})
             assert result.is_error is False
 
-    before_default = await _tool_calls_total(http_server, profile="default")
+    before_default = await tool_calls_total(http_server, profile="default")
     await call(http_server.mcp_url)
-    after_default = await _tool_calls_total(http_server, profile="default")
+    after_default = await tool_calls_total(http_server, profile="default")
     assert after_default - before_default == 1
 
-    before_override = await _tool_calls_total(http_server, profile="claude-code")
+    before_override = await tool_calls_total(http_server, profile="claude-code")
     await call(f"{http_server.mcp_url}?profile=claude-code")
-    after_override = await _tool_calls_total(http_server, profile="claude-code")
+    after_override = await tool_calls_total(http_server, profile="claude-code")
     assert after_override - before_override == 1
 
 

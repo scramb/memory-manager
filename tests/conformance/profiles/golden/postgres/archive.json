@@ -1,0 +1,37 @@
+{
+  "backend": "postgres",
+  "format": 1,
+  "scenario": "archive",
+  "steps": [
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance archive\ndescription: Created for the archive scenario.\ntype: fact\n---\nTo be archived.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-archive.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "commit": "<commit:1>",
+        "id": "<ulid:1>",
+        "path": "me/fact/conformance-archive.md",
+        "version": "<version:1>"
+      },
+      "tool": "memory_write"
+    },
+    {
+      "arguments": {
+        "if_version": "<version:1>",
+        "path": "me/fact/conformance-archive.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "archived_path": "_archive/me/fact/conformance-archive.md",
+        "commit": "<commit:2>",
+        "version": "<version:2>"
+      },
+      "tool": "memory_archive"
+    }
+  ]
+}

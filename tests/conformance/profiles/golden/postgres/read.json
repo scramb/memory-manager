@@ -1,0 +1,27 @@
+{
+  "backend": "postgres",
+  "format": 1,
+  "scenario": "read",
+  "steps": [
+    {
+      "arguments": {
+        "items": [
+          "me/fact/conformance-seed.md"
+        ]
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "result": [
+          {
+            "content": "---\nid: <ulid:1>\ntitle: Conformance seed\ndescription: Seeded for the conformance suite.\ntype: fact\ntags: [color]\ncreated: <datetime>\nupdated: <datetime>\n---\nBlue.\n",
+            "id": "<ulid:1>",
+            "path": "me/fact/conformance-seed.md",
+            "version": "<version:1>"
+          }
+        ]
+      },
+      "tool": "memory_read"
+    }
+  ]
+}

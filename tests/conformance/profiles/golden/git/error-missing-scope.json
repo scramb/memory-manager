@@ -1,0 +1,18 @@
+{
+  "backend": "git",
+  "format": 1,
+  "scenario": "error-missing-scope",
+  "steps": [
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance missing scope\ndescription: Should never land - the identity lacks memory:write.\ntype: fact\n---\nNope.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-error-missing-scope.md"
+      },
+      "identity": "read_only",
+      "is_error": true,
+      "text": "Error executing tool memory_write: token lacks memory:write",
+      "tool": "memory_write"
+    }
+  ]
+}

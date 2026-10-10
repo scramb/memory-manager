@@ -1,0 +1,60 @@
+{
+  "backend": "git",
+  "format": 1,
+  "scenario": "error-stale-version",
+  "steps": [
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance stale version\ndescription: Created for the error-stale-version scenario.\ntype: fact\n---\nFirst.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-error-stale-version.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "commit": "<commit:1>",
+        "id": "<ulid:1>",
+        "path": "me/fact/conformance-error-stale-version.md",
+        "version": "<version:1>"
+      },
+      "tool": "memory_write"
+    },
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance stale version\ndescription: Created for the error-stale-version scenario.\ntype: fact\n---\nSecond, never actually written.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-error-stale-version.md"
+      },
+      "identity": "primary",
+      "is_error": true,
+      "structured": {
+        "current_content": "---\nid: <ulid:1>\ntitle: Conformance stale version\ndescription: Created for the error-stale-version scenario.\ntype: fact\ncreated: <datetime>\nupdated: <datetime>\n---\nFirst.\n",
+        "current_version": "<version:1>",
+        "error": "VersionConflict",
+        "message": "'me/fact/conformance-error-stale-version.md' has moved to version <version:1>, if_version is stale",
+        "path": "me/fact/conformance-error-stale-version.md"
+      },
+      "tool": "memory_write"
+    },
+    {
+      "arguments": {
+        "items": [
+          "me/fact/conformance-error-stale-version.md"
+        ]
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "result": [
+          {
+            "content": "---\nid: <ulid:1>\ntitle: Conformance stale version\ndescription: Created for the error-stale-version scenario.\ntype: fact\ncreated: <datetime>\nupdated: <datetime>\n---\nFirst.\n",
+            "id": "<ulid:1>",
+            "path": "me/fact/conformance-error-stale-version.md",
+            "version": "<version:1>"
+          }
+        ]
+      },
+      "tool": "memory_read"
+    }
+  ]
+}

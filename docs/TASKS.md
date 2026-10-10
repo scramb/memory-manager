@@ -381,7 +381,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open
 
-- [ ] #136 The conformance suite runs the full tool set and its error cases once per profile ⛔ blocked by #132
+- [x] #136 The conformance suite runs the full tool set and its error cases once per profile
 
 ### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
 
