@@ -13,7 +13,7 @@ Verification commands are written as `make <target>`; the Makefile is created in
 
 Goal: planning files, accepted ADRs for language, license, git library and auth model, green CI skeleton. · Due: open
 
-### WP-01 — Planning skeleton · Branch: `wp/01-planning-skeleton` · PR: open
+### WP-01 — Planning skeleton · Branch: `wp/01-planning-skeleton` · PR: #55
 
 - [x] #1 `CLAUDE.md`, `docs/PLAN.md`, `docs/TASKS.md` exist and pass `scripts/check-docs.sh`
 - [x] #2 Research notes on MCP spec, authorization, claude.ai connectors and SDKs are in `docs/research/` with sources
@@ -163,16 +163,16 @@ Goal: complete docs, security review done, importers, first signed release.
 
 Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shared state, two replicas on one dataset, first latency baseline. · Due: open
 
-### WP-16 — Enterprise decisions · F-01 · Branch: `wp/16-enterprise-decisions` · PR: open
+### WP-16 — Enterprise decisions · F-01 · Branch: `wp/16-enterprise-decisions` · PR: #110
 
 - [x] #93 Enterprise decisions are recorded as accepted ADRs with research and the F-01 plan
 
-### WP-17 — Storage backend interface · F-01 · Branch: `wp/17-storage-interface` · PR: open
+### WP-17 — Storage backend interface · F-01 · Branch: `wp/17-storage-interface` · PR: #111
 
 - [x] #94 A `StorageBackend` protocol with a Git implementation passes a backend contract suite
 - [x] #95 MCP tools, app wiring and CLI use only `StorageBackend`
 
-### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: open
+### WP-18 — Postgres backend · F-01 · Branch: `wp/18-postgres-backend` · PR: #114
 
 - [x] #96 The Postgres backend stores notes with append-only revisions and passes the read/write/edit contract tests
 - [x] #97 `PostgresBackend` passes the full storage contract suite
@@ -180,7 +180,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #98 The indexer builds the search index from `vault_notes` in the write transaction
 - [x] #99 Parallel writers in two processes against one Postgres lose no writes
 
-### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: open
+### WP-19 — Namespaces and RLS · F-01 · Branch: `wp/19-namespace-rls` · PR: #121
 
 - [x] #100 RLS limits every content table to the caller's namespaces even without a WHERE clause
 - [x] #115 Static tokens carry an owner principal for Postgres mode
@@ -190,13 +190,13 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 - [x] #101 Principal and alias resolution enforce the namespace permission matrix in application code
 - [x] #102 Search and index results carry `namespace_kind`
 
-### WP-20 — Shared state and replicas · F-01 · Branch: `wp/20-shared-state` · PR: open
+### WP-20 — Shared state and replicas · F-01 · Branch: `wp/20-shared-state` · PR: #113
 
 - [x] #103 Rate limits, the login brute-force window and pending login state live in a Postgres-backed `SharedState`
 - [x] #104 A Valkey implementation of `SharedState` passes the same contract suite
 - [x] #105 Shutdown drains in-flight requests and the stateless transport behaviour is pinned by tests
 
-### WP-21 — Latency baseline · F-01 · Branch: `wp/21-load-baseline` · PR: open
+### WP-21 — Latency baseline · F-01 · Branch: `wp/21-load-baseline` · PR: #139
 
 - [x] #106 Two server processes serve one Postgres dataset consistently
 - [x] #122 Rate limiters count in separate key spaces
@@ -214,7 +214,7 @@ Goal: Postgres backend behind `StorageBackend`, namespaces enforced by RLS, shar
 
 Goal: Entra sign-in through the facade with roles and groups, a worker with an embedding queue, and deprovisioning through the Graph delta sync. · Due: open
 
-### WP-22 — Entra login · F-01 · Branch: `wp/22-entra-login` · PR: open
+### WP-22 — Entra login · F-01 · Branch: `wp/22-entra-login` · PR: #284
 
 - [x] #212 Mock Entra IdP (OIDC + Graph) under tests/mock_idp/
 - [x] #213 Codes/tokens bound to `users`; verifier emits oid/roles/groups
@@ -222,7 +222,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 - [x] #215 `LOGIN_MODE=entra` with tenant allowlist, roles, groups incl. overage ⛔ blocked by #213, #214
 - [x] #216 Refresh re-check via Graph, 15-min access tokens, `ENTRA_MAX_SESSION` ⛔ blocked by #215
 
-### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: open
+### WP-23 — Worker and embedding queue · F-01 · Branch: `wp/23-worker-embeddings` · PR: #287
 
 - [x] #125 Vector-index spike → `docs/research/vector-index.md` + ADR-0016 (Proposed)
 - [x] #217 `memory-manager worker` with health/ready/metrics port; singleton jobs; OAuth cleanup moved from api
@@ -231,7 +231,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 - [x] #220 Chunks schema per ADR-0016; `EMBEDDING_DIMENSIONS` pinned at first migrate ⛔ blocked by #125, ADR-0016 accepted (spike #125), #219
 - [x] #221 Per-kind vector search with ADR-0016 HNSW settings, RRF-fused ⛔ blocked by #220
 
-### WP-24 — Deprovisioning · F-01 · Branch: `wp/24-deprovisioning` · PR: open
+### WP-24 — Deprovisioning · F-01 · Branch: `wp/24-deprovisioning` · PR: #290
 
 - [x] #222 `disable_user`: revoke all token families + owned static tokens ⛔ blocked by #213, #216
 - [x] #223 Graph users delta sync job in the worker ⛔ blocked by #222, #217, #214
@@ -244,7 +244,7 @@ Goal: Entra sign-in through the facade with roles and groups, a worker with an e
 
 Goal: `memory_promote`, `/account` self-service and admin area, break-glass, erasure and retention, quotas, blocklists, SIEM export and `migrate git-to-postgres`. · Due: open
 
-### WP-25 — Promote and account self-service · F-01 · Branch: `wp/25-promote-account` · PR: open
+### WP-25 — Promote and account self-service · F-01 · Branch: `wp/25-promote-account` · PR: #289
 
 - [x] #226 Both storage backends promote a note as a new superseding note
 - [x] #227 Claude promotes a personal note into a shared namespace with `memory_promote` ⛔ blocked by #226
@@ -252,7 +252,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 - [x] #229 Signed-in users reach the `/account` page in every embedded login mode ⛔ blocked by #228, #215
 - [x] #230 Users download their personal memory as a Markdown ZIP from `/account` ⛔ blocked by #229
 
-### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: open
+### WP-26 — Admin area, break-glass and erasure · F-01 · Branch: `wp/26-admin-erasure` · PR: #294
 
 - [x] #231 Erasure hard-deletes a note, a namespace or a user's memory and pseudonymizes what stays ⛔ blocked by #219, #216
 - [x] #232 Users erase their own personal memory after typing a confirmation ⛔ blocked by #229, #231
@@ -266,14 +266,14 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 - [x] #240 Personal memories of deprovisioned users are erased after `PERSONAL_RETENTION_DAYS` ⛔ blocked by #231, #219, #223
 - [x] #241 After a user is deleted no content of theirs remains and their shared traces are pseudonymized ⛔ blocked by #236, #240
 
-### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: open
+### WP-27 — Quotas, blocklists and SIEM export · F-01 · Branch: `wp/27-quotas-blocklists` · PR: #286
 
 - [x] #242 Write rate quotas per user, namespace and token hold across replicas
 - [x] #243 Note count and size quotas reject writes that would exceed a namespace's limit ⛔ blocked by #242
 - [x] #244 Writes matching an operator blocklist category are rejected and audited without content ⛔ blocked by #226
 - [x] #245 Every audit record is exported to stdout or OTLP for a SIEM
 
-### WP-28 — Git-to-Postgres migration · F-01 · Branch: `wp/28-migrate-git` · PR: open
+### WP-28 — Git-to-Postgres migration · F-01 · Branch: `wp/28-migrate-git` · PR: #285
 
 - [x] #246 `migrate git-to-postgres --dry-run` reports the namespace mapping and every note it would import
 - [x] #247 `migrate git-to-postgres` imports current notes byte-identically with Git history as revisions ⛔ blocked by #246
@@ -286,7 +286,7 @@ Goal: `memory_promote`, `/account` self-service and admin area, break-glass, era
 
 Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kind, and observability. · Due: open
 
-### WP-29 — Helm enterprise profile · F-01 · Branch: `wp/29-helm-enterprise` · PR: open
+### WP-29 — Helm enterprise profile · F-01 · Branch: `wp/29-helm-enterprise` · PR: #282
 
 - [x] #249 The chart refuses more than one replica or an autoscaler unless storage.backend is postgres
 - [x] #250 The chart renders separate api and worker Deployments with graceful shutdown for the postgres backend ⛔ blocked by #249, #219
@@ -296,14 +296,14 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 - [x] #254 The chart can deploy an optional Valkey without persistence for shared state ⛔ blocked by #250, #253
 - [x] #255 NetworkPolicies limit api, worker, Valkey and Postgres traffic to the needed flows ⛔ blocked by #251, #252, #254
 
-### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: open
+### WP-30 — Entra module and Flux example · F-01 · Branch: `wp/30-entra-flux` · PR: #288
 
 - [x] #256 An OpenTofu module under deploy/entra creates the Entra app registration for the auth facade ⛔ blocked by #216
 - [x] #257 A Flux enterprise example deploys the chart with the enterprise profile ⛔ blocked by #255, #216
 - [x] #258 A kind E2E workflow rolls out the Flux enterprise example and gets /readyz 200 from three api replicas ⛔ blocked by #257, #216, #219
 - [x] #259 An operator guide explains how to run the enterprise profile end to end ⛔ blocked by #256, #257, #258
 
-### WP-31 — Observability · F-01 · Branch: `wp/31-observability` · PR: open
+### WP-31 — Observability · F-01 · Branch: `wp/31-observability` · PR: #292
 
 - [x] #260 Every rate-limit and quota rejection is counted per limiter in /metrics ⛔ blocked by #242, #243
 - [x] #261 Job queue length and embedding lag are exported as Prometheus gauges ⛔ blocked by #219
@@ -318,7 +318,7 @@ Goal: Helm enterprise profile, Entra OpenTofu module, Flux example proven on kin
 
 Goal: Target-size load test incl. replica failure, threat model and compliance templates, upgrade guide and release v0.2.0. · Due: open
 
-### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: open
+### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: #298
 
 - [x] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
 - [x] #267 Loader writes chunks with synthetic vectors and builds the ADR-0016 HNSW index ⛔ blocked by #266, #221
@@ -330,7 +330,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 - [x] #296 Unfiltered vector searches on the user partition use the namespace B-tree instead of scanning every chunk
 - [x] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
 
-### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
+### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: #295
 
 - [x] #272 STRIDE threat model covers every trust boundary of the enterprise deployment ⛔ blocked by #232, #227, #230, #241, #233, #238, #239, #235, #243, #244, #245, #255
 - [x] #273 Pen-test checklist turns the threat model into executable test cases ⛔ blocked by #272
@@ -338,12 +338,12 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 - [x] #275 Compliance templates for the deletion concept with backup horizon and roles and permissions ⛔ blocked by #274, #241, #233, #238, #239, #235, #243, #244, #245, #252
 - [x] #276 Compliance templates for DPIA, employee transparency notice and Germany section ⛔ blocked by #274, #275
 
-### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: open
+### WP-34 — Release v0.2.0 · F-01 · Branch: `wp/34-release-0-2` · PR: #299
 
 - [x] #277 Upgrade smoke test proves 0.1.x → 0.2.0 incl. migration and export rollback ⛔ blocked by #248
 - [x] #278 Upgrade guide 0.1.x → 0.2.0 incl. git-to-postgres migration and export rollback ⛔ blocked by #277, #259
 - [x] #279 README enterprise section with links to guides, benchmark and compliance ⛔ blocked by #278, #271, #276
-- [ ] #280 v0.2.0 released with cosign-verified image and Helm chart ⛔ blocked by #224, #225, #273, #279
+- [x] #280 v0.2.0 released with cosign-verified image and Helm chart ⛔ blocked by #224, #225, #273, #279
 
 ---
 

@@ -5,7 +5,7 @@
 > lives exclusively in `docs/TASKS.md`.
 > Source of truth for tasks: GitHub issues in `scramb/memory-manager`; `docs/TASKS.md` is the readable mirror.
 
-Last updated: 2026-10-08 (F-02 decisions, F-01 M8–M11 decisions) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
+Last updated: 2026-10-10 (F-01 done with v0.2.0) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
 
 ## Goal
 
@@ -146,7 +146,7 @@ F-01 (M8–M11) is built before F-02 (M12–M17) starts (O32).
 
 | Feature | Benefit | Milestones | Status |
 |---|---|---|---|
-| [F-01 Enterprise Scale](./features/F-01-enterprise-scale.md) | about 2,000 Entra users with personal, group, project and org memory on a horizontally scaled server | M7–M11 | in progress |
+| [F-01 Enterprise Scale](./features/F-01-enterprise-scale.md) | about 2,000 Entra users with personal, group, project and org memory on a horizontally scaled server | M7–M11 | done (v0.2.0; latency follow-up #297) |
 | [F-02 Client Integrations](./features/F-02-client-integrations.md) | one memory from every common AI client (Open WebUI, IDEs, CLIs, agent runtimes, ChatGPT, Gemini), set up with `connect` and checked with `doctor`; ends in v1.0.0-rc | M12–M17 | planned |
 
 ## Open decisions

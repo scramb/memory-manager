@@ -1,6 +1,6 @@
 # F-01 — Enterprise Scale
 
-Status: in progress · Created: 2026-10-07
+Status: done (v0.2.0, 2026-10-10; latency targets at target size not met, follow-up #297) · Created: 2026-10-07
 Milestones: M7, M8, M9, M10, M11 · Work packages: WP-16 … WP-34 · Label: `feature:F-01`
 
 ## Benefit
