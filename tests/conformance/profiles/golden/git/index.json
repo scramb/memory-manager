@@ -1,0 +1,29 @@
+{
+  "backend": "git",
+  "format": 1,
+  "scenario": "index",
+  "steps": [
+    {
+      "arguments": {},
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "result": [
+          {
+            "description": "Seeded for the conformance suite.",
+            "id": "<ulid:1>",
+            "namespace_kind": null,
+            "path": "me/fact/conformance-seed.md",
+            "tags": [
+              "color"
+            ],
+            "title": "Conformance seed",
+            "type": "fact",
+            "updated": "<datetime>"
+          }
+        ]
+      },
+      "tool": "memory_index"
+    }
+  ]
+}

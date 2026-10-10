@@ -1,0 +1,39 @@
+{
+  "backend": "postgres",
+  "format": 1,
+  "scenario": "error-foreign-namespace",
+  "steps": [
+    {
+      "arguments": {
+        "items": [
+          "ns-a/fact/conformance-error-foreign-namespace.md"
+        ]
+      },
+      "identity": "foreign",
+      "is_error": false,
+      "structured": {
+        "result": [
+          {
+            "error": {
+              "error": "NotFound",
+              "message": "'ns-a/fact/conformance-error-foreign-namespace.md' does not exist"
+            },
+            "item": "ns-a/fact/conformance-error-foreign-namespace.md"
+          }
+        ]
+      },
+      "tool": "memory_read"
+    },
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance foreign namespace\ndescription: Should never land - a different principal's namespace.\ntype: fact\n---\nNope.\n",
+        "if_version": "new",
+        "path": "ns-a/fact/conformance-error-foreign-namespace.md"
+      },
+      "identity": "foreign",
+      "is_error": true,
+      "text": "Error executing tool memory_write: caller may not write to namespace 'ns-a'",
+      "tool": "memory_write"
+    }
+  ]
+}

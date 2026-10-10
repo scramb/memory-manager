@@ -1,0 +1,33 @@
+{
+  "backend": "git",
+  "format": 1,
+  "scenario": "search",
+  "steps": [
+    {
+      "arguments": {
+        "query": "conformance"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "mode": "fulltext",
+        "results": [
+          {
+            "description": "Seeded for the conformance suite.",
+            "id": "<ulid:1>",
+            "namespace_kind": null,
+            "path": "me/fact/conformance-seed.md",
+            "score": "<score>",
+            "snippet": "**Conformance** seed\nSeeded for the **conformance** suite.\nTags: color\n\nBlue",
+            "tags": [
+              "color"
+            ],
+            "title": "Conformance seed",
+            "type": "fact"
+          }
+        ]
+      },
+      "tool": "memory_search"
+    }
+  ]
+}

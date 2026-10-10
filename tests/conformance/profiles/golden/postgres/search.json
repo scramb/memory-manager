@@ -1,0 +1,19 @@
+{
+  "backend": "postgres",
+  "format": 1,
+  "scenario": "search",
+  "steps": [
+    {
+      "arguments": {
+        "query": "conformance"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "mode": "fulltext",
+        "results": []
+      },
+      "tool": "memory_search"
+    }
+  ]
+}

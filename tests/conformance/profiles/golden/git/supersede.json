@@ -1,0 +1,47 @@
+{
+  "backend": "git",
+  "format": 1,
+  "scenario": "supersede",
+  "steps": [
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance supersede (old)\ndescription: Created for the supersede scenario.\ntype: fact\n---\nOutdated.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-supersede.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "commit": "<commit:1>",
+        "id": "<ulid:1>",
+        "path": "me/fact/conformance-supersede.md",
+        "version": "<version:1>"
+      },
+      "tool": "memory_write"
+    },
+    {
+      "arguments": {
+        "if_version": "<version:1>",
+        "new_content": "---\ntitle: Conformance supersede (new)\ndescription: Replaces the old note.\ntype: fact\n---\nCurrent.\n",
+        "new_path": "me/fact/conformance-supersede-new.md",
+        "old": "me/fact/conformance-supersede.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "commit": "<commit:2>",
+        "new": {
+          "id": "<ulid:2>",
+          "path": "me/fact/conformance-supersede-new.md",
+          "version": "<version:2>"
+        },
+        "old": {
+          "path": "me/fact/conformance-supersede.md",
+          "valid_to": "<today>",
+          "version": "<version:3>"
+        }
+      },
+      "tool": "memory_supersede"
+    }
+  ]
+}

@@ -379,9 +379,9 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 - [x] #134 Personal tokens carry a kind and are bounded by their owner's rights
 - [x] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, #229
 
-### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open
+### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: #311
 
-- [ ] #136 The conformance suite runs the full tool set and its error cases once per profile ⛔ blocked by #132
+- [x] #136 The conformance suite runs the full tool set and its error cases once per profile
 
 ### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
 

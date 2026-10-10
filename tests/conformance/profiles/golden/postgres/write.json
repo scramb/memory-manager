@@ -1,0 +1,37 @@
+{
+  "backend": "postgres",
+  "format": 1,
+  "scenario": "write",
+  "steps": [
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance write\ndescription: Created for the write scenario.\ntype: fact\n---\nFirst.\n",
+        "if_version": "new",
+        "path": "me/fact/conformance-write.md"
+      },
+      "identity": "primary",
+      "is_error": false,
+      "structured": {
+        "commit": "<commit:1>",
+        "id": "<ulid:1>",
+        "path": "me/fact/conformance-write.md",
+        "version": "<version:1>"
+      },
+      "tool": "memory_write"
+    },
+    {
+      "arguments": {
+        "content": "---\ntitle: Conformance write\ndescription: Created for the write scenario.\ntype: fact\n---\nReplaced.\n",
+        "if_version": "<version:1>",
+        "path": "me/fact/conformance-write.md"
+      },
+      "identity": "primary",
+      "is_error": true,
+      "structured": {
+        "error": "NoteFormatError",
+        "message": "missing required field 'id'"
+      },
+      "tool": "memory_write"
+    }
+  ]
+}
