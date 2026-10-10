@@ -116,7 +116,7 @@ M12 settles the first two with the linter, the profiles and the conformance suit
 |---|---|---|---|
 | M12 — Shared client foundation | compatibility profiles + linter, usage rules from one source, personal tokens (CLI), conformance suite per profile, `connect`/`doctor --client` for Claude Code, client docs skeleton | `make check` and `uv run pytest tests/conformance` green with profiles `claude-ai` and `claude-code`; the CI job `compat-lint` and `instructions generate --check` run; `memory-manager connect claude-code --dry-run` then `connect` then `doctor --client claude-code` succeed against a local server | WP-35 … WP-41 |
 | M13 — Open WebUI, released on its own | native MCP with per-user OAuth, filter, import of built-in memories, Compose + Helm example, docs; a 0.x release | `uv run pytest tests/e2e/clients/test_openwebui.py` green against the pinned version and the two previous minors (users A and B isolated, filter within budget, same results as the conformance suite); release with a CHANGELOG entry; admin setup per docs in < 15 min (timed by the owner) | WP-42 … WP-46 |
-| **Gate** — support matrix | owner approved *Full / Partial / Not possible* per client on 2026-10-08 | matrix below; copied to `docs/clients/README.md` by #129 (#159) | WP-35 |
+| **Gate** — support matrix | owner approved *Full / Partial / Not possible* per client on 2026-10-08 | matrix in [`../clients/README.md`](../clients/README.md); copied there by #129 (#159) | WP-35 |
 | M14 — IDE and CLI clients | profiles, `integrations/`, `connect`/`doctor` for Codex, Gemini CLI / Code Assist, Cursor, Copilot, Antigravity; local headless harness; org rollout docs | conformance suite green for every approved profile; checklist entries filled for Claude Code, Codex CLI and Gemini CLI (headless harness) and for the GUI clients | WP-47 … WP-51 |
 | M15 — Autonomous agent runtimes | agent identity and write guard, Hermes and OpenClaw at the approved tier, importers | conformance + E2E for both runtimes with pinned versions; the injection test proves that a third party's "remember …" never reaches the owner's namespace | WP-52 … WP-55 |
 | M16 — Web clients | ChatGPT and Gemini Enterprise per the approved matrix; manual client checklist | checklist in `docs/release/client-checklist.md` filled for every GUI/web client, with result and version | WP-56 … WP-58 |
@@ -172,23 +172,7 @@ All milestones are cut into GitHub issues (owner's request, 2026-10-08), not onl
 
 Approved by the owner on 2026-10-08 (O19), based on the desk research of 2026-10-07 in [`docs/research/clients/`](../research/clients/). Each level is re-verified with a tested version when the client's work package starts; a client that turns out weaker is downgraded in `docs/clients/README.md` and reported, never promised.
 
-| Client | MCP transport | Auth that fits our server | Server `instructions` used | Proposed level | Main caveat |
-|---|---|---|---|---|---|
-| claude.ai | Streamable HTTP | OAuth (CIMD/DCR) | yes | Full | — (verified 2026-10-07) |
-| Claude Code | stdio, HTTP | OAuth (CIMD), static token | yes (≤ 2,048 chars) | Full | — (verified) |
-| Open WebUI ≥ 0.6.31 | Streamable HTTP, admin-configured | per-user OAuth (DCR, `client_secret_post`), no CIMD | no | Full (M13) | tool must be enabled per chat; DCR request shape unverified live |
-| Codex CLI / IDE | stdio, Streamable HTTP | CIMD, DCR, bearer from env | no → `AGENTS.md` | Full (cloud agent unverified) | reported MCP call cancellation under `codex exec` |
-| Gemini CLI | stdio, SSE, HTTP | DCR, headers; no CIMD; strict `iss` check | yes | Full | names ≤ 63 chars, `additionalProperties` stripped; free tier status unclear |
-| Gemini Code Assist | via Gemini CLI agent mode | as Gemini CLI | partly | Partial | IDE agent mode only |
-| GitHub Copilot (VS Code, CLI) | stdio, HTTP, SSE | CIMD, DCR, headers | yes | Full | 128 tools per request |
-| Copilot coding agent, JetBrains | HTTP | headers only (no OAuth) in the cloud agent | no | Partial | needs a static token; firewall reachability unknown |
-| Cursor | stdio, HTTP, SSE | DCR, headers; no CIMD | no → rules file | Partial | reported: static `Authorization` header dropped when the server advertises OAuth |
-| Google Antigravity | stdio, HTTP | DCR, CIMD, headers | unverified | Partial | sources mostly secondary |
-| Hermes Agent | stdio, HTTP, SSE | headers, OAuth (DCR) | unverified → skill | Full, tier 1 | third-party messages can trigger writes (ADR-0013) |
-| OpenClaw | stdio, HTTP, SSE | headers, per-requester OAuth | unverified → skill | Full, tier 1 | tier 2 is TypeScript (O17) |
-| ChatGPT | remote MCP apps | OAuth (CIMD, DCR) | unverified | Partial | write actions only on Business/Enterprise/Edu; mobile unclear; secondary sources |
-| Gemini Enterprise | Streamable HTTP, admin data store (preview) | OAuth with pre-registered client only | unverified | Partial ⛔ O18 | no DCR; ≤ 100 actions |
-| Gemini app (consumer) | custom MCP apps, US only | DCR, reported failing | unverified | Not possible (reliably) | revisit at M16 |
+The matrix itself lives in [`docs/clients/README.md`](../clients/README.md).
 
 ## Decisions
 
@@ -202,7 +186,7 @@ All open decisions were taken by the owner on 2026-10-08.
 | O16 | Agent identity and write guard | agent namespace kind, server-side policy, approval queue, explicit delegation | [ADR-0013](../adr/0013-agent-identity.md) |
 | O17 | Native agent integration (tier 2) | tier 1 (MCP) only in v1; #191, #192 closed as not planned | [ADR-0014](../adr/0014-agent-integration-tier.md) |
 | O18 | Clients without DCR/CIMD (Gemini Enterprise) | operator-registered confidential OAuth clients in our AS | [ADR-0015](../adr/0015-preregistered-oauth-clients.md) |
-| O19 | Support matrix | draft approved as is | this file, `docs/clients/README.md` (#129) |
+| O19 | Support matrix | draft approved as is | this file, [`docs/clients/README.md`](../clients/README.md) (#129) |
 | O20 | Docs website tooling | plain Markdown on GitHub, no site generator | PLAN technology decisions |
 | O21 | Model API keys for CLI E2E in CI | none for now; CLI clients are verified manually with the local harness and the checklist; agent runtimes and Open WebUI run in CI against the scripted stub model. Possibly later: a CI token with a spend limit, then the harness runs the CLI checks in CI as well | PLAN technology decisions |
 
