@@ -532,7 +532,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 
 ### WP-59 — Stable API and compatibility policy · F-02 · Branch: `wp/59-stable-api` · PR: open
 
-- [ ] #199 `docs/compatibility.md` defines the SemVer and deprecation policy
+- [x] #199 `docs/compatibility.md` defines the SemVer and deprecation policy
 - [ ] #200 The tool contract, config format, note format and CLI are documented as stable reference ⛔ blocked by #199
 - [ ] #201 A contract snapshot test fails on breaking changes to the tool contract ⛔ blocked by #199
 - [ ] #202 An upgrade guide from the last 0.x release exists and its migrations are tested ⛔ blocked by #199, #280 (F-01 WP-34)
