@@ -409,7 +409,7 @@ def create_app(
             account_pool_cell.pool = services.pool
 
             token_verifier = (
-                StaticTokenVerifier(services.pool)
+                StaticTokenVerifier(services.pool, resolver=services.owner_rights_resolver)
                 if services.pool is not None and oauth_provider is None
                 else None
             )
@@ -743,6 +743,7 @@ def _build_oauth_provider(
             entra_access_token_ttl=authenticator.access_token_ttl,
             entra_max_session=authenticator.max_session,
             entra_refresh_check=authenticator.check_refresh,
+            owner_rights_resolver=services.owner_rights_resolver,
         )
     return MemoryManagerOAuthProvider(
         services.pool,
@@ -750,6 +751,7 @@ def _build_oauth_provider(
         issuer=issuer,
         client_secret_key=config.oauth_client_secret_key,
         cimd_fetcher=resolved_cimd_fetcher,
+        owner_rights_resolver=services.owner_rights_resolver,
     )
 
 

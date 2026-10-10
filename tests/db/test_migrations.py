@@ -51,6 +51,7 @@ class TestMigrate:
             "0020_admin_namespaces",
             "0021_break_glass_workflow",
             "0023_break_glass_notice",
+            "0025_token_kind",
         ]
         tables = {
             row["table_name"]
@@ -107,6 +108,7 @@ class TestMigrate:
             "0020_admin_namespaces",
             "0021_break_glass_workflow",
             "0023_break_glass_notice",
+            "0025_token_kind",
         ]
         assert second == []
 
@@ -139,6 +141,7 @@ class TestMigrate:
             "0020_admin_namespaces",
             "0021_break_glass_workflow",
             "0023_break_glass_notice",
+            "0025_token_kind",
         ]
 
     async def test_succeeds_for_a_non_superuser_role_once_vector_already_exists(
@@ -209,6 +212,7 @@ class TestMigrate:
                 "0020_admin_namespaces",
                 "0021_break_glass_workflow",
                 "0023_break_glass_notice",
+                "0025_token_kind",
             ]
         finally:
             await admin_conn.execute(f'drop database if exists "{db_name}"')
@@ -303,6 +307,7 @@ class TestMigrateBackendPostgres:
             "0021_break_glass_workflow",
             "0023_break_glass_notice",
             "0024_frequent_lexemes_partitions",
+            "0025_token_kind",
         ]
         tables = {
             row["table_name"]

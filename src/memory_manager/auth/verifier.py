@@ -17,6 +17,23 @@ token with an owner principal (`owner_oid` + `roles`, ADR-0008 addendum
 without one carries exactly `{"namespaces": [...]}`, as before (#116 wires
 either into the request path).
 
+A `kind="personal"` token (ADR-0012, #134) additionally has its rights
+bounded by its owner's *current* ones, on every single verification, via
+the optional `resolver` (`auth.owner_rights.OwnerRightsResolver`):
+`resolver is None` (no resolver wired in - every test that builds
+`StaticTokenVerifier`/`verify_bearer_token` directly, without going through
+`app.open_services`) fails closed, `None`, the same as an unknown token -
+never silently treats a personal token as unrestricted. An owner that has
+gone away (`OwnerRights.allowed=False`) also verifies to `None`; otherwise
+`claims["namespaces"]` is narrowed to the intersection of the token's own
+namespaces and the owner's current ones (`owner_rights.intersect_namespaces`)
+- an empty intersection verifies to `None` too, never `claims["namespaces"]
+= []` (`mcp/authz.py`'s `_token_namespaces` reads an empty list as
+*unrestricted*, the exact opposite). `claims["groups"]` is set from
+`OwnerRights.groups` when the resolver found one (`"postgres"` only). A
+`kind="service"`/`"agent"` token's claims are byte-identical to before this
+module ever knew about `kind` at all.
+
 An OAuth access token issued from a completed Entra login (ADR-0006, #213)
 carries the same `claims["oid"]`/`claims["roles"]`, plus `claims["groups"]` -
 read live from `auth.users`/`user_groups` on every verification, never
@@ -44,7 +61,8 @@ import asyncpg
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
 from memory_manager.auth import store, users
-from memory_manager.auth.tokens import verify
+from memory_manager.auth.owner_rights import OwnerRightsResolver, intersect_namespaces
+from memory_manager.auth.tokens import KIND_PERSONAL, verify
 
 __all__ = ["OAUTH_ACCESS_TOKEN_PREFIX", "StaticTokenVerifier", "verify_bearer_token"]
 
@@ -58,15 +76,20 @@ OAUTH_ACCESS_TOKEN_PREFIX = "mma_"  # noqa: S105 - a format marker, not a creden
 class StaticTokenVerifier(TokenVerifier):
     """Verifies a bearer token against the `static_tokens` table in `pool`."""
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, *, resolver: OwnerRightsResolver | None = None) -> None:
         self._pool = pool
+        self._resolver = resolver
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        return await _verify_static_token(self._pool, token)
+        return await _verify_static_token(self._pool, token, resolver=self._resolver)
 
 
 async def verify_bearer_token(
-    pool: asyncpg.Pool, token: str, *, oauth_resource: str
+    pool: asyncpg.Pool,
+    token: str,
+    *,
+    oauth_resource: str,
+    resolver: OwnerRightsResolver | None = None,
 ) -> AccessToken | None:
     """The one place a bearer token on `/mcp` is checked once OAuth is enabled.
 
@@ -78,13 +101,18 @@ async def verify_bearer_token(
     (ADR-0004: audience enforced) is rejected here, not left to
     `AuthSettings.validate_token_resource` - that SDK flag would also reject
     every static token, which carries no `resource` of its own at all.
+    `resolver` (ADR-0012, #134) is only ever consulted for a static token -
+    an OAuth access token is already bounded by its own owner's live
+    `disabled_at`/groups inline, below.
     """
     if token.startswith(OAUTH_ACCESS_TOKEN_PREFIX):
         return await _verify_oauth_access_token(pool, token, oauth_resource=oauth_resource)
-    return await _verify_static_token(pool, token)
+    return await _verify_static_token(pool, token, resolver=resolver)
 
 
-async def _verify_static_token(pool: asyncpg.Pool, token: str) -> AccessToken | None:
+async def _verify_static_token(
+    pool: asyncpg.Pool, token: str, *, resolver: OwnerRightsResolver | None = None
+) -> AccessToken | None:
     info = await verify(pool, token)
     if info is None:
         return None
@@ -92,6 +120,21 @@ async def _verify_static_token(pool: asyncpg.Pool, token: str) -> AccessToken | 
     if info.owner_oid is not None:
         claims["oid"] = info.owner_oid
         claims["roles"] = list(info.roles)
+    if info.kind == KIND_PERSONAL:
+        # `info.owner_oid is None` can only happen for a row inserted outside
+        # `create_token` (the DB CHECK forbids it otherwise) - treated the
+        # same as "no resolver": fail closed rather than verify unbounded.
+        if resolver is None or info.owner_oid is None:
+            return None
+        rights = await resolver.resolve(info.owner_oid)
+        if not rights.allowed:
+            return None
+        narrowed = intersect_namespaces(info.namespaces, rights.namespaces)
+        if narrowed is None:
+            return None
+        claims["namespaces"] = list(narrowed)
+        if rights.groups is not None:
+            claims["groups"] = list(rights.groups)
     return AccessToken(
         token=token,
         client_id=f"{_CLIENT_ID_PREFIX}{info.name}",

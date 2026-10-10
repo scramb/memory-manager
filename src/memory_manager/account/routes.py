@@ -53,6 +53,7 @@ from memory_manager.account import delete as account_delete
 from memory_manager.account import export as account_export
 from memory_manager.account import pending as account_pending
 from memory_manager.account import sessions
+from memory_manager.account import tokens as account_tokens
 from memory_manager.account.sections import DEFAULT_SECTIONS, SectionContext, render_sections
 from memory_manager.account.templates import CSRF_FIELD_NAME, account_page, account_response
 from memory_manager.app import Services
@@ -242,6 +243,9 @@ async def _account_page(request: Request) -> Response:
         is_postgres_backend=isinstance(services.storage, PostgresBackend),
         app_role=services.app_role,
         session_id=session_id,
+        owner_rights_resolver=services.owner_rights_resolver,
+        personal_token_max_days=services.personal_token_max_days,
+        static_token_max_days=services.static_token_max_days,
     )
     sections_html = await render_sections(ctx, DEFAULT_SECTIONS)
     csrf = sessions.csrf_token(session_id, _CSRF_FORM_LOGOUT)
@@ -293,7 +297,10 @@ def page_routes() -> list[Route]:
     `account.break_glass_notice.break_glass_notice_routes` take
     `SESSION_COOKIE` as a parameter rather than importing it directly, so
     those modules stay free to be imported here without a cycle back (their
-    own docstrings).
+    own docstrings). `POST /account/tokens` and `POST /account/tokens/revoke`
+    (`account.tokens.token_routes`, ADR-0012, #135) follow the identical
+    "mounted whenever an `Authenticator` is configured" condition and the
+    identical `SESSION_COOKIE`-as-a-parameter shape.
     """
     return [
         Route(PATH, endpoint=_account_page, methods=["GET"]),
@@ -305,4 +312,5 @@ def page_routes() -> list[Route]:
         *account_break_glass.break_glass_routes(SESSION_COOKIE),
         *account_break_glass_notice.break_glass_notice_routes(SESSION_COOKIE),
         *account_break_glass_viewer.break_glass_viewer_routes(SESSION_COOKIE),
+        *account_tokens.token_routes(SESSION_COOKIE),
     ]

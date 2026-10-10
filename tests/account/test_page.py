@@ -350,8 +350,15 @@ async def test_logout_with_a_valid_csrf_token_revokes_the_session(
     async with _running_app(environ, config, authenticator=authenticator) as (_app, client):
         await _login_with_password(client)
         page_response = await client.get(PATH)
+        # Scoped to the logout form's own action (#135 added a second form - the
+        # token section's create form - ahead of it on the page, so a bare, unscoped
+        # search for the first `CSRF_FIELD_NAME` field would grab that one's token
+        # instead; `tests/account/test_export.py`'s own `_export_csrf_token` scopes
+        # the identical way, for the identical reason).
+        form_marker = f'action="{html.escape(LOGOUT_PATH)}"'
+        form_start = page_response.text.index(form_marker)
         marker = f'name="{CSRF_FIELD_NAME}" value="'
-        start = page_response.text.index(marker) + len(marker)
+        start = page_response.text.index(marker, form_start) + len(marker)
         end = page_response.text.index('"', start)
         csrf_token = html.unescape(page_response.text[start:end])
 

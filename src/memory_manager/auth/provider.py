@@ -82,6 +82,7 @@ from memory_manager.auth import store
 from memory_manager.auth.cimd import CimdError, ClientMetadataFetcher
 from memory_manager.auth.login import LoginPrincipal, PendingAuthorization
 from memory_manager.auth.login_entra import EntraRefreshOutcome
+from memory_manager.auth.owner_rights import OwnerRightsResolver
 from memory_manager.auth.verifier import OAUTH_ACCESS_TOKEN_PREFIX, verify_bearer_token
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 
@@ -241,6 +242,7 @@ class MemoryManagerOAuthProvider(
         entra_access_token_ttl: timedelta = _ENTRA_DEFAULT_ACCESS_TOKEN_TTL,
         entra_max_session: timedelta = _ENTRA_DEFAULT_MAX_SESSION,
         entra_refresh_check: EntraRefreshCheck | None = None,
+        owner_rights_resolver: OwnerRightsResolver | None = None,
     ) -> None:
         self._pool = pool
         self._resource = resource
@@ -262,6 +264,11 @@ class MemoryManagerOAuthProvider(
         self._entra_access_token_ttl = entra_access_token_ttl
         self._entra_max_session = entra_max_session
         self._entra_refresh_check = entra_refresh_check
+        # ADR-0012, #134: only ever consulted by `load_access_token` -> `verify_bearer_token`
+        # for a `kind="personal"` *static* token; an OAuth access token (every token this
+        # provider itself issues) is already bounded by its own owner's live `disabled_at`/
+        # groups inline (`verify_bearer_token`'s own `_verify_oauth_access_token` branch).
+        self._owner_rights_resolver = owner_rights_resolver
 
     @property
     def resource(self) -> str:
@@ -579,7 +586,12 @@ class MemoryManagerOAuthProvider(
     # ---- access -------------------------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        return await verify_bearer_token(self._pool, token, oauth_resource=self._resource)
+        return await verify_bearer_token(
+            self._pool,
+            token,
+            oauth_resource=self._resource,
+            resolver=self._owner_rights_resolver,
+        )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         kind = "refresh" if isinstance(token, RefreshToken) else "access"
