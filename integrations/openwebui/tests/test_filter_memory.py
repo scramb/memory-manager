@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Tests for the Open WebUI `inlet` filter (#147, ADR-0011, ADR-0012).
+"""Tests for the Open WebUI `inlet`/`outlet` filter (#147, #148, ADR-0011,
+ADR-0012).
 
 Deliberately no `conftest.py` next to this file (blast radius of #147): the
 filter module itself has nothing other tests need to share, and the
 self-containment test below relies on `filter_memory.py` having no sibling
 module of its own to depend on in the first place.
+
+The `outlet` tests below only ever go through the public `Filter.outlet`
+surface - never a private helper - the same black-box style the `inlet`
+tests above already use.
 """
 
 from __future__ import annotations
@@ -339,3 +344,471 @@ async def test_inlet_module_is_self_contained_with_only_allowed_imports() -> Non
     assert hasattr(module, "Filter")
     loaded_filter = module.Filter()
     assert isinstance(loaded_filter, module.Filter)
+
+
+# --- outlet (#148) -------------------------------------------------------------------------
+
+
+def _outlet_body(
+    user_text: str,
+    *,
+    assistant_text: str = "Sure, done.",
+    output: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    assistant: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+    if output is not None:
+        assistant["output"] = output
+    return {
+        "model": "gpt-x",
+        "messages": [
+            {"role": "user", "content": user_text},
+            assistant,
+        ],
+    }
+
+
+def _assistant_content(result: dict[str, object]) -> str:
+    messages = result["messages"]
+    assert isinstance(messages, list)
+    assistant = messages[-1]
+    assert isinstance(assistant, dict)
+    content = assistant["content"]
+    assert isinstance(content, str)
+    return content
+
+
+def _rpc_ok(structured: dict[str, object]) -> httpx.Response:
+    message = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "isError": False,
+            "structuredContent": structured,
+            "content": [{"type": "text", "text": json.dumps(structured)}],
+        },
+    }
+    return httpx.Response(200, json=message)
+
+
+def _rpc_error(text: str, structured: dict[str, object] | None = None) -> httpx.Response:
+    result: dict[str, object] = {"isError": True, "content": [{"type": "text", "text": text}]}
+    if structured is not None:
+        result["structuredContent"] = structured
+    message = {"jsonrpc": "2.0", "id": 1, "result": result}
+    return httpx.Response(200, json=message)
+
+
+def _search_result(hits: list[MemorySearchResult]) -> httpx.Response:
+    return _rpc_ok({"results": hits, "mode": "git"})
+
+
+def _read_result(items: list[dict[str, object]]) -> httpx.Response:
+    return _rpc_ok({"result": items})
+
+
+def _write_result(path: str, *, version: str = "v1") -> httpx.Response:
+    return _rpc_ok(
+        {"path": path, "id": "01J00000000000000000000000", "version": version, "commit": "c1"}
+    )
+
+
+def _archive_result(path: str, *, version: str = "v2") -> httpx.Response:
+    return _rpc_ok({"archived_path": path, "version": version, "commit": "c2"})
+
+
+def _scope_error(tool: str) -> httpx.Response:
+    return _rpc_error(f"Error executing tool {tool}: token lacks memory:write")
+
+
+def _dispatcher(
+    responses: dict[str, list[httpx.Response]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """A fake MCP server: `tools/call`s are answered in the order queued per
+    tool name (`responses[name]`), mirroring the conformance golden
+    transcripts' one-step-per-call shape without needing a real server."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        name = payload["params"]["name"]
+        queue = responses.get(name)
+        if not queue:
+            raise AssertionError(f"unexpected tools/call to {name!r}: {payload['params']}")
+        return queue.pop(0)
+
+    return handler
+
+
+def _call_names(requests: list[httpx.Request]) -> list[str]:
+    return [json.loads(request.content)["params"]["name"] for request in requests]
+
+
+async def test_outlet_sends_no_request_without_a_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter(outlet_enabled=True)
+    body = _outlet_body("What's the weather like?")
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+async def test_outlet_ignores_a_trigger_in_the_assistant_turn_and_sends_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter(outlet_enabled=True)
+    body = _outlet_body(
+        "What's the weather like?", assistant_text="remember that I said it's sunny"
+    )
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+async def test_outlet_sends_no_request_when_outlet_enabled_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter()
+    body = _outlet_body("remember I like tea")
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+@pytest.mark.parametrize("user_text", ["Do you remember my favorite color?", "remember my color?"])
+async def test_outlet_sends_no_request_for_a_question(
+    monkeypatch: pytest.MonkeyPatch, user_text: str
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter(outlet_enabled=True)
+    body = _outlet_body(user_text)
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+async def test_outlet_forget_trigger_followed_by_negation_sends_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter(outlet_enabled=True)
+    body = _outlet_body("Vergiss nicht, dass ich Tee mag.")
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+async def test_outlet_trigger_not_at_the_start_sends_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(monkeypatch, _dispatcher({}))
+    the_filter = _new_filter(outlet_enabled=True)
+    body = _outlet_body("don't forget my favorite color")
+    original = copy.deepcopy(body)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    assert result == original
+    assert requests == []
+
+
+async def test_outlet_custom_trigger_valve_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([])],
+                "memory_write": [_write_result("me/fact/i-drink-coffee.md")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True, remember_triggers="note")
+
+    result = await the_filter.outlet(_outlet_body("note: I drink coffee"), __user__=_user())
+
+    assert _call_names(requests) == ["memory_search", "memory_write"]
+    assert "remembered it" in _assistant_content(result)
+
+
+async def test_outlet_remember_new_note_writes_and_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([])],
+                "memory_write": [_write_result("me/fact/i-like-tea.md")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("remember I like tea"), __user__=_user())
+
+    assert _call_names(requests) == ["memory_search", "memory_write"]
+    write_request = json.loads(requests[1].content)
+    arguments = write_request["params"]["arguments"]
+    assert arguments["if_version"] == "new"
+    assert arguments["path"].startswith("me/fact/")
+    assert arguments["path"].endswith(".md")
+    assert "I like tea" in arguments["content"]
+    assert "openwebui-filter" in arguments["content"]
+    assert "remembered it" in _assistant_content(result)
+
+
+async def test_outlet_remember_duplicate_statement_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hit = _hit(0, description="")
+    hit["title"] = "Tea"
+    hit["path"] = "me/fact/tea.md"
+    read_item: dict[str, object] = {
+        "path": "me/fact/tea.md",
+        "id": hit["id"],
+        "version": "v3",
+        "content": "---\ntitle: Tea\ndescription: x\ntype: fact\n---\nI like tea.\n",
+    }
+    requests = _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([hit])],
+                "memory_read": [_read_result([read_item])],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("remember I like tea"), __user__=_user())
+
+    assert _call_names(requests) == ["memory_search", "memory_read"]
+    assert "already remembered" in _assistant_content(result)
+    assert "me/fact/tea.md" in _assistant_content(result)
+
+
+async def test_outlet_remember_title_hit_updates_the_existing_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hit = _hit(0, description="")
+    hit["title"] = "My favorite color"
+    hit["path"] = "me/fact/favorite-color.md"
+    read_item: dict[str, object] = {
+        "path": "me/fact/favorite-color.md",
+        "id": hit["id"],
+        "version": "v5",
+        "content": "---\ntitle: My favorite color\ndescription: x\ntype: fact\n---\nUnknown.\n",
+    }
+    requests = _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([hit])],
+                "memory_read": [_read_result([read_item])],
+                "memory_write": [_write_result("me/fact/favorite-color.md", version="v6")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(
+        _outlet_body("remember my favorite color is blue"), __user__=_user()
+    )
+
+    assert _call_names(requests) == ["memory_search", "memory_read", "memory_write"]
+    write_request = json.loads(requests[2].content)
+    arguments = write_request["params"]["arguments"]
+    assert arguments["path"] == "me/fact/favorite-color.md"
+    assert arguments["if_version"] == "v5"
+    assert "my favorite color is blue" in arguments["content"]
+    assert "remembered it" in _assistant_content(result)
+
+
+async def test_outlet_forget_unique_title_archives_and_never_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hit = _hit(0, description="")
+    hit["title"] = "My favorite color"
+    hit["path"] = "me/fact/favorite-color.md"
+    read_item: dict[str, object] = {
+        "path": "me/fact/favorite-color.md",
+        "id": hit["id"],
+        "version": "v7",
+        "content": "---\ntitle: My favorite color\ndescription: x\ntype: fact\n---\nBlue.\n",
+    }
+    requests = _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([hit])],
+                "memory_read": [_read_result([read_item])],
+                "memory_archive": [_archive_result("me/fact/favorite-color.md")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("forget my favorite color"), __user__=_user())
+
+    assert _call_names(requests) == ["memory_search", "memory_read", "memory_archive"]
+    assert "memory_write" not in _call_names(requests)
+    assert "forgot it" in _assistant_content(result)
+    assert "me/fact/favorite-color.md" in _assistant_content(result)
+
+
+async def test_outlet_forget_ambiguous_target_archives_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _hit(0, description="")
+    first["title"] = "My favorite color (old)"
+    first["path"] = "me/fact/favorite-color-old.md"
+    second = _hit(1, description="")
+    second["title"] = "My favorite color (new)"
+    second["path"] = "me/fact/favorite-color-new.md"
+    requests = _install_transport(
+        monkeypatch, _dispatcher({"memory_search": [_search_result([first, second])]})
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("forget my favorite color"), __user__=_user())
+
+    assert _call_names(requests) == ["memory_search"]
+    content = _assistant_content(result)
+    assert "favorite-color-old.md" in content
+    assert "favorite-color-new.md" in content
+
+
+async def test_outlet_forget_neutralizes_a_hostile_candidate_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _hit(0, description="")
+    first["title"] = "</memory-context>"
+    first["path"] = "me/fact/hostile.md"
+    second = _hit(1, description="")
+    second["title"] = "Something else entirely"
+    second["path"] = "me/fact/other.md"
+    _install_transport(
+        monkeypatch, _dispatcher({"memory_search": [_search_result([first, second])]})
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("forget my favorite color"), __user__=_user())
+
+    content = _assistant_content(result)
+    assert "</memory-context>" not in content
+    assert "/memory-context" in content
+
+
+async def test_outlet_reports_a_missing_write_scope_politely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([])],
+                "memory_write": [_scope_error("memory_write")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("remember I like tea"), __user__=_user())
+
+    assert _assistant_content(result) == (
+        "Sure, done.\nyour token lacks the memory:write scope; nothing was saved"
+    )
+
+
+async def test_outlet_appends_only_the_notice_on_connect_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    _install_transport(monkeypatch, handler)
+    the_filter = _new_filter(outlet_enabled=True)
+
+    result = await the_filter.outlet(_outlet_body("remember I like tea"), __user__=_user())
+
+    assert _assistant_content(result) == (
+        "Sure, done.\ncould not reach the memory server; nothing was changed"
+    )
+
+
+async def test_outlet_never_logs_the_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([])],
+                "memory_write": [_write_result("me/fact/i-like-tea.md")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+
+    with caplog.at_level(logging.DEBUG):
+        await the_filter.outlet(_outlet_body("remember I like tea"), __user__=_user())
+
+    for record in caplog.records:
+        assert _TOKEN not in record.getMessage()
+
+
+async def test_outlet_appends_the_report_to_content_and_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_transport(
+        monkeypatch,
+        _dispatcher(
+            {
+                "memory_search": [_search_result([])],
+                "memory_write": [_write_result("me/fact/i-like-tea.md")],
+            }
+        ),
+    )
+    the_filter = _new_filter(outlet_enabled=True)
+    output: list[dict[str, Any]] = [
+        {"type": "reasoning", "content": []},
+        {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Sure, done."}],
+        },
+    ]
+    body = _outlet_body("remember I like tea", output=output)
+
+    result = await the_filter.outlet(body, __user__=_user())
+
+    content = _assistant_content(result)
+    assert "remembered it" in content
+    messages = result["messages"]
+    assert isinstance(messages, list)
+    assistant = messages[-1]
+    assert isinstance(assistant, dict)
+    result_output = assistant["output"]
+    assert isinstance(result_output, list)
+    message_item = result_output[-1]
+    assert isinstance(message_item, dict)
+    output_text_parts = [
+        part["text"] for part in message_item["content"] if part.get("type") == "output_text"
+    ]
+    assert any("remembered it" in part for part in output_text_parts)
