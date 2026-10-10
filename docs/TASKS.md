@@ -412,7 +412,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 
 ### WP-44 — Open WebUI filter · F-02 · Branch: `wp/44-openwebui-filter` · PR: open
 
-- [ ] #147 The Open WebUI filter injects relevant notes as a marked data block within a token budget ⛔ blocked by #128, #142, #134
+- [x] #147 The Open WebUI filter injects relevant notes as a marked data block within a token budget
 - [ ] #148 The filter outlet saves or archives a note only on an explicit remember or forget request ⛔ blocked by #147
 - [ ] #149 `tool_memory.py` and `system_prompt.md` cover Open WebUI setups without native MCP ⛔ blocked by #128, #142
 - [ ] #150 The filter injects relevant notes and stays within its budget against the pinned stack ⛔ blocked by #144, #147
