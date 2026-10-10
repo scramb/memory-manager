@@ -376,7 +376,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
 
-- [ ] #134 Personal tokens carry a kind and are bounded by their owner's rights
+- [x] #134 Personal tokens carry a kind and are bounded by their owner's rights
 - [ ] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, #229
 
 ### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open

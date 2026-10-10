@@ -32,6 +32,24 @@ today's fully optional owner/expiry (F-01 "Existing users"). `token list`
 flags a token that predates enterprise mode (or was inserted directly) with
 `enterprise_violations`/`owners_not_in_users` instead of re-deriving the
 same checks.
+
+`kind` (`KIND_PERSONAL`/`KIND_AGENT`/`KIND_SERVICE`, ADR-0012, #134,
+`migrations/0025_token_kind.sql`) says whether a token belongs to a person,
+an agent (`KIND_AGENT` - WP-52, not reachable from `cli.py` yet) or a
+service; every token `create_token` has ever accepted before this defaults
+to `KIND_SERVICE` and keeps behaving exactly as before. A `KIND_PERSONAL`
+token additionally requires an owner and an expiry no further out than
+`personal_max_days` from now (`_validate_personal`, mirroring the same
+"Python before insert AND DB CHECK" convention `_validate_enterprise`
+already follows) - `auth.verifier._verify_static_token` is what then
+narrows such a token's rights down to its owner's *current* ones on every
+single verification (`auth.owner_rights`), not only at creation, since
+"the owner's rights can shrink after creation" (ADR-0012 option A).
+`created_by`/`description` are plain metadata, never interpreted: the
+former is this module's own account of who ran `create_token` (an audit
+trail, CLAUDE.md "audit log for every write" - `cli.py` passes a fixed
+marker, never personal data), the latter is free text for a human to tell
+their own tokens apart.
 """
 
 from __future__ import annotations
@@ -44,10 +62,17 @@ from datetime import UTC, datetime, timedelta
 
 import asyncpg
 
+from memory_manager.audit import AuditWriter
+
 __all__ = [
     "ALL_NAMESPACES",
     "DEFAULT_MAX_EXPIRES_DAYS",
+    "DEFAULT_PERSONAL_MAX_EXPIRES_DAYS",
+    "KIND_AGENT",
+    "KIND_PERSONAL",
+    "KIND_SERVICE",
     "MEMORY_ROLES",
+    "TOKEN_KINDS",
     "TokenInfo",
     "create_token",
     "enterprise_violations",
@@ -66,6 +91,22 @@ ALL_NAMESPACES = "*"
 #: overridable per deployment via `STATIC_TOKEN_MAX_DAYS` (`cli.py`).
 DEFAULT_MAX_EXPIRES_DAYS = 90
 
+#: ADR-0012's default maximum lifetime for a personal token, overridable per
+#: deployment via `PERSONAL_TOKEN_MAX_DAYS` (`cli.py`). In enterprise mode
+#: (`STORAGE_BACKEND=postgres`) both ceilings apply to the same `expires_at` -
+#: `create_token` runs `_validate_personal` and `_validate_enterprise`
+#: unconditionally once each applies, so the effective maximum is whichever
+#: of `STATIC_TOKEN_MAX_DAYS`/`PERSONAL_TOKEN_MAX_DAYS` is smaller.
+DEFAULT_PERSONAL_MAX_EXPIRES_DAYS = 90
+
+#: Who/what a token represents (ADR-0012, #134). `KIND_AGENT` is accepted by
+#: the DB CHECK (`migrations/0025_token_kind.sql`) but not reachable from
+#: `cli.py` yet - WP-52 wires up agent tokens/policies.
+KIND_PERSONAL = "personal"
+KIND_AGENT = "agent"
+KIND_SERVICE = "service"
+TOKEN_KINDS = (KIND_PERSONAL, KIND_AGENT, KIND_SERVICE)
+
 #: The three Entra app role values `0005_rls.sql`'s `mm_readable_ns`/`mm_writable_ns`
 #: read from `app.roles` (ADR-0008 §3's permission matrix). The only roles a token's
 #: `roles` column may ever carry.
@@ -80,7 +121,8 @@ _OWNER_OID_MAX_LENGTH = 128
 _LAST_USED_MIN_INTERVAL = timedelta(minutes=1)
 
 _SELECT_COLUMNS = (
-    "name, scopes, namespaces, owner_oid, roles, created_at, expires_at, revoked_at, last_used_at"
+    "name, scopes, namespaces, owner_oid, roles, kind, created_by, description, "
+    "created_at, expires_at, revoked_at, last_used_at"
 )
 
 
@@ -89,7 +131,10 @@ class TokenInfo:
     """A static token's metadata - never the plaintext or its `token_hash`.
 
     `owner_oid`/`roles` are `None`/`()` for a legacy token created without an owner
-    principal (ADR-0008 addendum 2026-10-07, #115).
+    principal (ADR-0008 addendum 2026-10-07, #115). `kind` is `KIND_SERVICE` for
+    every token predating ADR-0012 (#134) and every token `create_token` is not
+    explicitly told otherwise - `created_by`/`description` are `None` for the same
+    tokens, since neither existed before this column was added.
     """
 
     name: str
@@ -101,6 +146,13 @@ class TokenInfo:
     expires_at: datetime | None
     revoked_at: datetime | None
     last_used_at: datetime | None
+    # Defaulted, and kept last: every direct `TokenInfo(...)` construction that
+    # predates ADR-0012 (#134, this module's own `_row_to_info` aside, always
+    # keyword-based) keeps compiling unchanged - `tests/auth/
+    # test_static_tokens_enterprise.py`'s own `_info` helper among them.
+    kind: str = KIND_SERVICE
+    created_by: str | None = None
+    description: str | None = None
 
 
 def _hash_token(plaintext: str) -> str:
@@ -118,6 +170,9 @@ def _row_to_info(row: asyncpg.Record) -> TokenInfo:
         namespaces=tuple(row["namespaces"]),
         owner_oid=row["owner_oid"],
         roles=tuple(row["roles"]),
+        kind=row["kind"],
+        created_by=row["created_by"],
+        description=row["description"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
         revoked_at=row["revoked_at"],
@@ -188,6 +243,31 @@ def _validate_enterprise(
         )
 
 
+def _validate_personal(
+    *, owner_oid: str | None, expires_at: datetime | None, max_expires_days: int
+) -> None:
+    """ADR-0012: raise `ValueError` naming the first `KIND_PERSONAL` rule
+    `create_token` does not meet - a personal token identifies one person and
+    is useless without both an owner and an expiry.
+
+    Runs after `_validate_owner_and_roles`, so `owner_oid is None` already
+    implies `roles == ()` by the time this is called. Independent of
+    `_validate_enterprise`: both run unconditionally once they apply, so a
+    `KIND_PERSONAL` token created with `enterprise=True` is bound by whichever
+    of `max_expires_days`/the enterprise ceiling is smaller (`cli.py`'s
+    `PERSONAL_TOKEN_MAX_DAYS`/`STATIC_TOKEN_MAX_DAYS`).
+    """
+    if owner_oid is None:
+        raise ValueError("a personal token (ADR-0012) requires an owner: pass --owner and --role")
+    if expires_at is None:
+        raise ValueError("a personal token (ADR-0012) requires an expiry: pass --expires-days")
+    if expires_at > datetime.now(UTC) + timedelta(days=max_expires_days):
+        raise ValueError(
+            "a personal token (ADR-0012) allows an expiry of at most "
+            f"{max_expires_days} days from now, got {expires_at.isoformat()}"
+        )
+
+
 async def create_token(
     pool: asyncpg.Pool,
     name: str,
@@ -197,21 +277,37 @@ async def create_token(
     expires_at: datetime | None = None,
     owner_oid: str | None = None,
     roles: Sequence[str] = (),
+    kind: str = KIND_SERVICE,
+    created_by: str | None = None,
+    description: str | None = None,
     enterprise: bool = False,
     max_expires_days: int = DEFAULT_MAX_EXPIRES_DAYS,
+    personal_max_days: int = DEFAULT_PERSONAL_MAX_EXPIRES_DAYS,
 ) -> tuple[str, TokenInfo]:
     """Create a new token named `name` and return `(plaintext, TokenInfo)`.
 
     The plaintext is generated here and returned exactly once - nothing else
     in this module can ever reproduce it from what is stored. Raises
     `asyncpg.UniqueViolationError` if `name` is already taken, `ValueError`
-    if `roles` contains anything outside `MEMORY_ROLES`, the owner/roles
-    pairing is invalid (`_validate_owner_and_roles`), or - with
-    `enterprise=True` (ADR-0006 §7, #224; `cli.py`'s `token create` sets it
-    from `STORAGE_BACKEND=postgres`) - the owner, expiry or owner-in-`users`
+    if `kind` is not one of `TOKEN_KINDS`, `roles` contains anything outside
+    `MEMORY_ROLES`, the owner/roles pairing is invalid
+    (`_validate_owner_and_roles`), `kind=KIND_PERSONAL` and the owner/expiry
+    rule ADR-0012 requires is not met (`_validate_personal`), or -
+    with `enterprise=True` (ADR-0006 §7, #224; `cli.py`'s `token create` sets
+    it from `STORAGE_BACKEND=postgres`) - the owner, expiry or owner-in-`users`
     rule that mode additionally requires is not met (`_validate_enterprise`).
+    Writes one `audit_log` entry (CLAUDE.md "audit log for every write") once
+    the insert succeeds - `created_by` is its `actor` if given, the token's
+    own `name` otherwise (there is no better actor to record for a token
+    `create_token` was called for with no caller identity at all).
     """
+    if kind not in TOKEN_KINDS:
+        raise ValueError(f"unknown kind {kind!r}, expected one of {TOKEN_KINDS}")
     deduped_roles = _validate_owner_and_roles(owner_oid, roles)
+    if kind == KIND_PERSONAL:
+        _validate_personal(
+            owner_oid=owner_oid, expires_at=expires_at, max_expires_days=personal_max_days
+        )
     if enterprise:
         _validate_enterprise(
             owner_oid=owner_oid,
@@ -234,9 +330,10 @@ async def create_token(
         # string-built-from-a-request-parameter pattern S608 looks for.
         f"""
         insert into static_tokens (
-            name, token_hash, scopes, namespaces, expires_at, owner_oid, roles
+            name, token_hash, scopes, namespaces, expires_at, owner_oid, roles,
+            kind, created_by, description
         )
-        values ($1, $2, $3, $4, $5, $6, $7)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         returning {_SELECT_COLUMNS}
         """,  # noqa: S608
         name,
@@ -246,9 +343,21 @@ async def create_token(
         expires_at,
         owner_oid,
         list(deduped_roles),
+        kind,
+        created_by,
+        description,
     )
     if row is None:  # pragma: no cover - `insert ... returning` always returns its own row
         raise RuntimeError(f"insert into static_tokens for {name!r} returned no row")
+    await AuditWriter(pool).record(
+        actor=created_by if created_by is not None else name,
+        client="auth",
+        op="token_create",
+        path=None,
+        commit_sha=None,
+        outcome="ok",
+        detail={"name": name, "kind": kind},
+    )
     return plaintext, _row_to_info(row)
 
 
@@ -299,13 +408,30 @@ async def owners_not_in_users(pool: asyncpg.Pool, owner_oids: Sequence[str]) -> 
     return frozenset(oid for oid in unique if oid not in known)
 
 
-async def revoke_token(pool: asyncpg.Pool, name: str) -> bool:
-    """Mark the token `name` revoked. Returns whether a not-yet-revoked token was found."""
+async def revoke_token(pool: asyncpg.Pool, name: str, *, actor: str | None = None) -> bool:
+    """Mark the token `name` revoked. Returns whether a not-yet-revoked token was found.
+
+    Writes one `audit_log` entry (CLAUDE.md "audit log for every write") only when a
+    row was actually revoked - a call that found nothing to revoke made no write, so
+    there is nothing to audit. `actor` is `name` itself when not given, the same
+    fallback `create_token` uses for its own audit entry.
+    """
     result = await pool.execute(
         "update static_tokens set revoked_at = now() where name = $1 and revoked_at is null",
         name,
     )
-    return result != "UPDATE 0"
+    revoked = result != "UPDATE 0"
+    if revoked:
+        await AuditWriter(pool).record(
+            actor=actor if actor is not None else name,
+            client="auth",
+            op="token_revoke",
+            path=None,
+            commit_sha=None,
+            outcome="ok",
+            detail={"name": name},
+        )
+    return revoked
 
 
 async def verify(pool: asyncpg.Pool, plaintext: str) -> TokenInfo | None:

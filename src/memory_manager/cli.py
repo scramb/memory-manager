@@ -73,11 +73,16 @@ import mcp_types
 import uvicorn
 
 from memory_manager.app import open_services, open_storage
+from memory_manager.auth import login
 from memory_manager.auth.graph import GraphClient
 from memory_manager.auth.login_password import hash_password
+from memory_manager.auth.owner_rights import intersect_namespaces
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
     DEFAULT_MAX_EXPIRES_DAYS,
+    DEFAULT_PERSONAL_MAX_EXPIRES_DAYS,
+    KIND_PERSONAL,
+    KIND_SERVICE,
     MEMORY_ROLES,
     TokenInfo,
     create_token,
@@ -252,22 +257,49 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "token":
         if args.subcommand in ("create", "list"):
             try:
-                enterprise = storage_backend_from_env(dict(os.environ)) == "postgres"
+                storage_backend = storage_backend_from_env(dict(os.environ))
+                enterprise = storage_backend == "postgres"
                 max_expires_days = _static_token_max_days()
+                personal_max_days = _personal_token_max_days()
             except (StorageConfigError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
         if args.subcommand == "create":
+            requested_namespaces = args.namespaces or [ALL_NAMESPACES]
+            # ADR-0012 (#134): checked at creation too, not only on every later
+            # verification (`auth.owner_rights`, `auth.verifier`) - the `"postgres"`
+            # half of this same rule is `create_token(..., enterprise=True)`'s
+            # existing owner-in-`users` check, below.
+            if args.kind == KIND_PERSONAL and storage_backend == "git" and args.owner is not None:
+                try:
+                    namespace_map = login.parse_namespace_map(os.environ.get("LOGIN_NAMESPACE_MAP"))
+                    default_namespaces = login.parse_namespaces(os.environ.get("LOGIN_NAMESPACES"))
+                except ServerConfigError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 2
+                owner_namespaces = login.resolve_namespaces(
+                    [args.owner], namespace_map=namespace_map, default=default_namespaces
+                )
+                if intersect_namespaces(requested_namespaces, owner_namespaces) is None:
+                    print(
+                        f"owner {args.owner!r} may use none of {requested_namespaces!r} "
+                        f"(ADR-0012): the owner's current namespaces are {owner_namespaces!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
             return asyncio.run(
                 _run_token_create(
                     args.name,
                     scopes=args.scopes,
-                    namespaces=args.namespaces or [ALL_NAMESPACES],
+                    namespaces=requested_namespaces,
                     expires_days=args.expires_days,
                     owner_oid=args.owner,
                     roles=args.roles or [],
+                    kind=args.kind,
+                    description=args.description,
                     enterprise=enterprise,
                     max_expires_days=max_expires_days,
+                    personal_max_days=personal_max_days,
                 )
             )
         if args.subcommand == "list":
@@ -595,6 +627,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         choices=MEMORY_ROLES,
         help=f"repeatable; one of {MEMORY_ROLES!r}; required together with --owner",
+    )
+    token_create_parser.add_argument(
+        "--kind",
+        dest="kind",
+        default=KIND_SERVICE,
+        choices=(KIND_PERSONAL, KIND_SERVICE),
+        help=f"one of {(KIND_PERSONAL, KIND_SERVICE)!r}, default {KIND_SERVICE!r} (ADR-0012, "
+        "#134); a personal token additionally requires --owner/--role and --expires-days "
+        "within PERSONAL_TOKEN_MAX_DAYS (default 90)",
+    )
+    token_create_parser.add_argument(
+        "--description",
+        dest="description",
+        default=None,
+        help="free text to tell this token apart from others of the same owner (ADR-0012)",
     )
 
     token_subparsers.add_parser("list", help="list every token's metadata (never the token itself)")
@@ -1032,8 +1079,11 @@ async def _run_token_create(
     expires_days: int | None,
     owner_oid: str | None,
     roles: list[str],
+    kind: str,
+    description: str | None,
     enterprise: bool,
     max_expires_days: int,
+    personal_max_days: int,
 ) -> int:
     pool = await _open_migrated_pool()
     if pool is None:
@@ -1052,8 +1102,14 @@ async def _run_token_create(
                 expires_at=expires_at,
                 owner_oid=owner_oid,
                 roles=roles,
+                kind=kind,
+                # Never personal data (CLAUDE.md "token hashes only" extends to this audit
+                # marker too): a fixed literal naming the tool that ran this, not who ran it.
+                created_by="cli",
+                description=description,
                 enterprise=enterprise,
                 max_expires_days=max_expires_days,
+                personal_max_days=personal_max_days,
             )
         except asyncpg.UniqueViolationError:
             print(f"a token named {name!r} already exists", file=sys.stderr)
@@ -1066,9 +1122,10 @@ async def _run_token_create(
 
     print(plaintext)
     print(
-        f"^ token {info.name!r} created with scopes={list(info.scopes)} "
+        f"^ token {info.name!r} created with kind={info.kind!r} scopes={list(info.scopes)} "
         f"namespaces={list(info.namespaces)} owner_oid={info.owner_oid!r} "
-        f"roles={list(info.roles)} - store it now, it will not be shown again",
+        f"roles={list(info.roles)} description={info.description!r} - store it now, it "
+        "will not be shown again",
         file=sys.stderr,
     )
     return 0
@@ -1108,9 +1165,10 @@ async def _run_token_list(*, enterprise: bool, max_expires_days: int) -> int:
 def _print_token_info(info: TokenInfo, *, violations: tuple[str, ...] = ()) -> None:
     status = "revoked" if info.revoked_at is not None else "active"
     print(
-        f"{info.name}\tstatus={status}\tscopes={','.join(info.scopes)}\t"
+        f"{info.name}\tstatus={status}\tkind={info.kind}\tscopes={','.join(info.scopes)}\t"
         f"namespaces={','.join(info.namespaces)}\towner_oid={info.owner_oid or '-'}\t"
-        f"roles={','.join(info.roles) or '-'}\tcreated_at={info.created_at.isoformat()}\t"
+        f"roles={','.join(info.roles) or '-'}\tdescription={info.description or '-'}\t"
+        f"created_at={info.created_at.isoformat()}\t"
         f"expires_at={info.expires_at.isoformat() if info.expires_at else '-'}\t"
         f"last_used_at={info.last_used_at.isoformat() if info.last_used_at else '-'}\t"
         f"enterprise_violations={','.join(violations) or '-'}"
@@ -1123,7 +1181,8 @@ async def _run_token_revoke(name: str) -> int:
         return 2
 
     try:
-        revoked = await revoke_token(pool, name)
+        # Same fixed, non-personal marker `_run_token_create` passes as `created_by`.
+        revoked = await revoke_token(pool, name, actor="cli")
     finally:
         await pool.close()
 
@@ -1566,6 +1625,30 @@ def _static_token_max_days() -> int:
         raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be an integer, got {raw!r}") from exc
     if value <= 0:
         raise ValueError(f"{_STATIC_TOKEN_MAX_DAYS_ENV} must be positive, got {value}")
+    return value
+
+
+_PERSONAL_TOKEN_MAX_DAYS_ENV = "PERSONAL_TOKEN_MAX_DAYS"  # noqa: S105 - an env var name
+
+
+def _personal_token_max_days() -> int:
+    """The personal-token expiry ceiling (`PERSONAL_TOKEN_MAX_DAYS`, ADR-0012, #134),
+    default `tokens.DEFAULT_PERSONAL_MAX_EXPIRES_DAYS` (90 days) - the same shape
+    `_static_token_max_days` above already has for the unrelated enterprise ceiling.
+    In enterprise mode both apply to the same `expires_at` (`create_token`'s own
+    docstring), so the effective maximum for a personal token there is whichever of
+    the two is smaller. Raises `ValueError` naming the variable if it is set but not a
+    positive integer.
+    """
+    raw = os.environ.get(_PERSONAL_TOKEN_MAX_DAYS_ENV)
+    if raw is None:
+        return DEFAULT_PERSONAL_MAX_EXPIRES_DAYS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_PERSONAL_TOKEN_MAX_DAYS_ENV} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{_PERSONAL_TOKEN_MAX_DAYS_ENV} must be positive, got {value}")
     return value
 
 

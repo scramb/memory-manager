@@ -58,6 +58,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import asyncpg
 
@@ -99,6 +100,15 @@ from memory_manager.vault import blocklist
 from memory_manager.vault.repo import Repo
 from memory_manager.vault.sync import ChangeSet, poll_loop
 
+if TYPE_CHECKING:
+    # Deferred to a local import inside `open_services` at runtime (below): `memory_manager.
+    # auth`'s own package `__init__` imports `auth.prm`, which imports `Services` straight back
+    # from this module (#118's cycle, `auth.scopes`'s own docstring) - a module-level import here
+    # would try to resolve `Services` before this module has finished defining it. `open_services`
+    # itself only ever runs once this module is fully imported, so the same import inside its body
+    # is cycle-free.
+    from memory_manager.auth.owner_rights import OwnerRightsResolver
+
 __all__ = ["Services", "open_services", "open_storage"]
 
 _logger = logging.getLogger(__name__)
@@ -128,6 +138,13 @@ class Services:
     (`config.break_glass_approvers_from_env` always returns a value, default
     2) - `account.break_glass`'s approve route is its one reader, and only
     ever reaches it from a `"postgres"`-backend admin session.
+
+    `owner_rights_resolver` (ADR-0012, #134) is built the same way regardless
+    of backend too (`LOGIN_NAMESPACE_MAP`/`LOGIN_NAMESPACES`, parsed eagerly
+    so a malformed value fails at startup like every other `*_from_env` call
+    here) - `http.py` threads it into `StaticTokenVerifier`/
+    `MemoryManagerOAuthProvider`, both of which only ever consult it for a
+    `kind="personal"` static token (`auth.owner_rights`).
     """
 
     repo: Repo | None
@@ -139,6 +156,7 @@ class Services:
     storage: StorageBackend
     trigger_sync: Callable[[], Awaitable[ChangeSet]] | None = None
     app_role: str | None = None
+    owner_rights_resolver: OwnerRightsResolver | None = None
     break_glass_approvers: int = 2
 
 
@@ -350,7 +368,10 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     regardless of backend, into `Services.break_glass_approvers`.
     `BLOCKLIST_FILE` is loaded eagerly here too (`vault.blocklist.
     load_rules`), same "fails before anything is started" contract as the
-    rest of this list (#244).
+    rest of this list (#244). `LOGIN_NAMESPACE_MAP`/`LOGIN_NAMESPACES` are
+    read the same way, regardless of backend, into `Services.
+    owner_rights_resolver` (ADR-0012, #134) - a `kind="personal"` static
+    token's own bound on every verification (`auth.owner_rights`).
     """
     storage_backend_name = storage_backend_from_env(dict(environ))
     database_url = environ.get("DATABASE_URL")
@@ -359,6 +380,18 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
     app_role = database_app_role_from_env(dict(environ))
     break_glass_approvers = break_glass_approvers_from_env(dict(environ))
     blocklist.load_rules(blocklist_file_from_env(dict(environ)))
+    # ADR-0012, #134: local import, not a module-level one - `memory_manager.auth`'s own
+    # package `__init__` imports `auth.prm`, which imports `Services` straight back from
+    # this module (this function's own docstring/module-level `TYPE_CHECKING` comment above
+    # explain the cycle that would otherwise create); this line only ever runs once this
+    # module has finished importing. Parsed eagerly, regardless of backend, so a malformed
+    # `LOGIN_NAMESPACE_MAP` fails at startup like every other `*_from_env` call above -
+    # `login_password.py`/`login_oidc.py` already read the same two variables the same way.
+    from memory_manager.auth import login
+    from memory_manager.auth.owner_rights import OwnerRightsResolver
+
+    login_namespace_map = login.parse_namespace_map(environ.get("LOGIN_NAMESPACE_MAP"))
+    login_default_namespaces = login.parse_namespaces(environ.get("LOGIN_NAMESPACES"))
 
     async with _open_backend(
         storage_backend_name,
@@ -405,6 +438,12 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                 provider = handle.provider
                 handle.storage.add_audit_hook(_audit_write_hook(AuditWriter(pool)))
 
+            owner_rights_resolver = OwnerRightsResolver(
+                backend=storage_backend_name,
+                pool=pool,
+                namespace_map=login_namespace_map,
+                default_namespaces=login_default_namespaces,
+            )
             try:
                 yield Services(
                     repo=handle.repo,
@@ -416,6 +455,7 @@ async def open_services(environ: Mapping[str, str]) -> AsyncIterator[Services]:
                     storage=handle.storage,
                     trigger_sync=trigger_sync,
                     app_role=app_role,
+                    owner_rights_resolver=owner_rights_resolver,
                     break_glass_approvers=break_glass_approvers,
                 )
             finally:
