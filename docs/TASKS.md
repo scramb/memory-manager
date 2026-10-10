@@ -374,7 +374,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 - [x] #305 The audit log records the client profile of every write
 - [x] #306 The short delivery mode serves the short form as instructions
 
-### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
+### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: #308
 
 - [x] #134 Personal tokens carry a kind and are bounded by their owner's rights
 - [x] #135 Users create, list and revoke their own personal tokens on `/account` ⛔ blocked by #134, #229
