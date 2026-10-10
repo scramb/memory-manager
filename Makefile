@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down contract-snapshot
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -51,6 +51,13 @@ conformance:
 
 conformance-golden:
 	MM_CONFORMANCE_UPDATE=1 uv run pytest tests/conformance/profiles
+
+# Records tests/contract/snapshot.json to the real server's current tool contract
+# (#201, ADR-0010, ADR-0017) - refuses to write over a breaking change; see
+# tests/contract_snapshot.py's module docstring for MM_CONTRACT_UPDATE=breaking,
+# the deliberate pre-major act that overrides that refusal.
+contract-snapshot:
+	MM_CONTRACT_UPDATE=1 uv run pytest tests/contract
 
 test:
 ifdef PKG
