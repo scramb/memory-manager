@@ -7,14 +7,16 @@
 # is on PATH, or $COMPOSE_ENGINE if set.
 #
 # Creates deploy/openwebui/.env from its .env.example once, filled with a
-# fresh, random WEBUI_SECRET_KEY (never overwritten afterwards - that key
-# must stay stable across restarts, docker-compose.yml's header comment
-# explains why), then brings the stack up in two phases and polls every
-# container until the long-running ones (postgres, memory-manager,
-# scripted-model, open-webui) report healthy and the one-shots
-# (volume-perms, vault-init) have exited 0 - podman-compose 1.3 does not
-# block `up -d` on `condition: service_healthy` the way `docker compose up`
-# does, so this script is the thing that actually waits.
+# fresh, random WEBUI_SECRET_KEY, and deploy/openwebui/.env-memory-manager
+# plus its plaintext-password sibling once, both from freshly generated
+# secrets (none overwritten afterwards - those values must stay stable
+# across restarts, docker-compose.yml's header comment explains why), then
+# brings the stack up in two phases and polls every container until the
+# long-running ones (postgres, memory-manager, scripted-model, open-webui)
+# report healthy and the one-shots (volume-perms, vault-init) have exited 0
+# - podman-compose 1.3 does not block `up -d` on `condition: service_healthy`
+# the way `docker compose up` does, so this script is the thing that
+# actually waits.
 #
 # Two phases, not one `up -d --build`: docker-compose.yml deliberately
 # drops `depends_on` on the one-shots (volume-perms, vault-init) from
@@ -70,6 +72,33 @@ if [[ ! -f "$env_file" ]]; then
   echo "created ${env_file} with a fresh, random WEBUI_SECRET_KEY"
 else
   echo "reusing existing ${env_file} (WEBUI_SECRET_KEY must stay stable)"
+fi
+
+# memory-manager's own AS secrets (#142, docker-compose.yml's header
+# comment): an argon2id admin password hash and a Fernet client-secret
+# encryption key, generated once inside the already-built memory-manager
+# image (never locally - a dev venv may not even have `argon2-cffi`/
+# `cryptography` on PATH in the same versions) and never regenerated -
+# ADMIN_PASSWORD_HASH and OAUTH_CLIENT_SECRET_KEY must stay stable across
+# restarts for the same reason WEBUI_SECRET_KEY above does.
+mm_env_file="deploy/openwebui/.env-memory-manager"
+admin_password_file="deploy/openwebui/.admin-password"
+if [[ ! -f "$mm_env_file" ]]; then
+  "${COMPOSE[@]}" -f "$COMPOSE_FILE" -p "$PROJECT" build memory-manager
+  admin_password=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+  admin_password_hash=$(printf '%s' "$admin_password" \
+    | podman run --rm -i memory-manager:dev memory-manager hash-password)
+  oauth_client_secret_key=$(podman run --rm memory-manager:dev python3 -c \
+    "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+  {
+    echo "ADMIN_PASSWORD_HASH=${admin_password_hash}"
+    echo "OAUTH_CLIENT_SECRET_KEY=${oauth_client_secret_key}"
+  } > "$mm_env_file"
+  printf '%s\n' "$admin_password" > "$admin_password_file"
+  chmod 600 "$mm_env_file" "$admin_password_file"
+  echo "created ${mm_env_file} and ${admin_password_file} with fresh secrets"
+else
+  echo "reusing existing ${mm_env_file} (ADMIN_PASSWORD_HASH must stay stable)"
 fi
 
 dump_logs() {

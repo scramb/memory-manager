@@ -31,3 +31,10 @@ override.tf.json
 # the per-deployment secret OAuth tokens get encrypted with, see
 # deploy/openwebui/docker-compose.yml's header comment).
 deploy/openwebui/.env
+
+# Same stack's own AS secrets (#142): an argon2id admin password hash plus
+# a Fernet client-secret encryption key, and the plaintext admin password
+# the headless e2e driver logs in with - never committed, see
+# deploy/openwebui/docker-compose.yml's header comment.
+deploy/openwebui/.env-memory-manager
+deploy/openwebui/.admin-password

@@ -16,11 +16,19 @@
 # `deploy/openwebui/.env` is REQUIRED (unlike the root compose.yaml's own,
 # genuinely optional `.env`): it must carry a stable WEBUI_SECRET_KEY, since
 # Open WebUI encrypts stored OAuth client info and per-user tokens with it
-# (docs/research/clients/openwebui.md "Other env"; relevant once #142/#143
-# wire up the OAuth connection on top of this stack) - a key that changes
+# (docs/research/clients/openwebui.md "Other env") - a key that changes
 # between runs makes every previously stored OAuth session undecryptable.
 # `scripts/openwebui-up.sh` creates this file once, with a random key, and
 # never overwrites it.
+#
+# `deploy/openwebui/.env-memory-manager` is this stack's own counterpart for
+# memory-manager's embedded AS (ADR-0004, enabled here for the #142 spike):
+# ADMIN_PASSWORD_HASH (an argon2id hash, `memory-manager hash-password`) and
+# OAUTH_CLIENT_SECRET_KEY (a Fernet key, `ClientSecretCipher` in
+# `src/memory_manager/auth/store.py`).
+# `scripts/openwebui-up.sh` creates this once, together with a gitignored
+# plaintext copy of the generated password (`.admin-password`, for the
+# headless driver only), and never overwrites either afterwards.
 #
 # ENABLE_PERSISTENT_CONFIG (Open WebUI's own default): most of the
 # environment variables below are only read on Open WebUI's *first* start
@@ -101,15 +109,37 @@ services:
       VAULT_REMOTE: file:///data/remote.git
       # Must match the host port published below (18081, not 8080/18080 -
       # both already used elsewhere, see scripts/openwebui-up.sh): this is
-      # the origin a browser reaches the AS at for #142/#143's OAuth flow,
-      # not merely a label.
+      # the origin a browser (and, with open-webui's own network_mode
+      # below, open-webui's backend too) reaches the AS at for #142's OAuth
+      # flow, not merely a label.
       PUBLIC_URL: http://localhost:18081
+      # The SDK's own issuer check (mcp/server/auth/routes.py,
+      # validate_issuer_url) only accepts https or localhost/127.0.0.1/
+      # [::1] - "memory-manager" (the compose DNS name) would fail it. The
+      # app must therefore actually listen on the port PUBLIC_URL names
+      # (18081, not the image's own default 8080), so that both the
+      # browser and open-webui's backend reach the same loopback address
+      # the issuer claims (#142, "Networking" finding).
+      PORT: "18081"
+      # Enables the embedded AS (ADR-0004) for this spike (#142); the
+      # admin password hash and the DCR client-secret encryption key below
+      # come from env_file, not literals here, same reasoning as
+      # docker-compose.yml's own WEBUI_SECRET_KEY handling for open-webui.
+      LOGIN_MODE: password
+      LOGIN_NAMESPACES: demo
+    env_file:
+      - path: .env-memory-manager
+        required: true
     volumes:
       - vault-clone:/data
       - vault-remote:/data/remote.git
       - ../../scripts/http-healthcheck.py:/healthcheck.py:ro
     ports:
-      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18081:18081"
+      # open-webui below joins this container's network namespace
+      # (network_mode: "service:memory-manager") instead of publishing its
+      # own port, so its host-facing port is published here.
+      - "127.0.0.1:3000:8080"
     # Only postgres here, and only because it stays running (`condition:
     # service_healthy` on a long-running container is a safe, permanent
     # `podman --requires=postgres`). volume-perms and vault-init are
@@ -125,7 +155,7 @@ services:
     # explains why that stands in as its own mounted file rather than an
     # inline "-c" one-liner here.
     healthcheck:
-      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:8080/readyz"]
+      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:18081/readyz"]
       interval: 5s
       timeout: 5s
       start_period: 20s
@@ -157,6 +187,15 @@ services:
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
+    # Shares memory-manager's network namespace instead of getting its own
+    # (#142, "Networking" finding): open-webui's backend, not only its
+    # browser-facing links, must reach PUBLIC_URL (http://localhost:18081)
+    # for DCR and token exchange, and the SDK's issuer check only accepts
+    # that URL's "localhost" because it IS the loopback of the container it
+    # runs in. The host-facing ports for both services are published on
+    # memory-manager instead (see there); this service declares none of
+    # its own, and podman rejects doing so together with network_mode.
+    network_mode: "service:memory-manager"
     environment:
       OPENAI_API_BASE_URLS: http://scripted-model:8091/v1
       OPENAI_API_KEYS: dummy-key-not-checked-by-the-stub
@@ -171,6 +210,8 @@ services:
       ENABLE_SEARCH_QUERY_GENERATION: "false"
       ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
       ENABLE_VERSION_UPDATE_CHECK: "false"
+      # The browser-facing origin (unaffected by the shared network
+      # namespace above: a host port, published on memory-manager).
       WEBUI_URL: http://localhost:3000
     env_file:
       - path: .env
@@ -180,9 +221,11 @@ services:
     # not read_only.
     volumes:
       - openwebui-data:/app/backend/data
-    ports:
-      - "127.0.0.1:3000:8080"
+    # Needs memory-manager's network namespace to already exist (above),
+    # and scripted-model to answer /v1 chat completions.
     depends_on:
+      memory-manager:
+        condition: service_healthy
       scripted-model:
         condition: service_healthy
     healthcheck:

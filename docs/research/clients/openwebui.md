@@ -1,6 +1,6 @@
 # Open WebUI as a memory-manager client
 
-Retrieved: 2026-10-07 · Tested version: none (desk research; latest release v0.11.4)
+Retrieved: 2026-10-07, live spike 2026-10-10 (#142, WP-42) · Tested version: 0.11.4
 
 Method: `docs.openwebui.com` is not reachable from the research environment, so the documentation was read from its source repository (`open-webui/docs`, `main` at commit `f687d16`, 2026-10-07). The pages are the same Markdown that the site renders; links below point at the published site. Behaviour was cross-checked against the Open WebUI source at tag `v0.11.4` (commit `8bd8b4f`, which is also `main` on the retrieval date). Code references are given as `path` at `v0.11.4`. Anything not confirmed by docs or code is marked **unverified**.
 
@@ -160,15 +160,167 @@ Open WebUI connects to our server as an admin-configured **MCP (Streamable HTTP)
 
 Recommendation for evaluation, not a decision: **A** is the only option that fits the current auth model without an ADR. We still need to check that our AS's DCR handles Open WebUI's registration request (`client_secret_post`, redirect `/oauth/clients/<id>/callback`). B and C would be separate decisions to make via ADR. An Open WebUI filter calling our HTTP API is a further non-MCP path (identity from `__user__` or `__oauth_token__`), but it needs a REST surface and a trust model, so it is out of scope for v1.
 
+## Spike results (2026-10-10)
+
+Driven live against the pinned stack (#141/#142,
+`deploy/openwebui/docker-compose.yml`, `scripts/openwebui-up.sh`,
+`tests/e2e/openwebui_driver.py`) with memory-manager's embedded AS
+(ADR-0004) enabled: `LOGIN_MODE=password`, `PORT=18081`,
+`PUBLIC_URL=http://localhost:18081`. Tested version: 0.11.4 throughout
+this section; every claim below is either an observed, reproduced result
+or a code citation, never recall.
+
+### Networking: a shared network namespace, not a DNS name
+
+The SDK's own issuer check (`.venv/.../mcp/server/auth/routes.py`
+`validate_issuer_url`, `v2.3.0` as installed) only accepts `https` or
+`localhost`/`127.0.0.1`/`[::1]` - the compose DNS name `memory-manager`
+fails it, and Open WebUI's **backend**, not only the browser, must reach
+`PUBLIC_URL` directly (DCR, token exchange). The fix verified live:
+`open-webui` joins memory-manager's own network namespace
+(`network_mode: "service:memory-manager"`; podman-compose 1.3 turns this
+into `--network=container:<name>`, confirmed against
+`podman_compose.py`'s `get_net_args_from_network_mode`), memory-manager
+listens on `PORT=18081` inside that shared namespace, and both services'
+host-facing ports are published on memory-manager's own `ports:` list
+(`127.0.0.1:18081:18081`, `127.0.0.1:3000:8080`). Verified:
+
+- `curl -s localhost:18081/.well-known/oauth-protected-resource` from the
+  host → `{"resource":"http://localhost:18081/mcp", ...}`.
+- `podman exec mm-openwebui_open-webui_1 curl -fsS
+  http://localhost:18081/.well-known/oauth-authorization-server` → 200
+  with a full AS metadata document (same loopback, from inside
+  open-webui's shared namespace).
+- `podman exec mm-openwebui_open-webui_1 getent hosts scripted-model` →
+  resolves (`10.89.1.6 scripted-model.dns.podman`) - the shared namespace
+  still carries the project's own DNS, so open-webui's existing
+  `OPENAI_API_BASE_URLS=http://scripted-model:8091/v1` keeps working
+  unchanged.
+
+**Production consequence (#154):** with a real `https://` `PUBLIC_URL`
+this whole workaround disappears (`validate_issuer_url` passes `https`
+unconditionally) - ordinary same-cluster service DNS is enough, and no
+network-namespace sharing is needed. What stays true in both cases: Open
+WebUI's **backend**, not just a user's browser, must have egress to
+`PUBLIC_URL` (DCR and token exchange are server-to-server), so a
+production NetworkPolicy must allow it, not only ingress from users'
+browsers.
+
+### DCR and the per-user OAuth flow: both work, unmodified
+
+`tests/e2e/openwebui_driver.py connect` (signup as the first/admin user →
+`POST /api/v1/configs/oauth/clients/register?type=mcp` → `POST
+/api/v1/configs/tool_servers` with `auth_type=oauth_2.1` → `GET
+/oauth/clients/mcp:<id>/authorize`, following redirects through
+memory-manager's `/login?pending=...` form, the admin password, and back
+to Open WebUI's own callback) **completed end to end with no `?error=`**,
+confirming ADR-0011's load-bearing assumption and closing the note's
+previous top open question. Observed (never a token or secret value, only
+shapes - `oauth_clients.client_info`/`oauth_tokens`/`oauth_pending` in
+memory-manager's own Postgres, `user`/`oauth_session` in Open WebUI's
+SQLite):
+
+| Code finding (already established) | Live confirmation |
+|---|---|
+| DCR: `client_name='Open WebUI'`, redirect `{WEBUI_URL}/oauth/clients/mcp:<id>/callback`, `token_endpoint_auth_method=client_secret_post` default (`utils/oauth.py#L503-L645`) | `oauth_clients.client_info` carries exactly this: `client_name="Open WebUI"`, `redirect_uris=["http://localhost:3000/oauth/clients/mcp:memmgr/callback"]`, `token_endpoint_auth_method="client_secret_post"`, and a `client_secret` is present (encrypted at rest, ADR-0004 addendum) |
+| PKCE S256, `resource` from PRM verbatim on `/authorize` (`utils/oauth.py#L862-L877`, `#L776-L797`) | `oauth_pending` (kind `authorize`): `params->>'resource' = 'http://localhost:18081/mcp'` (byte-for-byte the PRM `resource`), a `code_challenge` is set |
+| Discovery via anonymous `initialize` + `WWW-Authenticate` (`utils/oauth.py#L390-L466`) | memory-manager's access log: `POST /mcp` → `401`, immediately followed by `GET /.well-known/oauth-protected-resource/mcp` → `200`, both **before** any `/authorize` call - triggered by saving the tool-server connection, not by a user's own consent click |
+| `client_id` path segment `mcp:<server_id>` is Open WebUI's own lookup key, not the AS-issued `client_id` (unverified before this spike) | Confirmed: the AS-issued `client_id` in `oauth_clients`/`oauth_tokens` is a UUID (`9d3acf46-...`); `mcp:memmgr` only ever appears in Open WebUI's own URLs (`/oauth/clients/mcp:memmgr/{authorize,callback}`) and its SQLite `oauth_session.provider` column |
+| `oauth_session` stores the per-user token server-side, keyed by provider (module docstring, "Auth and identity forwarding") | `oauth_session` (Open WebUI SQLite): one row, `provider='mcp:memmgr'`, `user_id` = the signed-in user, `token` present (460 bytes, encrypted - length only read, never the content) |
+
+### M2 confirmed live: Open WebUI is mislabeled `"claude-code"` in our own audit trail
+
+`_client_label_for` (`src/memory_manager/auth/provider.py:641-647`) labels
+a registered client `"claude-ai"` only if a redirect URI's host is in
+`_CLAUDE_AI_HOSTS`, else `"claude-code"` - there is no third label.
+Live: `oauth_tokens.client_label = 'claude-code'` for the Open WebUI
+connection just completed (redirect host `localhost`, not a claude.ai
+host). This is **not** a WP-42 blocker (ADR-0011 does not depend on the
+label), but every audit entry and `token list` row for an Open WebUI user
+will read "claude-code" until #143/#144 add a real label - tracked there,
+not fixed here.
+
+### UserValves and filter token access (#142's own scope)
+
+A throwaway probe `Filter` function (installed via `POST
+/api/v1/functions/create`, exercised through one `/api/chat/completions`
+turn, then deleted via `DELETE /api/v1/functions/id/<id>/delete` - the
+code never left `/tmp`, per this task's Blast-Radius) observed, live:
+
+- `__user__` is a flat dict with (among others) `id`, `email`, `role`,
+  `oauth`, `settings` and `valves` as top-level keys - confirming
+  "Functions/Filters/Valves"'s existing claim.
+- Setting a `UserValves` field through `POST
+  /api/v1/functions/id/<id>/valves/user/update` round-trips, **in
+  plaintext**, as `user.settings->'functions'->'valves'->'<function_id>'`
+  in Open WebUI's own database (confirmed by reading the row directly:
+  `{"functions": {"valves": {"probe_wp42": {"marker": "hello-from-probe"}}}}`)
+  - `ENABLE_VALVE_ENCRYPTION` was not set (default `false`, `env.py:767`),
+    matching the code finding; the Fernet-encrypted case
+    (`ENABLE_VALVE_ENCRYPTION=true`) was not re-run live in this spike
+    (a second `openwebui-data` volume lifecycle for one already-settled
+    code citation), so that half stays a code finding
+    (`utils/valves.py#L13-L25`), not a live one.
+  - The same resolved `UserValves` instance is *also* available as
+    `__user__["valves"]` (a typed object, `marker='hello-from-probe'`
+    observed directly) - the two paths coexist: `__user__["valves"]` is
+    the per-function, already-resolved view; `__user__["settings"]` is
+    the raw, persisted JSON every other function (and, unencrypted, every
+    DB reader) can see too.
+- `__oauth_token__` was `None` in both `inlet` and `outlet` for the user
+  who just completed the `mcp:memmgr` OAuth connection - confirming
+  `get_system_oauth_token` filters out `mcp:` sessions
+  (`utils/tools.py`/`utils/middleware.py#L3796-L3826`).
+- The undocumented internal path **does** reach the MCP token:
+  `__request__.app.state.oauth_client_manager.get_oauth_token(__user__["id"], "mcp:memmgr")`
+  returned a non-`None` value inside `inlet` (checked as a boolean only,
+  never logged) - confirming code finding 4's "undocumented" internal API
+  actually works, not merely that it exists in source.
+
+### Owner hints for #143/#144/#155 (not decided here)
+
+- **(a)** A filter could fetch the MCP token through the internal API
+  above instead of requiring a personal token pasted into `UserValves`
+  (ADR-0011 Option A's "Filter" half) - demonstrated reachable, not
+  evaluated as a design option; ADR-0011 already reserves that choice to
+  the owner.
+- **(b)** UserValves are plaintext by default and readable by every
+  function with access to `__user__["settings"]`, confirmed live above -
+  docs for #155 must say plainly that `ENABLE_VALVE_ENCRYPTION=true` is
+  required before any function stores something sensitive in a
+  `UserValves` field (a personal memory-manager token, for instance).
+
+### Predicted AS mismatches for #143/#144 (ADR-0004/ADR-0009 vs. Open WebUI's client)
+
+| # | Mismatch | Status |
+|---|---|---|
+| M1 | Issuer/network: our SDK rejects a non-`https`, non-loopback issuer | **Resolved for this spike** by the shared network namespace above; **#154** (Helm/production) needs `https://` instead, not this workaround |
+| M2 | `_client_label_for` has no "Open WebUI" label | **Confirmed live** above; cosmetic (audit trail only), not a functional blocker |
+| M3 | Refresh-token replay detection revokes the whole family (`provider.py:519-527`) on reuse, while Open WebUI refreshes without a lock 5 minutes before expiry on every request (`utils/oauth.py#L1060-L1180`) | **Code finding only** - reproducing the race needs two genuinely concurrent Open WebUI requests inside the access token's last 5 minutes, a timing window too narrow to force cheaply in this spike; left for #143/#144 to design a fix (e.g. a short grace window on first-reuse) and test for themselves |
+| M4 | A server-side preflight `GET /authorize` (no redirect follow) could leave an orphan `oauth_pending` row per admin click, and every Open WebUI user shares one egress IP against our `oauth_limiter` (`http.py:160,1005-1007`) | **Partially confirmed**: the anonymous-`initialize`-plus-discovery preflight on `/mcp` (above) is real and happens on every connection save, but this spike's own `/authorize` call always completed (no abandoned `oauth_pending` row observed after a successful run); the shared-egress-IP rate-limit bucket is a code finding only (this spike never drove two users through the same connection in parallel) |
+| M5 | `LOGIN_MODE=password` has exactly one subject (`login_password.py#L100-L104`) | **Confirmed by construction**: this spike's own admin user is the only subject `LOGIN_MODE=password` can ever authenticate; a second real user needs `LOGIN_MODE=oidc` plus a mock IdP (#144) |
+
+None of the above broke ADR-0011's load-bearing assumption (the AS
+accepting Open WebUI's DCR request and completing the per-user OAuth
+dance) - no STOP/Gate condition from this task's contract was triggered.
+
 ## Open questions
 
-- Does our DCR endpoint accept `token_endpoint_auth_method=client_secret_post` with `client_name='Open WebUI'`? This needs a live test against v0.11.4.
-- Are OAuth 2.1 modes offered for **OpenAPI** connections, or only for MCP? (unverified)
-- Which auth modes do user-level direct OpenAPI servers support? (unverified)
-- What tool name length or schema features does each model provider accept with the `<server_id>_` prefix? We should keep server ids and tool names short. (unverified)
-- In which version was `FORWARD_USER_INFO_HEADER_JWT_SECRET` introduced? It is present at v0.11.4 but has no CHANGELOG entry. (unverified)
-- For B with Entra: does adding a custom API scope to `MICROSOFT_OAUTH_SCOPE` break Open WebUI features that call Graph with that token? (unverified)
-- For `system_oauth`, which token does Open WebUI pick when a user has several OAuth sessions or providers? The code prefers the `oauth_session_id` cookie and falls back to the most recent session.
+None of the following blocks WP-42 … WP-46: ADR-0011 already picked
+Option A (per-user OAuth 2.1 for tools, personal tokens for the filter),
+which is the one path this spike had to prove and did (see "Spike
+results" above). Every remaining question below belongs to a path ADR-0011
+left for a later ADR (B, C) or to a provider-specific detail no planned
+WP depends on; each line says why.
+
+- **Resolved, live:** does our DCR endpoint accept `token_endpoint_auth_method=client_secret_post` with `client_name='Open WebUI'`? Yes - Tested version: 0.11.4, see "Spike results" above (`tests/e2e/openwebui_driver.py connect` completed with no `?error=`).
+- Are OAuth 2.1 modes offered for **OpenAPI** connections, or only for MCP? (still unverified) - blocks WP-4x: no, Option A only ever uses the MCP connection; OpenAPI is not part of any WP-42 … WP-46 task.
+- Which auth modes do user-level direct OpenAPI servers support? (still unverified) - blocks WP-4x: no, same reason.
+- What tool name length or schema features does each model provider accept with the `<server_id>_` prefix? (still unverified) - blocks WP-4x: no for WP-42 (this spike kept `server_id` to 6 characters, `memmgr`, well under the 47-character budget the existing "MCP support" table already derived); a concrete provider-by-provider limit is only relevant once #146/#150 run real models against real providers.
+- In which version was `FORWARD_USER_INFO_HEADER_JWT_SECRET` introduced? (still unverified) - blocks WP-4x: no, it is ADR-0011 Option C's mechanism, explicitly deferred to its own future ADR.
+- For B with Entra: does adding a custom API scope to `MICROSOFT_OAUTH_SCOPE` break Open WebUI features that call Graph with that token? (still unverified) - blocks WP-4x: no, Option B (`system_oauth`) is deferred to ADR-0006 §8's resource-server mode, not part of WP-42 … WP-46.
+- For `system_oauth`, which token does Open WebUI pick when a user has several OAuth sessions or providers? (code-level answer only: prefers the `oauth_session_id` cookie, falls back to the most recent session) - blocks WP-4x: no, same reason as the previous line.
+- M3 (refresh-token replay vs. Open WebUI's lock-free early refresh) and M4's shared-egress-IP rate-limit bucket - both code findings only (see "Predicted AS mismatches" above); not re-opened as questions here, but #143/#144 must read that table before changing `provider.py`/`http.py`.
 
 ## Sources
 
@@ -191,5 +343,10 @@ Recommendation for evaluation, not a decision: **A** is the only option that fit
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/utils/middleware.py
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/env.py
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/memories.py
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/configs.py (spike, 2026-10-10: `/oauth/clients/register`, `/tool_servers`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/functions.py (spike, 2026-10-10: `/create`, `/id/{id}/update`, `/id/{id}/valves/user/update`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/auths.py (spike, 2026-10-10: `/signup`, `create_session_response`)
+- memory-manager's own `.venv` at `mcp==2.3.0` (`uv.lock`): `mcp/server/auth/routes.py` `validate_issuer_url` (spike, 2026-10-10)
+- `podman_compose.py` (Debian package `podman-compose` 1.3.0, `/usr/lib/python3/dist-packages/podman_compose.py`): `get_net_args_from_network_mode` (spike, 2026-10-10)
 - https://github.com/open-webui/mcpo
 - https://github.com/open-webui/helm-charts/blob/main/charts/open-webui/Chart.yaml
