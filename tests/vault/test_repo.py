@@ -104,6 +104,13 @@ class TestCommitFile:
         with pytest.raises(ValueError):
             author_for("robot")
 
+    def test_openwebui_is_a_known_client(self) -> None:
+        """#143: Open WebUI's `_client_label_for` label must be an `author_for` client
+        `queue.py`'s write path can commit as, or every Open WebUI write would raise."""
+        author = author_for("openwebui")
+        assert author.name == "openwebui"
+        assert author.email == "openwebui@memory-manager.invalid"
+
 
 class TestPush:
     def test_push_rejected_when_remote_moved_ahead(

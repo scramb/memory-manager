@@ -35,7 +35,7 @@ _COMMITTER_NAME = "memory-manager"
 _COMMITTER_EMAIL = "memory-manager@memory-manager.invalid"
 
 _CLIENT_DOMAIN = "memory-manager.invalid"
-_KNOWN_CLIENTS = ("claude-ai", "claude-code", "human", "import")
+_KNOWN_CLIENTS = ("claude-ai", "claude-code", "openwebui", "human", "import")
 
 # The SHA-1 of the empty tree: diffing against it turns "every file in
 # <new_head>" into the same add/modify/delete shape a normal diff produces,
@@ -66,7 +66,7 @@ def author_for(client: str) -> Author:
     """Map a client identifier to the `Author` it commits as.
 
     Raises `ValueError` if `client` is not one of the known clients
-    (`claude-ai`, `claude-code`, `human`, `import`).
+    (`claude-ai`, `claude-code`, `openwebui`, `human`, `import`).
     """
     if client not in _KNOWN_CLIENTS:
         allowed = ", ".join(_KNOWN_CLIENTS)

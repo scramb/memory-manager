@@ -58,6 +58,7 @@ intersected with the supported set rather than trusted outright.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -133,6 +134,19 @@ ENTRA_GRAPH_UNAVAILABLE_MARKER = "entra refresh check: graph is temporarily unav
 #: Claude Code's loopback redirect; `_client_label_for` reads this to decide the committer
 #: identity a write through that client's tokens uses (`mcp/server.py`'s `current_client`).
 _CLAUDE_AI_HOSTS = frozenset({"claude.ai", "claude.com"})
+
+#: Open WebUI's DCR `client_name` (`docs/research/clients/openwebui.md`'s spike, #142,
+#: `open_webui/utils/oauth.py` v0.11.4, L517-538) - `_client_label_for` only trusts this
+#: together with `_OPENWEBUI_CALLBACK_PATH_RE` below, since a `client_name` alone is an
+#: unauthenticated, client-supplied string any DCR caller could send.
+_OPENWEBUI_CLIENT_NAME = "Open WebUI"
+
+#: The path shape of Open WebUI's own OAuth callback, `/oauth/clients/<id>/callback`
+#: (`<id>` is Open WebUI's own connection key, for example `mcp:memmgr` - unrelated to
+#: our AS-issued `client_id`). Matched against a registered redirect URI's path, never
+#: against the scheme/host (`_CLAUDE_AI_HOSTS`'s claude.ai/claude.com check already
+#: covers that distinction and keeps priority over this one).
+_OPENWEBUI_CALLBACK_PATH_RE = re.compile(r"^/oauth/clients/[^/]+/callback$")
 
 
 class _AuthorizationCode(AuthorizationCode):
@@ -651,9 +665,20 @@ class MemoryManagerOAuthProvider(
 
 
 def _client_label_for(client: OAuthClientInformationFull) -> str:
-    """`"claude-ai"` if any registered redirect URI points at claude.ai/claude.com, else
-    `"claude-code"` (`vault.repo.author_for`'s two machine-client identities, #36 step 7)."""
+    """`"claude-ai"` if any registered redirect URI points at claude.ai/claude.com,
+    `"openwebui"` if the client registered as `client_name="Open WebUI"` with a redirect
+    URI shaped like its own `/oauth/clients/<id>/callback` callback, else `"claude-code"`
+    (`vault.repo.author_for`'s three machine-client identities, #36 step 7 / #143).
+
+    The claude.ai host check keeps priority: a client's `client_name` is unauthenticated,
+    client-supplied input, so it only ever narrows the fallback branch, never the one
+    already tied to a redirect host.
+    """
     for redirect_uri in client.redirect_uris or ():
         if urlsplit(str(redirect_uri)).hostname in _CLAUDE_AI_HOSTS:
             return "claude-ai"
+    if client.client_name == _OPENWEBUI_CLIENT_NAME:
+        for redirect_uri in client.redirect_uris or ():
+            if _OPENWEBUI_CALLBACK_PATH_RE.match(urlsplit(str(redirect_uri)).path):
+                return "openwebui"
     return "claude-code"

@@ -264,9 +264,11 @@ def current_client() -> str:
 
     An OAuth access token (#36) carries its own committer identity in
     `claims["client_label"]` - `"claude-ai"` when the token's client
-    registered a claude.ai/claude.com redirect URI, `"claude-code"`
-    otherwise (`auth.provider`'s `_client_label_for`, set once at issuance,
-    not re-derived here). A static token (#34) carries no such claim and
+    registered a claude.ai/claude.com redirect URI, `"openwebui"` when it
+    registered as Open WebUI's own DCR client (`client_name="Open WebUI"`
+    plus its `/oauth/clients/<id>/callback` redirect shape, #143),
+    `"claude-code"` otherwise (`auth.provider`'s `_client_label_for`, set
+    once at issuance, not re-derived here). A static token (#34) carries no such claim and
     always commits as `"claude-code"`, regardless of the token's own name or
     `MEMORY_CLIENT` - static tokens authenticate human-driven clients
     (Claude Code, CI), not a separate committer identity. Stdio mode has no
