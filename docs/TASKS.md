@@ -367,10 +367,10 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: open
 
-- [ ] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/`
-- [ ] #131 Each MCP request runs under the profile chosen by override, clientInfo or default ⛔ blocked by #130
+- [x] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/`
+- [ ] #131 Each MCP request runs under the profile chosen by override, clientInfo or default
 - [ ] #132 Every tool carries MCP annotations and the core usage rules in its description
-- [ ] #133 A schema linter fails CI when a tool violates a supported profile's limits ⛔ blocked by #130
+- [ ] #133 A schema linter fails CI when a tool violates a supported profile's limits
 
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
 
