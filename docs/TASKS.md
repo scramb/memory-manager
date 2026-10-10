@@ -400,7 +400,8 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [x] #141 A pinned Open WebUI stack runs in Compose with memory-manager, Postgres and Ollama
 - [x] #142 Open WebUI's OAuth client, UserValves storage and filter token access are verified against the pinned stack ⛔ blocked by #141
 - [x] #143 Open WebUI registers via DCR and each user completes OAuth against our authorization server ⛔ blocked by #142
-- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP ⛔ blocked by #143
+- [ ] #310 A refresh token presented twice concurrently is treated as a replay
+- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP ⛔ blocked by #310
 
 ### WP-43 — Open WebUI profile · F-02 · Branch: `wp/43-openwebui-profile` · PR: open
 
