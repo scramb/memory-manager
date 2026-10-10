@@ -106,7 +106,23 @@ The owner decided on 2026-10-07 to keep the ranking unchanged and to bound only 
 
 **Rejected:** AND-first with an OR fallback. It changes ranking semantics for every vault, and for natural-language questions the OR fallback still reads the saturated posting lists.
 
-## Addendum 2026-10-08 — erasure scope and replay after a restore
+## Addendum 2026-10-09 — skipping the #117 retry once the vector side already has enough (#291)
+
+WP-32's load test (#291) found the #117 retry above itself as the dominant latency cost for a vector-only hybrid search: a query engineered to have no lexical match at all starves the selective-filtered attempt the same way a frequent-word query does, pays the full retry, and gets nothing for it once a vector leg already covers the same query. Measured on the WP-32 load-test vault (50k chunks/10k notes): ~135 ms per retry, pushing `search_vector_only`'s p95 (361–617 ms) over F-01's 300 ms search budget (`docs/benchmarks/vector-only-search.md`).
+
+The owner's standing approval for recommendations that do not change F-01's functional scope covers this change (same basis as the original #117 decision above).
+
+**Decision:** `search.py`'s `hybrid_search` runs its vector legs *before* the full-text side and skips the #117 retry only once those legs already returned at least `limit` chunks (the final note count the call returns) - an outcome-based condition, not "an embedding exists". A vector side that is itself starved (RLS hiding every row of every visible kind, a `chunks.model`/dimension mismatch, or genuinely nothing near the query) still gets the retry, exactly like a plain full-text-only call always did.
+
+**What changes:** no schema change, no change to the #117 detection/capping mechanism itself (`mm_frequent_lexemes`, `_CANDIDATE_CAP`) - only whether `fulltext_search`'s already-existing `retry_unfiltered` escape hatch fires for one specific caller (`_hybrid_search_impl`), and only once its own vector legs make the retry moot.
+
+**Why not "skip whenever an embedding exists":** an earlier draft of this fix keyed the skip on `provider is not None`/`embedding is not None` alone. WP-32's own load test exposed why that is unsafe on its own: a mismatch between the load test's loader and the server's `EMBEDDING_MODEL` made every vector leg return zero rows (`vector_search`'s `c.model = $n` filter excluding every stored chunk), and the retry-skip still fired - a search that structurally finds nothing looked fast for the wrong reason, not because the fix worked. Gating on the vector side's actual outcome catches that failure mode instead of hiding it.
+
+**Measured effect:** `docs/benchmarks/vector-only-search.md` records the before/after per-stage timings and a k6 correctness check (#291) added alongside the existing latency scenarios. A first version of that check sampled hit/miss from the load scenarios' own random (principal, query) draws and proved unreliable (0–14 samples per run, flaky at that size - a second verification round's own finding). The version actually shipped (`search_correctness_lexical`/`search_correctness_vector_only`, `search.js`) instead runs a fixed, visibility-chosen set of 50 lexical and 50 vector-only query/principal pairs as a dedicated, non-timed scenario, gated on both hit rate (`rate>=0.9`) and sample count (`count>=50`) - the latter is what makes a run with too few (or zero) samples fail loud rather than pass by default. Three consecutive `make loadtest-smoke` runs each measured 50/50 (100 %) on both checks; reproducing the `chunks.model` mismatch by hand dropped `check:vector` to 2/50 (4 %), crossing its threshold and failing the build as intended, while `check:lexical` (no embedding dependency) stayed 50/50 - reverted immediately after, no tracked file left in that state.
+
+**Eval:** `make eval`'s recall@5/MRR on the golden set is unaffected - the golden set runs against the Git backend (no ADR-0016 per-kind legs, no load-test loader), and the retry-skip condition never changes which candidates `fulltext_search`/`vector_search` themselves find, only whether a already-redundant second full-text statement runs.
+
+**Rejected:** keeping the unconditional `embedding is not None` skip (hides exactly the regression this addendum exists to fix); reverting to always running the retry regardless of the vector side's outcome (restores the latency cost #291 set out to remove, for the common case where the vector side already has a good answer).
 
 Two points of §3 were incomplete. The owner decided on 2026-10-08:
 

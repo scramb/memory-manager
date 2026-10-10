@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Generates a synthetic vault (loadtest.generate, #266) and bulk-loads it
+# - chunks and the ADR-0016 HNSW index included (--with-chunks, #267) -
+# straight into the already-running chart's own "memory_manager" database
+# (#270), using the CNPG superuser Secret (the chart's own cnpg block's
+# enableSuperuserAccess flag, charts/memory-manager/templates/
+# cnpg-cluster.yaml) rather than the owner's own: COPY has no row-security
+# evaluation path at all and is rejected outright for any non-superuser,
+# non-BYPASSRLS role on a FORCE ROW LEVEL SECURITY table
+# (migrations/0005_rls.sql), confirmed manually against a throwaway table
+# with an explicit, permissive policy before --use-existing-database
+# existed. --use-existing-database (loadtest/load.py) is what keeps this
+# from ever dropping/recreating that database out from under the 3
+# already-ready, already-serving api replicas scripts/loadtest-cluster.sh
+# installs before this Job ever runs.
+#
+# --maintenance-work-mem/--max-parallel-maintenance-workers (#271): raised
+# from loadtest/load.py's own 1GB/unset defaults for the target-size HNSW
+# build - the ADR-0016 group/project/org partitions stay small at this
+# vault's own namespace mix (Zipf-weighted, 200 personal namespaces vs. 20
+# group + 10 project + 1 org - docs/benchmarks/target-size.md's own dataset
+# facts), but headroom for the index-build session costs nothing once the
+# CNPG Cluster's own resources (scripts/loadtest-cluster.sh's own
+# LOADTEST_HELM_SET) are raised to fit it.
+#
+# The CNPG superuser Secret's own "uri" carries a literal "*" database
+# name (any database, not one in particular) - this Job's own command
+# rewrites it to "memory_manager" before handing it to loadtest.load's
+# own --admin-url.
+#
+# __LOADTEST_IMAGE__/__LOADTEST_NOTES__/__LOADTEST_APP_ROLE__/
+# __LOADTEST_MCP_BASE_URL__ are substituted by scripts/loadtest-cluster.sh
+# (sed) - the image this run built and pushed, LOADTEST_NOTES, the
+# chart's own database block's appRole value, and the api Service's own
+# in-cluster base URL (both namespace- and release-name-dependent,
+# CLAUDE.md: no operator-specific values committed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mm-loadtest-generate-load
+  labels:
+    app.kubernetes.io/name: mm-loadtest-generate-load
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mm-loadtest-generate-load
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: generate-load
+          image: __LOADTEST_IMAGE__
+          # Always, not the default IfNotPresent: LOADTEST_IMAGE_TAG is
+          # fixed (default "loadtest"), not unique per run.
+          imagePullPolicy: Always
+          env:
+            - name: LOADTEST_NOTES
+              value: "__LOADTEST_NOTES__"
+            - name: LOADTEST_APP_ROLE
+              value: "__LOADTEST_APP_ROLE__"
+            - name: LOADTEST_MCP_BASE_URL
+              value: "__LOADTEST_MCP_BASE_URL__"
+            - name: ADMIN_URI_RAW
+              valueFrom:
+                secretKeyRef:
+                  name: memory-manager-db-superuser
+                  key: uri
+          # Request/limit (#271): this Job carried no resources block at
+          # all before - a BestEffort Pod, which let an unbounded producer/
+          # consumer imbalance in loadtest.load's own chunk-building
+          # pipeline (fixed in the same task, _windowed's own bound) grow
+          # into a **host**-level OOM instead of a contained Pod OOM (the
+          # first 2026-10-09 target-size attempt: ~39 GiB RSS, killed the
+          # whole node, briefly took down other Pods' liveness probes with
+          # it - docs/benchmarks/target-size.md). 18Gi is sized from this
+          # task's own measurement, after the windowing fix, at the fixed
+          # 1M-note/5M-chunk target size: the container's cgroup memory
+          # usage plateaued at ~12.9 GiB (anon 8.6 GiB + file 2.5 GiB +
+          # kernel 1.8 GiB, per the cgroup v2 stat file) through the whole chunk-loading
+          # phase, not growing further - that baseline (holding all 1M
+          # `_Row`s plus 8 spawned worker processes for the run's own
+          # duration) is unrelated to the windowing bug and was simply
+          # invisible underneath the ~39 GiB the bug itself added; a first
+          # try at 12Gi sat right at that baseline with too little margin
+          # for the index-build phase's own `--maintenance-work-mem 2GB`
+          # session on top, hence 18Gi, not 12Gi.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 18Gi
+          command:
+            - sh
+            - -euc
+            - |
+              admin_url="${ADMIN_URI_RAW%/*}/memory_manager"
+              echo "generating ${LOADTEST_NOTES} synthetic notes..."
+              # 200 users/tokens - the same shape scripts/loadtest-smoke.sh
+              # already validates (its own comment: every personal
+              # namespace needs its own token, so --users and --tokens
+              # must match). loadtest/k8s/k6-job.yaml's own lowered
+              # MM_SEARCH_RATE/MM_READ_RATE/MM_WRITE_RATE - not a higher
+              # token count - is what keeps this run under the chart's
+              # own default per-token rate-limit budget (see that file's
+              # own comment): raising --tokens instead, tried first,
+              # cleared the rate-limit thresholds but then measured a low
+              # search_correctness_hit_rate{check:vector} - this run's own
+              # deterministic correctness pairs (loadtest/k6/search.js)
+              # are seed-selected from the generated vault, and an
+              # untested --users value shifts which ones get picked.
+              python -m loadtest.generate \
+                --notes "$LOADTEST_NOTES" --users 200 --groups 20 --seed 1 \
+                --out /data/vault-out
+              echo "loading into memory_manager via the CNPG superuser secret..."
+              python -m loadtest.load \
+                --vault /data/vault-out \
+                --admin-url "$admin_url" \
+                --db-name memory_manager \
+                --app-role "$LOADTEST_APP_ROLE" \
+                --context-out /data/vault-out/k6-context.json \
+                --base-url "$LOADTEST_MCP_BASE_URL" \
+                --tokens 200 \
+                --with-chunks \
+                --embedding-model loadtest-stub \
+                --results-out /data/vault-out/chunk-results.json \
+                --use-existing-database \
+                --maintenance-work-mem 2GB \
+                --max-parallel-maintenance-workers 4
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mm-loadtest-data

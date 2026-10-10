@@ -30,6 +30,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
+# Cluster/registry/CNPG bootstrap mechanics shared with
+# scripts/loadtest-cluster.sh (#270, WP-32) - see that file for its own
+# local-kind path.
+source "${REPO_ROOT}/scripts/lib/kind-cluster.sh"
+
 # --- pinned tool versions (docs/research/kind-e2e.md) ----------------------
 KIND_VERSION="${KIND_VERSION:-v0.30.0}"
 KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.33.4@sha256:25a6018e48dfcaee478f4a59af81157a437f15e6e140bf103f85a2e7cd0cbbf2}"
@@ -58,36 +63,12 @@ TOOLS_DIR="$(mktemp -d)"
 trap 'rm -rf "$TOOLS_DIR"' EXIT
 
 # --- container engine (docker on GitHub runners, podman locally) -----------
-if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
-  ENGINE="$CONTAINER_ENGINE"
-elif command -v docker >/dev/null 2>&1; then
-  ENGINE=docker
-elif command -v podman >/dev/null 2>&1; then
-  ENGINE=podman
-else
-  echo "FAIL: neither docker nor podman found on PATH" >&2
-  exit 1
-fi
-echo "using container engine: ${ENGINE}"
-
-if [[ "$ENGINE" == podman ]]; then
-  # Rootful podman (see module docstring) - kind's own podman provider needs
-  # it, and the registry container below must land in the same, rootful
-  # container storage/network as the kind nodes it shares the "kind"
-  # network with.
-  CTR=(sudo podman)
-  KIND=(sudo -E env "KIND_EXPERIMENTAL_PROVIDER=podman" kind)
-else
-  CTR=(docker)
-  KIND=(kind)
-fi
+mm_detect_container_engine
 
 # --- pinned kind/flux CLIs, fetched fresh every run (validate.yml's own
 # kubeconform/tofu pattern) - never whatever happens to be on PATH ----------
-echo "installing kind ${KIND_VERSION} and flux ${FLUX_VERSION} into ${TOOLS_DIR}"
-curl -sL "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
-  -o "${TOOLS_DIR}/kind"
-chmod +x "${TOOLS_DIR}/kind"
+mm_install_pinned_kind "$KIND_VERSION" "$TOOLS_DIR"
+echo "installing flux ${FLUX_VERSION} into ${TOOLS_DIR}"
 curl -sL "https://github.com/fluxcd/flux2/releases/download/v${FLUX_VERSION}/flux_${FLUX_VERSION}_linux_amd64.tar.gz" \
   | tar xz -C "${TOOLS_DIR}" flux
 chmod +x "${TOOLS_DIR}/flux"
@@ -137,69 +118,28 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 1. local registry ------------------------------------------------------
-echo "--- creating local registry ---"
-"${CTR[@]}" rm -f "$REGISTRY_NAME" >/dev/null 2>&1 || true
-"${CTR[@]}" run -d --restart=always -p "127.0.0.1:${REGISTRY_HOST_PORT}:5000" \
-  --network bridge --name "$REGISTRY_NAME" docker.io/library/registry:3
+mm_start_local_registry "$REGISTRY_NAME" "$REGISTRY_HOST_PORT"
 
 # --- 2. kind cluster ---------------------------------------------------------
-echo "--- creating kind cluster '${CLUSTER_NAME}' ---"
-"${KIND[@]}" delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
-KIND_CONFIG="${TOOLS_DIR}/kind-config.yaml"
-cat >"$KIND_CONFIG" <<'EOF'
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-containerdConfigPatches:
-- |-
-  [plugins."io.containerd.grpc.v1.cri".registry]
-    config_path = "/etc/containerd/certs.d"
-EOF
-"${KIND[@]}" create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$KIND_CONFIG"
-"${KCTL[@]}" wait --for=condition=Ready node --all --timeout=120s
+mm_create_kind_cluster "$CLUSTER_NAME" "$KIND_NODE_IMAGE" "$TOOLS_DIR"
 
 # --- 3. wire the registry into the cluster's network -----------------------
 # Both engines name the network a kind cluster's nodes land on "kind"
 # (confirmed locally for podman; the same name docker's own kind provider
-# has always used) - this connects the registry container onto it too.
-KIND_NETWORK="kind"
-"${CTR[@]}" network connect "$KIND_NETWORK" "$REGISTRY_NAME" 2>/dev/null || true
-REGISTRY_IP="$("${CTR[@]}" inspect "$REGISTRY_NAME" --format "{{(index .NetworkSettings.Networks \"${KIND_NETWORK}\").IPAddress}}")"
-if [[ -z "$REGISTRY_IP" ]]; then
-  echo "FAIL: could not determine the registry container's IP on the '${KIND_NETWORK}' network" >&2
-  exit 1
-fi
-echo "registry '${REGISTRY_NAME}' reachable in-cluster at ${REGISTRY_IP}:5000, from the host at localhost:${REGISTRY_HOST_PORT}"
-
-# containerd on each node aliases "localhost:${REGISTRY_HOST_PORT}" (the
-# image refs built/pushed below) to the registry's raw IP - a pod's own
-# network stack (Flux's source-controller) cannot resolve either the
-# registry's engine-level name or "localhost:<port>" the way node-level
-# containerd can (docs/research/kind-e2e.md), which is why the
-# HelmRepository below is pointed at this same IP directly instead.
-for node in $("${KIND[@]}" get nodes --name "$CLUSTER_NAME"); do
-  "${CTR[@]}" exec "$node" mkdir -p "/etc/containerd/certs.d/localhost:${REGISTRY_HOST_PORT}"
-  printf '[host."http://%s:5000"]\n' "$REGISTRY_IP" \
-    | "${CTR[@]}" exec -i "$node" cp /dev/stdin "/etc/containerd/certs.d/localhost:${REGISTRY_HOST_PORT}/hosts.toml"
-done
+# has always used) - sets REGISTRY_IP, which the HelmRepository below is
+# pointed at directly (a pod's own network stack, Flux's
+# source-controller, cannot resolve either the registry's engine-level
+# name or "localhost:<port>" the way node-level containerd can,
+# docs/research/kind-e2e.md).
+mm_wire_registry_into_kind "$CLUSTER_NAME" "$REGISTRY_NAME" "$REGISTRY_HOST_PORT"
 
 # --- 4. build + push the memory-manager and mock-idp images ----------------
-# podman needs --tls-verify=false against the plain-HTTP local registry;
-# docker treats "localhost:<port>" as insecure automatically (both verified
-# locally/against validate.yml's own docker job), so the flag is podman-only.
-push_image() {
-  if [[ "$ENGINE" == podman ]]; then
-    "${CTR[@]}" push --tls-verify=false "$1"
-  else
-    "${CTR[@]}" push "$1"
-  fi
-}
-
 echo "--- building memory-manager:${IMAGE_TAG} from ${MM_E2E_IMAGE_SRC} ---"
 MM_GIT_SHA="$(git -C "$MM_E2E_IMAGE_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 "${CTR[@]}" build -t "localhost:${REGISTRY_HOST_PORT}/memory-manager:${IMAGE_TAG}" \
   --build-arg "MM_GIT_SHA=${MM_GIT_SHA}" \
   -f "${MM_E2E_IMAGE_SRC}/Dockerfile" "$MM_E2E_IMAGE_SRC"
-push_image "localhost:${REGISTRY_HOST_PORT}/memory-manager:${IMAGE_TAG}"
+mm_push_image "localhost:${REGISTRY_HOST_PORT}/memory-manager:${IMAGE_TAG}"
 
 # tests/mock_idp/Containerfile needs the root .dockerignore's own excluded
 # "tests" directory (its own top comment: podman's --ignorefile swaps in
@@ -216,7 +156,7 @@ cp -r "${REPO_ROOT}/src" "${MOCK_IDP_CTX}/src"
 cp -r "${REPO_ROOT}/tests/mock_idp" "${MOCK_IDP_CTX}/tests/mock_idp"
 "${CTR[@]}" build -t "localhost:${REGISTRY_HOST_PORT}/mock-idp:${IMAGE_TAG}" \
   -f "${REPO_ROOT}/tests/mock_idp/Containerfile" "$MOCK_IDP_CTX"
-push_image "localhost:${REGISTRY_HOST_PORT}/mock-idp:${IMAGE_TAG}"
+mm_push_image "localhost:${REGISTRY_HOST_PORT}/mock-idp:${IMAGE_TAG}"
 
 # --- 5. package + push the Helm chart as an OCI artifact --------------------
 echo "--- packaging and pushing the Helm chart ---"
@@ -224,10 +164,7 @@ helm package "${REPO_ROOT}/charts/memory-manager" --version "$CHART_VERSION" --a
 helm push "${TOOLS_DIR}/memory-manager-${CHART_VERSION}.tgz" "oci://localhost:${REGISTRY_HOST_PORT}/charts" --plain-http
 
 # --- 6. CNPG operator (pinned release manifest) -----------------------------
-echo "--- installing the CNPG operator ${CNPG_OPERATOR_VERSION} ---"
-"${KCTL[@]}" apply --server-side -f \
-  "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v${CNPG_OPERATOR_VERSION}/cnpg-${CNPG_OPERATOR_VERSION}.yaml"
-"${KCTL[@]}" wait --for=condition=Available deployment/cnpg-controller-manager -n cnpg-system --timeout=180s
+mm_install_cnpg_operator "$CNPG_OPERATOR_VERSION" "kind-${CLUSTER_NAME}"
 
 # --- 7. Flux (pinned version, only the controllers this E2E needs) ---------
 echo "--- installing Flux ${FLUX_VERSION} (source-controller, helm-controller) ---"

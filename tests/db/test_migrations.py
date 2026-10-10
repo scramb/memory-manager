@@ -302,6 +302,7 @@ class TestMigrateBackendPostgres:
             "0020_admin_namespaces",
             "0021_break_glass_workflow",
             "0023_break_glass_notice",
+            "0024_frequent_lexemes_partitions",
         ]
         tables = {
             row["table_name"]

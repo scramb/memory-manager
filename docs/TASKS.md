@@ -320,12 +320,15 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 
 ### WP-32 — Load test at target size · F-01 · Branch: `wp/32-load-target` · PR: open
 
-- [ ] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
-- [ ] #267 Loader writes chunks with synthetic vectors and builds the ADR-0016 HNSW index ⛔ blocked by #266, #221
-- [ ] #268 Embedding stub answers query embeddings deterministically for load tests ⛔ blocked by #266
-- [ ] #269 Local load test runs 3 replicas with a replica kill on Postgres or Valkey shared state ⛔ blocked by #267, #268
-- [ ] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
-- [ ] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
+- [x] #266 Generator produces a 1M-note / ~5M-chunk vault with deterministic synthetic vectors ⛔ blocked by #221, ADR-0016 accepted (spike #125)
+- [x] #267 Loader writes chunks with synthetic vectors and builds the ADR-0016 HNSW index ⛔ blocked by #266, #221
+- [x] #268 Embedding stub answers query embeddings deterministically for load tests ⛔ blocked by #266
+- [x] #269 Local load test runs 3 replicas with a replica kill on Postgres or Valkey shared state ⛔ blocked by #267, #268
+- [x] #291 Vector-only searches meet the F-01 search latency budget ⛔ blocked by #269
+- [x] #293 Vector-only search finds its target on the Helm deployment as on a single process ⛔ blocked by #291
+- [x] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
+- [x] #296 Unfiltered vector searches on the user partition use the namespace B-tree instead of scanning every chunk
+- [x] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
 
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
 

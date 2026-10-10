@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Builds a standalone image for the loadtest/ package (#270), layered
+# straight on top of an already-built memory-manager image (BASE_IMAGE,
+# built from the root Dockerfile) rather than its own `uv sync`: that
+# image's own venv already has memory_manager itself installed
+# (`--no-editable`), so this only ever adds the one thing it is missing -
+# loadtest/, which is standalone load-test tooling (pyproject.toml's own
+# comment), never part of the installed package. Runs as the same
+# non-root user the base image already created.
+#
+# Used by scripts/loadtest-cluster.sh for both the generate+load Job and
+# the embedding-stub Deployment (loadtest/k8s/embedding-stub.yaml) - one
+# image, not a second python:3.12-slim + pip-install-at-startup one, so
+# both ever only run exactly what `uv sync` already resolved and this
+# repository's own CI already lints/type-checks (mypy's own `files`
+# includes "loadtest", pyproject.toml).
+#
+# Build:
+#   podman build -f loadtest/k8s/Containerfile \
+#     --build-arg BASE_IMAGE=<registry>/memory-manager:<tag> \
+#     -t <registry>/memory-manager-loadtest:<tag> .
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+COPY loadtest/ /app/loadtest/
+ENV PYTHONPATH=/app
+
+USER 10001:10001
+# No CMD: scripts/loadtest-cluster.sh's own Jobs/Deployment each set their
+# own `python -m loadtest.<module> ...` command.

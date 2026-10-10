@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The #268 embedding stub (loadtest/embedding_stub.py), in-cluster, so
+# EMBEDDING_URL (values-loadtest.yaml's own `--set` of embedding's own url
+# key, scripts/loadtest-cluster.sh) has something real to answer the
+# api/worker Deployments' query-time embedding calls (#270). Runs the same
+# image as the generate+load Job (loadtest/k8s/Containerfile) - never a
+# bare slim Python image with packages installed at Pod start, so this
+# never runs anything this repository's own CI has not already linted/
+# type-checked/tested.
+#
+# `--queries` needs the exact queries.jsonl the generate+load Job's own
+# generate run produced (loadtest/embedding_stub.py's own docstring) -
+# mm-loadtest-data (pvc.yaml) is read-only here, read-write for the Job
+# that fills it; scripts/loadtest-cluster.sh waits for the Job to finish
+# before this Deployment's first readiness probe is expected to pass (the
+# queries.jsonl path does not exist before then, and the container
+# crash-loops on --queries until it does - an expected, bounded wait, not
+# a failure of this manifest).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mm-loadtest-embedding-stub
+  labels:
+    app.kubernetes.io/name: mm-loadtest-embedding-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mm-loadtest-embedding-stub
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mm-loadtest-embedding-stub
+    spec:
+      containers:
+        - name: embedding-stub
+          image: __LOADTEST_IMAGE__
+          # Always, not IfNotPresent: LOADTEST_IMAGE_TAG is fixed (default
+          # "loadtest"), not unique per run - a repeated run must never
+          # serve a kubelet-cached image from an earlier one.
+          imagePullPolicy: Always
+          command:
+            - python
+            - -m
+            - loadtest.embedding_stub
+            - --queries
+            - /data/vault-out/queries.jsonl
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8081"
+            - --dimension
+            - "1024"
+          ports:
+            - name: http
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            failureThreshold: 60
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mm-loadtest-data
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedding-stub
+  labels:
+    app.kubernetes.io/name: mm-loadtest-embedding-stub
+spec:
+  selector:
+    app.kubernetes.io/name: mm-loadtest-embedding-stub
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http

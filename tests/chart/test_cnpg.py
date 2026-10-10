@@ -117,3 +117,20 @@ def test_no_rendered_object_uses_the_deprecated_in_tree_field(
 
     for doc in result.documents():
         assert "barmanObjectStore" not in str(doc), doc.get("kind")
+
+
+def test_default_render_has_no_superuser_access(render: Callable[..., _ChartRender]) -> None:
+    """Off by default (#270) - api/worker never need it (ADR-0008: they
+    always connect as the non-superuser owner/app role), and the git-mode
+    golden render (`tests/chart/test_backend_guard.py`) must stay exactly
+    what it was before this value existed."""
+    cluster = render().find("Cluster")
+
+    assert "enableSuperuserAccess" not in cluster["spec"]
+
+
+def test_enable_superuser_access_flag_turns_it_on(render: Callable[..., _ChartRender]) -> None:
+    result = render(set_values={"database.cnpg.enableSuperuserAccess": "true"})
+
+    cluster = result.find("Cluster")
+    assert cluster["spec"]["enableSuperuserAccess"] is True

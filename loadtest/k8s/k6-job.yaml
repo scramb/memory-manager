@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Runs loadtest/k6/smoke.js in-cluster against the chart's own api Service
+# (#270) - no load balancer of its own needed, kube-proxy already spreads
+# every request across all 3 ready api Pods (loadtest/k6/lib.js's own
+# round robin, built for scripts/loadtest-smoke.sh's separate per-replica
+# processes, degrades to a single, already-load-balanced base URL here
+# without any change to that file). scripts/loadtest-cluster.sh creates
+# the "mm-loadtest-k6-scripts" ConfigMap this Job mounts at /scripts
+# straight from loadtest/k6/*.js (`kubectl create configmap --from-file`)
+# - never duplicated into this manifest, so the two can never drift.
+#
+# --summary-export writes onto the same PVC the generate+load Job filled
+# (mm-loadtest-data) rather than an emptyDir - a Job's own Pod is gone by
+# the time scripts/loadtest-cluster.sh collects results, so the summary
+# has to outlive it somewhere scripts/loadtest-cluster.sh can still reach
+# (`kubectl cp` from a short-lived debug Pod, or - cheaper - straight off
+# this same PVC via `kubectl exec` into the Pod the kill step already
+# needs a handle on).
+#
+# __LOADTEST_WARMUP_SECONDS__/__LOADTEST_MEASURE_SECONDS__ are substituted
+# by scripts/loadtest-cluster.sh (sed) - the exact warmup/measure window it
+# uses for its own kill-delay arithmetic (LOADTEST_KILL_AFTER), so the two
+# never silently drift apart the way two independently hardcoded literals
+# could. __K6_IMAGE__ is that script's own K6_IMAGE (default
+# docker.io/grafana/k6:2.3.0, same pinned release scripts/
+# loadtest-smoke.sh uses).
+#
+# MM_SEARCH_RATE/MM_READ_RATE/MM_WRITE_RATE (smoke.js's own, already
+# env-overridable call rates, #269 - no change to that file): lowered
+# from its own defaults (8, 7, 3) to stay under the chart's own *default*
+# RATE_LIMIT_MCP_PER_MINUTE/RATE_LIMIT_WRITE_PER_MINUTE (2 and 0.5 calls
+# per second per token - config.py's own _DEFAULT_MCP_PER_MINUTE/
+# _DEFAULT_WRITE_PER_MINUTE),
+# which this chart exposes no value for overriding the way scripts/
+# loadtest-smoke.sh's own directly-started replicas do
+# (RATE_LIMIT_MCP_PER_MINUTE=1000000 there). smoke.js's own comment on
+# the measured `search`/`read`/`write` scenarios already explains why:
+# `constant-arrival-rate` round-robins every iteration across its *whole*
+# `preAllocatedVUs` pool regardless of how few it actually needs at this
+# latency (3/2/2 respectively) - each pre-allocated VU (and so each
+# fixed, per-token rate-limit bucket, http.py's own "keyed by the hashed
+# bearer token") ends up carrying rate/preAllocatedVUs calls/s, which
+# exceeded both budgets at the defaults (confirmed: 8 over 3 VUs, 7 over
+# 2 VUs, and the write scenario's own 2 calls per iteration over 2 VUs,
+# all above the 2 and 0.5 calls-per-second-per-token budgets above,
+# measured as a sustained 21-31% 429 rate against the live chart
+# defaults). search_vector_only's own default (rate 2, preAllocatedVUs
+# 3) already clears both and is left alone.
+#
+# --no-connection-reuse (a k6 CLI flag, not a loadtest/k6/smoke.js change):
+# the single Service URL above means every VU's persistent keep-alive
+# connection, once established, is pinned (via the kernel's own conntrack
+# entry) to whichever Pod kube-proxy's iptables DNAT picked for it - a
+# forced-killed Pod's existing connections keep routing to it until they
+# individually time out, however long that takes, rather than failing
+# over immediately the way a brand new connection would (iptables drops
+# the dead Pod from the Service's endpoint list within milliseconds of
+# the delete). loadtest/k6/lib.js's own per-VU circuit breaker (built for
+# scripts/loadtest-smoke.sh's own distinct per-replica base_urls, #269)
+# has nothing to mark unhealthy here - there is only ever the one URL -
+# so a fresh connection (and so a fresh, already-updated DNAT decision)
+# every request is what actually keeps this Job's own measured error
+# rate inside loadtest/k6/smoke.js's own thresholds across a real forced
+# Pod kill, confirmed against a run that still failed them without this
+# flag.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mm-loadtest-k6
+  labels:
+    app.kubernetes.io/name: mm-loadtest-k6
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mm-loadtest-k6
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: __K6_IMAGE__
+          # `mkdir -p` first: --summary-export never creates its own parent
+          # directory, and /data/results does not exist on a freshly
+          # provisioned PVC (verified against the image's own entrypoint -
+          # k6's official image is Alpine-based and does carry /bin/sh).
+          command:
+            - sh
+            - -euc
+            - |
+              mkdir -p /data/results
+              k6 run \
+                --no-connection-reuse \
+                --summary-trend-stats 'avg,med,p(95),p(99),max' \
+                --summary-export=/data/results/summary.json \
+                /scripts/smoke.js
+          env:
+            - name: MM_CONTEXT_FILE
+              value: /data/vault-out/k6-context.json
+            - name: MM_QUERIES_FILE
+              value: /data/vault-out/queries.jsonl
+            - name: MM_WARMUP_DURATION
+              value: "__LOADTEST_WARMUP_SECONDS__s"
+            - name: MM_MEASURE_DURATION
+              value: "__LOADTEST_MEASURE_SECONDS__s"
+            - name: MM_EMBEDDINGS_MODE
+              value: stub
+            - name: MM_SEARCH_RATE
+              value: "5"
+            - name: MM_READ_RATE
+              value: "3"
+            - name: MM_WRITE_RATE
+              value: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mm-loadtest-data
+        - name: scripts
+          configMap:
+            name: mm-loadtest-k6-scripts
