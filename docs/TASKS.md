@@ -401,7 +401,9 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [x] #142 Open WebUI's OAuth client, UserValves storage and filter token access are verified against the pinned stack ⛔ blocked by #141
 - [x] #143 Open WebUI registers via DCR and each user completes OAuth against our authorization server ⛔ blocked by #142
 - [x] #310 A refresh token presented twice concurrently is treated as a replay
-- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP
+- [ ] #313 The Open WebUI stack starts per backend with a mock IdP and two real subjects
+- [ ] #314 Open WebUI runs a scripted MCP tool call on behalf of the signed-in user
+- [ ] #144 Two Open WebUI users write and read only their own memory over native MCP ⛔ blocked by #313, #314
 
 ### WP-43 — Open WebUI profile · F-02 · Branch: `wp/43-openwebui-profile` · PR: open
 
