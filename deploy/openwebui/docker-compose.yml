@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Local Open WebUI stack for the WP-42 spike (#141): Open WebUI pinned at
+# OPENWEBUI_VERSION (exported by the Makefile's openwebui-up/openwebui-down
+# targets, default 0.11.4 - docs/research/clients/openwebui.md), talking to
+# a scripted, OpenAI-compatible stub model (tests/e2e/stubs/scripted_model.py)
+# instead of a real provider, so tool calls are deterministic. memory-manager
+# and its Postgres/pgvector index come from the same build this worktree's
+# Makefile `image` target produces (image: memory-manager:dev - never the
+# published ghcr.io tag, so this never needs network access to a registry
+# for our own code). Ollama is opt-in (`--profile ollama`, see
+# scripts/openwebui-up.sh/Makefile) for the real small model the nightly
+# filter check (#151) and manual exploration use; pulling and running a
+# model would otherwise blow well past this stack's own startup budget.
+#
+# `deploy/openwebui/.env` is REQUIRED (unlike the root compose.yaml's own,
+# genuinely optional `.env`): it must carry a stable WEBUI_SECRET_KEY, since
+# Open WebUI encrypts stored OAuth client info and per-user tokens with it
+# (docs/research/clients/openwebui.md "Other env"; relevant once #142/#143
+# wire up the OAuth connection on top of this stack) - a key that changes
+# between runs makes every previously stored OAuth session undecryptable.
+# `scripts/openwebui-up.sh` creates this file once, with a random key, and
+# never overwrites it.
+#
+# ENABLE_PERSISTENT_CONFIG (Open WebUI's own default): most of the
+# environment variables below are only read on Open WebUI's *first* start
+# and then written into its own database - changing one of them later has
+# no effect until the `openwebui-data` volume is gone - that is, after
+# `make openwebui-down` (which runs `down -v`).
+#
+# Same `${VAR:-default}` caution as compose.yaml's own header comment:
+# podman-compose 1.3 passes that syntax through literally, unresolved, when
+# the variable is undefined anywhere - so every value below is either a
+# plain literal, a bare `${VAR}` that the Makefile always exports before
+# invoking this file (OPENWEBUI_VERSION), or comes from `env_file` (no
+# interpolation step at all, so nothing to get wrong there).
+
+services:
+  # Same ownership fix-up as compose.yaml's own volume-perms - see there
+  # for why this is needed at all (Docker's root:root fresh-volume default).
+  volume-perms:
+    image: docker.io/library/busybox:1.37
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/perms/vault-clone", "/perms/vault-remote"]
+    volumes:
+      - vault-clone:/perms/vault-clone
+      - vault-remote:/perms/vault-remote
+    restart: "no"
+
+  postgres:
+    image: docker.io/pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mm
+      POSTGRES_PASSWORD: mm
+      POSTGRES_DB: mm
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    # No published host port, same reasoning as compose.yaml: nothing
+    # outside this project needs to reach it, and a fixed host port would
+    # risk colliding with mm-pg (make db-up) or another local Postgres.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mm -d mm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: seeds the local vault "remote" with a first note - same
+  # script and reasoning as compose.yaml's own vault-init.
+  #
+  # No `depends_on` on volume-perms here on purpose: podman-compose 1.3
+  # turns every `depends_on` entry, whatever its `condition`, into a plain
+  # `podman --requires=...` on the container (podman_compose.py,
+  # `container_to_args`) - podman's own, permanent "this container must be
+  # running" dependency, not docker-compose's one-shot "ran to completion"
+  # check. volume-perms exits 0 and stays exited by design (`restart:
+  # "no"`), so once it has, `--requires=volume-perms` can never be
+  # satisfied again - `podman start` on anything requiring it then fails
+  # with "internal libpod error" while trying to restart it, and the
+  # container is left stuck in `Created`. scripts/openwebui-up.sh runs and
+  # waits for volume-perms before starting this service instead.
+  vault-init:
+    build: ../..
+    image: memory-manager:dev
+    command: ["/bin/sh", "/compose-init.sh"]
+    environment:
+      VAULT_REMOTE: file:///data/remote.git
+    volumes:
+      - vault-remote:/data/remote.git
+      - ../../scripts/compose-init.sh:/compose-init.sh:ro
+    restart: "no"
+
+  memory-manager:
+    build: ../..
+    image: memory-manager:dev
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "10001:10001"
+    environment:
+      DATABASE_URL: postgresql://mm:mm@postgres:5432/mm
+      VAULT_REMOTE: file:///data/remote.git
+      # Must match the host port published below (18081, not 8080/18080 -
+      # both already used elsewhere, see scripts/openwebui-up.sh): this is
+      # the origin a browser reaches the AS at for #142/#143's OAuth flow,
+      # not merely a label.
+      PUBLIC_URL: http://localhost:18081
+    volumes:
+      - vault-clone:/data
+      - vault-remote:/data/remote.git
+      - ../../scripts/http-healthcheck.py:/healthcheck.py:ro
+    ports:
+      - "127.0.0.1:18081:8080"
+    # Only postgres here, and only because it stays running (`condition:
+    # service_healthy` on a long-running container is a safe, permanent
+    # `podman --requires=postgres`). volume-perms and vault-init are
+    # deliberately absent - see vault-init's own comment above for why a
+    # `depends_on` on either one-shot would get this container stuck in
+    # `Created` instead. scripts/openwebui-up.sh starts and waits for both
+    # before starting this service.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No curl in this image (Dockerfile's runtime stage installs only git
+    # and openssh-client) - scripts/http-healthcheck.py's own docstring
+    # explains why that stands in as its own mounted file rather than an
+    # inline "-c" one-liner here.
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 20
+
+  # The deterministic chat model (#141): same memory-manager image (its
+  # venv already carries Starlette/uvicorn, transitive runtime deps of
+  # `mcp`, ADR-0001 - no second image to build), but started by file path
+  # against the read-only mounted stub module instead of the real server -
+  # tests/e2e/stubs/scripted_model.py's own docstring explains why it stays
+  # import-free of `tests.`/`loadtest.` so this works at all.
+  scripted-model:
+    build: ../..
+    image: memory-manager:dev
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "10001:10001"
+    command: ["python3", "/stubs/scripted_model.py", "--host", "0.0.0.0", "--port", "8091"]
+    volumes:
+      - ../../tests/e2e/stubs:/stubs:ro
+      - ../../scripts/http-healthcheck.py:/healthcheck.py:ro
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:8091/healthz"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPENWEBUI_VERSION}
+    environment:
+      OPENAI_API_BASE_URLS: http://scripted-model:8091/v1
+      OPENAI_API_KEYS: dummy-key-not-checked-by-the-stub
+      OLLAMA_BASE_URL: http://ollama:11434
+      # Otherwise a plain task request against the stub model consumes a
+      # scripted turn before the test's own tool-call turn ever runs
+      # (docs/research/clients/openwebui.md: these all issue their own,
+      # separate chat completions).
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      WEBUI_URL: http://localhost:3000
+    env_file:
+      - path: .env
+        required: true
+    # Runs as root in the upstream image and writes its SQLite/config state
+    # under /app/backend/data - unlike memory-manager/scripted-model above,
+    # not read_only.
+    volumes:
+      - openwebui-data:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    depends_on:
+      scripted-model:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 120s
+      retries: 30
+
+  # Opt-in (`--profile ollama`, scripts/openwebui-up.sh/Makefile): the real
+  # small model for manual exploration and the nightly filter check (#151).
+  # Left out of `openwebui-up`'s default run for the same reason
+  # compose.yaml's own ollama service is - pulling a model would blow well
+  # past this stack's startup budget.
+  ollama:
+    image: docker.io/ollama/ollama:0.40.2
+    profiles: ["ollama"]
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+
+volumes:
+  pg-data:
+  vault-clone:
+  vault-remote:
+  openwebui-data:
+  ollama-data:

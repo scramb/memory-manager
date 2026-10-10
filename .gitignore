@@ -25,3 +25,9 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Open WebUI local stack (#141, WP-42) - scripts/openwebui-up.sh creates
+# this with a random WEBUI_SECRET_KEY on first run; never committed (it is
+# the per-deployment secret OAuth tokens get encrypted with, see
+# deploy/openwebui/docker-compose.yml's header comment).
+deploy/openwebui/.env

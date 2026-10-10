@@ -124,6 +124,19 @@ Related: `ENABLE_OAUTH_TOKEN_EXCHANGE` (with `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIEN
 | v0.10.2 / v0.10.1 / v0.10.0 | 2026-07-01 / 06-29 / 06-29 | Memory rework, MCP OAuth scope and resource settings |
 | v0.9.6 … v0.9.0 | 2026-06-01 … 04-20 | `{{USER_EMAIL}}` and `{{USER_ROLE}}`, `MCP_INITIALIZE_TIMEOUT` |
 
+**Re-verified 2026-10-10** for the pinned local stack (#141, WP-42,
+`deploy/openwebui/docker-compose.yml`): v0.11.4 is still the latest release
+(GitHub releases API, published 2026-09-21, tag commit `8bd8b4f`). The
+`0.11.4` and `v0.11.4` image tags on `ghcr.io/open-webui/open-webui` share
+one index digest, `sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f`;
+the previous two minors for a later version matrix (WP-46) are 0.10.2 and
+0.9.6. The OCI image carries **no** `HEALTHCHECK` of its own (the compose
+file defines one), but does carry `curl` and `jq`; its `/health` endpoint
+returns `{"status": true}`. Pulling it is about 1.65 GB. Ollama is pinned
+at `docker.io/ollama/ollama:0.40.2` for the same stack's opt-in `ollama`
+profile. Source: GitHub releases API and `ghcr.io` manifest, both retrieved
+2026-10-10.
+
 - **Cadence:** a new minor version every 1–2 months (0.9.0 Apr → 0.10.0 Jun → 0.11.0 Jul), with frequent patch releases. Pre-1.0 minors contain breaking changes.
 - **Images:**
   - `ghcr.io/open-webui/open-webui:vX.Y.Z` (also `-cuda` and `-ollama`)

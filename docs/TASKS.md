@@ -397,7 +397,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 
 ### WP-42 — Open WebUI spike and per-user auth · F-02 · Branch: `wp/42-openwebui-auth` · PR: open
 
-- [ ] #141 A pinned Open WebUI stack runs in Compose with memory-manager, Postgres and Ollama
+- [x] #141 A pinned Open WebUI stack runs in Compose with memory-manager, Postgres and Ollama
 - [ ] #142 Open WebUI's OAuth client, UserValves storage and filter token access are verified against the pinned stack ⛔ blocked by #141
 - [ ] #143 Open WebUI registers via DCR and each user completes OAuth against our authorization server ⛔ blocked by #142
 - [ ] #144 Two Open WebUI users write and read only their own memory over native MCP ⛔ blocked by #143
