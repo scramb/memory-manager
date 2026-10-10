@@ -44,10 +44,8 @@ from contextvars import ContextVar, Token
 from memory_manager.compat.profiles import DEFAULT_PROFILE, Profile, get_profile
 
 __all__ = [
-    "UndeliverableProfile",
     "current_profile_override",
     "current_resolved_profile",
-    "require_deliverable",
     "reset_profile_override",
     "reset_resolved_profile",
     "resolve_profile",
@@ -79,32 +77,6 @@ _override_var: ContextVar[str | None] = ContextVar("mm_profile_override", defaul
 #: request that explicitly resolved to `default` would, never a third "no profile at all"
 #: state a caller would have to special-case.
 _resolved_var: ContextVar[str] = ContextVar("mm_resolved_profile", default=DEFAULT_PROFILE)
-
-
-class UndeliverableProfile(NotImplementedError):
-    """`resolve_profile` picked a profile whose `delivery_mode` has no implementation yet.
-
-    `"full"` and `"descriptions"` are implemented (#131, #132); `"short"` is #306. No
-    profile registered in `compat/profiles.py` uses `"short"` right now, so this should
-    never actually fire - it exists so that registering such a profile later fails loudly
-    at the point it is first resolved for a real request, rather than silently serving
-    the wrong (or no) usage-rules content.
-    """
-
-
-def require_deliverable(profile: Profile) -> Profile:
-    """`profile`, unchanged, if its `delivery_mode` is implemented - raises otherwise.
-
-    The one place that enforces "only `full`/`descriptions` are deliverable" (#132's
-    addition to this work package's own Ergebnis): every call to `resolve_profile` below
-    runs through this, so a caller never has to check `delivery_mode` itself.
-    """
-    if profile.delivery_mode not in ("full", "descriptions"):
-        raise UndeliverableProfile(
-            f"profile {profile.name!r} uses delivery_mode {profile.delivery_mode!r}, "
-            "which is not implemented yet (#306 for 'short')"
-        )
-    return profile
 
 
 def set_profile_override(name: str) -> Token[str | None]:
@@ -155,7 +127,7 @@ def current_resolved_profile() -> str:
 
 
 def resolve_profile(client_info_name: str | None, *, override: str | None = None) -> Profile:
-    """The deliverable `Profile` for one request, per ADR-0010's resolution order.
+    """The `Profile` for one request, per ADR-0010's resolution order.
 
     `override`, when given, wins outright - it is trusted to be whatever
     `set_profile_override` (HTTP) or `build_server`'s `stdio_profile` keyword (stdio)
@@ -170,8 +142,9 @@ def resolve_profile(client_info_name: str | None, *, override: str | None = None
     error: ADR-0010's "unknown names are rejected" is about an *override* naming a profile
     directly, not about a client this registry simply does not recognize yet.
 
-    Always returns a profile `require_deliverable` has already checked - a caller never
-    has to check `delivery_mode` itself.
+    Every `DeliveryMode` is deliverable (`"full"`, `"descriptions"` and `"short"` alike,
+    #306) - `mcp/server.py`'s `_ProfileMiddleware` is the one place that branches on
+    `delivery_mode`, so this function never has to.
     """
     if override is not None:
         name = override
@@ -179,4 +152,4 @@ def resolve_profile(client_info_name: str | None, *, override: str | None = None
         name = _CLIENT_INFO_PROFILE.get(client_info_name, DEFAULT_PROFILE)
     else:
         name = DEFAULT_PROFILE
-    return require_deliverable(get_profile(name))
+    return get_profile(name)

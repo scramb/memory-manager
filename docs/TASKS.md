@@ -372,7 +372,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 - [x] #132 Every tool carries MCP annotations and the core usage rules in its description
 - [x] #133 A schema linter fails CI when a tool violates a supported profile's limits
 - [ ] #305 The audit log records the client profile of every write
-- [ ] #306 The short delivery mode serves the short form as instructions
+- [x] #306 The short delivery mode serves the short form as instructions
 
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
 

@@ -102,7 +102,7 @@ from memory_manager.mcp.authz import (
     writable_namespaces,
 )
 from memory_manager.mcp.errors import error_to_dict
-from memory_manager.mcp.instructions import CORE_RULES, GUIDE, INSTRUCTIONS
+from memory_manager.mcp.instructions import CORE_RULES, GUIDE, INSTRUCTIONS, SHORT
 from memory_manager.observability import instrument_tool
 from memory_manager.quotas import NamespaceKind, QuotaChecker, StorageQuotaChecker
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
@@ -309,8 +309,8 @@ class _ProfileMiddleware:
     `build_server`, for `serve --stdio --profile`) - whichever of the two a given process
     could ever have set.
 
-    For `"full"` (`compat.select.require_deliverable`'s other deliverable mode, and the
-    only one any profile registered in `compat/profiles.py` actually uses today), this
+    For `"full"` (one of `compat.profiles.DeliveryMode`'s three values, and the only one
+    any profile registered in `compat/profiles.py` actually uses today), this
     middleware changes nothing about the request or the result it produces - `ctx` goes
     into `call_next` unchanged and whatever it returns comes straight back - so
     `default`'s behaviour stays byte-for-byte what it always was (conformance's own
@@ -329,6 +329,13 @@ class _ProfileMiddleware:
     only ever has to drop a dict key, with nothing to re-validate afterwards. Every other
     method's result is untouched, the same as `"full"`.
 
+    For `"short"` (#306: the condensed form `mcp/instructions.py`'s `SHORT` already holds
+    for client instruction files, #128 - no profile registered today uses it either),
+    this middleware instead replaces the `instructions` value of those same two methods
+    with `SHORT`, through `_with_short_instructions` below - the same plain-`dict`
+    seam `_without_instructions` relies on, swapping a value instead of dropping the key.
+    Every other method's result is untouched, the same as `"full"` and `"descriptions"`.
+
     !!! warning
         Per `ServerMiddleware`'s own docstring: `initialize` is handled inline, with the
         transport's read loop parked until this chain returns - awaiting a
@@ -339,8 +346,8 @@ class _ProfileMiddleware:
     """
 
     #: The only two methods whose result ever carries `instructions` (module
-    #: docstring's `"descriptions"` paragraph) - `server/discover`'s own 2026-07-28 RPC
-    #: name, not a method this server defines itself.
+    #: docstring's `"descriptions"`/`"short"` paragraphs) - `server/discover`'s own
+    #: 2026-07-28 RPC name, not a method this server defines itself.
     _INSTRUCTIONS_METHODS = frozenset({"initialize", "server/discover"})
 
     def __init__(self, *, stdio_profile: str | None = None) -> None:
@@ -363,8 +370,11 @@ class _ProfileMiddleware:
             result = await call_next(ctx)
         finally:
             reset_resolved_profile(token)
-        if profile.delivery_mode == "descriptions" and ctx.method in self._INSTRUCTIONS_METHODS:
-            return self._without_instructions(result)
+        if ctx.method in self._INSTRUCTIONS_METHODS:
+            if profile.delivery_mode == "descriptions":
+                return self._without_instructions(result)
+            if profile.delivery_mode == "short":
+                return self._with_short_instructions(result)
         return result
 
     @staticmethod
@@ -380,6 +390,17 @@ class _ProfileMiddleware:
         if not isinstance(result, dict) or "instructions" not in result:
             return result
         return {key: value for key, value in result.items() if key != "instructions"}
+
+    @staticmethod
+    def _with_short_instructions(result: HandlerResult) -> HandlerResult:
+        """`result` with its `instructions` value replaced by `SHORT`, for the `"short"`
+        delivery mode (#306) - a no-op for anything but the plain `dict` `_inner` already
+        produced (module docstring's `"short"` paragraph), the same guard
+        `_without_instructions` above applies for the same reason.
+        """
+        if not isinstance(result, dict) or "instructions" not in result:
+            return result
+        return {**result, "instructions": SHORT}
 
     @staticmethod
     def _client_info_name(ctx: ServerRequestContext[Any, Any]) -> str | None:

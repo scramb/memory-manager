@@ -16,7 +16,13 @@ from mcp_types import TextContent
 
 from memory_manager.app import Services
 from memory_manager.compat.profiles import get_profile
-from memory_manager.mcp.instructions import CORE_RULES, GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions import (
+    CORE_RULES,
+    GUIDE,
+    INSTRUCTIONS,
+    SHORT,
+    TOOL_DATA_SENTENCE,
+)
 from memory_manager.mcp.server import build_server
 
 # #132, ADR-0010: `memory_index`/`memory_read`/`memory_search` never modify the vault
@@ -119,6 +125,29 @@ async def test_descriptions_delivery_mode_omits_instructions(
     )
     async with Client(build_server(services), mode=mode) as client:
         assert client.instructions is None
+
+
+@pytest.mark.parametrize("mode", ["legacy", "auto"])
+async def test_short_delivery_mode_serves_the_short_form_as_instructions(
+    services: Services, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """#306: a profile resolved to `delivery_mode="short"` serves `SHORT` as
+    `instructions`, in place of the full `INSTRUCTIONS`, for both the 2025-11-25
+    `initialize` result (`mode="legacy"`) and the 2026-07-28 `server/discover` result
+    (`mode="auto"`, this in-process server's own era) -
+    `_ProfileMiddleware._with_short_instructions`'s one job. `resolve_profile` is
+    monkeypatched rather than registering a real `"short"` profile in
+    `compat/profiles.py` (no profile uses that mode yet, module docstring there) - the
+    seam `mcp/server.py`'s middleware itself calls, so this exercises exactly what a
+    resolved `"short"` profile would trigger.
+    """
+    short_profile = replace(get_profile("default"), delivery_mode="short")
+    monkeypatch.setattr(
+        "memory_manager.mcp.server.resolve_profile",
+        lambda *args, **kwargs: short_profile,
+    )
+    async with Client(build_server(services), mode=mode) as client:
+        assert client.instructions == SHORT
 
 
 async def test_list_prompts_includes_memory_guide(services: Services) -> None:

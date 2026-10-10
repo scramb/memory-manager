@@ -2,8 +2,7 @@
 """Tests for `compat/select.py`'s profile resolver (#131, ADR-0010).
 
 Only the resolver's own contract is asserted here: resolution order, rejection of an
-unknown override, the unmapped-`clientInfo.name`-falls-back-to-`default` rule, and that
-every profile actually registered in `compat/profiles.py` is deliverable today.
+unknown override, and the unmapped-`clientInfo.name`-falls-back-to-`default` rule.
 `mcp/server.py`'s middleware (which calls this module) and `http.py`'s ASGI middleware
 (which sets the override) are exercised end to end by `tests/conformance/`, not here.
 """
@@ -12,12 +11,10 @@ from __future__ import annotations
 
 import pytest
 
-from memory_manager.compat.profiles import DEFAULT_PROFILE, UnknownProfile, profile_names
+from memory_manager.compat.profiles import DEFAULT_PROFILE, UnknownProfile
 from memory_manager.compat.select import (
-    UndeliverableProfile,
     current_profile_override,
     current_resolved_profile,
-    require_deliverable,
     reset_profile_override,
     reset_resolved_profile,
     resolve_profile,
@@ -90,30 +87,3 @@ class TestResolvedProfileContextvar:
         finally:
             reset_resolved_profile(token)
         assert current_resolved_profile() == DEFAULT_PROFILE
-
-
-@pytest.mark.parametrize("name", profile_names())
-def test_every_registered_profile_is_deliverable_today(name: str) -> None:
-    from memory_manager.compat.profiles import get_profile
-
-    require_deliverable(get_profile(name))
-
-
-def test_require_deliverable_accepts_the_descriptions_delivery_mode() -> None:
-    from dataclasses import replace
-
-    from memory_manager.compat.profiles import get_profile
-
-    descriptions_mode_profile = replace(get_profile(DEFAULT_PROFILE), delivery_mode="descriptions")
-    assert require_deliverable(descriptions_mode_profile) is descriptions_mode_profile
-
-
-def test_require_deliverable_rejects_the_short_delivery_mode() -> None:
-    from dataclasses import replace
-
-    from memory_manager.compat.profiles import get_profile
-
-    # #306: `short` has no implementation yet, unlike `descriptions` above (#132).
-    short_mode_profile = replace(get_profile(DEFAULT_PROFILE), delivery_mode="short")
-    with pytest.raises(UndeliverableProfile):
-        require_deliverable(short_mode_profile)
