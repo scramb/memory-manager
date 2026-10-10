@@ -1,6 +1,7 @@
 # memory-manager
 
-**Status: v0.1.0 — first release.**
+**Status: v0.2.0 — enterprise profile (F-01) released; target-size latency not yet met (see
+"Enterprise").** Upgrading from v0.1: [`docs/guides/upgrade-0.2.md`](./docs/guides/upgrade-0.2.md).
 
 A self-hosted, production-grade long-term memory for Claude that claude.ai (web/mobile) and
 Claude Code share through one remote MCP server. Human-readable Markdown in Git is the source
@@ -37,11 +38,17 @@ See [`docs/PLAN.md`](./docs/PLAN.md) for the full goal, scope and architecture, 
 - Hybrid search: full-text + `pgvector`, fused with RRF; embeddings are optional (Ollama,
   OpenAI-compatible, or none — full-text-only fallback).
 - MCP server over stdio (Claude Code) and Streamable HTTP (claude.ai and Claude Code), one
-  instance for both.
+  instance for both. Tools: `memory_search`, `memory_read`, `memory_files`, `memory_index`,
+  `memory_write`, `memory_edit`, `memory_supersede`, `memory_archive` and `memory_promote`
+  (copy a note into a shared namespace); usage rules ship as server instructions plus the
+  `memory_guide` prompt.
 - Embedded OAuth 2.1 authorization server with OIDC and password login, client ID metadata
   documents (CIMD), per-client and per-IP limits, and an audit log for every write.
 - Static scoped bearer tokens as a lighter-weight alternative to OAuth.
-- Vault import/export for migration and backup.
+- Write-rate and storage quotas, an optional operator blocklist for content categories, and
+  audit export to a SIEM (stdout and/or OTLP).
+- Vault import (Markdown, Claude, ChatGPT) and export for migration and backup, plus
+  `migrate git-to-postgres` into the enterprise backend.
 - Container images signed (cosign) with an SBOM published alongside each release; the image
   bundles the Valkey client and the OTel SDK/exporter, both inert until configured.
 - Deployment via Helm chart, Kustomize base, or a Flux example.
@@ -135,7 +142,10 @@ everything above, this profile adds:
   access.
 - Provable erasure and retention (GDPR Art. 17) outside MCP, and write-rate/storage quotas per
   user, namespace or token ([`docs/guides/quotas.md`](./docs/guides/quotas.md)).
-- Horizontal scaling: stateless `api`/`worker` replicas sharing state through Postgres or Valkey.
+- Horizontal scaling: stateless `api` replicas plus a `worker` (`memory-manager worker`) that
+  runs indexing and periodic jobs from a Postgres jobs outbox, sharing state through Postgres
+  or Valkey ([ADR-0009](./docs/adr/0009-stateless-replicas.md),
+  [ADR-0016](./docs/adr/0016-vector-index.md)).
 - Observability: traces from requests into worker jobs, metrics, dashboards and alerts.
 
 **Requirements:** a Microsoft Entra ID tenant with a one-time tenant-admin consent step, Postgres
@@ -156,6 +166,9 @@ Read on:
   [`docs/guides/upgrade-0.2.md`](./docs/guides/upgrade-0.2.md)
 - Running the enterprise profile end to end (Entra, Flux rollout, scaling, backups/restore):
   [`docs/guides/enterprise-operations.md`](./docs/guides/enterprise-operations.md)
+- What happens to a user's access and memory on role removal, offboarding and restore:
+  [`docs/guides/data-lifecycle.md`](./docs/guides/data-lifecycle.md)
+- Entra app registration as an OpenTofu module: [`deploy/entra/`](./deploy/entra/)
 - GitOps example with Flux: [`deploy/flux/enterprise/README.md`](./deploy/flux/enterprise/README.md)
 - Helm chart enterprise values: [`charts/memory-manager/values-enterprise.yaml`](./charts/memory-manager/values-enterprise.yaml)
 - Load-test report at target size:
@@ -173,6 +186,14 @@ Read on:
   [`docs/security-review.md`](./docs/security-review.md)
 - Exporting the audit log to a SIEM (stdout and/or OTLP, `AUDIT_EXPORT`):
   [`docs/guides/audit-export.md`](./docs/guides/audit-export.md)
+- Rejecting writes by content category (`BLOCKLIST_FILE`):
+  [`docs/guides/blocklist.md`](./docs/guides/blocklist.md)
+
+## Roadmap
+
+Next up is [F-02 Client Integrations](./docs/features/F-02-client-integrations.md) (planned):
+compatibility profiles for further MCP clients, personal tokens and a per-profile conformance
+suite. The current backlog is in [`docs/TASKS.md`](./docs/TASKS.md).
 
 ## Comparison
 
