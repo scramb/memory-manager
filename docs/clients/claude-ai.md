@@ -92,7 +92,10 @@ is shared by the whole organisation rather than issued per member.
 | sign-in page says access denied | account not on the allowlist, or e-mail not verified at the IdP | add the address or the IdP subject to the allowlist |
 | scripts get HTTP 403 from a CDN in front of the server | bot protection blocks default library user agents | send a real `User-Agent`; claude.ai is unaffected |
 
-`doctor --client claude-ai` is planned (#138) and will cover this connector once it ships.
+`memory-manager doctor --client claude-ai` always fails its first step ("config found"):
+claude.ai's connector lives only in its own web UI, there is no local file for `doctor` to
+read back. Verify the connection directly in claude.ai's Settings > Connectors instead (the
+"Setup/Global" steps above), or check across clients the way the next section describes.
 
 ## Check across clients
 

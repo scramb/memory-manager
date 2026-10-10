@@ -93,7 +93,11 @@ from memory_manager.auth.tokens import (
     owners_not_in_users,
     revoke_token,
 )
+from memory_manager.clients import REGISTRY as CLIENT_REGISTRY
 from memory_manager.clients.connect import run_claude_ai, run_claude_code
+from memory_manager.clients.doctor import render_text as render_client_doctor_report
+from memory_manager.clients.doctor import run_client_doctor
+from memory_manager.clients.doctor import to_json as client_doctor_to_json
 from memory_manager.compat import lint as compat_lint
 from memory_manager.compat.profiles import Profile, get_profile, profile_names
 from memory_manager.config import (
@@ -173,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
+        if args.client is not None:
+            return asyncio.run(_run_doctor_client_command(args))
         return _run_doctor_command(args.vault)
 
     if args.command == "compat":
@@ -380,6 +386,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--vault",
         default=os.environ.get("VAULT_DIR"),
         help="path to the vault root (defaults to $VAULT_DIR)",
+    )
+    doctor_parser.add_argument(
+        "--client",
+        choices=sorted(CLIENT_REGISTRY),
+        default=None,
+        help="check this client's own configured connection instead of the vault "
+        "(--vault/$VAULT_DIR are ignored)",
+    )
+    doctor_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="with --client: skip the memory_write/memory_read/memory_edit/memory_archive "
+        "round trip, only prove memory_index works",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="with --client: print the report as JSON instead of text",
+    )
+    doctor_parser.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path(),
+        help="with --client: project directory its project/local scope config applies to "
+        "(default: cwd)",
     )
     connect_parser = subparsers.add_parser(
         "connect", help="add the memory-manager server to a client's own config"
@@ -798,6 +829,27 @@ def _run_doctor_command(vault: str | None) -> int:
     report = run_doctor(Path(vault))
     _print_doctor_report(report)
     return 1 if report.errors else 0
+
+
+async def _run_doctor_client_command(args: argparse.Namespace) -> int:
+    """`memory-manager doctor --client <name>` (#138): check that client's own configured
+    connection, not the vault - `_run_doctor_command` above stays untouched for every call
+    without `--client`."""
+    adapter = CLIENT_REGISTRY[args.client]
+    env = dict(os.environ)
+    home = Path(env.get("HOME") or str(Path.home()))
+    report = await run_client_doctor(
+        adapter,
+        home=home,
+        project_dir=args.project_dir.resolve(),
+        env=env,
+        read_only=args.read_only,
+    )
+    if args.json:
+        print(json.dumps(client_doctor_to_json(report), indent=2))
+    else:
+        print(render_client_doctor_report(report))
+    return 0 if report.ok else 1
 
 
 def _print_doctor_report(report: DoctorReport) -> None:

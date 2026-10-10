@@ -157,9 +157,19 @@ session or supplies their own static token/header; the `.mcp.json` itself stays 
   `INSTRUCTIONS` is kept under that limit.
 - **Removing a server:** `claude mcp remove <name>` (match the `--scope` it was added with).
 
-`doctor --client claude-code` is planned (#138) and will cover both transports once it ships.
-In the meantime, `claude mcp list` prints one line per configured server, ending in
-`✔ Connected` once the MCP handshake completes.
+`memory-manager doctor --client claude-code` reads whichever scope (local, project, user -
+highest precedence first) carries a `memory-manager` entry and checks it step by step: config
+found, the server's URL reachable, authentication, the compatibility profile, then a
+write/read/edit/archive round trip in a disposable `mm-doctor` namespace nothing else ever
+touches. Each step reports pass, fail or skip with a hint on failure (a wrong or revoked
+token names the env var to check; a token without `memory:write` or without `mm-doctor` in
+its namespace list gets a hint to recreate it) - exit code 0 iff nothing failed. `--read-only`
+skips the write/read/edit/archive round trip (only `memory_index` still proves read access);
+`--json` prints the same report as JSON, never with a token value in it. The `mm-doctor`
+namespace accumulates one archived note per run - harmless, but worth an occasional `doctor
+--vault`/manual cleanup on a long-lived server. `claude mcp list` is Claude Code's own,
+narrower diagnosis (one line per configured server, ending in `✔ Connected` once the MCP
+handshake completes) - useful as a quicker first check, not a substitute.
 
 ## Check across clients
 

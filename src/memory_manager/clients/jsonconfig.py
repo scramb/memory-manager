@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
-__all__ = ["ClientConfigError", "merge_server_entry"]
+__all__ = ["ClientConfigError", "merge_server_entry", "read_server_entry"]
 
 _INDENT_RE = re.compile(r"\n([ \t]+)\S")
 _DEFAULT_INDENT = "  "
@@ -70,6 +71,45 @@ def merge_server_entry(
     servers[name] = merged_entry
     data["mcpServers"] = servers
     return _render(data, current_text)
+
+
+def read_server_entry(
+    current_text: str, *, name: str, scope: str, project_dir: Path
+) -> dict[str, Any] | None:
+    """The raw `mcpServers[name]` object `merge_server_entry` would have written over, read
+    back out of `current_text` instead - `None` if there is none.
+
+    For `scope == "local"`, reads `projects[str(project_dir)].mcpServers[name]` instead of
+    the top-level `mcpServers` (docs/research/clients/claude-code.md: local scope is the same
+    file, keyed by the absolute project path) - `project_dir` must already be the exact
+    absolute path the client itself would use as that key, same as `merge_server_entry`'s own
+    caller resolves it. Raises `ClientConfigError` on the same bad shapes `merge_server_entry`
+    rejects (not valid JSON, duplicate key, a non-object `mcpServers`/`projects` entry) -
+    reading never silently returns `None` for a config this module cannot trust.
+    """
+    data = _parse(current_text)
+
+    if scope == "local":
+        projects = data.get("projects")
+        if projects is None:
+            return None
+        if not isinstance(projects, dict):
+            raise ClientConfigError("'projects' must be an object")
+        project_entry = projects.get(str(project_dir))
+        if project_entry is None:
+            return None
+        if not isinstance(project_entry, dict):
+            raise ClientConfigError(f"'projects'[{str(project_dir)!r}] must be an object")
+        servers_obj = project_entry.get("mcpServers")
+    else:
+        servers_obj = data.get("mcpServers")
+
+    if servers_obj is None:
+        return None
+    if not isinstance(servers_obj, dict):
+        raise ClientConfigError("'mcpServers' must be an object")
+    entry = servers_obj.get(name)
+    return entry if isinstance(entry, dict) else None
 
 
 def _parse(text: str) -> dict[str, Any]:

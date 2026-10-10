@@ -386,7 +386,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
 
 - [x] #137 `connect claude-code` merges the server into Claude Code's config, and `connect claude-ai` prints the setup steps
-- [ ] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace
+- [x] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace
 
 ---
 
