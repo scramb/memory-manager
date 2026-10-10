@@ -120,9 +120,8 @@ _DEFAULT = Profile(
 
 _CLAUDE_AI = Profile(
     name="claude-ai",
-    # docs/features/F-02-client-integrations.md:177, support matrix: server
-    # `instructions` support is "yes" for claude.ai, with no documented truncation - see
-    # max_instructions_chars below.
+    # docs/clients/README.md:44, support matrix: server `instructions` support is "yes"
+    # for claude.ai, with no documented truncation - see max_instructions_chars below.
     delivery_mode="full",
     # docs/research/mcp-auth-and-connectors.md §4 (l.181 is Claude Code's truncation;
     # claude.ai's own "Limits:" bullets, l.155-158, document no instructions-length cap)
@@ -149,8 +148,8 @@ _CLAUDE_AI = Profile(
 
 _CLAUDE_CODE = Profile(
     name="claude-code",
-    # docs/features/F-02-client-integrations.md:178, support matrix: server
-    # `instructions` support is "yes (≤ 2,048 chars)" for Claude Code.
+    # docs/clients/README.md:45, support matrix: server `instructions` support is
+    # "yes, ≤ 2,048 chars" for Claude Code.
     delivery_mode="full",
     # docs/research/mcp-auth-and-connectors.md §5 l.181 [K1], retrieved 2026-10-06:
     # "Tool descriptions and instructions are truncated at 2,048 characters each."

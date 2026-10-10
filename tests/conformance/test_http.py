@@ -44,6 +44,7 @@ reuses for the parametrised `"postgres"` case.
 
 from __future__ import annotations
 
+import re
 import secrets
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
@@ -61,12 +62,14 @@ from http_fixtures import Server as _Server
 from http_fixtures import run_http_server
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
-from mcp_types import METHOD_NOT_FOUND, UNSUPPORTED_PROTOCOL_VERSION
+from mcp_types import METHOD_NOT_FOUND, UNSUPPORTED_PROTOCOL_VERSION, Implementation
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
 from memory_manager.auth.tokens import ALL_NAMESPACES, MEMORY_ROLES, create_token
+from memory_manager.compat.profiles import profile_names
 from memory_manager.db.migrate import migrate
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
+from memory_manager.mcp.instructions import INSTRUCTIONS
 from memory_manager.storage.postgres import PostgresBackend
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
@@ -477,6 +480,151 @@ async def test_handshake_and_tool_surface(
 
         unknown_tool_result = await client.call_tool("no_such_tool", {})
         assert unknown_tool_result.is_error is True
+
+
+# --- Client profile (#131, ADR-0010): override, clientInfo mapping, deliverability --
+
+_METRIC_LINE_RE = re.compile(r"^(?P<name>\w+)\{(?P<labels>[^}]*)\}\s+(?P<value>\S+)$")
+_LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _counter_value(text: str, name: str, **labels: str) -> float:
+    """The sample value of `name{labels...}` in a Prometheus text-exposition `text`,
+    or `0.0` if that exact label set never appeared - the same "absent means zero"
+    reading a fresh `Counter` already has before its first `.inc()`.
+    """
+    for line in text.splitlines():
+        match = _METRIC_LINE_RE.match(line)
+        if match is None or match["name"] != name:
+            continue
+        if dict(_LABEL_RE.findall(match["labels"])) == labels:
+            return float(match["value"])
+    return 0.0
+
+
+async def _tool_calls_total(server: _Server, *, profile: str) -> float:
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{server.base_url}/metrics")
+    return _counter_value(
+        response.text, "mm_tool_calls_total", tool="memory_index", outcome="ok", profile=profile
+    )
+
+
+async def test_default_profile_is_unchanged_without_an_override(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
+    """No override, no mapped `clientInfo.name` (`mcp.Client`'s own default,
+    `DEFAULT_CLIENT_INFO`'s `name="mcp"`, unmapped) resolves to `default` - the
+    `instructions` text is `mcp/instructions.py`'s `INSTRUCTIONS` exactly, and the tool
+    listing is identical whether or not `?profile=default` is appended to the MCP URL
+    naming that same resolved profile explicitly (Ergebnis: `default` stays
+    byte-for-byte unchanged).
+    """
+
+    async def tool_names(url: str) -> list[tuple[str, str | None]]:
+        transport = streamable_http_client(
+            url, http_client=httpx2.AsyncClient(headers=http_headers)
+        )
+        async with Client(transport, mode="auto") as client:
+            assert client.instructions == INSTRUCTIONS
+            listing = await client.list_tools()
+            return [(tool.name, tool.description) for tool in listing.tools]
+
+    plain = await tool_names(http_server.mcp_url)
+    explicit_default = await tool_names(f"{http_server.mcp_url}?profile=default")
+    assert explicit_default == plain
+
+
+async def test_unknown_profile_query_param_is_rejected(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{http_server.mcp_url}?profile=nope",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={**http_headers, "Accept": "application/json, text/event-stream"},
+        )
+
+    assert response.status_code == 400
+    for name in profile_names():
+        assert name in response.text
+
+
+async def test_unknown_profile_header_is_rejected(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            http_server.mcp_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                **http_headers,
+                "Accept": "application/json, text/event-stream",
+                "MM-Client-Profile": "nope",
+            },
+        )
+
+    assert response.status_code == 400
+    for name in profile_names():
+        assert name in response.text
+
+
+async def test_override_wins_over_a_mapped_client_info_name_on_the_modern_protocol(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
+    """2026-07-28: `clientInfo.name="claude-code"` (sourced,
+    `docs/research/clients/client-info-names.md`) maps to the `claude-code` profile on
+    its own - `?profile=default` on the MCP URL still wins (ADR-0010's resolution
+    order). Observed as a `/metrics` delta on `mm_tool_calls_total{profile=...}`, not
+    just the response shape, which is byte-identical either way by construction.
+    """
+    claude_code_info = Implementation(name="claude-code", version="1.0")
+
+    async def call(url: str) -> None:
+        transport = streamable_http_client(
+            url, http_client=httpx2.AsyncClient(headers=http_headers)
+        )
+        async with Client(transport, mode="auto", client_info=claude_code_info) as client:
+            result = await client.call_tool("memory_index", {})
+            assert result.is_error is False
+
+    before_mapped = await _tool_calls_total(http_server, profile="claude-code")
+    await call(http_server.mcp_url)
+    after_mapped = await _tool_calls_total(http_server, profile="claude-code")
+    assert after_mapped - before_mapped == 1
+
+    before_default = await _tool_calls_total(http_server, profile="default")
+    await call(f"{http_server.mcp_url}?profile=default")
+    after_default = await _tool_calls_total(http_server, profile="default")
+    assert after_default - before_default == 1
+
+
+async def test_override_wins_over_default_on_the_legacy_protocol(
+    http_server: _Server, http_headers: dict[str, str]
+) -> None:
+    """2025-11-25: no mapped `clientInfo.name` here (`mcp.Client`'s own default)
+    resolves to `default` as always - `?profile=claude-code` overrides it anyway, the
+    same `/metrics`-delta proof as the modern-protocol test above, for the handshake
+    era instead.
+    """
+
+    async def call(url: str) -> None:
+        transport = streamable_http_client(
+            url, http_client=httpx2.AsyncClient(headers=http_headers)
+        )
+        async with Client(transport, mode="legacy") as client:
+            result = await client.call_tool("memory_index", {})
+            assert result.is_error is False
+
+    before_default = await _tool_calls_total(http_server, profile="default")
+    await call(http_server.mcp_url)
+    after_default = await _tool_calls_total(http_server, profile="default")
+    assert after_default - before_default == 1
+
+    before_override = await _tool_calls_total(http_server, profile="claude-code")
+    await call(f"{http_server.mcp_url}?profile=claude-code")
+    after_override = await _tool_calls_total(http_server, profile="claude-code")
+    assert after_override - before_override == 1
 
 
 # --- Raw HTTP checks: protocol-layer errors reachable only by hand-set headers -----

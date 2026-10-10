@@ -76,11 +76,19 @@ from typing import Annotated, Any, NotRequired, TypedDict
 
 from mcp.server.auth.provider import OAuthAuthorizationServerProvider, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent
 
 from memory_manager.app import Services
+from memory_manager.compat.profiles import get_profile
+from memory_manager.compat.select import (
+    current_profile_override,
+    reset_resolved_profile,
+    resolve_profile,
+    set_resolved_profile,
+)
 from memory_manager.db import rls
 from memory_manager.mcp import namespaces
 from memory_manager.mcp.authz import (
@@ -271,6 +279,88 @@ def current_client() -> str:
     if token.claims is not None and "client_label" in token.claims:
         return str(token.claims["client_label"])
     return _DEFAULT_CLIENT
+
+
+class _ProfileMiddleware:
+    """Resolves the `compat.select`/ADR-0010 client profile for every request (#131).
+
+    `ServerMiddleware` (provisional in `mcp` 2.3.0, `mcp/server/context.py:146`, pinned -
+    see this work package's own risk note) runs for every inbound message, including
+    `initialize`, before any params validation (`mcp/server/runner.py:225`'s
+    `_compose_server_middleware`): exactly the seam ADR-0010's resolution order needs, so
+    it never has to live inside a tool handler.
+
+    `clientInfo.name` is read two different ways depending on where in the handshake this
+    request is, both read-only, neither going anywhere near the result:
+
+    - `ctx.method == "initialize"` (the 2025-11-25-and-earlier handshake, still in
+      flight): `ctx.connection.client_params` is **not** set yet - `runner.py` only
+      commits it after this middleware chain returns - so the only place `clientInfo` is
+      readable at all is the raw wire params, `ctx.params["clientInfo"]["name"]`.
+    - every other request - the 2026-07-28 per-request envelope (`Connection.
+      from_envelope` synthesizes `client_params` before any middleware ever runs, from
+      that request's own `_meta`), or a post-handshake request on a session-based
+      connection (stdio, or legacy HTTP, both committed by their own earlier
+      `initialize`) - `ctx.session.client_params.client_info.name` already has it.
+
+    The override side of ADR-0010's order combines `compat.select.
+    current_profile_override()` (set by `http.py`'s ASGI middleware for one HTTP
+    request - absent for stdio, which has no ASGI layer) with `stdio_profile` (given to
+    `build_server`, for `serve --stdio --profile`) - whichever of the two a given process
+    could ever have set.
+
+    For the only delivery mode implemented today (`"full"`, `compat.select.
+    require_deliverable`), this middleware changes nothing about the request or the
+    result it produces - `ctx` goes into `call_next` unchanged and whatever it returns
+    comes straight back - so `default`'s behaviour stays byte-for-byte what it always was
+    (conformance's own guarantee, not just this docstring's claim). It only ever sets
+    `compat.select`'s *resolved-profile* contextvar, for `observability/metrics.py`'s
+    `track_tool_call` to read, for the duration of `call_next`.
+
+    !!! warning
+        Per `ServerMiddleware`'s own docstring: `initialize` is handled inline, with the
+        transport's read loop parked until this chain returns - awaiting a
+        server-initiated request from inside it would deadlock the connection. This
+        middleware never sends anything to the client at all, so that risk never
+        actually arises here, but any future addition to this class must keep it that
+        way.
+    """
+
+    def __init__(self, *, stdio_profile: str | None = None) -> None:
+        if stdio_profile is not None:
+            # Fail fast at server construction, not on the first request - mirrors
+            # `compat.select.set_profile_override`'s own eager validation.
+            get_profile(stdio_profile)
+        self._stdio_profile = stdio_profile
+
+    async def __call__(
+        self, ctx: ServerRequestContext[Any, Any], call_next: CallNext
+    ) -> HandlerResult:
+        client_info_name = self._client_info_name(ctx)
+        override = current_profile_override()
+        if override is None:
+            override = self._stdio_profile
+        profile = resolve_profile(client_info_name, override=override)
+        token = set_resolved_profile(profile.name)
+        try:
+            return await call_next(ctx)
+        finally:
+            reset_resolved_profile(token)
+
+    @staticmethod
+    def _client_info_name(ctx: ServerRequestContext[Any, Any]) -> str | None:
+        if ctx.method == "initialize":
+            params = ctx.params or {}
+            client_info = params.get("clientInfo")
+            if isinstance(client_info, Mapping):
+                name = client_info.get("name")
+                if isinstance(name, str):
+                    return name
+            return None
+        client_params = ctx.session.client_params
+        if client_params is None:
+            return None
+        return client_params.client_info.name
 
 
 _STDIO_ACTOR = "stdio"
@@ -733,6 +823,7 @@ def build_server(
     auth_server_provider: OAuthAuthorizationServerProvider[Any, Any, Any] | None = None,
     quota_checker: QuotaChecker | None = None,
     storage_quota_checker: StorageQuotaChecker | None = None,
+    stdio_profile: str | None = None,
 ) -> MCPServer:
     """Build the MCP server for `services`, with all memory tools and `memory_guide` registered.
 
@@ -774,6 +865,14 @@ def build_server(
     docstring, `quotas.StorageQuotaChecker`'s own). A `StorageQuotaExceeded`
     (also a `ToolError`) stops the call the
     same way `QuotaExceeded` does.
+
+    `stdio_profile` (#131, ADR-0010) is `cli.py`'s `serve --stdio --profile`: the one
+    client profile a stdio connection runs under when given, same precedence as `http.py`'s
+    `?profile=`/`MM-Client-Profile` override (`_ProfileMiddleware` combines whichever of
+    the two a given process could have). `None` (stdio with no `--profile`, and every HTTP
+    server - `http.py` never passes this) leaves the per-request `clientInfo.name`
+    mapping/`default` fallback as the only source, exactly as before this parameter
+    existed.
     """
     mcp = MCPServer(
         name="memory-manager",
@@ -781,6 +880,7 @@ def build_server(
         auth=auth,
         token_verifier=token_verifier,
         auth_server_provider=auth_server_provider,
+        middleware=[_ProfileMiddleware(stdio_profile=stdio_profile)],
     )
 
     @mcp.prompt(name="memory_guide")

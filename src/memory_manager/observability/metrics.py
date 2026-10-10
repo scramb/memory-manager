@@ -7,10 +7,14 @@ default registry, the usual pattern for that library - `metrics_endpoint`
 `generate_latest()`, no registry plumbing needed anywhere else.
 
 What each metric answers:
-- `mm_tool_calls_total`/`mm_tool_duration_seconds` (`tool`, `outcome`):
-  how often, how long, and whether an MCP tool call succeeded - from
+- `mm_tool_calls_total` (`tool`, `outcome`, `profile`)/`mm_tool_duration_seconds`
+  (`tool`): how often, how long, and whether an MCP tool call succeeded - from
   `track_tool_call`, the decorator `observability.instrument_tool` applies
-  to every tool in `mcp/server.py`.
+  to every tool in `mcp/server.py`. `profile` is the client profile
+  `compat.select.current_resolved_profile()` reports for the call in flight
+  (#131, ADR-0010) - only on the counter, not the duration histogram, to keep
+  that histogram's cardinality at one series per tool regardless of how many
+  profiles exist.
 - `mm_queue_writes_total` (`op`, `outcome`)/`mm_queue_depth`: the write
   queue's own throughput and backlog - `queue.py` calls `record_queue_write`
   after every write job and sets `QUEUE_DEPTH` after every `put`/`get` on
@@ -82,6 +86,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
 from memory_manager import __commit__, __version__
+from memory_manager.compat.select import current_resolved_profile
 
 __all__ = [
     "GIT_DURATION_SECONDS",
@@ -112,7 +117,7 @@ __all__ = [
 METRICS_ENABLED_ENV = "METRICS_ENABLED"
 _FALSY_BOOL_ENV = frozenset({"0", "false", "no", "off", ""})
 
-TOOL_CALLS_TOTAL = Counter("mm_tool_calls_total", "MCP tool calls.", ["tool", "outcome"])
+TOOL_CALLS_TOTAL = Counter("mm_tool_calls_total", "MCP tool calls.", ["tool", "outcome", "profile"])
 TOOL_DURATION_SECONDS = Histogram(
     "mm_tool_duration_seconds", "MCP tool call duration in seconds.", ["tool"]
 )
@@ -228,7 +233,9 @@ def track_tool_call(tool: str) -> Callable[[_ToolFunc], _ToolFunc]:
                 outcome = "error" if getattr(result, "is_error", False) else "ok"
                 return result
             finally:
-                TOOL_CALLS_TOTAL.labels(tool=tool, outcome=outcome).inc()
+                TOOL_CALLS_TOTAL.labels(
+                    tool=tool, outcome=outcome, profile=current_resolved_profile()
+                ).inc()
                 TOOL_DURATION_SECONDS.labels(tool=tool).observe(time.monotonic() - start)
 
         return wrapper  # type: ignore[return-value]

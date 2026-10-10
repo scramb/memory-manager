@@ -77,6 +77,7 @@ from memory_manager.auth.tokens import (
     owners_not_in_users,
     revoke_token,
 )
+from memory_manager.compat.profiles import profile_names
 from memory_manager.config import (
     EmbeddingConfig,
     EmbeddingConfigError,
@@ -220,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "serve":
-        return _serve(stdio=args.stdio, http=args.http)
+        return _serve(stdio=args.stdio, http=args.http, profile=args.profile)
 
     if args.command == "worker":
         return _run_worker_command()
@@ -513,6 +514,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--http",
         action="store_true",
         help="serve over Streamable HTTP, binding to $HOST:$PORT (default 127.0.0.1:8080)",
+    )
+    serve_parser.add_argument(
+        "--profile",
+        choices=profile_names(),
+        default=None,
+        help="the client profile (#131, ADR-0010) this stdio connection's single client "
+        "runs under, instead of the default fallback - --stdio only",
     )
 
     subparsers.add_parser(
@@ -1250,9 +1258,15 @@ def _write_baseline(path: Path, report: EvalReport, provider: str) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def _serve(*, stdio: bool, http: bool) -> int:
+def _serve(*, stdio: bool, http: bool, profile: str | None = None) -> int:
     if stdio == http:
         print("serve: pass exactly one of --stdio or --http", file=sys.stderr)
+        return 2
+    if http and profile is not None:
+        # #131/ADR-0010: `--http`'s own override is the `?profile=`/`MM-Client-Profile`
+        # request, resolved per request by `http.py`'s middleware - a single process-wide
+        # `--profile` makes no sense once more than one client can connect.
+        print("serve: --profile is only valid with --stdio, not --http", file=sys.stderr)
         return 2
 
     # stdout is the stdio transport's protocol channel - every log line must
@@ -1266,14 +1280,14 @@ def _serve(*, stdio: bool, http: bool) -> int:
 
     try:
         if stdio:
-            return asyncio.run(_serve_stdio())
+            return asyncio.run(_serve_stdio(profile=profile))
         return asyncio.run(_serve_http())
     except (VaultConfigError, EmbeddingConfigError, ServerConfigError, BlocklistConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
 
-async def _serve_stdio() -> int:
+async def _serve_stdio(*, profile: str | None = None) -> int:
     """Run the stdio transport.
 
     Refuses `STORAGE_BACKEND=postgres` (ADR-0008 addendum "identity sources
@@ -1281,6 +1295,11 @@ async def _serve_stdio() -> int:
     process always holds the owner credentials (`DATABASE_URL`), so a
     claimed stdio identity would protect nothing even if the request path
     switched roles for it.
+
+    `profile` (`--profile`, already restricted to `profile_names()` by argparse's
+    `choices`) is this connection's single client profile (#131, ADR-0010) - passed
+    straight through to `build_server`'s `stdio_profile` keyword, which combines it with
+    that connection's `clientInfo.name` the same way `http.py`'s override does for HTTP.
     """
     if storage_backend_from_env(dict(os.environ)) == "postgres":
         print(
@@ -1292,7 +1311,7 @@ async def _serve_stdio() -> int:
         )
         return 2
     async with open_services(os.environ) as services:
-        server = build_server(services)
+        server = build_server(services, stdio_profile=profile)
         await server.run_stdio_async()
     return 0
 

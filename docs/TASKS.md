@@ -368,11 +368,11 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: open
 
 - [x] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/`
-- [ ] #131 Each MCP request runs under the profile chosen by override, clientInfo or default
+- [x] #131 Each MCP request runs under the profile chosen by override, clientInfo or default
 - [ ] #132 Every tool carries MCP annotations and the core usage rules in its description
 - [ ] #133 A schema linter fails CI when a tool violates a supported profile's limits
-- [ ] #305 The audit log records the client profile of every write ⛔ blocked by #131
-- [ ] #306 The short delivery mode serves the short form as instructions ⛔ blocked by #131, #128
+- [ ] #305 The audit log records the client profile of every write
+- [ ] #306 The short delivery mode serves the short form as instructions
 
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open
 
@@ -381,12 +381,12 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: open
 
-- [ ] #136 The conformance suite runs the full tool set and its error cases once per profile ⛔ blocked by #131, #132
+- [ ] #136 The conformance suite runs the full tool set and its error cases once per profile ⛔ blocked by #132
 
 ### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: open
 
 - [ ] #137 `connect claude-code` merges the server into Claude Code's config, and `connect claude-ai` prints the setup steps
-- [ ] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace ⛔ blocked by #131, #137
+- [ ] #138 `doctor --client` proves reachability, auth, profile and a write round trip in a test namespace ⛔ blocked by #137
 
 ---
 
