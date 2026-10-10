@@ -28,7 +28,9 @@ _BEGIN_MARKER = "<!-- BEGIN memory-manager instructions -->"
 _END_MARKER = "<!-- END memory-manager instructions -->"
 
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
-_MAX_SNIPPET_LINES = 26
+# 27, not 26: the core grew by one line when it became two sentences (owner decision
+# 2026-10-10, #132) - still short enough to paste into a project CLAUDE.md.
+_MAX_SNIPPET_LINES = 27
 _MIN_DESCRIPTION_LENGTH = 40
 
 

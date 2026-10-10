@@ -16,7 +16,7 @@ from mcp_types import TextContent
 
 from memory_manager.app import Services
 from memory_manager.compat.profiles import get_profile
-from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions import CORE_RULES, GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
 from memory_manager.mcp.server import build_server
 
 # #132, ADR-0010: `memory_index`/`memory_read`/`memory_search` never modify the vault
@@ -60,7 +60,7 @@ async def test_initialize_result_carries_the_instructions(services: Services) ->
         assert client.instructions == INSTRUCTIONS
 
 
-async def test_list_tools_descriptions_all_carry_the_data_not_instructions_sentence(
+async def test_list_tools_descriptions_all_carry_the_core_rules(
     services: Services,
 ) -> None:
     async with Client(build_server(services)) as client:
@@ -77,7 +77,9 @@ async def test_list_tools_descriptions_all_carry_the_data_not_instructions_sente
         "memory_promote",
     }
     for tool in listing.tools:
-        assert TOOL_DATA_SENTENCE in (tool.description or ""), tool.name
+        description = tool.description or ""
+        assert CORE_RULES in description, tool.name
+        assert TOOL_DATA_SENTENCE in description, tool.name
 
 
 async def test_list_tools_annotations_match_the_read_or_write_shape(services: Services) -> None:

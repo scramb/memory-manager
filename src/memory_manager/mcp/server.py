@@ -102,7 +102,7 @@ from memory_manager.mcp.authz import (
     writable_namespaces,
 )
 from memory_manager.mcp.errors import error_to_dict
-from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions import CORE_RULES, GUIDE, INSTRUCTIONS
 from memory_manager.observability import instrument_tool
 from memory_manager.quotas import NamespaceKind, QuotaChecker, StorageQuotaChecker
 from memory_manager.search import NoteHit, SearchFilters, hybrid_search
@@ -464,14 +464,14 @@ _WRITE_TOOL_ANNOTATIONS = ToolAnnotations(
     open_world_hint=False,
 )
 
-# Each tool's description is built from `TOOL_DATA_SENTENCE` rather than repeating the
-# sentence as a second hardcoded copy, so the one rule every tool carries can never drift
-# from `INSTRUCTIONS`/`GUIDE`'s wording of it. Passed explicitly as `@mcp.tool(description=...)`
+# Each tool's description is built from `CORE_RULES` rather than repeating its two sentences
+# as a second hardcoded copy, so the core rules every tool carries can never drift from
+# `INSTRUCTIONS`/`GUIDE`'s wording of them. Passed explicitly as `@mcp.tool(description=...)`
 # (an f-string cannot be a function's docstring - only a literal string/bytes constant is);
 # each function keeps a short plain docstring of its own for readers of this module.
 _MEMORY_INDEX_DESCRIPTION = f"""List every note in the vault: the table of contents to read first.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 Returns one entry per note (id, path, title, description, type, tags, updated,
 namespace_kind), sorted by path. `namespace` and `type` filter to an exact match;
 archived notes are excluded unless `include_archived` is set. A note that fails to
@@ -481,7 +481,7 @@ parse is reported as a `warning` entry instead of being silently dropped.
 
 _MEMORY_READ_DESCRIPTION = f"""Read one or more notes by vault path or id.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 Each entry in `items` is either a note's vault path (e.g.
 'personal/fact/favorite-color.md') or its ULID `id`. Returns one result per item, in
 the same order: `{{path, id, version, content}}` on success, `{{item, error}}` if that one
@@ -490,7 +490,7 @@ per call."""
 
 _MEMORY_SEARCH_DESCRIPTION = f"""Search notes by `query`, ranked best match first.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 Search before asserting facts about the user - results are pointers, not full
 content: read a note with `memory_read` before relying on its details.
 
@@ -509,7 +509,7 @@ keeps this tool usable without Postgres. `namespace_kind` is 'personal', 'group'
 
 _MEMORY_WRITE_DESCRIPTION = f"""Create or replace the note at `path`.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 `content` must be a complete note file: a `---`-delimited YAML frontmatter block
 followed by the Markdown body. Required frontmatter fields are `title` (1-120
 chars), `description` (1-150 chars, shown in `memory_index`) and `type` (one of
@@ -534,7 +534,7 @@ client could act on."""
 _MEMORY_EDIT_DESCRIPTION = f"""\
 Replace one exact occurrence of `old_str` with `new_str` in the note at `path`.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 `old_str` is matched against the note's raw file text (frontmatter and body) and
 must occur exactly once; if it occurs zero or more than once, this errors with the
 match count instead of guessing - include more surrounding context to make
@@ -549,7 +549,7 @@ client could act on."""
 _MEMORY_SUPERSEDE_DESCRIPTION = f"""\
 Replace the note `old` with a new note at `new_path`, keeping both.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 Use this when a fact changed and the old note's history should stay readable -
 never `memory_write`/`memory_edit` a note into saying something different, since
 that erases what it used to say. `old` is the old note's vault path or ULID `id`;
@@ -572,7 +572,7 @@ structured content carries enough to retry, the same way `memory_write` does."""
 _MEMORY_PROMOTE_DESCRIPTION = f"""\
 Copy the note at `path` into `target_namespace`, a shared namespace you can write to.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 The default write target stays your own namespace (`me`) - use this only when a note
 should actually become shared, team-visible knowledge, and only into a namespace you
 already have write access to. The copy gets a new `id` at `<target_namespace>/<type>/
@@ -594,7 +594,7 @@ not exist or is archived, or the target path already exists - returns an error r
 _MEMORY_ARCHIVE_DESCRIPTION = f"""\
 Archive the note at `path`: move it to `_archive/`, never delete it.
 
-{TOOL_DATA_SENTENCE}
+{CORE_RULES}
 Use this for a note that is obsolete or simply wrong, and nothing should replace
 it - if a corrected version should take its place, use `memory_supersede` instead,
 so the old content stays linked to what replaced it. `path` is the note's vault

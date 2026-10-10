@@ -5,6 +5,9 @@
 three constants as they were hand-written in `mcp/instructions.py` before this generator
 existed - the contract the generator must keep: parsing the committed `docs/memory-guide.md`
 and rendering from it must reproduce them exactly, not just something close enough.
+`tests/guide/golden/CORE_RULES` is the same kind of byte-exact copy for the two-sentence core
+(owner decision 2026-10-10, #132); `TOOL_DATA_SENTENCE`'s own golden stays exactly what it was
+before `CORE_RULES` existed - just its first sentence, not the second one.
 """
 
 from __future__ import annotations
@@ -17,7 +20,13 @@ from memory_manager.cli import main
 from memory_manager.guide import GuideFormatError, is_current, parse_guide
 from memory_manager.guide.targets import TARGETS, render_target
 from memory_manager.mcp import instructions_generated
-from memory_manager.mcp.instructions import GUIDE, INSTRUCTIONS, SHORT, TOOL_DATA_SENTENCE
+from memory_manager.mcp.instructions import (
+    CORE_RULES,
+    GUIDE,
+    INSTRUCTIONS,
+    SHORT,
+    TOOL_DATA_SENTENCE,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _GUIDE_PATH = _ROOT / "docs" / "memory-guide.md"
@@ -31,21 +40,28 @@ def _golden(name: str) -> str:
 
 def test_parsed_sections_of_the_committed_guide_equal_the_golden_values() -> None:
     sections = parse_guide(_GUIDE_PATH.read_text(encoding="utf-8"))
-    assert sections["core"] == _golden("TOOL_DATA_SENTENCE")
+    assert sections["core"] == _golden("CORE_RULES")
     assert sections["instructions"] == _golden("INSTRUCTIONS")
     assert sections["long"] == _golden("GUIDE")
 
 
 def test_generated_module_constants_equal_the_golden_values() -> None:
     assert _golden("TOOL_DATA_SENTENCE") == instructions_generated.TOOL_DATA_SENTENCE
+    assert _golden("CORE_RULES") == instructions_generated.CORE_RULES
     assert _golden("INSTRUCTIONS") == instructions_generated.INSTRUCTIONS
     assert _golden("GUIDE") == instructions_generated.GUIDE
 
 
 def test_reexported_constants_equal_the_golden_values() -> None:
     assert _golden("TOOL_DATA_SENTENCE") == TOOL_DATA_SENTENCE
+    assert _golden("CORE_RULES") == CORE_RULES
     assert _golden("INSTRUCTIONS") == INSTRUCTIONS
     assert _golden("GUIDE") == GUIDE
+
+
+def test_tool_data_sentence_is_the_core_rules_first_line() -> None:
+    assert CORE_RULES.split("\n", 1)[0] == TOOL_DATA_SENTENCE
+    assert CORE_RULES != TOOL_DATA_SENTENCE
 
 
 def test_instructions_stays_within_the_claude_code_truncation_limit() -> None:
