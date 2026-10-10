@@ -1,0 +1,52 @@
+[
+  {
+    "id": "0198b0a1-caf3-7bee-8dec-a1b2c3d4e5f1",
+    "user_id": "0198b0aa-caf3-7bee-8dec-a1b2c3d4e5fa",
+    "type": "user",
+    "path": null,
+    "content": "The user prefers tea over coffee.",
+    "meta": null,
+    "updated_at": 1760000000,
+    "created_at": 1760000000
+  },
+  {
+    "id": "0198b0a2-caf3-7bee-8dec-a1b2c3d4e5f2",
+    "user_id": "0198b0aa-caf3-7bee-8dec-a1b2c3d4e5fa",
+    "type": "context",
+    "path": null,
+    "content": "The fictional project Rivermouth moved its launch date to spring.",
+    "meta": {"source": "manual"},
+    "updated_at": 1760000100,
+    "created_at": 1760000100
+  },
+  {
+    "id": "0198b0a3-caf3-7bee-8dec-a1b2c3d4e5f3",
+    "user_id": "0198b0aa-caf3-7bee-8dec-a1b2c3d4e5fa",
+    "type": "context",
+    "path": "projects/rivermouth",
+    "content": "Rivermouth's staging environment lives in a fictional region called eu-test-one.",
+    "meta": null,
+    "updated_at": 1760000200,
+    "created_at": 1760000200
+  },
+  {
+    "id": "0198b0a4-caf3-7bee-8dec-a1b2c3d4e5f4",
+    "user_id": "0198b0aa-caf3-7bee-8dec-a1b2c3d4e5fa",
+    "type": "user",
+    "path": null,
+    "content": "the user prefers tea over coffee!",
+    "meta": null,
+    "updated_at": 1760000300,
+    "created_at": 1760000300
+  },
+  {
+    "id": "0198b0a5-caf3-7bee-8dec-a1b2c3d4e5f5",
+    "user_id": "0198b0aa-caf3-7bee-8dec-a1b2c3d4e5fa",
+    "type": "context",
+    "path": "projects/rivermouth/archive/a-very-long-fictional-subdirectory-name-used-only-to-exercise-the-tag-length-cap",
+    "content": "Rivermouth's old archive moved to a fictional cold-storage bucket.",
+    "meta": null,
+    "updated_at": 1760000400,
+    "created_at": 1760000400
+  }
+]
