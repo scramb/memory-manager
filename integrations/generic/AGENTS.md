@@ -1,7 +1,7 @@
 <!-- generated from docs/memory-guide.md by `memory-manager instructions generate` — do not edit -->
 ## Memory
 
-Durable facts, preferences and decisions about the user live in the memory-manager vault, reached through the `memory_*` MCP tools (`claude mcp list`, `/mcp`) — not in this file, and not lost between sessions.
+Durable facts, preferences and decisions about the user live in the memory-manager vault, reached through its `memory_*` MCP tools — not lost between sessions.
 
 <!-- BEGIN memory-manager instructions -->
 Tools for Claude's long-term memory: Markdown notes stored in Git, kept curated rather than cluttered.

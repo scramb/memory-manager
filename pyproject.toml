@@ -49,6 +49,14 @@ packages = ["src/memory_manager"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# `instructions_generated.py` (#127, `guide/generate.py`) carries its three string constants
+# as single long lines, deliberately not re-wrapped or quote-normalised by `ruff format` -
+# `ruff format --check`/`ruff check` would otherwise fight `memory-manager instructions
+# generate --check` over the same bytes. `force-exclude` makes this apply even when
+# pre-commit passes the file's path explicitly (its default is to only honour excludes for
+# files discovered by ruff's own file-finding, not ones named on the command line).
+extend-exclude = ["src/memory_manager/mcp/instructions_generated.py"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "RUF"]

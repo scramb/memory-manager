@@ -20,6 +20,14 @@ token that does not meet that rule;
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
+`instructions generate [--check]` renders `mcp/instructions_generated.py` from
+`docs/memory-guide.md`, the single source for the server `instructions`, the `memory_guide`
+prompt and every client's instruction file (#127, #128, `guide/generate.py`,
+`guide/targets.py`); `--client <name>` additionally renders that one client's file (choices
+from `guide.targets.TARGETS`), `--all` renders every client's file - the module itself is
+always rendered/checked regardless. `--check` exits 1 instead of writing when any of the
+rendered files is stale, and is what `make lint`/CI run.
+
 `worker` runs `worker.py`'s periodic singleton jobs, plus the `jobs` outbox
 consumer (#218, `worker.consume_jobs`), as a separate process (#217,
 ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still runs
@@ -84,6 +92,9 @@ from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_postgres, export_vault
+from memory_manager.guide import GuideFormatError
+from memory_manager.guide.generate import parse_guide, render_module
+from memory_manager.guide.targets import TARGETS, render_target
 from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
@@ -123,6 +134,9 @@ _DEFAULT_GOLDEN = Path("eval/golden.yaml")
 _DEFAULT_EVAL_VAULT = Path("examples/vault")
 _DEFAULT_BASELINE = Path("eval/baseline.json")
 _DEFAULT_EVAL_K = 5
+
+_DEFAULT_GUIDE = Path("docs/memory-guide.md")
+_DEFAULT_INSTRUCTIONS_OUT = Path("src/memory_manager/mcp/instructions_generated.py")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _ALLOW_UNAUTHENTICATED_ENV = "MM_ALLOW_UNAUTHENTICATED"
@@ -194,6 +208,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 return _run_migrate_git_to_postgres_dry_run(args.vault, args.map or [])
             return asyncio.run(_run_migrate_git_to_postgres_apply(args.vault, args.map or []))
+        parser.print_help()
+        return 1
+
+    if args.command == "instructions":
+        if args.instructions_target == "generate":
+            return _run_instructions_generate(
+                args.check, args.guide, args.out, args.client, args.all_clients
+            )
         parser.print_help()
         return 1
 
@@ -445,6 +467,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="report the mapping and every note that would be imported, writing nothing",
     )
 
+    instructions_parser = subparsers.add_parser(
+        "instructions",
+        help="render mcp/instructions_generated.py and client instruction files from "
+        "docs/memory-guide.md",
+    )
+    instructions_subparsers = instructions_parser.add_subparsers(dest="instructions_target")
+    instructions_generate_parser = instructions_subparsers.add_parser(
+        "generate", help="render the generated module and client files from the Markdown source"
+    )
+    instructions_generate_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if any rendered file is stale instead of writing it (no file is touched)",
+    )
+    instructions_generate_parser.add_argument(
+        "--guide", type=Path, default=_DEFAULT_GUIDE, help="path to the Markdown source"
+    )
+    instructions_generate_parser.add_argument(
+        "--out",
+        type=Path,
+        default=_DEFAULT_INSTRUCTIONS_OUT,
+        help="path to the generated Python module (unaffected by --client/--all)",
+    )
+    instructions_target_group = instructions_generate_parser.add_mutually_exclusive_group()
+    instructions_target_group.add_argument(
+        "--client",
+        choices=sorted(TARGETS),
+        help="additionally render this one client's instruction file",
+    )
+    instructions_target_group.add_argument(
+        "--all",
+        dest="all_clients",
+        action="store_true",
+        help="additionally render every client's instruction file",
+    )
+
     serve_parser = subparsers.add_parser("serve", help="run the MCP server")
     serve_parser.add_argument(
         "--stdio",
@@ -531,6 +589,48 @@ def _run_hash_password() -> int:
         return 2
     print(hash_password(password))
     return 0
+
+
+def _run_instructions_generate(
+    check: bool, guide: Path, out: Path, client: str | None, all_clients: bool
+) -> int:
+    try:
+        guide_text = guide.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"{guide} does not exist", file=sys.stderr)
+        return 2
+    try:
+        sections = parse_guide(guide_text)
+    except GuideFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    # The module is always rendered/checked; --client/--all add client files on top of it.
+    rendered: list[tuple[Path, str]] = [(out, render_module(sections))]
+    client_names = sorted(TARGETS) if all_clients else [client] if client else []
+    for name in client_names:
+        target = TARGETS[name]
+        rendered.append((Path(target.output), render_target(target, sections)))
+
+    if check:
+        stale = [path for path, content in rendered if not _file_matches(path, content)]
+        if stale:
+            for path in stale:
+                print(
+                    f"{path} is stale; run `memory-manager instructions generate --all`",
+                    file=sys.stderr,
+                )
+            return 1
+        return 0
+
+    for path, content in rendered:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return 0
+
+
+def _file_matches(path: Path, content: str) -> bool:
+    return path.exists() and path.read_text(encoding="utf-8") == content
 
 
 def _run_doctor_command(vault: str | None) -> int:
