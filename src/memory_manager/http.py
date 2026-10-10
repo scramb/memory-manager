@@ -21,8 +21,12 @@ Resource Metadata at both well-known URLs (`/.well-known/oauth-protected-
 resource[/mcp]`, #35, see `memory_manager.auth.prm`'s module docstring for
 exactly what the SDK does and doesn't provide here on its own), the
 `scope` parameter on the 401 `WWW-Authenticate` challenge
-(`_ScopeChallengeMiddleware`), and Origin validation per the MCP spec's
-DNS-rebinding guidance. Origin validation is kept
+(`_ScopeChallengeMiddleware`), Origin validation per the MCP spec's
+DNS-rebinding guidance, and the `?profile=`/`MM-Client-Profile` client-profile
+override (`_ClientProfileMiddleware`, #131, ADR-0010) - see `compat/select.py`'s
+module docstring for the full resolution order, which continues in
+`mcp/server.py`'s own middleware once a request reaches `mcp_app`. Origin
+validation is kept
 deliberately separate from the SDK's own `TransportSecuritySettings` (which
 checks `Host`, not just `Origin`, and is keyed off `host` looking like
 `127.0.0.1`/`localhost`/`::1`) - running both would mean two different
@@ -83,7 +87,7 @@ from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.datastructures import Headers, MutableHeaders
+from starlette.datastructures import Headers, MutableHeaders, QueryParams
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -125,6 +129,8 @@ from memory_manager.auth.shared_state import (
     build_valkey_shared_state,
 )
 from memory_manager.auth.verifier import StaticTokenVerifier
+from memory_manager.compat.profiles import UnknownProfile, profile_names
+from memory_manager.compat.select import reset_profile_override, set_profile_override
 from memory_manager.config import (
     ServerConfig,
     ServerConfigError,
@@ -653,6 +659,9 @@ def create_app(
             ),
         ),
         Middleware(_OriginValidationMiddleware, allowed_origins=config.allowed_origins),
+        # Resolves the `?profile=`/`MM-Client-Profile` override (#131, ADR-0010) before
+        # the request ever reaches `mcp_app`/`_McpMount` below.
+        Middleware(_ClientProfileMiddleware, mcp_path=config.mcp_path),
         # Wraps the whole app, including the `Mount` below, so it sees the
         # `WWW-Authenticate` header `mcp_app`'s own `RequireAuthMiddleware`/
         # `BearerAuthBackend` build on a 401 (see `memory_manager.auth.prm`'s
@@ -1252,6 +1261,66 @@ class _OriginValidationMiddleware:
             return
 
         await self._app(scope, receive, send)
+
+
+_PROFILE_QUERY_KEY = "profile"
+_PROFILE_HEADER = "mm-client-profile"
+
+
+class _ClientProfileMiddleware:
+    """Resolves the `?profile=`/`MM-Client-Profile` override for `mcp_path` (#131, ADR-0010).
+
+    Only runs for `mcp_path` - the `scope["path"]` check below mirrors
+    `_OriginValidationMiddleware` above, not a Starlette `Route` lookup, since this also
+    runs ahead of routing. Every other route (health/ready, PRM, OAuth, the vault
+    webhook) has no use for a client profile and is left untouched.
+
+    The `profile` query parameter wins over the `MM-Client-Profile` header, per ADR-0010's
+    order; neither present leaves `compat.select`'s override contextvar untouched, so
+    `mcp/server.py`'s own middleware falls through to that request's `clientInfo.name` (or
+    `default`). Either one present but naming no registered profile - including the empty
+    string, `?profile=` with nothing after the `=` - is rejected with 400, listing every
+    valid name (`compat.profiles.profile_names()`): ADR-0010's "unknown profile names are
+    rejected, never silently mapped" applies to this override exactly as much as it does
+    to `compat.profiles.get_profile`'s own callers.
+
+    Sets `compat.select`'s override contextvar for the lifetime of this one request only
+    (`finally: reset_profile_override(token)`) - `mcp/server.py`'s `_ProfileMiddleware`
+    runs further in, inside the same ASGI call stack and therefore the same
+    `contextvars.Context`, so it sees exactly this value without either module importing
+    the other.
+    """
+
+    def __init__(self, app: ASGIApp, *, mcp_path: str) -> None:
+        self._app = app
+        self._mcp_path = mcp_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != self._mcp_path:
+            await self._app(scope, receive, send)
+            return
+
+        raw = QueryParams(scope["query_string"]).get(_PROFILE_QUERY_KEY)
+        if raw is None:
+            raw = Headers(scope=scope).get(_PROFILE_HEADER)
+        if raw is None:
+            await self._app(scope, receive, send)
+            return
+
+        try:
+            token = set_profile_override(raw)
+        except UnknownProfile:
+            valid = ", ".join(profile_names())
+            response = PlainTextResponse(
+                f"unknown profile {raw!r}, expected one of ({valid})", status_code=400
+            )
+            await response(scope, receive, send)
+            return
+
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            reset_profile_override(token)
 
 
 _WWW_AUTHENTICATE_HEADER = "www-authenticate"

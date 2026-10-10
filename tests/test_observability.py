@@ -164,10 +164,14 @@ async def _captured_json_logs() -> AsyncIterator[io.StringIO]:
 async def test_tool_call_metrics_count_a_successful_read(bare_remote: Path, tmp_path: Path) -> None:
     config = ServerConfig()
     async with _running_app(_environ(bare_remote, tmp_path), config) as app:
-        before = _value(TOOL_CALLS_TOTAL.labels(tool="memory_index", outcome="ok"))
+        before = _value(
+            TOOL_CALLS_TOTAL.labels(tool="memory_index", outcome="ok", profile="default")
+        )
         async with _mcp_client(app, config) as client:
             result = await client.call_tool("memory_index", {})
-        after = _value(TOOL_CALLS_TOTAL.labels(tool="memory_index", outcome="ok"))
+        after = _value(
+            TOOL_CALLS_TOTAL.labels(tool="memory_index", outcome="ok", profile="default")
+        )
 
     assert result.is_error is False
     assert after - before == 1
@@ -176,7 +180,9 @@ async def test_tool_call_metrics_count_a_successful_read(bare_remote: Path, tmp_
 async def test_tool_call_metrics_count_an_error_outcome(bare_remote: Path, tmp_path: Path) -> None:
     config = ServerConfig()
     async with _running_app(_environ(bare_remote, tmp_path), config) as app:
-        before = _value(TOOL_CALLS_TOTAL.labels(tool="memory_write", outcome="error"))
+        before = _value(
+            TOOL_CALLS_TOTAL.labels(tool="memory_write", outcome="error", profile="default")
+        )
         async with _mcp_client(app, config) as client:
             # Wrong `if_version` for a path that does not exist yet -> a
             # `CallToolResult` with `is_error=True`, not a raised exception.
@@ -184,7 +190,9 @@ async def test_tool_call_metrics_count_an_error_outcome(bare_remote: Path, tmp_p
                 "memory_write",
                 {"path": _NOTE_PATH, "content": _note_content(), "if_version": "bogus"},
             )
-        after = _value(TOOL_CALLS_TOTAL.labels(tool="memory_write", outcome="error"))
+        after = _value(
+            TOOL_CALLS_TOTAL.labels(tool="memory_write", outcome="error", profile="default")
+        )
 
     assert result.is_error is True
     assert after - before == 1

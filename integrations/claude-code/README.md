@@ -45,7 +45,7 @@ Claude Code lists what is available.
 ## Using the snippet instead
 
 If you would rather not rely on Claude deciding to invoke a skill, paste
-[`CLAUDE.snippet.md`](./CLAUDE.snippet.md) into the project's `CLAUDE.md` — it is kept under 26
+[`CLAUDE.snippet.md`](./CLAUDE.snippet.md) into the project's `CLAUDE.md` — it is kept to 27
 lines so it stays a small addition, not a new section to maintain.
 
 ## Connecting the server

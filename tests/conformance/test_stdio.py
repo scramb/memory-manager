@@ -55,6 +55,7 @@ from mcp import Client, MCPDeprecationWarning
 from mcp.client.stdio import StdioServerParameters
 from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
+from memory_manager.compat.profiles import profile_names
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
 
@@ -81,6 +82,11 @@ _EXPECTED_TOOL_NAMES = frozenset(
         "memory_promote",
     }
 )
+
+# #132, ADR-0010: the subset of `_EXPECTED_TOOL_NAMES` that never modifies the vault -
+# `tool.annotations.read_only_hint` must be `True` for exactly these, `False` for
+# every other expected tool name.
+_READ_TOOL_NAMES = frozenset({"memory_index", "memory_read", "memory_search"})
 
 _SEEDED_PATH = "personal/fact/favorite-color.md"
 _SEEDED_BODY = "Blue.\n"
@@ -294,6 +300,9 @@ async def test_handshake_and_tool_surface(
         for tool in listing.tools:
             assert tool.description
             assert tool.input_schema["type"] == "object"
+            assert tool.annotations is not None, tool.name
+            expected_read_only = tool.name in _READ_TOOL_NAMES
+            assert tool.annotations.read_only_hint is expected_read_only, tool.name
 
         prompts = await client.list_prompts()
         assert any(prompt.name == "memory_guide" for prompt in prompts.prompts)
@@ -356,6 +365,53 @@ async def test_serve_stdio_refuses_the_postgres_backend() -> None:
 
     assert process.returncode == 2
     assert b"STORAGE_BACKEND=postgres" in stderr
+
+
+# --- `--profile` (#131, ADR-0010): the stdio-only client-profile override ----------
+
+
+async def test_profile_flag_rejects_an_unknown_name() -> None:
+    """`--profile`'s argparse `choices=profile_names()` rejects an unregistered name
+    before the server ever starts (ADR-0010: an override is rejected, not silently
+    mapped): exit code 2, usage text naming every valid profile.
+    """
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        *_CLI_ARGS,
+        "--profile",
+        "nope",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=dict(os.environ),
+    )
+    _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=_SHUTDOWN_TIMEOUT)
+
+    assert process.returncode == 2
+    for name in profile_names():
+        assert name.encode() in stderr
+
+
+@_PARAMETRIZE_VERSIONS
+async def test_profile_flag_serves_both_protocol_revisions(
+    stdio_env: dict[str, str], version: str
+) -> None:
+    """`--profile claude-code` (a registered, deliverable profile) changes nothing
+    about the wire behaviour for either protocol revision - `full` is byte-identical
+    by construction (`compat.select`'s own docstring); this is stdio's conformance
+    proof of that claim, for both eras `mcp.Client` can reach here.
+    """
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[*_CLI_ARGS, "--profile", "claude-code"],
+        env=dict(stdio_env),
+    )
+    mode = "legacy" if version == _HANDSHAKE_VERSION else "auto"
+    async with Client(params, mode=mode) as client:
+        assert client.protocol_version == version
+        assert client.instructions
+        result = await client.call_tool("memory_index", {})
+        assert result.is_error is False
 
 
 # --- Raw JSON-RPC checks: protocol-layer errors, malformed input, discover ----------

@@ -117,6 +117,16 @@ jobs:
           MM_REQUIRE_HELM: "1"
         run: uv run pytest tests/chart
 
+  compat-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - name: Schema linter against every registered client profile (#133, ADR-0010)
+        run: make compat-lint
+
   python:
     runs-on: ubuntu-latest
     services:

@@ -42,12 +42,23 @@ consumer produces this way, including the pre-write sync inside
 `submit()` - a human's change reaches a subscriber (the indexer) the
 first time any of those three paths happens to pick it up, not only when
 the poll loop's own timer does.
+
+`submit()` also snapshots the caller's `contextvars.Context` (`_WriteJob.context`)
+and replays it for exactly one thing: the audit hooks run by `_run_write_job` (#305).
+The consumer is one long-lived background task with no connection to any particular
+request otherwise, so without this, `AuditHook`s would see whatever happens to be
+ambient on *that* task (nothing, usually) instead of the submitting request's own
+`compat.select` resolved profile and `observability.logging` request id. Every other
+hook - the indexer's `WriteHook`, every `SyncHook`, `_process` itself - keeps running
+in the consumer's own ambient context: a pre-write sync picking up a human's change
+must never get attributed to the request that happened to trigger it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -126,7 +137,26 @@ class _SyncJob:
     future: asyncio.Future[ChangeSet]
 
 
-_QueueItem = tuple[WriteRequest, asyncio.Future[WriteResult]] | _SyncJob
+@dataclass(frozen=True)
+class _WriteJob:
+    """A queued write: the request, the submitter's future, and its context snapshot.
+
+    `context` is `contextvars.copy_context()`, taken inside `submit()` before the
+    request is queued - the submitting request's own `contextvars` (`compat.select`'s
+    resolved profile, `observability.logging`'s request id) at the moment of
+    submission, frozen so the consumer's own long-lived task (with none of that
+    ambient otherwise) can replay it later. Used for exactly one thing:
+    `_run_write_job` runs the audit hooks under it (`_run_audit_hooks_in_context`,
+    module docstring) - never `_process` itself, the indexer's `WriteHook`, or any
+    `SyncHook`, which all keep running in the consumer's own ambient context.
+    """
+
+    request: WriteRequest
+    future: asyncio.Future[WriteResult]
+    context: contextvars.Context
+
+
+_QueueItem = _WriteJob | _SyncJob
 
 
 class WriteQueue:
@@ -199,9 +229,16 @@ class WriteQueue:
 
         Raises whatever `WriteError` the write failed with; returns the
         `WriteResult` on success.
+
+        Snapshots this call's `contextvars.Context` into the queued `_WriteJob`
+        (module docstring, #305) - taken here, in the caller's own task, since the
+        consumer that eventually processes this job runs on its own long-lived task
+        with no access to it otherwise.
         """
         future: asyncio.Future[WriteResult] = asyncio.get_running_loop().create_future()
-        await self._queue.put((request, future))
+        await self._queue.put(
+            _WriteJob(request=request, future=future, context=contextvars.copy_context())
+        )
         QUEUE_DEPTH.set(self._queue.qsize())
         return await future
 
@@ -238,8 +275,8 @@ class WriteQueue:
             else:
                 await self._run_write_job(item)
 
-    async def _run_write_job(self, item: tuple[WriteRequest, asyncio.Future[WriteResult]]) -> None:
-        request, future = item
+    async def _run_write_job(self, job: _WriteJob) -> None:
+        request, future = job.request, job.future
         try:
             result = await self._process(request)
         except Exception as exc:  # routed to the submitter, not raised here
@@ -250,12 +287,12 @@ class WriteQueue:
             # as a real, flaky race once this ran with a real Postgres: a
             # `fetchrow` landing on the *previous* write's row, or none at
             # all, because this one's `INSERT` was still in flight).
-            await self._run_audit_hooks(request, None, exc)
+            await self._run_audit_hooks_in_context(job.context, request, None, exc)
             if not future.done():
                 future.set_exception(exc)
             record_queue_write(request.op, "error")
         else:
-            await self._run_audit_hooks(request, result, None)
+            await self._run_audit_hooks_in_context(job.context, request, result, None)
             if not future.done():
                 future.set_result(result)
             record_queue_write(request.op, "ok")
@@ -607,6 +644,26 @@ class WriteQueue:
                 await hook(result, request, changed_paths)
             except Exception:
                 _logger.exception("write queue hook failed for %s", request.path)
+
+    async def _run_audit_hooks_in_context(
+        self,
+        context: contextvars.Context,
+        request: WriteRequest,
+        result: WriteResult | None,
+        error: Exception | None,
+    ) -> None:
+        """`_run_audit_hooks`, replayed under the submitter's own `context` (#305).
+
+        Runs as a child task of the consumer's own task, built with
+        `context=context` so it (and everything it awaits) sees exactly the
+        `contextvars` that were ambient in `submit()`'s caller, not the consumer's
+        own - then awaited in place, so ordering stays what it already was (the
+        future still only resolves after this returns) and cancelling the
+        consumer task (`stop()`) still cancels this too, the same as it already
+        cancelled whatever `_run_audit_hooks` itself was awaiting.
+        """
+        task = asyncio.create_task(self._run_audit_hooks(request, result, error), context=context)
+        await task
 
     async def _run_audit_hooks(
         self, request: WriteRequest, result: WriteResult | None, error: Exception | None

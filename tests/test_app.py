@@ -12,24 +12,36 @@ write that happened to pick it up even finishes.
 
 from __future__ import annotations
 
+import json
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
+import httpx2
 import pytest
 import pytest_asyncio
 from git_fixtures import human_commit
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.auth.provider import AccessToken
+from starlette.applications import Starlette
 
 from memory_manager.app import open_services
-from memory_manager.config import StorageConfigError
+from memory_manager.auth.tokens import ALL_NAMESPACES, create_token
+from memory_manager.compat.select import reset_resolved_profile, set_resolved_profile
+from memory_manager.config import ServerConfig, StorageConfigError
 from memory_manager.db import rls
+from memory_manager.http import create_app
+from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
 from memory_manager.queue import WriteRequest
 from memory_manager.storage.base import VersionConflict
 from memory_manager.vault.note import Note, serialize
 from memory_manager.vault.ulid import new_ulid
+
+_PUBLIC_URL = "https://mm.example.test"
 
 _NOW = datetime(2025, 6, 1, tzinfo=UTC)
 _HUMAN_PATH = "personal/fact/human.md"
@@ -128,6 +140,45 @@ def _note_bytes(**overrides: object) -> bytes:
     }
     defaults.update(overrides)
     return serialize(Note(**defaults))  # type: ignore[arg-type]
+
+
+def _new_note_content(path: str) -> str:
+    return (
+        "---\ntitle: New note\ndescription: Written by a test.\ntype: fact\n"
+        f"---\n\nWritten to {path}.\n"
+    )
+
+
+# --- The real HTTP transport: `detail.profile`/`request_id` on a "git"-backend
+# write's audit row (#305) - helpers copied from `tests/auth/test_limits_audit.py`.
+
+
+def _environ(bare_remote: Path, tmp_path: Path, database_url: str) -> dict[str, str]:
+    return {
+        "VAULT_REMOTE": str(bare_remote),
+        "VAULT_DIR": str(tmp_path / "vault"),
+        "DATABASE_URL": database_url,
+    }
+
+
+@asynccontextmanager
+async def _running_app(
+    environ: Mapping[str, str], config: ServerConfig
+) -> AsyncIterator[Starlette]:
+    app = create_app(lambda: open_services(environ), config)
+    async with app.router.lifespan_context(app):
+        yield app
+
+
+def _authed_mcp_client(
+    app: Starlette, url: str, token: str, *, extra_headers: Mapping[str, str] | None = None
+) -> Client:
+    headers = {"Authorization": f"Bearer {token}", **(extra_headers or {})}
+    http_client = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://testserver", headers=headers
+    )
+    transport = streamable_http_client(url, http_client=http_client)
+    return Client(transport, mode="legacy")
 
 
 async def test_a_human_commit_ahead_of_a_write_reaches_the_index(
@@ -300,3 +351,146 @@ async def test_postgres_backend_writes_get_exactly_one_audit_row_each_including_
     assert rows[0]["commit_sha"] == result.commit
     assert rows[1]["op"] == "write"
     assert rows[1]["outcome"] == "conflict"
+
+
+async def test_postgres_backend_writes_are_audited_with_the_resolved_profile(
+    test_database_url: str, app_role: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PostgresBackend` runs its audit hook inline in the request's own task, so
+    `current_resolved_profile()` (#305) already reads whatever the caller set -
+    no context snapshot needed here, unlike the `"git"`-backend queue below.
+    """
+    environ = {
+        "STORAGE_BACKEND": "postgres",
+        "DATABASE_URL": test_database_url,
+        "DATABASE_APP_ROLE": app_role,
+    }
+    default_path = "personal/fact/default-profile.md"
+    mapped_path = "personal/fact/claude-code-profile.md"
+
+    async with open_services(environ) as services:
+        assert services.pool is not None
+        await _seed_personal_namespace(test_database_url, oid=_TEST_OID, alias="personal")
+        _as_principal(monkeypatch, oid=_TEST_OID, roles=["Memory.User"])
+
+        await services.storage.write(
+            default_path, _note_bytes(title="Default"), if_version="new", client="ci"
+        )
+
+        profile_token = set_resolved_profile("claude-code")
+        try:
+            await services.storage.write(
+                mapped_path, _note_bytes(title="Mapped"), if_version="new", client="ci"
+            )
+        finally:
+            reset_resolved_profile(profile_token)
+
+        default_row = await services.pool.fetchrow(
+            "select detail from audit_log where path = $1", default_path
+        )
+        mapped_row = await services.pool.fetchrow(
+            "select detail from audit_log where path = $1", mapped_path
+        )
+
+    assert default_row is not None
+    assert json.loads(default_row["detail"])["profile"] == "default"
+    assert mapped_row is not None
+    assert json.loads(mapped_row["detail"])["profile"] == "claude-code"
+
+
+# --- The real HTTP transport, "git" backend: `detail.profile`/`request_id` on a
+# queued write's audit row (#305) - the case that actually needs `WriteQueue.submit`'s
+# context snapshot, since the audit hook runs on the write queue's own consumer task.
+
+
+async def test_memory_write_over_http_is_audited_with_the_resolved_profile(
+    bare_remote: Path, tmp_path: Path, test_database_url: str
+) -> None:
+    config = ServerConfig(public_url=_PUBLIC_URL)
+    default_path = "personal/fact/default-profile.md"
+    mapped_path = "personal/fact/claude-code-profile.md"
+    base_url = f"http://testserver{config.mcp_path}"
+
+    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
+        pool: asyncpg.Pool | None = app.state.services.pool
+        assert pool is not None
+        plaintext, _info = await create_token(
+            pool, "ci", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+        )
+
+        async with _authed_mcp_client(app, base_url, plaintext) as client:
+            result = await client.call_tool(
+                "memory_write",
+                {
+                    "path": default_path,
+                    "content": _new_note_content(default_path),
+                    "if_version": "new",
+                },
+            )
+            assert result.is_error is False
+
+        async with _authed_mcp_client(app, f"{base_url}?profile=claude-code", plaintext) as client:
+            result = await client.call_tool(
+                "memory_write",
+                {
+                    "path": mapped_path,
+                    "content": _new_note_content(mapped_path),
+                    "if_version": "new",
+                },
+            )
+            assert result.is_error is False
+
+        default_row = await pool.fetchrow(
+            "select detail from audit_log where path = $1", default_path
+        )
+        mapped_row = await pool.fetchrow(
+            "select detail from audit_log where path = $1", mapped_path
+        )
+
+    assert default_row is not None
+    assert json.loads(default_row["detail"])["profile"] == "default"
+    assert mapped_row is not None
+    assert json.loads(mapped_row["detail"])["profile"] == "claude-code"
+
+
+async def test_memory_write_over_http_is_exported_with_the_requests_id(
+    bare_remote: Path,
+    tmp_path: Path,
+    test_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`AUDIT_EXPORT=stdout`'s exported record for a queued `"git"`-backend write
+    carries the request's own `X-Request-ID` (#305) - proof the context snapshot
+    fixes `observability.logging.current_request_id()` too, not only the profile.
+    """
+    monkeypatch.setenv("AUDIT_EXPORT", "stdout")
+    config = ServerConfig(public_url=_PUBLIC_URL)
+    path = "personal/fact/request-id.md"
+
+    async with _running_app(_environ(bare_remote, tmp_path, test_database_url), config) as app:
+        pool: asyncpg.Pool | None = app.state.services.pool
+        assert pool is not None
+        plaintext, _info = await create_token(
+            pool, "ci", scopes=[READ_SCOPE, WRITE_SCOPE], namespaces=[ALL_NAMESPACES]
+        )
+
+        async with _authed_mcp_client(
+            app,
+            f"http://testserver{config.mcp_path}",
+            plaintext,
+            extra_headers={"X-Request-ID": "req-git-write-305"},
+        ) as client:
+            result = await client.call_tool(
+                "memory_write",
+                {"path": path, "content": _new_note_content(path), "if_version": "new"},
+            )
+            assert result.is_error is False
+
+    exported = [
+        json.loads(line) for line in capsys.readouterr().err.strip().splitlines() if line.strip()
+    ]
+    write_records = [record for record in exported if record.get("path") == path]
+    assert len(write_records) == 1
+    assert write_records[0]["request_id"] == "req-git-write-305"
+    assert write_records[0]["detail"]["profile"] == "default"

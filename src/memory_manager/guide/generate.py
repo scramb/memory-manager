@@ -35,7 +35,7 @@ do not edit by hand. Edit docs/memory-guide.md and regenerate instead.
 
 from __future__ import annotations
 
-__all__ = ["GUIDE", "INSTRUCTIONS", "SHORT", "TOOL_DATA_SENTENCE"]
+__all__ = ["CORE_RULES", "GUIDE", "INSTRUCTIONS", "SHORT", "TOOL_DATA_SENTENCE"]
 
 '''
 
@@ -94,9 +94,18 @@ def _strip_one_trailing_newline(raw: str) -> str:
 
 
 def render_module(sections: dict[str, str]) -> str:
-    """Render the full source text of `instructions_generated.py` for these sections."""
+    """Render the full source text of `instructions_generated.py` for these sections.
+
+    `core` (owner decision 2026-10-10, #132) is two sentences on two lines: `CORE_RULES`
+    carries both verbatim, `TOOL_DATA_SENTENCE` carries only the first - the one rule every
+    tool description repeated on its own before `CORE_RULES` existed, kept at exactly its
+    former value so nothing that already depends on that exact sentence breaks.
+    """
+    core = sections["core"]
+    tool_data_sentence = core.split("\n", 1)[0]
     assignments = (
-        ("TOOL_DATA_SENTENCE", sections["core"]),
+        ("TOOL_DATA_SENTENCE", tool_data_sentence),
+        ("CORE_RULES", core),
         ("INSTRUCTIONS", sections["instructions"]),
         ("GUIDE", sections["long"]),
         ("SHORT", sections["short"]),

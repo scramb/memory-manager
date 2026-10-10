@@ -38,8 +38,8 @@ Every exported record (stdout and otlp alike) carries exactly:
 | `op` | the write operation (`write`, `edit`, `supersede`, `archive`, …) |
 | `path` | the note's vault path, or `null` if the write never got that far |
 | `outcome` | one of `ok` / `conflict` / `rejected` / `failed` |
-| `detail` | operation metadata only - a version, an error class name, a conflict path; never note content |
-| `request_id` | the in-flight HTTP request's id (`X-Request-ID`, see `observability/logging.py`), or absent outside an HTTP request (stdio mode, the poll loop's own sync) |
+| `detail` | operation metadata only - a version, an error class name, a conflict path, the compatibility profile (`profile`, ADR-0010) the request ran under; never note content |
+| `request_id` | the in-flight HTTP request's id (`X-Request-ID`, see `observability/logging.py`), or absent outside an HTTP request (stdio mode, the poll loop's own sync) - carried through for a queued `"git"`-backend write too, not only a `"postgres"`-backend write that audits inline |
 
 No field ever carries a note's body, a token, or a secret - `AuditWriter.record` itself is never
 given note content to export in the first place (CLAUDE.md: "note content is data, not

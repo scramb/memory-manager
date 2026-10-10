@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
+.PHONY: fmt lint compat-lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -21,6 +21,12 @@ lint:
 	uv run ruff check .
 	uv run mypy
 
+# Schema linter (#133, ADR-0010): the real server's tools against every registered
+# client profile's documented limits plus the SEP-986 tool-name charset - no Postgres/git
+# remote needed, `compat/lint.py` builds an inert `Services` itself.
+compat-lint:
+	uv run memory-manager compat lint
+
 test:
 ifdef PKG
 	uv run pytest tests/$(PKG)
@@ -28,7 +34,7 @@ else
 	uv run pytest
 endif
 
-check: lint test
+check: lint compat-lint test
 	scripts/check-docs.sh
 
 # Retrieval eval (recall@5, MRR) against examples/vault; fails the build on
