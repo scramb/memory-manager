@@ -365,7 +365,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 - [x] #129 `docs/clients` has a page template, the approved support matrix and pages for claude.ai and Claude Code
 
-### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: open
+### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: #309
 
 - [x] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/`
 - [x] #131 Each MCP request runs under the profile chosen by override, clientInfo or default
