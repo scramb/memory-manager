@@ -382,6 +382,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 ### WP-40 — Conformance suite per profile · F-02 · Branch: `wp/40-conformance-profiles` · PR: #311
 
 - [x] #136 The conformance suite runs the full tool set and its error cases once per profile
+- [x] #316 The conformance normaliser masks today's date in UTC like the server
 
 ### WP-41 — connect and doctor · F-02 · Branch: `wp/41-connect-doctor` · PR: #312
 
