@@ -38,3 +38,7 @@ deploy/openwebui/.env
 # deploy/openwebui/docker-compose.yml's header comment.
 deploy/openwebui/.env-memory-manager
 deploy/openwebui/.admin-password
+
+# Live e2e run artefact (WP-42): scripted_model.py writes the captured
+# live-mode script here for replay; never committed, see tests/e2e/stubs/scripted_model.py.
+tests/e2e/stubs/live-script.json

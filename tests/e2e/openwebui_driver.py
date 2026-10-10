@@ -12,6 +12,11 @@ developer machine with no stack up). Run it as a script instead:
         --admin-password-file deploy/openwebui/.admin-password \\
         --server-id memmgr
 
+    python3 tests/e2e/openwebui_driver.py chat \\
+        --admin-password-file deploy/openwebui/.admin-password \\
+        --server-id memmgr --model-id scripted-model \\
+        --message "search my notes"
+
 It reuses one cookie jar across both origins (`:3000` Open WebUI, `:18081`
 memory-manager's embedded AS) deliberately - a real browser driving this
 same flow would do exactly that, since both answer on "localhost" and
@@ -25,8 +30,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
+import re
 import sys
-from dataclasses import dataclass
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
@@ -37,6 +47,20 @@ _OAUTH_CLIENT_TYPE = "mcp"
 _DEFAULT_SERVER_ID = "memmgr"
 _DEFAULT_WEBUI_URL = "http://localhost:3000"
 _DEFAULT_RESOURCE_SERVER_URL = "http://localhost:18081"
+
+#: Every user and group may read an MCP tool-server connection it is attached to
+#: (`utils/access_control.has_access`'s "public read" shape, v0.11.4) - set on the
+#: *first* `configure_tool_server` call (#314) because every later
+#: `POST /api/v1/configs/tool_servers` re-creates the connection (and its OAuth
+#: client) from scratch, there is no "patch just this field" endpoint
+#: (`routers/configs.py.set_tool_servers_config`).
+_PUBLIC_READ_ACCESS_GRANTS: list[dict[str, str]] = [
+    {"principal_type": "user", "principal_id": "*", "permission": "read"}
+]
+
+#: `templates.oidc_interstitial_page` ("Continue to sign in") - only the
+#: continue-link's `href`, never anything from the upstream IdP's own page.
+_INTERSTITIAL_CONTINUE_RE = re.compile(r'<a class="button" href="([^"]+)">')
 
 
 class OpenWebUiDriverError(RuntimeError):
@@ -55,6 +79,31 @@ class ConnectResult:
     authorize_followed_to_webui: bool
     final_url: str
     final_status_code: int
+
+
+@dataclass(frozen=True)
+class ChatToolCallResult:
+    """What `OpenWebUiDriver.run_scripted_tool_chat` (#314) read back from
+    `GET /api/v1/chats/{chat_id}` - the chat/message ids so a caller can look
+    the conversation up again, and every `function_call_output` item found on
+    the assistant message (`output` list, `utils/middleware.py`, v0.11.4):
+    `{"type": "function_call_output", "call_id": ..., "output": [{"type":
+    "input_text", "text": ...}, ...], "status": "completed"|"failed"}`."""
+
+    chat_id: str
+    assistant_message_id: str
+    function_call_outputs: list[dict[str, Any]] = field(default_factory=list)
+
+    def output_text(self) -> str:
+        """All `input_text` parts of every `function_call_output`, joined -
+        what a caller checks for "Tool … not found" (#314's own Definition
+        of Done) without having to walk the nested shape itself."""
+        return "\n".join(
+            str(part.get("text", ""))
+            for item in self.function_call_outputs
+            for part in item.get("output", [])
+            if part.get("type") == "input_text"
+        )
 
 
 class OpenWebUiDriver:
@@ -112,20 +161,30 @@ class OpenWebUiDriver:
         """`POST /api/v1/configs/tool_servers` - the admin step that adds the
         MCP connection, `auth_type=oauth_2.1`, carrying the encrypted blob
         `register_oauth_client` just produced in `info.oauth_client_info`
-        (`utils/oauth.py.ensure_client_from_config`'s own read path)."""
+        (`utils/oauth.py.ensure_client_from_config`'s own read path).
+
+        `url` carries the full `/mcp` path and `path` is sent only because
+        `ToolServerConnection.path` is a required field - Open WebUI's own
+        `connect_mcp_server` (`utils/middleware.py`, v0.11.4) uses `url`
+        *verbatim* as the Streamable HTTP endpoint and never appends `path`
+        (#314's load-bearing fix: `url=<resource server>` alone 404s on
+        every request and the chat silently ends with no tools). `config`
+        carries `_PUBLIC_READ_ACCESS_GRANTS` already on this first call,
+        since every later `POST` here re-creates the connection (and its
+        OAuth client) from scratch - there is no "add a grant" endpoint."""
         response = await self._client.post(
             f"{self._webui_url}/api/v1/configs/tool_servers",
             json={
                 "TOOL_SERVER_CONNECTIONS": [
                     {
-                        "url": self._resource_server_url,
+                        "url": f"{self._resource_server_url}/mcp",
                         "path": "mcp",
                         "type": "mcp",
                         "auth_type": "oauth_2.1",
                         "forward_cookies": False,
                         "headers": None,
                         "key": None,
-                        "config": {"enable": True},
+                        "config": {"enable": True, "access_grants": _PUBLIC_READ_ACCESS_GRANTS},
                         "info": {
                             "id": server_id,
                             "oauth_client_info": self._oauth_client_info,
@@ -139,11 +198,49 @@ class OpenWebUiDriver:
                 f"tool server configuration failed: {response.status_code} {response.text}"
             )
 
+    async def _complete_login_page(
+        self, response: httpx.Response, *, password: str
+    ) -> httpx.Response:
+        """Finishes whatever memory-manager's `/login` shows, detected from the
+        page's own markup rather than a configured `LOGIN_MODE` (#314, so this
+        one hook keeps working once #313 switches to `oidc`):
+
+        - the password form (`templates.login_password_page`, the only page
+          `LOGIN_MODE=password` - every live run this task's own Definition of
+          Done needs - ever shows): submits it with `password`.
+        - the OIDC interstitial (`templates.oidc_interstitial_page`, "Continue
+          to sign in"): follows its `confirm=1` link onward and returns that
+          response unfinished - driving the upstream IdP's own page after that
+          is #313's job, not this generic hook's.
+
+        Raises if the page is neither (an unexpected error page, for
+        instance) and never logs or returns the password itself."""
+        page = response
+        while 'name="password"' not in page.text:
+            match = _INTERSTITIAL_CONTINUE_RE.search(page.text)
+            if match is None:
+                raise OpenWebUiDriverError(
+                    f"'/login' page is neither a password form nor an interstitial: {page.url}"
+                )
+            continue_url = httpx.URL(str(page.url)).join(html.unescape(match.group(1)))
+            page = await self._client.get(continue_url)
+            if "/login" not in str(page.url):
+                # Left memory-manager's own /login (e.g. redirected onward to
+                # an upstream IdP) - whatever comes next is a different
+                # authenticator's own flow (#313), not this hook's.
+                return page
+
+        pending = page.url.params.get("pending", "")
+        if not pending:
+            raise OpenWebUiDriverError(f"no 'pending' id in the /login URL: {page.url}")
+        login_base = str(page.url).split("?", 1)[0]
+        return await self._client.post(login_base, data={"pending": pending, "password": password})
+
     async def run_oauth_flow(self, *, server_id: str, password: str) -> ConnectResult:
         """Drives the per-user consent: `GET /oauth/clients/mcp:<id>/authorize`
         (Open WebUI) -> memory-manager's `/authorize` -> `/login?pending=...`
-        -> `POST /login` with the admin password -> back through
-        memory-manager's `/authorize` completion -> Open WebUI's own
+        -> `_complete_login_page` (password form or OIDC interstitial) -> back
+        through memory-manager's `/authorize` completion -> Open WebUI's own
         `/oauth/clients/mcp:<id>/callback`. One `httpx.AsyncClient` with a
         shared cookie jar and `follow_redirects=True` carries every hop
         except the password form itself, exactly like one browser tab
@@ -161,15 +258,8 @@ class OpenWebUiDriver:
                 f"expected to land on memory-manager's /login, got {login_url} "
                 f"({authorize_response.status_code})"
             )
-        pending = httpx.URL(login_url).params.get("pending", "")
-        if not pending:
-            raise OpenWebUiDriverError(f"no 'pending' id in the /login URL: {login_url}")
 
-        login_base = f"{login_url.split('?', 1)[0]}"
-        submit_response = await self._client.post(
-            login_base,
-            data={"pending": pending, "password": password},
-        )
+        submit_response = await self._complete_login_page(authorize_response, password=password)
         final_url = str(submit_response.url)
         if "error" in httpx.URL(final_url).params:
             raise OpenWebUiDriverError(
@@ -199,6 +289,114 @@ class OpenWebUiDriver:
         await self.configure_tool_server(server_id=server_id)
         return await self.run_oauth_flow(server_id=server_id, password=admin_password)
 
+    async def add_user(self, *, name: str, email: str, password: str, role: str = "user") -> None:
+        """`POST /api/v1/auths/add` (admin-only, `role="user"` by default) -
+        creates a second local account next to the admin `signup_admin`
+        made, so a caller can later sign that user in on their *own*
+        `httpx.AsyncClient`/cookie jar (see `sign_in`) instead of sharing the
+        admin's session - #144's own job, not exercised by this task's live
+        run (one admin user is enough for #314's Definition of Done), but
+        the seam this method and `sign_in` give it."""
+        response = await self._client.post(
+            f"{self._webui_url}/api/v1/auths/add",
+            json={"name": name, "email": email, "password": password, "role": role},
+        )
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(f"add user failed: {response.status_code} {response.text}")
+
+    async def sign_in(self, *, email: str, password: str) -> None:
+        """`POST /api/v1/auths/signin` on *this* driver's own `httpx.AsyncClient` -
+        sets the `token` session cookie (`create_session_response`,
+        `routers/auths.py`, v0.11.4) a chat call needs. Run this on a driver
+        built with its own client per user (one cookie jar each - a user
+        added through `add_user` must never share the admin's); `connect`'s
+        own `signup_admin` already leaves the admin signed in, so a fresh
+        `connect` run does not need this call for the admin itself."""
+        response = await self._client.post(
+            f"{self._webui_url}/api/v1/auths/signin",
+            json={"email": email, "password": password},
+        )
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(f"signin failed: {response.status_code} {response.text}")
+
+    async def run_scripted_tool_chat(
+        self, *, model_id: str, server_id: str, message: str
+    ) -> ChatToolCallResult:
+        """Drives one user turn through Open WebUI's native MCP tool loop
+        (#314): `POST /api/v1/chats/new` for a real `chat_id`, then `POST
+        /api/chat/completions` with `stream: true`, `tool_ids:
+        ["server:mcp:<server_id>"]` (`utils/middleware.py`'s own
+        `server:mcp:` prefix, v0.11.4), this `chat_id` and a fresh assistant
+        `id` - deliberately *without* `session_id`, so `main.py`'s
+        `chat_completion` takes its synchronous branch (the `if
+        metadata.get('session_id') and metadata.get('chat_id')` fan-out is
+        for the WebSocket/multi-model case only) and the whole tool loop
+        (`get_event_emitter_and_caller`/`streaming_chat_response_handler`)
+        runs - and is persisted to the chat - before the HTTP response
+        returns. That response is `200 null` by design
+        (`streaming_chat_response_handler`'s own `response_handler` has no
+        `return` statement), so the actual result is read back with `GET
+        /api/v1/chats/{chat_id}` -> `chat.history.messages[<assistant
+        id>].output`'s `function_call_output` items, this method's return
+        value (`ChatToolCallResult`)."""
+        new_chat_response = await self._client.post(
+            f"{self._webui_url}/api/v1/chats/new",
+            json={
+                "chat": {
+                    "models": [model_id],
+                    "history": {"messages": {}, "currentId": None},
+                    "messages": [],
+                    "title": "New Chat",
+                    "timestamp": int(time.time() * 1000),
+                }
+            },
+        )
+        if new_chat_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chats/new failed: {new_chat_response.status_code} {new_chat_response.text}"
+            )
+        chat_id = new_chat_response.json().get("id", "")
+        if not chat_id:
+            raise OpenWebUiDriverError(f"chats/new returned no chat id: {new_chat_response.json()}")
+
+        assistant_message_id = str(uuid.uuid4())
+        completion_response = await self._client.post(
+            f"{self._webui_url}/api/chat/completions",
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": message}],
+                "stream": True,
+                "tool_ids": [f"server:mcp:{server_id}"],
+                "chat_id": chat_id,
+                "id": assistant_message_id,
+            },
+        )
+        if completion_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chat completion failed: {completion_response.status_code} "
+                f"{completion_response.text}"
+            )
+
+        chat_detail_response = await self._client.get(f"{self._webui_url}/api/v1/chats/{chat_id}")
+        if chat_detail_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"reading the chat back failed: {chat_detail_response.status_code} "
+                f"{chat_detail_response.text}"
+            )
+        chat_detail = chat_detail_response.json() or {}
+        messages = (chat_detail.get("chat") or {}).get("history", {}).get("messages", {})
+        assistant_message = messages.get(assistant_message_id) or {}
+        output = assistant_message.get("output") or []
+        function_call_outputs = [
+            item for item in output if item.get("type") == "function_call_output"
+        ]
+
+        return ChatToolCallResult(
+            chat_id=chat_id,
+            assistant_message_id=assistant_message_id,
+            function_call_outputs=function_call_outputs,
+        )
+
 
 def _read_password(args: argparse.Namespace) -> str:
     if args.admin_password_file:
@@ -225,6 +423,31 @@ async def _run_connect(args: argparse.Namespace) -> int:
     return 0 if result.authorize_followed_to_webui else 1
 
 
+async def _run_chat(args: argparse.Namespace) -> int:
+    """Signs the admin back in (a fresh process has no cookie jar from an
+    earlier `connect` run) and drives one scripted tool-calling turn - run
+    this *after* `connect` has registered the MCP server and completed that
+    user's OAuth consent, or `connect_mcp_server` finds no stored token
+    and the chat ends with no tools, same as an un-consented user."""
+    password = _read_password(args)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        driver = OpenWebUiDriver(
+            client, webui_url=args.webui_url, resource_server_url=args.resource_server_url
+        )
+        await driver.sign_in(email=args.admin_email, password=password)
+        result = await driver.run_scripted_tool_chat(
+            model_id=args.model_id, server_id=args.server_id, message=args.message
+        )
+    print(result)
+    if not result.function_call_outputs:
+        print("no function_call_output items on the assistant message", file=sys.stderr)
+        return 1
+    if "not found" in result.output_text().lower():
+        print("a function_call_output reports a missing tool", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -240,9 +463,23 @@ def main(argv: list[str] | None = None) -> int:
     connect_parser.add_argument("--admin-password-file", default=None)
     connect_parser.add_argument("--admin-password", default=None)
 
+    chat_parser = subparsers.add_parser(
+        "chat", help="sign in as the admin and run one scripted, tool-calling chat turn"
+    )
+    chat_parser.add_argument("--webui-url", default=_DEFAULT_WEBUI_URL)
+    chat_parser.add_argument("--resource-server-url", default=_DEFAULT_RESOURCE_SERVER_URL)
+    chat_parser.add_argument("--server-id", default=_DEFAULT_SERVER_ID)
+    chat_parser.add_argument("--model-id", default="scripted-model")
+    chat_parser.add_argument("--admin-email", default="spike-admin@example.com")
+    chat_parser.add_argument("--admin-password-file", default=None)
+    chat_parser.add_argument("--admin-password", default=None)
+    chat_parser.add_argument("--message", default="search my notes")
+
     args = parser.parse_args(argv)
     if args.command == "connect":
         return asyncio.run(_run_connect(args))
+    if args.command == "chat":
+        return asyncio.run(_run_chat(args))
     raise SystemExit(f"unknown command: {args.command}")  # pragma: no cover - argparse guards this
 
 

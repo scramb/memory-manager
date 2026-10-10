@@ -40,10 +40,22 @@ or
 
     {"content": "a final assistant reply"}
 
-A turn index past the end of the script, or no `--script` at all, falls
-back to one fixed text reply (`_DEFAULT_TURN`) - the "without script" case
+A turn index past the end of the script, no `--script` at all, or (#314) a
+`--script` path whose file does not exist *at request time*, falls back to
+one fixed text reply (`_DEFAULT_TURN`) - the "without script" case
 the docs/TASKS.md Definition of Done for #141 only needs the shape of, not
 any particular scripted conversation (that is #144/#150's job).
+
+With `--script`, the file is re-read on **every** `/v1/chat/completions`
+request (#314) rather than once at startup: a live run
+(`deploy/openwebui/docker-compose.yml`) mounts `tests/e2e/stubs` read-only
+and starts this stub before a test's own script exists on disk, so the
+file can appear - or change - after the process is already serving
+requests. Turn selection still only looks at the request's own message
+list (see `_turn_index` below), so re-reading does not reintroduce session
+state: two requests carrying the same `messages` get the same answer
+regardless of when either one reads the file, as long as the file itself
+has not changed between them.
 
 Both `"stream": false` and `"stream": true` are served. Streaming follows
 the OpenAI `chat.completion.chunk` shape: a tool-call turn emits one delta
@@ -104,6 +116,22 @@ def _turn_for(script: Sequence[Mapping[str, Any]], index: int) -> Mapping[str, A
     if 0 <= index < len(script):
         return script[index]
     return _DEFAULT_TURN
+
+
+def _current_script(
+    static_script: Sequence[Mapping[str, Any]], script_path: Path | None
+) -> Sequence[Mapping[str, Any]]:
+    """The script for *this* request: re-read from `script_path` every time
+    (module docstring, #314) when one was given, falling back to no script
+    (-> `_DEFAULT_TURN`, same as no `--script` at all) while the file does
+    not exist yet. `static_script` is only used when no path was given at
+    all, keeping the in-process tests (`create_app(script)`) unaffected."""
+    if script_path is None:
+        return static_script
+    try:
+        return load_script(script_path)
+    except FileNotFoundError:
+        return ()
 
 
 def _tool_call_message(turn_index: int, tool_calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -178,9 +206,18 @@ async def _stream_text_turn(
 
 
 def create_app(
-    script: Sequence[Mapping[str, Any]] = (), *, model_id: str = _DEFAULT_MODEL_ID
+    script: Sequence[Mapping[str, Any]] = (),
+    *,
+    model_id: str = _DEFAULT_MODEL_ID,
+    script_path: Path | None = None,
 ) -> Starlette:
-    """Builds the stub: `GET /v1/models`, `POST /v1/chat/completions`, `GET /healthz`."""
+    """Builds the stub: `GET /v1/models`, `POST /v1/chat/completions`, `GET /healthz`.
+
+    `script` is a fixed, in-process script (what the unit tests below use).
+    `script_path`, when given, takes over instead and is re-read on every
+    `/v1/chat/completions` request (#314, see the module docstring) -
+    `main()` always passes this for the `--script`/`SCRIPTED_MODEL_SCRIPT`
+    CLI path; `script` stays the fixed-list seam for tests."""
 
     async def models(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -202,7 +239,7 @@ def create_app(
         stream = bool(body.get("stream", False))
 
         turn_index = _turn_index(messages)
-        turn = _turn_for(script, turn_index)
+        turn = _turn_for(_current_script(script, script_path), turn_index)
         tool_calls = turn.get("tool_calls")
 
         completion_id = f"chatcmpl-{turn_index}"
@@ -282,8 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     """Parse `argv` (`sys.argv[1:]` if omitted) and serve the stub until interrupted."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    script = load_script(args.script) if args.script is not None else []
-    app = create_app(script, model_id=args.model_id)
+    app = create_app(model_id=args.model_id, script_path=args.script)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 

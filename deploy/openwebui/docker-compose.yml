@@ -175,6 +175,13 @@ services:
       - /tmp
     user: "10001:10001"
     command: ["python3", "/stubs/scripted_model.py", "--host", "0.0.0.0", "--port", "8091"]
+    environment:
+      # Re-read on every request (#314, tests/e2e/stubs/scripted_model.py's
+      # own docstring) - a test writes this file into the already read-only
+      # mounted tests/e2e/stubs directory above *after* the stack is up, so
+      # no extra mount is needed. Its absence (today's default) is
+      # unchanged: the stub falls back to its one fixed text reply.
+      SCRIPTED_MODEL_SCRIPT: /stubs/live-script.json
     volumes:
       - ../../tests/e2e/stubs:/stubs:ro
       - ../../scripts/http-healthcheck.py:/healthcheck.py:ro

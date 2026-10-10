@@ -305,6 +305,86 @@ None of the above broke ADR-0011's load-bearing assumption (the AS
 accepting Open WebUI's DCR request and completing the per-user OAuth
 dance) - no STOP/Gate condition from this task's contract was triggered.
 
+### #314: a scripted native MCP tool call, deterministic and read back
+
+Driven live against the same pinned stack with the admin user `connect`
+already completed (above): `tests/e2e/openwebui_driver.py chat` ran one
+turn through `tests/e2e/stubs/scripted_model.py`'s own
+`live-script.json` (a throwaway file written into the already read-only
+mounted `tests/e2e/stubs` directory for this run only, then removed - it
+never belongs to the deliverable, the driver/stub code does), scripted to
+call `memmgr_memory_search` and then give a text reply. Tested version:
+0.11.4 throughout.
+
+- **`url` vs `path` (load-bearing fix):** `connect_mcp_server`
+  (`utils/middleware.py`) builds the Streamable HTTP client from
+  `mcp_server_connection.get('url', '')` **verbatim** and never reads
+  `path` at all - confirmed by reading the function, not inferred.
+  `url=http://localhost:18081` (the resource server's origin alone, the
+  spike's own `configure_tool_server` shape before this fix) makes every
+  tool-server request `POST /` - memory-manager's own router has no route
+  there, so the SDK (or Starlette underneath it) answers `404`, logged at
+  debug level only (`connect_mcp_server`'s `except Exception: log.debug`),
+  and the chat simply ends with no tools and no visible error anywhere a
+  caller would look first. `url=http://localhost:18081/mcp` fixed it
+  live, confirmed by memory-manager's own access log showing
+  `"POST /mcp HTTP/1.1" 200` (initialize, `tools/list` and `tools/call`
+  in sequence) instead of a `404` on `/`. `ToolServerConnection.path` is
+  still sent (`"mcp"`, a required Pydantic field, v0.11.4), but is dead
+  weight for MCP connections - OpenAPI connections are the only ones that
+  still read it.
+- **`stream: true` + `chat_id` + `id`, no `session_id` (load-bearing
+  shape):** `main.py`'s `chat_completion` only takes the per-model
+  fan-out/WebSocket branch when `metadata.get('session_id') and
+  metadata.get('chat_id')` are both set; omitting `session_id` routes a
+  single-model request straight into the synchronous `process_chat` call
+  instead. With `stream: false` the response carries `tool_calls` verbatim
+  with no further processing - confirmed live: the stub's scripted
+  `tool_calls` turn came back unexecuted, `finish_reason: "tool_calls"`,
+  nothing written to the chat. With `stream: true` plus `chat_id`/`id`,
+  `process_chat_response` takes `streaming_chat_response_handler`'s
+  `if event_emitter:` branch (an event emitter only needs `chat_id` +
+  `message_id`, never `session_id` - a `event_caller`, which direct/client
+  tools and the Pyodide interpreter need, is the one thing that does
+  require `session_id`, and MCP tools never use it) and runs the full
+  native tool loop there, synchronously awaited.
+- **The `200 null` response (and why `GET /chats/{id}` is the only way to
+  read the result back):** `streaming_chat_response_handler`'s own inner
+  `response_handler` coroutine has no `return` statement, so `return await
+  response_handler(...)` yields `None`, which `chat_completion`'s
+  "Legacy/direct: single model, synchronous" branch returns as-is;
+  FastAPI serializes that as a `200` response with the literal JSON body
+  `null`. Confirmed live - `tests/e2e/openwebui_driver.py chat`'s
+  `/api/chat/completions` call returns `200`/`null` every time, and the
+  tool result only ever shows up in the subsequent `GET
+  /api/v1/chats/{chat_id}` call, under
+  `chat.history.messages[<assistant id>].output`, as one or more
+  `{"type": "function_call_output", "call_id": ..., "output": [{"type":
+  "input_text", "text": ...}], "status": "completed"}` items -
+  `streaming_chat_response_handler`'s own DB write (inside the awaited
+  `response_handler`) happens *before* the `200 null` response returns,
+  so no polling or retry was needed to read it straight back in the same
+  script.
+- **`access_grants` must be set on the very first `configure_tool_server`
+  call:** `set_tool_servers_config` (`routers/configs.py`) replaces
+  `tool_server.connections` wholesale and re-registers the OAuth client
+  from scratch on every `POST`, there is no "patch just the grants"
+  endpoint - so a driver that configures the connection once without
+  `config.access_grants` and tries to add it later would have to redo the
+  whole DCR dance. `has_connection_access`
+  (`utils/access_control/__init__.py`) already falls back to "private,
+  admin-only" without any grants, so the single admin user this task's
+  own Definition of Done needs was never actually blocked by the missing
+  grants - this fix matters once #144 adds a second, non-admin user, not
+  for #314 itself.
+- **Live result:** `function_call_outputs` on the read-back assistant
+  message carried exactly one `function_call_output` item, `status:
+  "completed"`, `output: [{"type": "input_text", "text": "{\n
+  \"results\": [],\n  \"mode\": \"fulltext\"\n}"}]` (the scripted-model's
+  memory vault is empty in this stack, so an empty hit list is the
+  correct answer) - **not** "Tool … not found" or any other failure
+  shape, confirming #314's own Definition of Done.
+
 ## Open questions
 
 None of the following blocks WP-42 … WP-46: ADR-0011 already picked
@@ -346,7 +426,11 @@ WP depends on; each line says why.
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/memories.py
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/configs.py (spike, 2026-10-10: `/oauth/clients/register`, `/tool_servers`)
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/functions.py (spike, 2026-10-10: `/create`, `/id/{id}/update`, `/id/{id}/valves/user/update`)
-- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/auths.py (spike, 2026-10-10: `/signup`, `create_session_response`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/auths.py (spike, 2026-10-10: `/signup`, `/add`, `/signin`, `create_session_response`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/chats.py (spike, 2026-10-10: `/new`, `GET /{id}`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/models/chats.py (spike, 2026-10-10: `ChatForm`, `ChatResponse`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/main.py (spike, 2026-10-10: `/api/chat/completions`, `chat_completion`, `process_chat`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/utils/access_control/__init__.py (spike, 2026-10-10: `has_access`, `has_connection_access`)
 - memory-manager's own `.venv` at `mcp==2.3.0` (`uv.lock`): `mcp/server/auth/routes.py` `validate_issuer_url` (spike, 2026-10-10)
 - `podman_compose.py` (Debian package `podman-compose` 1.3.0, `/usr/lib/python3/dist-packages/podman_compose.py`): `get_net_args_from_network_mode` (spike, 2026-10-10)
 - https://github.com/open-webui/mcpo

@@ -153,6 +153,61 @@ class TestChatCompletionsNonStreaming:
         assert response.json()["choices"][0]["message"]["content"] == "This is a scripted reply."
 
 
+class TestChatCompletionsScriptPath:
+    """`--script`/`script_path` (#314): re-read on every request, not once at
+    startup - a live run may mount the script file after the stub is
+    already serving, or change it mid-run."""
+
+    async def test_reads_the_script_file_fresh_on_every_request(self, tmp_path: Path) -> None:
+        path = tmp_path / "script.json"
+        path.write_text(json.dumps([{"content": "first version"}]), encoding="utf-8")
+        app = create_app(script_path=path)
+
+        async with _make_client(app) as client:
+            first = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+            assert first.json()["choices"][0]["message"]["content"] == "first version"
+
+            path.write_text(json.dumps([{"content": "second version"}]), encoding="utf-8")
+            second = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+            assert second.json()["choices"][0]["message"]["content"] == "second version"
+
+    async def test_falls_back_to_the_default_turn_while_the_file_does_not_exist_yet(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "not-written-yet.json"
+        app = create_app(script_path=path)
+
+        async with _make_client(app) as client:
+            before = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+            assert before.json()["choices"][0]["message"]["content"] == "This is a scripted reply."
+
+            path.write_text(json.dumps([{"content": "now it exists"}]), encoding="utf-8")
+            after = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+            assert after.json()["choices"][0]["message"]["content"] == "now it exists"
+
+    async def test_script_path_takes_over_from_the_fixed_script_argument(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "script.json"
+        path.write_text(json.dumps([{"content": "from the file"}]), encoding="utf-8")
+        app = create_app([{"content": "from the fixed list"}], script_path=path)
+
+        async with _make_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+
+        assert response.json()["choices"][0]["message"]["content"] == "from the file"
+
+
 def _parse_sse_events(raw: str) -> list[Any]:
     """`[DONE]` becomes `None`, every other `data: ...` line is JSON-decoded."""
     events: list[Any] = []
