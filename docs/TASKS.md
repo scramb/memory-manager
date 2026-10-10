@@ -519,7 +519,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 ### WP-58 — Manual client checklist · F-02 · Branch: `wp/58-client-checklist` · PR: open
 
 - [x] #160 `docs/release/client-checklist.md` lists the manual acceptance steps for every GUI and web client
-- [ ] #193 The client checklist is part of the release process ⛔ blocked by #160
+- [x] #193 The client checklist is part of the release process
 
 ---
 

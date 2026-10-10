@@ -1,5 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "pull-request-footer": "Before merging: fill this version's section in [docs/release/client-checklist.md](https://github.com/scramb/memory-manager/blob/main/docs/release/client-checklist.md) (copy `## Template` under `## Releases`).",
   "packages": {
     ".": {
       "release-type": "python",
