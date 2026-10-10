@@ -118,8 +118,9 @@ import random
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from collections import deque
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -244,6 +245,23 @@ _PARTITION_KINDS = ("user", "group", "project", "org")
 #: inter-process pickling overhead stays a small fraction of the work each
 #: shard actually does.
 _CHUNK_SHARD_SIZE = 200
+
+#: `build_chunk_rows_parallel`'s own in-flight window (#271, WP-32's
+#: target-size run): how many shards may be submitted-but-not-yet-
+#: `.result()`'d at once, as a multiple of the worker count. `Executor.map`
+#: (the pre-#271 implementation) submits every shard immediately and
+#: unconditionally, with no bound on how many *completed* results can pile
+#: up unconsumed while the single `COPY` consumer (`load_chunks_streaming`)
+#: works through them in submission order - each one's own `embedding_
+#: literal` is a ~7 KB text literal (a 1024-dim `halfvec`), so an unbounded
+#: backlog at the 1M-note/5M-chunk target size grows into tens of
+#: gigabytes before the run even finishes (confirmed: a 2026-10-09 attempt
+#: OOM-killed the loader Pod's host at ~39 GiB RSS, 32% through loading).
+#: `2` keeps enough shards queued that `max_workers` workers never starve
+#: waiting on the next one, without letting the backlog grow past a small
+#: constant multiple of one shard's own size - `_windowed`'s own docstring
+#: has the exact bound.
+_CHUNK_INFLIGHT_WINDOW_FACTOR = 2
 
 _VECTOR_LAYOUT_MIGRATION_PACKAGE = "memory_manager.db.migrations.postgres"
 _VECTOR_LAYOUT_MIGRATION_FILE = "0012_vector_layout.sql"
@@ -460,6 +478,44 @@ def _chunk_rows_for_shard(shard: Sequence[_Row], kinds: Mapping[str, str]) -> li
     return build_chunk_rows(shard, kinds)
 
 
+def _windowed[T](
+    submit: Callable[[Sequence[_Row]], Future[T]],
+    shards: Sequence[Sequence[_Row]],
+    *,
+    window: int,
+) -> Iterator[T]:
+    """Run `submit` over `shards`, never more than `window` shards
+    submitted-but-not-yet-`.result()`'d at once (#271): bounds a fast,
+    multi-process producer against a slower consumer that reads this
+    generator's own output one item at a time, instead of `Executor.map`'s
+    unconditional "submit every item immediately" (the pre-#271 bug this
+    replaces - see `_CHUNK_INFLIGHT_WINDOW_FACTOR`'s own docstring).
+
+    Fills a `deque` of up to `window` futures first, then - for every one
+    it yields - waits for the *oldest* outstanding future's own result
+    before submitting the next shard (not the other way around): this
+    keeps the invariant "at most `window` futures submitted and not yet
+    resolved" exactly `window`, never `window + 1` even transiently, which
+    submitting the replacement before resolving the popped one would allow.
+    `submit` is injected (not a bare `ProcessPoolExecutor.submit` call)
+    so this bound is tested without spinning up real worker processes
+    (`tests/loadtest/test_load.py`'s own fake-submit test) - the real
+    caller (`build_chunk_rows_parallel`) is the only place this ever runs
+    against an actual process pool.
+    """
+    pending: deque[Future[T]] = deque()
+    shard_iter = iter(shards)
+    for shard in itertools.islice(shard_iter, window):
+        pending.append(submit(shard))
+    while pending:
+        future = pending.popleft()
+        result = future.result()
+        next_shard = next(shard_iter, None)
+        if next_shard is not None:
+            pending.append(submit(next_shard))
+        yield result
+
+
 def build_chunk_rows_parallel(
     rows: Sequence[_Row],
     kinds: Mapping[str, str],
@@ -476,14 +532,17 @@ def build_chunk_rows_parallel(
 
     `rows` is split into consecutive shards of `shard_size` notes each
     (`_CHUNK_SHARD_SIZE`'s own rationale); yields one shard's own chunk rows
-    at a time, **in `rows`' own order** - `ProcessPoolExecutor.map` returns
-    results in submission order regardless of which worker finishes first,
-    so this is deterministic the same way the single-process
-    `build_chunk_rows` already is, never a hidden source of run-to-run
-    divergence. Yielding per shard (rather than returning one combined
-    list) lets a caller (`load_chunks_streaming`) start `COPY`ing a shard's
-    rows the moment they are ready, instead of holding every chunk row for
-    the whole vault in memory before the first `COPY` starts.
+    at a time, **in `rows`' own order** - `_windowed` resolves futures in
+    submission order regardless of which worker finishes first, so this is
+    deterministic the same way the single-process `build_chunk_rows`
+    already is, never a hidden source of run-to-run divergence. Yielding
+    per shard (rather than returning one combined list) lets a caller
+    (`load_chunks_streaming`) start `COPY`ing a shard's rows the moment
+    they are ready, instead of holding every chunk row for the whole vault
+    in memory before the first `COPY` starts - and `_windowed`'s own bound
+    (`_CHUNK_INFLIGHT_WINDOW_FACTOR` x the worker count) is what stops that
+    "the moment they are ready" promise from being defeated by a producer
+    that races far ahead of a slower consumer (#271).
     """
     shards = [rows[i : i + shard_size] for i in range(0, len(rows), shard_size)]
     if not shards:
@@ -496,8 +555,14 @@ def build_chunk_rows_parallel(
     # `"spawn"` starts each worker fresh instead - slower per worker, never
     # unsafe.
     context = multiprocessing.get_context("spawn")
+    resolved_workers = max_workers if max_workers is not None else (os.cpu_count() or 1)
+    window = max(1, resolved_workers * _CHUNK_INFLIGHT_WINDOW_FACTOR)
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=context) as pool:
-        yield from pool.map(_chunk_rows_for_shard, shards, itertools.repeat(kinds))
+        yield from _windowed(
+            lambda shard: pool.submit(_chunk_rows_for_shard, shard, kinds),
+            shards,
+            window=window,
+        )
 
 
 def _note_table_records(rows: Sequence[_Row]) -> list[tuple[Any, ...]]:

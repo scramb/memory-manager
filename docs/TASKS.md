@@ -328,7 +328,7 @@ Goal: Target-size load test incl. replica failure, threat model and compliance t
 - [x] #293 Vector-only search finds its target on the Helm deployment as on a single process ⛔ blocked by #291
 - [x] #270 Generic Kubernetes runner executes the load test against the enterprise profile ⛔ blocked by #269, #255, #253, #257
 - [x] #296 Unfiltered vector searches on the user partition use the namespace B-tree instead of scanning every chunk
-- [ ] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
+- [x] #271 The target-size benchmark report shows F-01's targets met on both shared-state implementations ⛔ blocked by #270, #263, #265
 
 ### WP-33 — Security and compliance documents · F-01 · Branch: `wp/33-security-compliance` · PR: open
 

@@ -86,6 +86,71 @@ Every other env var (`LOADTEST_SHARED_STATE`, `K6_IMAGE`, ...) matches
 `scripts/loadtest-smoke.sh`'s own meaning where both exist — see
 `scripts/loadtest-cluster.sh`'s own module docstring for the full list.
 
+## Reusing a loaded dataset across two shared-state runs (and an optional retry)
+
+Generating and loading a 1M-note/~5M-chunk vault is expensive enough that
+re-doing it for every `LOADTEST_SHARED_STATE` value - or for a same-dataset
+retry after a red run - is wasted time (#271): `LOADTEST_SKIP_GENERATE_LOAD=1`
+skips the generate+load Job entirely and reuses whatever vault is already
+loaded into `LOADTEST_NAMESPACE`'s database. The full sequence is three
+invocations - Postgres run, then Valkey run, then an *optional* retry of
+either - and **every run but the last one must set `KEEP_CLUSTER=1` (or
+`KEEP_RELEASE=1`, same effect on this, the existing-cluster path)**, or the
+next run in the sequence finds nothing left to reuse: on the existing-
+cluster path (`KUBE_CONTEXT` given, the second and third invocations below),
+this script's own cleanup trap uninstalls the Helm release - and so the CNPG
+`Cluster` and the loaded database with it - on every exit unless one of
+those two variables says otherwise; that applied even when `KEEP_CLUSTER=1`
+was only given to the *first* (bootstrapped) invocation, which is a
+different flag scope - #271's own first attempt at this sequence lost its
+loaded dataset exactly this way, between the Postgres run and the planned
+Valkey run, from a bare second invocation with `KUBE_CONTEXT` set and
+neither variable given.
+
+```sh
+# Run 1 (postgres shared state): bootstraps its own kind cluster, loads the
+# vault, measures - KEEP_CLUSTER=1 leaves the cluster, registry *and* the
+# installed release running afterwards (this run owns the cluster, so this
+# is the bootstrapped path's own meaning of KEEP_CLUSTER).
+LOADTEST_NOTES=1000000 LOADTEST_SHARED_STATE=postgres LOADTEST_KILL_AFTER=30 \
+  LOADTEST_HELM_SET="database.cnpg.instances=1 database.cnpg.storage.size=40Gi" \
+  LOADTEST_RESULTS_DIR=./results/postgres KEEP_CLUSTER=1 scripts/loadtest-cluster.sh
+
+# Run 2 (valkey shared state): points KUBE_CONTEXT/LOADTEST_REGISTRY back at
+# that same cluster/registry, skips generate+load, upgrades the release in
+# place (valkey.enabled=true) and measures again. LOADTEST_REGISTRY_
+# INSECURE=1 because that registry is still run 1's own plain-HTTP
+# throwaway one, never a real operator registry. KEEP_CLUSTER=1 (or
+# KEEP_RELEASE=1) here too - this is the existing-cluster path, so it skips
+# the release/namespace-object teardown, not a cluster delete (there is no
+# cluster for this invocation to delete) - needed again if a retry (below)
+# follows, same as after run 1.
+LOADTEST_NOTES=1000000 LOADTEST_SHARED_STATE=valkey LOADTEST_KILL_AFTER=30 \
+  LOADTEST_SKIP_GENERATE_LOAD=1 LOADTEST_REGISTRY_INSECURE=1 \
+  KUBE_CONTEXT=kind-mm-loadtest LOADTEST_REGISTRY=localhost:5002 \
+  LOADTEST_HELM_SET="database.cnpg.instances=1 database.cnpg.storage.size=40Gi" \
+  LOADTEST_RESULTS_DIR=./results/valkey KEEP_CLUSTER=1 scripts/loadtest-cluster.sh
+
+# Run 3 (optional retry, e.g. of run 1 after a one-off red k6 threshold):
+# same shape as run 2 - KUBE_CONTEXT/LOADTEST_REGISTRY/LOADTEST_REGISTRY_
+# INSECURE/LOADTEST_SKIP_GENERATE_LOAD unchanged, LOADTEST_SHARED_STATE set
+# back to whichever run is being retried. This is the *last* invocation in
+# the sequence, so KEEP_CLUSTER/KEEP_RELEASE is intentionally left unset -
+# its own normal cleanup tears the release and namespace objects down (but,
+# KUBE_CONTEXT given, nothing cluster-level) once this run's own results are
+# collected. Delete the kind cluster/registry yourself afterwards
+# (`kind delete cluster --name mm-loadtest`, `podman rm -f mm-loadtest-registry`).
+LOADTEST_NOTES=1000000 LOADTEST_SHARED_STATE=postgres LOADTEST_KILL_AFTER=30 \
+  LOADTEST_SKIP_GENERATE_LOAD=1 LOADTEST_REGISTRY_INSECURE=1 \
+  KUBE_CONTEXT=kind-mm-loadtest LOADTEST_REGISTRY=localhost:5002 \
+  LOADTEST_HELM_SET="database.cnpg.instances=1 database.cnpg.storage.size=40Gi" \
+  LOADTEST_RESULTS_DIR=./results/postgres-retry scripts/loadtest-cluster.sh
+```
+
+`pg_stat_user_functions` is reset (`pg_stat_reset()`) right before each
+run's own k6 Job starts, so a later run's self-time numbers are never
+diluted by an earlier run's own calls against the same, reused database.
+
 ## Known limitation
 
 The shared `PersistentVolumeClaim` the generate+load Job, the embedding

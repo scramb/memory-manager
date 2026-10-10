@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import random
 import secrets
+from collections.abc import Sequence
+from concurrent.futures import Future
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -16,6 +18,8 @@ import pytest
 
 from loadtest.generate import generate
 from loadtest.load import (
+    _Row,
+    _windowed,
     build_chunk_rows,
     build_chunk_rows_parallel,
     build_rows,
@@ -549,6 +553,71 @@ async def test_build_chunk_rows_parallel_matches_the_serial_version(tmp_path: Pa
 
     assert parallel == serial
     assert serial  # the generated vault actually has chunks to compare
+
+
+def test_windowed_never_lets_more_than_the_window_run_ahead_of_the_consumer() -> None:
+    """#271: `_windowed` must never have more than `window` shards
+    submitted-but-not-yet-`.result()`'d at once - the bound that replaces
+    `Executor.map`'s own "submit everything immediately", which let a fast
+    producer's completed-but-unconsumed shards pile up without limit and
+    OOM-killed the target-size run's loader Pod
+    (`docs/benchmarks/target-size.md`).
+
+    A fake, non-multiprocess `submit` (no real worker pool - this stays a
+    fast, deterministic unit test): each call resolves its own shard
+    immediately (`_ImmediateFuture.set_result` in `__init__`), but
+    `_ImmediateFuture.result` only runs its own bookkeeping (decrementing
+    `outstanding`) when actually called - exactly when `_windowed` itself
+    chooses to call it, one at a time, same as `load_chunks_streaming`'s
+    own `COPY`-per-shard consumption. `outstanding` (incremented on every
+    `fake_submit` call, decremented on every `.result()` call) is
+    therefore "how many shards are submitted and not yet consumed" at any
+    point in the run, independent of how fast the underlying future
+    happens to resolve - a slow consumer (this test's own single-item-at-
+    a-time `for` loop) is what the bound actually has to hold against, not
+    slow production.
+    """
+    outstanding = 0
+    max_outstanding = 0
+
+    class _ImmediateFuture(Future[Sequence[_Row]]):
+        def __init__(self, value: Sequence[_Row]) -> None:
+            super().__init__()
+            self.set_result(value)
+
+        def result(self, timeout: float | None = None) -> Sequence[_Row]:
+            nonlocal outstanding
+            outstanding -= 1
+            return super().result(timeout)
+
+    def fake_submit(shard: Sequence[_Row]) -> Future[Sequence[_Row]]:
+        nonlocal outstanding, max_outstanding
+        outstanding += 1
+        max_outstanding = max(max_outstanding, outstanding)
+        return _ImmediateFuture(shard)
+
+    # An odd, not-a-clean-multiple-of-the-window count (37, window 4) - on
+    # purpose, so the last, partial refill is exercised too, not just whole
+    # window-sized batches.
+    shards: list[Sequence[_Row]] = [
+        (
+            _Row(
+                id=f"n{i:03d}",
+                namespace="me",
+                path=f"me/note/n{i:03d}.md",
+                content=b"",
+                version="v",
+            ),
+        )
+        for i in range(37)
+    ]
+    window = 4
+
+    results = list(_windowed(fake_submit, shards, window=window))
+
+    assert results == shards
+    assert max_outstanding == window
+    assert outstanding == 0
 
 
 async def test_use_existing_database_loads_with_chunks_via_a_superuser_connection(

@@ -42,6 +42,69 @@
 #                        stub always runs, there being no "none" mode
 #                        worth exercising against a from-scratch chart
 #                        install).
+#   LOADTEST_HELM_SET  - extra, space-separated "key=value" pairs appended
+#                        to this run's own `helm upgrade --install` as
+#                        further `--set` flags, after every flag this
+#                        script sets itself - lets a caller reach any
+#                        chart value already supported (`database.cnpg.
+#                        instances`, `database.cnpg.storage.size`,
+#                        `database.cnpg.resources.*`, ...) without this
+#                        script growing one dedicated env var per field
+#                        (#271's own target-size run: disk-constrained
+#                        hardware needs `database.cnpg.instances=1` and a
+#                        larger `database.cnpg.storage.size`/`resources`
+#                        than this chart's own git-mode-sized defaults).
+#                        Never a *new* chart value - CLAUDE.md's "use
+#                        chart values... where the chart allows it" is the
+#                        boundary; a value the chart does not already
+#                        expose (e.g. postgresql.conf's own shared_buffers)
+#                        stays untunable through this flag, same as
+#                        through a plain `--set`.
+#   LOADTEST_REGISTRY_INSECURE - "1" pushes to LOADTEST_REGISTRY the same
+#                        plain-HTTP, --tls-verify=false way this script's
+#                        own bootstrapped-cluster path always does -
+#                        for a LOADTEST_SKIP_GENERATE_LOAD second run
+#                        pointed (via KUBE_CONTEXT/LOADTEST_REGISTRY) at a
+#                        *first* run's own disposable kind cluster and
+#                        throwaway local registry, which is still exactly
+#                        that plain-HTTP registry, never a real one.
+#                        Default "0".
+#   LOADTEST_SKIP_GENERATE_LOAD - "1" skips the generate+load Job
+#                        entirely and assumes `LOADTEST_NAMESPACE` already
+#                        carries a loaded vault from an earlier run against
+#                        the same cluster/database - for a second
+#                        LOADTEST_SHARED_STATE run against the *same*
+#                        target-size dataset (generating/loading 1M notes
+#                        twice costs real time the comparison itself does
+#                        not need, #271's own Reuse guidance) - see
+#                        docs/benchmarks/cluster-loadtest.md's own "Reusing
+#                        a loaded dataset across two shared-state runs"
+#                        section for the exact invocation sequence (every
+#                        run but the last one needs KEEP_CLUSTER/KEEP_
+#                        RELEASE below, or the next run has nothing left to
+#                        reuse). Default "0": every run generates and loads
+#                        its own vault, same as before this flag existed.
+#   KEEP_CLUSTER       - "1": on the bootstrapped path (KUBE_CONTEXT empty),
+#                        leaves the kind cluster, registry and installed
+#                        release running on exit instead of tearing the
+#                        whole cluster down (scripts/e2e-kind.sh's own
+#                        escape hatch, same name). On the existing-cluster
+#                        path (KUBE_CONTEXT given), this script owns no
+#                        cluster to keep - KEEP_CLUSTER=1 there instead
+#                        skips the Helm-release/namespace-object teardown
+#                        only (same effect KEEP_RELEASE below names more
+#                        accurately for that path; either name works on
+#                        either path - a caller driving both the first,
+#                        bootstrapped run and a later, KUBE_CONTEXT-given
+#                        run of a LOADTEST_SKIP_GENERATE_LOAD sequence needs
+#                        only one flag to carry through both). Default "0".
+#   KEEP_RELEASE       - "1": on the existing-cluster path, same as
+#                        KEEP_CLUSTER=1 above - leaves the installed
+#                        release and every namespace object as they are,
+#                        for a later LOADTEST_SKIP_GENERATE_LOAD run (or a
+#                        same-dataset retry) to reuse. Ignored on the
+#                        bootstrapped path (that one already has KEEP_
+#                        CLUSTER's own, longer-standing name). Default "0".
 #
 # Helm, not Flux: a generic runner should not require Flux CRDs on every
 # "any cluster with the enterprise Helm profile" this is meant to run
@@ -57,6 +120,8 @@ LOADTEST_SHARED_STATE="${LOADTEST_SHARED_STATE:-postgres}"
 LOADTEST_NAMESPACE="${LOADTEST_NAMESPACE:-memory-manager}"
 LOADTEST_STORAGE_CLASS="${LOADTEST_STORAGE_CLASS:-}"
 LOADTEST_RESULTS_DIR="${LOADTEST_RESULTS_DIR:-}"
+LOADTEST_HELM_SET="${LOADTEST_HELM_SET:-}"
+LOADTEST_SKIP_GENERATE_LOAD="${LOADTEST_SKIP_GENERATE_LOAD:-0}"
 KUBE_CONTEXT="${KUBE_CONTEXT:-}"
 LOADTEST_REGISTRY="${LOADTEST_REGISTRY:-}"
 LOADTEST_IMAGE_TAG="${LOADTEST_IMAGE_TAG:-loadtest}"
@@ -174,6 +239,28 @@ cleanup() {
     exit "$status"
   fi
 
+  # KEEP_CLUSTER=1 or KEEP_RELEASE=1 (the existing-cluster path, KUBE_CONTEXT
+  # given - #271's own Postgres-run -> Valkey-run -> optional-retry reuse
+  # sequence, docs/benchmarks/cluster-loadtest.md's own "Reusing a loaded
+  # dataset" section): leave the installed release, the loaded database and
+  # every namespace object exactly as they are, same promise the bootstrapped
+  # path's own KEEP_CLUSTER=1 already makes - this is the one thing that was
+  # missing for that reuse sequence to survive a run that KUBE_CONTEXT (not
+  # a self-bootstrapped kind cluster) pointed at: every earlier invocation of
+  # this script against an existing cluster tore the release down on exit
+  # unconditionally, destroying the just-loaded 1M-note/5M-chunk database
+  # before a planned second (`LOADTEST_SKIP_GENERATE_LOAD=1`) run or retry
+  # ever got to reuse it. Either variable name works here (KEEP_CLUSTER
+  # because that is what the bootstrapped path already calls it and callers
+  # running both paths in the same session need only set one flag; KEEP_
+  # RELEASE because there is no "cluster" this script owns on this path to
+  # keep - it never created one).
+  if [[ "${KEEP_CLUSTER:-0}" == "1" || "${KEEP_RELEASE:-0}" == "1" ]]; then
+    echo "KEEP_CLUSTER/KEEP_RELEASE=1 set - leaving release '${HELM_RELEASE}' and namespace '${LOADTEST_NAMESPACE}' as they are" >&2
+    rm -rf "$TOOLS_DIR"
+    exit "$status"
+  fi
+
   echo "tearing down: helm release, namespace objects" >&2
   helm uninstall "$HELM_RELEASE" --kube-context "$KUBE_CONTEXT" -n "$LOADTEST_NAMESPACE" >/dev/null 2>&1 || true
   "${KCTL[@]}" delete job mm-loadtest-generate-load mm-loadtest-k6 -n "$LOADTEST_NAMESPACE" \
@@ -211,13 +298,17 @@ else
 fi
 
 # --- build + push this run's own images --------------------------------------
-# Only the throwaway local registry (this script's own bootstrap path)
+# Only the throwaway local registry (this script's own bootstrap path, or
+# LOADTEST_REGISTRY_INSECURE=1 - a second, KUBE_CONTEXT-given invocation
+# deliberately pointed back at a *first* invocation's own already-running
+# throwaway registry, #271's own LOADTEST_SKIP_GENERATE_LOAD reuse recipe)
 # needs --tls-verify=false - an operator's own LOADTEST_REGISTRY is
 # expected to be a real, properly-TLS'd registry, same as every other
 # push this repository ever does (CLAUDE.md: generic, nothing
 # operator-specific assumed broken on purpose).
+LOADTEST_REGISTRY_INSECURE="${LOADTEST_REGISTRY_INSECURE:-0}"
 push_image() {
-  if [[ "$BOOTSTRAPPED_OWN_CLUSTER" == "1" && "$ENGINE" == podman ]]; then
+  if [[ "$ENGINE" == podman && ( "$BOOTSTRAPPED_OWN_CLUSTER" == "1" || "$LOADTEST_REGISTRY_INSECURE" == "1" ) ]]; then
     "${CTR[@]}" push --tls-verify=false "$1"
   else
     "${CTR[@]}" push "$1"
@@ -261,6 +352,11 @@ fi
 if [[ "$LOADTEST_SHARED_STATE" == "valkey" ]]; then
   HELM_ARGS+=(--set valkey.enabled=true)
 fi
+if [[ -n "$LOADTEST_HELM_SET" ]]; then
+  for kv in $LOADTEST_HELM_SET; do
+    HELM_ARGS+=(--set "$kv")
+  done
+fi
 
 echo "--- installing ${HELM_RELEASE} (enterprise + loadtest overlay) into ${LOADTEST_NAMESPACE} ---"
 helm "${HELM_ARGS[@]}"
@@ -280,6 +376,35 @@ while true; do
 done
 echo "OK: 3 api pods (${api_pods[*]})"
 
+# --- track_functions (#271: pg_stat_user_functions self-time needs this -
+# off by default, and this chart exposes no postgresql.conf override) ------
+# ALTER DATABASE, not ALTER SYSTEM: CNPG's own instance manager owns
+# postgresql.auto.conf (confirmed: a plain psql ALTER SYSTEM against the
+# superuser Secret fails "could not open file \"postgresql.auto.conf\":
+# Permission denied" on a CNPG-managed instance) - ALTER DATABASE instead
+# writes into pg_db_role_setting (a catalog row, no file access needed)
+# and takes effect for every *new* connection to this database from the
+# moment it commits. The already-running 3 api + 2 worker Pods' own
+# connection pools opened theirs before this point, though, so a rollout
+# restart of both right after is what actually gets every in-flight
+# backend to reconnect and pick it up - cheap and safe (ADR-0009: both
+# Deployments are stateless by design) this early, before any load has
+# run.
+echo "--- enabling pg_stat_user_functions (track_functions = all) ---"
+cnpg_cluster_name="$("${KCTL[@]}" get cluster -n "$LOADTEST_NAMESPACE" -o jsonpath='{.items[0].metadata.name}')"
+cnpg_su_uri="$("${KCTL[@]}" get secret "${cnpg_cluster_name}-superuser" -n "$LOADTEST_NAMESPACE" \
+  -o jsonpath='{.data.uri}' | base64 -d)"
+"${KCTL[@]}" exec -n "$LOADTEST_NAMESPACE" "${cnpg_cluster_name}-1" -c postgres -- \
+  psql "${cnpg_su_uri%/*}/memory_manager" -v ON_ERROR_STOP=1 \
+  -c "alter database memory_manager set track_functions = 'all';"
+"${KCTL[@]}" rollout restart "deployment/${HELM_RELEASE}-api" "deployment/${HELM_RELEASE}-worker" \
+  -n "$LOADTEST_NAMESPACE"
+"${KCTL[@]}" rollout status "deployment/${HELM_RELEASE}-api" -n "$LOADTEST_NAMESPACE" \
+  --timeout="${STEP_TIMEOUT_SECONDS}s"
+"${KCTL[@]}" rollout status "deployment/${HELM_RELEASE}-worker" -n "$LOADTEST_NAMESPACE" \
+  --timeout="${STEP_TIMEOUT_SECONDS}s"
+echo "OK: track_functions = all (api/worker restarted onto it)"
+
 # --- shared PVC (generate+load Job, embedding stub, k6 Job) ------------------
 echo "--- creating the shared PVC ---"
 PVC_YAML="$(sed \
@@ -293,36 +418,49 @@ fi
 echo "$PVC_YAML" | "${KCTL[@]}" apply -n "$LOADTEST_NAMESPACE" -f -
 
 # --- generate + load (#270's own 32a/32b) -------------------------------------
-echo "--- generating ${LOADTEST_NOTES} notes and loading them via the CNPG superuser secret ---"
 MCP_BASE_URL="http://${HELM_RELEASE}.${LOADTEST_NAMESPACE}.svc.cluster.local:8080/mcp"
-sed \
-  -e "s|__LOADTEST_IMAGE__|${LOADTEST_IMAGE}|g" \
-  -e "s/__LOADTEST_NOTES__/${LOADTEST_NOTES}/" \
-  -e "s/__LOADTEST_APP_ROLE__/memory_manager_app/" \
-  -e "s|__LOADTEST_MCP_BASE_URL__|${MCP_BASE_URL}|" \
-  "${REPO_ROOT}/loadtest/k8s/generate-load-job.yaml" \
-  | "${KCTL[@]}" apply -n "$LOADTEST_NAMESPACE" -f -
+GENERATE_LOAD_START=""
+GENERATE_LOAD_END=""
+if [[ "$LOADTEST_SKIP_GENERATE_LOAD" == "1" ]]; then
+  echo "--- LOADTEST_SKIP_GENERATE_LOAD=1: reusing the already-loaded vault in ${LOADTEST_NAMESPACE} ---"
+  "${KCTL[@]}" get job mm-loadtest-generate-load -n "$LOADTEST_NAMESPACE" \
+    -o jsonpath='{.status.succeeded}' | grep -q '^1$' \
+    || {
+      echo "FAIL: LOADTEST_SKIP_GENERATE_LOAD=1 but mm-loadtest-generate-load has not succeeded in ${LOADTEST_NAMESPACE} - nothing to reuse" >&2
+      exit 1
+    }
+  echo "OK: mm-loadtest-generate-load already succeeded - skipping"
+else
+  echo "--- generating ${LOADTEST_NOTES} notes and loading them via the CNPG superuser secret ---"
+  sed \
+    -e "s|__LOADTEST_IMAGE__|${LOADTEST_IMAGE}|g" \
+    -e "s/__LOADTEST_NOTES__/${LOADTEST_NOTES}/" \
+    -e "s/__LOADTEST_APP_ROLE__/memory_manager_app/" \
+    -e "s|__LOADTEST_MCP_BASE_URL__|${MCP_BASE_URL}|" \
+    "${REPO_ROOT}/loadtest/k8s/generate-load-job.yaml" \
+    | "${KCTL[@]}" apply -n "$LOADTEST_NAMESPACE" -f -
 
-GENERATE_LOAD_START=$(date +%s.%N)
-generate_load_deadline=$((SECONDS + STEP_TIMEOUT_SECONDS))
-while true; do
-  succeeded="$("${KCTL[@]}" get job mm-loadtest-generate-load -n "$LOADTEST_NAMESPACE" \
-    -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)"
-  failed="$("${KCTL[@]}" get job mm-loadtest-generate-load -n "$LOADTEST_NAMESPACE" \
-    -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)"
-  [[ "$succeeded" == "1" ]] && break
-  if [[ "$failed" == "1" ]]; then
-    echo "FAIL: mm-loadtest-generate-load Job failed" >&2
-    exit 1
-  fi
-  if (( SECONDS > generate_load_deadline )); then
-    echo "FAIL: mm-loadtest-generate-load Job did not complete within ${STEP_TIMEOUT_SECONDS}s" >&2
-    exit 1
-  fi
-  sleep 5
-done
-GENERATE_LOAD_END=$(date +%s.%N)
-echo "OK: generate+load Job completed"
+  GENERATE_LOAD_START=$(date +%s.%N)
+  generate_load_deadline=$((SECONDS + STEP_TIMEOUT_SECONDS))
+  while true; do
+    succeeded="$("${KCTL[@]}" get job mm-loadtest-generate-load -n "$LOADTEST_NAMESPACE" \
+      -o jsonpath='{.status.succeeded}' 2>/dev/null || echo 0)"
+    failed="$("${KCTL[@]}" get job mm-loadtest-generate-load -n "$LOADTEST_NAMESPACE" \
+      -o jsonpath='{.status.failed}' 2>/dev/null || echo 0)"
+    [[ "$succeeded" == "1" ]] && break
+    if [[ "$failed" == "1" ]]; then
+      echo "FAIL: mm-loadtest-generate-load Job failed" >&2
+      exit 1
+    fi
+    if (( SECONDS > generate_load_deadline )); then
+      echo "FAIL: mm-loadtest-generate-load Job did not complete within ${STEP_TIMEOUT_SECONDS}s" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+  GENERATE_LOAD_END=$(date +%s.%N)
+  echo "OK: generate+load Job completed"
+fi
 
 # --- embedding stub (#270's own 32c) ------------------------------------------
 echo "--- starting the embedding stub ---"
@@ -332,6 +470,16 @@ sed "s|__LOADTEST_IMAGE__|${LOADTEST_IMAGE}|g" "${REPO_ROOT}/loadtest/k8s/embedd
   -n "$LOADTEST_NAMESPACE" --timeout="${STEP_TIMEOUT_SECONDS}s"
 echo "OK: embedding stub Available"
 
+# --- reset pg_stat_user_functions right before the measured run (#271) ------
+# `pg_stat_reset()`, after generate+load (whose own heavy COPY/HNSW-build
+# queries are not the request path #271 measures) and before k6 (so this
+# run's own self-time numbers are never diluted by an earlier run's calls
+# against the same, reused database - LOADTEST_SKIP_GENERATE_LOAD's whole
+# point).
+echo "--- resetting pg_stat_user_functions before the measured run ---"
+"${KCTL[@]}" exec -n "$LOADTEST_NAMESPACE" "${cnpg_cluster_name}-1" -c postgres -- \
+  psql "${cnpg_su_uri%/*}/memory_manager" -v ON_ERROR_STOP=1 -c "select pg_stat_reset();" >/dev/null
+
 # --- k6 (#270's own 32d, the k6 Job) ------------------------------------------
 echo "--- creating the k6 scripts ConfigMap from loadtest/k6/*.js ---"
 "${KCTL[@]}" create configmap mm-loadtest-k6-scripts -n "$LOADTEST_NAMESPACE" \
@@ -339,6 +487,14 @@ echo "--- creating the k6 scripts ConfigMap from loadtest/k6/*.js ---"
   | "${KCTL[@]}" apply -f -
 
 echo "--- running k6 (loadtest/k6/smoke.js) against ${MCP_BASE_URL%/mcp} ---"
+# Delete any earlier mm-loadtest-k6 Job first (--wait: its Pod has to be
+# gone, not just the Job object, before the apply below creates a new one
+# under the same name) - a plain re-apply of an unchanged Job spec is a
+# no-op against an already-Completed Job (#271's own reuse path: a second
+# LOADTEST_SHARED_STATE run against the same namespace must still measure
+# its own, fresh k6 run, never read back the first run's result).
+"${KCTL[@]}" delete job mm-loadtest-k6 -n "$LOADTEST_NAMESPACE" --ignore-not-found --wait=true \
+  >/dev/null 2>&1 || true
 sed \
   -e "s/__LOADTEST_WARMUP_SECONDS__/${WARMUP_SECONDS}/" \
   -e "s/__LOADTEST_MEASURE_SECONDS__/${MEASURE_SECONDS}/" \
@@ -416,13 +572,19 @@ if [[ -n "$LOADTEST_RESULTS_DIR" ]]; then
   "${KCTL[@]}" get nodes -o json > "${LOADTEST_RESULTS_DIR}/nodes.json" 2>/dev/null || true
   "${KCTL[@]}" get storageclass -o wide > "${LOADTEST_RESULTS_DIR}/storageclasses.txt" 2>/dev/null || true
 
+  if [[ "$LOADTEST_SKIP_GENERATE_LOAD" == "1" ]]; then
+    generate_load_s="null"
+  else
+    generate_load_s="$(awk "BEGIN { print ${GENERATE_LOAD_END:-0} - ${GENERATE_LOAD_START:-0} }")"
+  fi
   jq -n \
     --argjson notes "$LOADTEST_NOTES" \
     --arg shared_state "$LOADTEST_SHARED_STATE" \
     --argjson kill_after "${LOADTEST_KILL_AFTER:-null}" \
     --arg killed_pod "$KILLED_POD" \
     --arg kill_timestamp "$KILL_TIMESTAMP" \
-    --argjson generate_load_s "$(awk "BEGIN { print ${GENERATE_LOAD_END:-0} - ${GENERATE_LOAD_START:-0} }")" \
+    --argjson generate_load_s "$generate_load_s" \
+    --argjson reused_vault "$([[ "$LOADTEST_SKIP_GENERATE_LOAD" == "1" ]] && echo true || echo false)" \
     --argjson k6_exit "$k6_exit" \
     --arg namespace "$LOADTEST_NAMESPACE" \
     '{
@@ -432,6 +594,7 @@ if [[ -n "$LOADTEST_RESULTS_DIR" ]]; then
       kill_after_seconds: $kill_after,
       forced_pod_deletion: (if $killed_pod == "" then null else {pod: $killed_pod, at: $kill_timestamp} end),
       step_seconds: {generate_and_load: $generate_load_s},
+      reused_vault: $reused_vault,
       namespace: $namespace,
       k6_exit: $k6_exit
     }' > "${LOADTEST_RESULTS_DIR}/timings.json"

@@ -191,6 +191,8 @@ F-01 (M8–M11) is built before F-02 (M12–M17) starts (O32).
 | O36 | `otel` extra in the published image | — decided: shipped, like `valkey` (ADR-0009 addendum) | — | owner ✔ 2026-10-08 |
 | O37 | Capacity for the target-size load test | — decided: the existing operator cluster as it is; the report is not a sizing commitment | — | owner ✔ 2026-10-08 |
 
+**Owner-accepted deviation on O24 (#271, 2026-10-09/10):** the target-size run (WP-32) runs on a single-node kind cluster on the implementer's own node, not an operator cluster — see [`docs/benchmarks/target-size.md`](./benchmarks/target-size.md) for the method and [F-01's feature file](./features/F-01-enterprise-scale.md) for the same note. The report is not a sizing commitment, same as O24/O37 already say. Both `postgres` and `valkey` shared-state runs completed (each once plus one retry) and measured real numbers that miss F-01's latency targets by one to two orders of magnitude, even after #296's fix — documented honestly per owner decision 2026-10-10 (status `done`, not a Gate; follow-up: #297) — the deviation stands regardless of that outcome.
+
 ## Risks
 
 | Risk | Impact | Mitigation |

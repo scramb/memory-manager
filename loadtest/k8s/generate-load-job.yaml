@@ -15,6 +15,15 @@
 # already-ready, already-serving api replicas scripts/loadtest-cluster.sh
 # installs before this Job ever runs.
 #
+# --maintenance-work-mem/--max-parallel-maintenance-workers (#271): raised
+# from loadtest/load.py's own 1GB/unset defaults for the target-size HNSW
+# build - the ADR-0016 group/project/org partitions stay small at this
+# vault's own namespace mix (Zipf-weighted, 200 personal namespaces vs. 20
+# group + 10 project + 1 org - docs/benchmarks/target-size.md's own dataset
+# facts), but headroom for the index-build session costs nothing once the
+# CNPG Cluster's own resources (scripts/loadtest-cluster.sh's own
+# LOADTEST_HELM_SET) are raised to fit it.
+#
 # The CNPG superuser Secret's own "uri" carries a literal "*" database
 # name (any database, not one in particular) - this Job's own command
 # rewrites it to "memory_manager" before handing it to loadtest.load's
@@ -58,6 +67,31 @@ spec:
                 secretKeyRef:
                   name: memory-manager-db-superuser
                   key: uri
+          # Request/limit (#271): this Job carried no resources block at
+          # all before - a BestEffort Pod, which let an unbounded producer/
+          # consumer imbalance in loadtest.load's own chunk-building
+          # pipeline (fixed in the same task, _windowed's own bound) grow
+          # into a **host**-level OOM instead of a contained Pod OOM (the
+          # first 2026-10-09 target-size attempt: ~39 GiB RSS, killed the
+          # whole node, briefly took down other Pods' liveness probes with
+          # it - docs/benchmarks/target-size.md). 18Gi is sized from this
+          # task's own measurement, after the windowing fix, at the fixed
+          # 1M-note/5M-chunk target size: `memory.current` plateaued at
+          # ~12.9 GiB (anon 8.6 GiB + file 2.5 GiB + kernel 1.8 GiB,
+          # `/sys/fs/cgroup/memory.stat`) through the whole chunk-loading
+          # phase, not growing further - that baseline (holding all 1M
+          # `_Row`s plus 8 spawned worker processes for the run's own
+          # duration) is unrelated to the windowing bug and was simply
+          # invisible underneath the ~39 GiB the bug itself added; a first
+          # try at 12Gi sat right at that baseline with too little margin
+          # for the index-build phase's own `--maintenance-work-mem 2GB`
+          # session on top, hence 18Gi, not 12Gi.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 18Gi
           command:
             - sh
             - -euc
@@ -92,7 +126,9 @@ spec:
                 --with-chunks \
                 --embedding-model loadtest-stub \
                 --results-out /data/vault-out/chunk-results.json \
-                --use-existing-database
+                --use-existing-database \
+                --maintenance-work-mem 2GB \
+                --max-parallel-maintenance-workers 4
           volumeMounts:
             - name: data
               mountPath: /data
