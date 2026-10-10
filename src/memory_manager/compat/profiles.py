@@ -3,7 +3,7 @@
 
 A `Profile` carries two things an incoming request needs once #131 picks one: how the
 usage rules reach the client (`delivery_mode`) and the client's documented limits, which
-the schema linter (#133) will check the tool contract against. Nothing here decides
+the schema linter (#133) checks the tool contract against. Nothing here decides
 *which* profile a request gets, and nothing here changes a tool's behaviour - that would
 make a profile a code path, which ADR-0010 rules out.
 
@@ -83,6 +83,12 @@ class Profile:
     #: `None` = not documented.
     max_tool_name_chars: int | None
 
+    #: The longest known server-name prefix this client prepends to a tool's name before
+    #: counting it against `max_tool_name_chars` (e.g. Open WebUI's `<server_id>_`), in
+    #: characters. `None` = not documented - `check_tools` (#133) reads that as "check the
+    #: bare tool name alone, with a 0-length prefix", never as "no prefix is ever added".
+    tool_name_prefix_chars: int | None
+
     #: JSON Schema keywords this client's tool-schema parser rejects outright (e.g. a
     #: Gemini-style OpenAPI subset refusing `$ref`). Empty for every profile here - none
     #: of the three documents such a restriction.
@@ -112,6 +118,8 @@ _DEFAULT = Profile(
     result_budget_tokens=None,
     # Not documented for an unspecified client.
     max_tool_name_chars=None,
+    # Not documented for an unspecified client.
+    tool_name_prefix_chars=None,
     # No client reviewed so far documents a disallowed-keyword subset.
     disallowed_schema_keywords=frozenset(),
     # Not documented for an unspecified client.
@@ -139,6 +147,9 @@ _CLAUDE_AI = Profile(
     # Not documented: §5 l.182 documents a tool-name prefix for prompts
     # (`/mcp__server__prompt`) only, not a length cap on tool names themselves.
     max_tool_name_chars=None,
+    # Not documented: same §5 l.182 prefix is for prompts, not a numeric prefix length to
+    # add to tool names.
+    tool_name_prefix_chars=None,
     # No disallowed-keyword subset is documented for claude.ai.
     disallowed_schema_keywords=frozenset(),
     # docs/research/mcp-auth-and-connectors.md §4 l.158 [C1], retrieved 2026-10-06: "No
@@ -167,6 +178,9 @@ _CLAUDE_CODE = Profile(
     # Not documented: §5 l.182 documents a tool-name prefix for prompts
     # (`/mcp__server__prompt`) only, not a length cap on tool names themselves.
     max_tool_name_chars=None,
+    # Not documented: same §5 l.182 prefix is for prompts, not a numeric prefix length to
+    # add to tool names.
+    tool_name_prefix_chars=None,
     # No disallowed-keyword subset is documented for Claude Code.
     disallowed_schema_keywords=frozenset(),
     # docs/research/mcp-auth-and-connectors.md §4 l.158 [C1], retrieved 2026-10-06: "No

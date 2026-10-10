@@ -65,6 +65,7 @@ def test_every_profile_has_at_least_one_set_limit(name: str) -> None:
         profile.result_budget_chars,
         profile.result_budget_tokens,
         profile.max_tool_name_chars,
+        profile.tool_name_prefix_chars,
         profile.max_tools,
     )
     assert any(limit is not None for limit in limits)
@@ -79,6 +80,7 @@ def test_every_set_limit_is_a_positive_int(name: str) -> None:
         profile.result_budget_chars,
         profile.result_budget_tokens,
         profile.max_tool_name_chars,
+        profile.tool_name_prefix_chars,
         profile.max_tools,
     )
     for limit in limits:

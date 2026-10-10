@@ -18,6 +18,7 @@ Method: spec text read from the `modelcontextprotocol/modelcontextprotocol` repo
 - The roadmap (last updated 2026-08-22) calls it "the 2026-07-28 release". It says that release "made a remote MCP server a normal HTTP workload". [S5]
 - The spec defines two **eras**. "Modern" is 2026-07-28 and later: version and capabilities travel in each request's `_meta`. "Legacy" is 2025-11-25 and earlier: there is an `initialize` handshake. A **dual-era** server may serve both eras on the same endpoint. [S6]
 - **Decision impact:** Claude's own connector docs say Claude follows the **2025-03-26, 2025-06-18 and 2025-11-25** authorization specs. They do not list 2026-07-28 ([C1]). Claude's connector troubleshooting still talks about `initialize` timeouts ([C5]). A server built for claude.ai today must therefore serve the **legacy (2025-11-25) Streamable HTTP shape**, ideally as dual-era. All four Tier-1 SDKs reviewed support both eras (see mcp-sdks.md).
+- **Tool names (SEP-986).** Retrieved 2026-10-10 · Feeds: #133 (`compat/lint.py`). Tool names SHOULD match `^[A-Za-z0-9._-]{1,128}$` (case-sensitive, 1-128 characters) [S13]. `mcp` 2.3.0 carries the identical pattern as `TOOL_NAME_REGEX` in `mcp/shared/tool_name_validation.py`, enforced only as a logged warning, not a hard rejection. Codex's own sanitizer is stricter and replaces non-matching characters instead of warning: `^[a-zA-Z0-9_-]+$`, no dot (docs/research/clients/codex.md:53 [CX5]).
 
 ## 2. Streamable HTTP transport
 
@@ -197,6 +198,7 @@ Changes relative to earlier revisions:
 - [S10] AS discovery — https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery
 - [S11] Client registration — https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration
 - [S12] Security considerations — https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations
+- [S13] SEP-986 tool names — https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names, retrieved 2026-10-10
 - [S-IP] Anthropic IP addresses — https://platform.claude.com/docs/en/api/ip-addresses
 - [C1] Build an MCP server for Claude — https://claude.com/docs/connectors/building
 - [C2] Authentication for connectors — https://claude.com/docs/connectors/building/authentication

@@ -46,6 +46,13 @@ would otherwise be reachable by anyone who can reach the port, with nothing
 in front of them. `/healthz`/`/readyz`/the vault webhook stay unauthenticated
 either way - the webhook has its own HMAC-signature check, and the health
 endpoints carry nothing sensitive.
+
+`compat lint` (#133, ADR-0010) builds the real server in-process (`compat/lint.py`),
+lists its tools, and checks them against every registered client profile's documented
+limits plus the SEP-986 tool-name charset - exit 0 clean, 1 on any violation. Unlike
+`import`/`migrate`/`instructions`/`token` above, calling `compat` with no subcommand is a
+usage error (exit 2), not a no-op print-help: it has exactly one subcommand today, and
+omitting it is never intentional.
 """
 
 from __future__ import annotations
@@ -57,10 +64,12 @@ import logging
 import os
 import secrets
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
+import mcp_types
 import uvicorn
 
 from memory_manager.app import open_services, open_storage
@@ -77,7 +86,8 @@ from memory_manager.auth.tokens import (
     owners_not_in_users,
     revoke_token,
 )
-from memory_manager.compat.profiles import profile_names
+from memory_manager.compat import lint as compat_lint
+from memory_manager.compat.profiles import Profile, get_profile, profile_names
 from memory_manager.config import (
     EmbeddingConfig,
     EmbeddingConfigError,
@@ -154,6 +164,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return _run_doctor_command(args.vault)
+
+    if args.command == "compat":
+        if args.compat_target == "lint":
+            return _run_compat_lint_command()
+        # Unlike the other subcommand groups above/below (`import`, `migrate`,
+        # `instructions`, `token`), a bare `compat` is a usage error (2), not "ran with
+        # nothing to do" (1) - there is exactly one subcommand today, and omitting it is
+        # always a mistake, never a valid no-op call.
+        parser.print_help()
+        return 2
 
     if args.command == "eval":
         return _run_eval_command(
@@ -587,6 +607,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="hash a password from stdin into an ADMIN_PASSWORD_HASH value (ADR-0004 L1)",
     )
 
+    compat_parser = subparsers.add_parser(
+        "compat",
+        help="check the real tool contract against every registered client profile (#133, "
+        "ADR-0010)",
+    )
+    compat_subparsers = compat_parser.add_subparsers(dest="compat_target")
+    compat_subparsers.add_parser(
+        "lint",
+        help="exit 1 if any tool violates a profile's documented limits, 0 otherwise",
+    )
+
     return parser
 
 
@@ -656,6 +687,29 @@ def _print_doctor_report(report: DoctorReport) -> None:
     for warning in report.warnings:
         print(f"WARNING: {warning}")
     print(f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+
+
+def _run_compat_lint_command(
+    tools: Sequence[mcp_types.Tool] | None = None,
+    profiles: Sequence[Profile] | None = None,
+) -> int:
+    """`memory-manager compat lint`: 0 clean, 1 on any violation.
+
+    `tools`/`profiles` default to the real server's tools (`compat.lint.list_server_tools`)
+    and every registered profile (`compat.profiles.profile_names`) - a test passes either
+    explicitly to check one rule in isolation, against a synthetic tool or profile,
+    without building the real server at all.
+    """
+    if tools is None:
+        tools = asyncio.run(compat_lint.list_server_tools())
+    if profiles is None:
+        profiles = [get_profile(name) for name in profile_names()]
+
+    violations = compat_lint.check_tools(tools, profiles)
+    for violation in violations:
+        print(f"{violation.profile} · {violation.tool} · {violation.rule} · {violation.value}")
+    print(f"{len(violations)} violation(s) across {len(tools)} tool(s), {len(profiles)} profile(s)")
+    return 1 if violations else 0
 
 
 def _run_export_command(

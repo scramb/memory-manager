@@ -8,11 +8,15 @@ override (`?profile=`, `MM-Client-Profile`, or `serve --stdio --profile`) wins o
 otherwise the connecting client's `clientInfo.name` is mapped if known, otherwise
 `profiles.DEFAULT_PROFILE`; today only the `full` delivery mode is actually deliverable
 (`select.require_deliverable`) - `descriptions` is #132, `short` is #306. Enforcing that
-the tool contract fits every profile's limits is the schema linter, #133.
+the tool contract fits every profile's limits is the schema linter, `lint.py` (#133).
 
-Deliberately does not import from `memory_manager.mcp` or `memory_manager.app`:
-`mcp/server.py` imports `select.py` to run profile selection as request middleware, and a
-reverse import here would make that a cycle.
+`profiles.py` and `select.py` deliberately do not import from `memory_manager.mcp` or
+`memory_manager.app`: `mcp/server.py` imports `select.py` to run profile selection as
+request middleware, and a reverse import here would make that a cycle. `lint.py` is the
+one documented exception - it builds the real server in-process to list its tools, so it
+imports `memory_manager.app.Services` and `memory_manager.mcp.server.build_server`
+directly; nothing in `mcp` or the rest of `compat` imports `lint.py` back, so this stays a
+one-way edge, not a cycle.
 """
 
 from __future__ import annotations
