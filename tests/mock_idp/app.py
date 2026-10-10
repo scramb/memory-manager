@@ -20,6 +20,20 @@ mock's own Graph endpoints can still tell a genuine mock-issued bearer from
 garbage, without pulling in a JOSE dependency CLAUDE.md's "few dependencies"
 guardrail and ADR-0006 both reject for this project.
 
+A `userinfo_endpoint` (#313, WP-42) is advertised in discovery and backed by
+a plain `access_token -> (tid, oid)` mapping recorded on every authorization-
+code token issuance - `auth.login_oidc.OidcAuthenticator` (`LOGIN_MODE=oidc`)
+calls it with the access token the token endpoint handed back and reads
+`sub` off the response, unlike `auth.login_entra.EntraAuthenticator`
+(`LOGIN_MODE=entra`), which reads `oid` straight off the ID token's own
+claims and never calls this endpoint at all. `sub` here is deliberately the
+user's own `oid` verbatim - unlike the ID token's pairwise `sub` claim
+(`_pairwise_sub` below), which exists only to keep a test from relying on
+`sub == oid` for the *Entra* claim shape a real tenant would never give. The
+access token itself is an opaque `secrets.token_urlsafe` value, not a JWT -
+`_userinfo` only ever looks it up in `_State.access_tokens`, never decodes
+it.
+
 State lives in one `_State` per `create_app()` call, mutated only through the
 routes below - there is no second writer (no background thread, no shared
 module-level global) so a `dataclass` with plain `dict`s is enough; the
@@ -110,6 +124,9 @@ class _State:
     delta_page_size: dict[str, int] = field(default_factory=dict)
     graph_faults: dict[str, list[_Fault]] = field(default_factory=dict)
     call_counts: dict[str, int] = field(default_factory=dict)
+    #: `access_token -> (tid, oid)`, recorded by `_token_from_code` on every
+    #: authorization-code grant - `_userinfo`'s own lookup (module docstring).
+    access_tokens: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 def _bump_revision(state: _State, tid: str) -> int:
@@ -202,6 +219,10 @@ async def _discovery(request: Request) -> Response:
             "issuer": issuer,
             "authorization_endpoint": f"{base}/oauth2/v2.0/authorize",
             "token_endpoint": f"{base}/oauth2/v2.0/token",
+            # #313, WP-42: `auth.login_oidc.OidcAuthenticator` (`LOGIN_MODE=oidc`)
+            # requires this field (module docstring) - `auth.login_entra.
+            # EntraAuthenticator` never reads it at all.
+            "userinfo_endpoint": f"{base}/oidc/userinfo",
             "jwks_uri": f"{base}/discovery/v2.0/keys",
             "response_types_supported": ["code", "id_token", "code id_token"],
             "response_modes_supported": ["query", "fragment", "form_post"],
@@ -332,12 +353,17 @@ def _token_from_code(
         claims["groups"] = list(user.groups)
 
     id_token = _sign_jwt(claims, state.signing_key)
+    access_token = secrets.token_urlsafe(24)
+    # #313, WP-42: `_userinfo`'s own lookup - see this module's docstring for
+    # why `sub` there is `oid` verbatim, unlike the ID token's pairwise `sub`
+    # claim above.
+    state.access_tokens[access_token] = (tid, user.oid)
     return JSONResponse(
         {
             "token_type": "Bearer",
             "scope": issued.scope,
             "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-            "access_token": secrets.token_urlsafe(24),
+            "access_token": access_token,
             "id_token": id_token,
         }
     )
@@ -387,6 +413,27 @@ async def _token(request: Request) -> Response:
     if grant_type == "client_credentials":
         return _token_client_credentials(state, tid, client, form, issuer)
     return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+
+# --- userinfo (OIDC generic, #313) ------------------------------------------
+
+
+async def _userinfo(request: Request) -> Response:
+    """`LOGIN_MODE=oidc`'s own identity call - see the module docstring for
+    why `sub` is `oid` verbatim here, never the ID token's pairwise `sub`."""
+    state: _State = request.app.state.mock
+    tid = request.path_params["tid"]
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+    mapped = state.access_tokens.get(auth.removeprefix("Bearer "))
+    if mapped is None or mapped[0] != tid:
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+    _, oid = mapped
+    user = state.users.get((tid, oid))
+    if user is None or user.deleted:
+        return JSONResponse({"error": "invalid_token"}, status_code=401)
+    return JSONResponse({"sub": user.oid, "name": user.display_name})
 
 
 # --- Microsoft Graph -------------------------------------------------------
@@ -668,6 +715,7 @@ def create_app(*, issuer_base: str | None = None) -> Starlette:
         ),
         Route("/{tid}/oauth2/v2.0/authorize", _authorize, methods=["GET"]),
         Route("/{tid}/oauth2/v2.0/token", _token, methods=["POST"]),
+        Route("/{tid}/oidc/userinfo", _userinfo, methods=["GET"]),
         # More specific Graph paths before the generic "/users/{oid}" route.
         Route(
             "/graph/v1.0/users/{oid}/getMemberGroups", _graph_get_member_groups, methods=["POST"]

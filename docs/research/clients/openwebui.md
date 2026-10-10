@@ -298,7 +298,7 @@ code never left `/tmp`, per this task's Blast-Radius) observed, live:
 | M2 | `_client_label_for` has no "Open WebUI" label | **Resolved in #143** - `_client_label_for` now also returns `"openwebui"` for a DCR client registered as `client_name="Open WebUI"` with a `/oauth/clients/<id>/callback` redirect (`provider.py`'s `_OPENWEBUI_CLIENT_NAME`/`_OPENWEBUI_CALLBACK_PATH_RE`), confirmed live by `tests/auth/test_openwebui_client.py` |
 | M3 | Refresh-token replay detection revokes the whole family (`provider.py:519-527`) on reuse, while Open WebUI refreshes without a lock 5 minutes before expiry on every request (`utils/oauth.py#L1060-L1180`) | **Owner decision 2026-10-10: option A** - rotation with family revocation stays for every client (ADR-0004 unchanged); no grace window (RFC 9700 §4.14.2 and OAuth 2.1 draft-16 §4.3.1 require replay detection only for public clients and mention no tolerance). An affected Open WebUI user occasionally reconnects; revisit with a grace window only if operation shows it. `tests/auth/test_openwebui_client.py` observes the sequential-replay outcome |
 | M4 | A server-side preflight `GET /authorize` (no redirect follow) could leave an orphan `oauth_pending` row per admin click, and every Open WebUI user shares one egress IP against our `oauth_limiter` (`http.py:160,1005-1007`) | **Partially confirmed**: the anonymous-`initialize`-plus-discovery preflight on `/mcp` (above) is real and happens on every connection save, but this spike's own `/authorize` call always completed (no abandoned `oauth_pending` row observed after a successful run); the shared-egress-IP rate-limit bucket is unchanged by #143 - its keying/sizing is **tracked in #154/#155** |
-| M5 | `LOGIN_MODE=password` has exactly one subject (`login_password.py#L100-L104`) | **Tracked in #144** - #143's own two-user test (`tests/auth/test_openwebui_client.py`) switches `FakeAuthenticator.subject`/`namespaces` between two flows instead; a second *real* subject still needs `LOGIN_MODE=oidc` plus a mock IdP |
+| M5 | `LOGIN_MODE=password` has exactly one subject (`login_password.py#L100-L104`) | **Resolved in #313** - see "#313: two real subjects per backend, via the mock IdP" below; #143's own two-user test (`tests/auth/test_openwebui_client.py`) had already covered this at the unit level with `FakeAuthenticator.subject`/`namespaces` |
 | M6 | `store.revoke_token_row`/`exchange_refresh_token`'s check-then-act (load the refresh token, check `revoked`, only then write `revoked_at`) is a narrower concurrency gap than M3's *sequential* replay: two genuinely simultaneous `/token` refresh calls presenting the same refresh token could both pass the check before either writes, minting two valid pairs from one token without tripping replay detection | **fixed in #310** - `revoke_token_row` is now a conditional, atomic `UPDATE ... WHERE revoked_at IS NULL RETURNING ...`, run in the same transaction as the winner's new pair (`exchange_refresh_token`); a losing concurrent caller is treated exactly like a replay (family revoked, `invalid_grant`). `tests/auth/test_oauth_flow.py::test_concurrent_refresh_with_the_same_token_exactly_one_succeeds` exercises the real race against Postgres |
 
 None of the above broke ADR-0011's load-bearing assumption (the AS
@@ -384,6 +384,68 @@ call `memmgr_memory_search` and then give a text reply. Tested version:
   memory vault is empty in this stack, so an empty hit list is the
   correct answer) - **not** "Tool … not found" or any other failure
   shape, confirming #314's own Definition of Done.
+
+### #313: two real subjects per backend, via the mock IdP
+
+M5 above ("Predicted AS mismatches") tracked this as open: `LOGIN_MODE=
+password` has exactly one subject, so a second *real* one needs
+`LOGIN_MODE=oidc` (git backend) or `LOGIN_MODE=entra` (postgres backend,
+since `me` only exists there, ADR-0008) plus a mock IdP. Both now exist as
+overlays on top of `deploy/openwebui/docker-compose.yml` -
+`oidc-git-overlay.yml` and `postgres-entra-overlay.yml`, brought up with
+`scripts/openwebui-up.sh <overlay path>` (or `make openwebui-up
+OPENWEBUI_EXTRA_COMPOSE_FILES=...`) - driven live, each reached two
+distinct `oauth_tokens.subject` rows for memory-manager's own embedded AS:
+
+- **git/OIDC**: `tests/mock_idp` joins memory-manager's own network
+  namespace (same loopback-issuer reasoning as `open-webui` above) and now
+  advertises a `userinfo_endpoint`, backed by a plain `access_token ->
+  (tid, oid)` map recorded on every authorization-code grant -
+  `auth.login_oidc.OidcAuthenticator` calls it and reads `sub` back as
+  `oid` verbatim (deliberately *not* the ID token's own pairwise `sub`,
+  which exists only for the Entra claim shape). Two mock users plus one
+  `openwebui-git-client` OIDC client were registered through the mock's
+  own `/_mock/` control API (`_register_entra_client`/`_create_entra_user`/
+  `_select_signin`'s own shapes in `tests/e2e/test_erasure.py`), and
+  `tests/e2e/openwebui_driver.py`'s existing `_complete_login_page`
+  interstitial hook - unmodified - carried each one through memory-manager's
+  `/login` all the way to the mock's `/authorize` and back, since it
+  already stops following redirects the moment `/login` is left behind.
+  Verified directly against Postgres: two `oauth_tokens` rows,
+  `subject` = `openwebui-git-user-a`/`openwebui-git-user-b`.
+- **postgres/Entra**: the same mock, same network-namespace trick, a
+  `db-role-init` one-shot (`psql -f`, waited for by
+  `scripts/openwebui-up.sh`'s own new phase 1b, *before* memory-manager
+  ever starts) creates `DATABASE_APP_ROLE=mm_app` and grants it to the
+  base file's own `POSTGRES_USER=mm` - `db.rls.check_app_role`'s startup
+  membership check needs exactly that. Two mock users (role
+  `Memory.User`) signed in the same way; verified directly against
+  Postgres: two `oauth_tokens` rows (`openwebui-pg-user-a`/`-b`) and two
+  `users` rows with those same `oid`s and `tid=openwebui-pg`.
+- Every IdP-specific value (issuer, tenant id, client id/secret, the OIDC
+  subject allowlist, the namespace map) lives in a generated, gitignored
+  `deploy/openwebui/.env-oidc-entra`, not in either overlay's own YAML -
+  not only because the client secrets are genuinely sensitive, but because
+  an OIDC issuer's own multi-segment shape is a token
+  `scripts/check-deploy-placeholders.sh` cannot tell apart from an
+  operator's own hostname (confirmed live: it rejected the literal before
+  this move, and passes afterwards).
+- `scripts/openwebui-up.sh` now takes any number of extra compose file
+  arguments and reads back which services actually exist in the merged
+  config (`compose ... config --services`) rather than hard-coding one
+  fixed list - an overlay's own one-shots/long-running services are waited
+  for the same way the base file's always were. `make openwebui-down`
+  takes the same `OPENWEBUI_EXTRA_COMPOSE_FILES` make variable. The
+  default, overlay-free stack (`make openwebui-up`) was re-verified
+  unchanged after all of the above.
+- One cosmetic, non-fatal finding: podman-compose 1.3 re-attempts creating
+  an already-running `postgres` as `db-role-init`'s/`memory-manager`'s own
+  `depends_on` dependency even when `postgres` is not in the `up` command's
+  own argument list, logging a harmless "container name ... already in
+  use" line - the stack still reaches `OK: all services healthy` every
+  time (confirmed across several from-clean runs); this script's own
+  polling loop is what actually decides pass/fail, never that command's
+  exit status.
 
 ## Open questions
 

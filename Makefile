@@ -16,6 +16,15 @@ LOADTEST_EMBEDDINGS ?= none
 OPENWEBUI_VERSION ?= 0.11.4
 export OPENWEBUI_VERSION
 
+# #313 (WP-42): extra compose files (relative to the repo root, space-
+# separated) layered on top of deploy/openwebui/docker-compose.yml - e.g.
+# `make openwebui-up OPENWEBUI_EXTRA_COMPOSE_FILES="deploy/openwebui/oidc-git-overlay.yml"`.
+# Empty by default, so a plain `make openwebui-up`/`make openwebui-down`
+# keeps today's behaviour unchanged. `openwebui-down` needs the *same*
+# value a matching `openwebui-up` call used - see docker-compose.yml's own
+# "mock-idp"/"db-role-init" services, which otherwise never get torn down.
+OPENWEBUI_EXTRA_COMPOSE_FILES ?=
+
 fmt:
 	uv run ruff format .
 	uv run ruff check --fix .
@@ -145,7 +154,9 @@ down:
 # Ollama (the `ollama` compose profile) is left out of both - opt-in only,
 # see docker-compose.yml's header comment.
 openwebui-up:
-	scripts/openwebui-up.sh
+	scripts/openwebui-up.sh $(OPENWEBUI_EXTRA_COMPOSE_FILES)
 
 openwebui-down:
-	podman compose -f "$$(pwd)/deploy/openwebui/docker-compose.yml" -p mm-openwebui --profile ollama down -v
+	podman compose -f "$$(pwd)/deploy/openwebui/docker-compose.yml" \
+		$(foreach f,$(OPENWEBUI_EXTRA_COMPOSE_FILES),-f "$$(pwd)/$(f)") \
+		-p mm-openwebui --profile ollama down -v

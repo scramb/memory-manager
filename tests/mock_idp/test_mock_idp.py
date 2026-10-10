@@ -159,6 +159,45 @@ async def test_code_flow_with_pkce_yields_id_token_with_selected_user_claims(
     assert "_claim_names" not in claims
 
 
+async def test_discovery_includes_userinfo_endpoint(mock_idp_client: httpx.AsyncClient) -> None:
+    """#313, WP-42: `auth.login_oidc.OidcAuthenticator` requires this field -
+    see `tests/mock_idp/app.py`'s own module docstring."""
+    response = await mock_idp_client.get(f"/{_TID}/v2.0/.well-known/openid-configuration")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["userinfo_endpoint"].endswith(f"/{_TID}/oidc/userinfo")
+
+
+async def test_userinfo_returns_sub_as_oid_for_the_signed_in_user(
+    mock_idp_client: httpx.AsyncClient,
+) -> None:
+    """#313, WP-42: unlike the ID token's pairwise `sub` claim (see
+    `test_code_flow_with_pkce_yields_id_token_with_selected_user_claims`),
+    the userinfo response's `sub` is `oid` verbatim - the shape
+    `LOGIN_MODE=oidc` actually relies on."""
+    await _register_client(mock_idp_client)
+    await _create_user(mock_idp_client, "user-6", display_name="Grace Hopper")
+    await _select_signin(mock_idp_client, "user-6")
+
+    tokens = await _run_code_flow(mock_idp_client)
+
+    response = await mock_idp_client.get(
+        f"/{_TID}/oidc/userinfo",
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sub"] == "user-6"
+    assert body["name"] == "Grace Hopper"
+
+
+async def test_userinfo_rejects_an_unknown_token(mock_idp_client: httpx.AsyncClient) -> None:
+    response = await mock_idp_client.get(
+        f"/{_TID}/oidc/userinfo", headers={"Authorization": "Bearer not-a-real-token"}
+    )
+    assert response.status_code == 401
+
+
 async def test_overage_user_gets_claim_names_and_no_groups(
     mock_idp_client: httpx.AsyncClient,
 ) -> None:

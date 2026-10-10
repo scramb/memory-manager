@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Overlay for #313 (WP-42): proves the `postgres` backend's Entra facade
+# login (`LOGIN_MODE=entra`, ADR-0006) against the mock IdP
+# (`tests/mock_idp`) - `me` only exists with `STORAGE_BACKEND=postgres` and
+# a principal (ADR-0008), which neither `password` nor `oidc` ever give.
+# Apply together with the base file - `scripts/openwebui-up.sh` does this
+# when given this overlay's path as an argument, or by hand:
+#
+#   podman compose -f "$(pwd)/deploy/openwebui/docker-compose.yml" \
+#     -f "$(pwd)/deploy/openwebui/postgres-entra-overlay.yml" \
+#     -p mm-openwebui up -d
+#
+# See oidc-git-overlay.yml's own header comment for why `mock-idp` shares
+# memory-manager's network namespace and why every IdP-specific value
+# (issuer/authority, Graph URL, client id/secret, tenant id) lives in the
+# generated `.env-oidc-entra` next to this file rather than here.
+services:
+  # One-shot (`scripts/openwebui-up.sh`'s own phase 1, same reasoning as the
+  # base file's `vault-init` - no `depends_on` *on* this service from
+  # anything else, for the same "stuck in Created" reason that file's own
+  # comment on `vault-init` gives): creates `DATABASE_APP_ROLE` (`mm_app`)
+  # and grants it to the base file's own `POSTGRES_USER=mm` via `psql -f`,
+  # once postgres itself is healthy - postgres' RLS startup check in
+  # memory-manager's own `db` package needs exactly that membership (see
+  # the mounted SQL file's own comment) before `memory-manager` can start
+  # at all.
+  db-role-init:
+    image: docker.io/pgvector/pgvector:pg16
+    environment:
+      PGPASSWORD: mm
+    entrypoint: ["psql", "-h", "postgres", "-U", "mm", "-d", "mm", "-v", "ON_ERROR_STOP=1", "-f", "/role-init.sql"]
+    volumes:
+      - ./postgres-init/01-app-role.sql:/role-init.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  mock-idp:
+    build: ../..
+    image: memory-manager:dev
+    network_mode: "service:memory-manager"
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "10001:10001"
+    working_dir: /opt
+    command: ["python3", "-m", "mock_idp", "--host", "0.0.0.0", "--port", "18082"]
+    environment:
+      MOCK_IDP_ISSUER_BASE: http://localhost:18082
+    volumes:
+      - ../../tests/mock_idp:/opt/mock_idp:ro
+      - ../../scripts/http-healthcheck.py:/healthcheck.py:ro
+    depends_on:
+      memory-manager:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:18082/_mock/health"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  memory-manager:
+    environment:
+      STORAGE_BACKEND: postgres
+      LOGIN_MODE: entra
+      DATABASE_APP_ROLE: mm_app
+      # The mock has no JWKS and serves plain `http://` (ADR-0006 §2/§8;
+      # `tests/mock_idp/app.py`'s own module docstring) - required for
+      # `EntraAuthenticator`/`GraphClient` to accept a non-`https` authority
+      # and Graph URL at all.
+      ENTRA_ALLOW_INSECURE_AUTHORITY: "1"
+      # See oidc-git-overlay.yml's own comment on this variable.
+      RATE_LIMIT_OAUTH_BURST: "20"
+    env_file:
+      - path: .env-oidc-entra
+        required: true
+    ports:
+      - "127.0.0.1:18082:18082"
+
+  open-webui:
+    environment:
+      BYPASS_MODEL_ACCESS_CONTROL: "true"

@@ -39,6 +39,12 @@ deploy/openwebui/.env
 deploy/openwebui/.env-memory-manager
 deploy/openwebui/.admin-password
 
+# oidc-git-overlay.yml/postgres-entra-overlay.yml's own secrets (#313,
+# WP-42): the mock IdP's client secrets plus the issuer/authority/tenant
+# values that go with them - never committed, see either overlay's own
+# header comment.
+deploy/openwebui/.env-oidc-entra
+
 # Live e2e run artefact (WP-42): scripted_model.py writes the captured
 # live-mode script here for replay; never committed, see tests/e2e/stubs/scripted_model.py.
 tests/e2e/stubs/live-script.json
