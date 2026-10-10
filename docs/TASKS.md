@@ -361,7 +361,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 - [ ] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
 - [ ] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones ⛔ blocked by #127
 
-### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: open
+### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: #304
 
 - [x] #129 `docs/clients` has a page template, the approved support matrix and pages for claude.ai and Claude Code
 
