@@ -19,11 +19,18 @@ Claude Code ──(HTTP/stdio)───┼──► MCP server ──► write q
                              └── embeddings: pluggable (Ollama/bge-m3 | OpenAI-compatible | none)
 ```
 
+The diagram shows the default, single-writer **Git** storage backend. An enterprise deployment
+runs the same server against the **Postgres** storage backend instead (source of truth with
+append-only revisions, horizontal `api`/`worker` replicas, Entra login) — see "Enterprise" below
+and [ADR-0007](./docs/adr/0007-storage-backend.md).
+
 See [`docs/PLAN.md`](./docs/PLAN.md) for the full goal, scope and architecture, and
 [`docs/TASKS.md`](./docs/TASKS.md) for the current work backlog.
 
 ## Features
 
+- Storage backend: Git (default, Markdown as the source of truth) or Postgres with append-only
+  revisions (enterprise, [ADR-0007](./docs/adr/0007-storage-backend.md)) — see "Enterprise" below.
 - Vault: Markdown notes in Git as the source of truth, Postgres fully rebuildable from it.
 - Writes carry `if_version`; conflicts surface the current content instead of overwriting it.
 - Deletes are soft (archived to `_archive/`, never hard-deleted).
@@ -112,6 +119,52 @@ Remote setup for both clients (OAuth, verified 2026-10-07): [`docs/guides/remote
   restore): [`docs/guides/enterprise-operations.md`](./docs/guides/enterprise-operations.md)
 - Cutting and verifying a release (image and chart signatures, SBOM):
   [`docs/releasing.md`](./docs/releasing.md)
+
+## Enterprise
+
+An organisation with Microsoft Entra ID can run memory-manager for about 2,000 employees on the
+`postgres` storage backend (source of truth with append-only revisions, enterprise,
+[ADR-0007](./docs/adr/0007-storage-backend.md)) instead of the default Git backend. On top of
+everything above, this profile adds:
+
+- Personal, group, project and org namespaces, enforced by Postgres row-level security as well
+  as application code ([ADR-0008](./docs/adr/0008-namespace-permissions.md)).
+- Sign-in through Microsoft Entra ID, with deprovisioned users cut off by a Graph delta sync
+  ([ADR-0006](./docs/adr/0006-enterprise-auth-entra.md)).
+- An `/account` page for self-service and administration, and a break-glass path for emergency
+  access.
+- Provable erasure and retention (GDPR Art. 17) outside MCP, and write-rate/storage quotas per
+  user, namespace or token ([`docs/guides/quotas.md`](./docs/guides/quotas.md)).
+- Horizontal scaling: stateless `api`/`worker` replicas sharing state through Postgres or Valkey.
+- Observability: traces from requests into worker jobs, metrics, dashboards and alerts.
+
+**Requirements:** a Microsoft Entra ID tenant with a one-time tenant-admin consent step, Postgres
+16+ with `pgvector` run via the CloudNativePG (CNPG) operator, and a Kubernetes cluster running
+the Helm chart's enterprise profile ([`charts/memory-manager/values-enterprise.yaml`](./charts/memory-manager/values-enterprise.yaml)).
+
+**Measured at target size:** at the 1M-note / 5M-chunk target size the latency targets are not
+yet met — after the fix in #296, p95 was 43–56 s for search, 16–37 s for read and 19–55 s for
+write (targets: <300 ms / <100 ms / <200 ms), with 1.9–6.5 % failed requests. The measured cause
+and the full numbers are in
+[`docs/benchmarks/target-size.md`](./docs/benchmarks/target-size.md); the follow-up is tracked in
+[#297](https://github.com/scramb/memory-manager/issues/297). Enterprise scale at this size is not
+yet proven.
+
+Read on:
+
+- Upgrading an existing v0.1 deployment to v0.2 and the enterprise profile:
+  [`docs/guides/upgrade-0.2.md`](./docs/guides/upgrade-0.2.md)
+- Running the enterprise profile end to end (Entra, Flux rollout, scaling, backups/restore):
+  [`docs/guides/enterprise-operations.md`](./docs/guides/enterprise-operations.md)
+- GitOps example with Flux: [`deploy/flux/enterprise/README.md`](./deploy/flux/enterprise/README.md)
+- Helm chart enterprise values: [`charts/memory-manager/values-enterprise.yaml`](./charts/memory-manager/values-enterprise.yaml)
+- Load-test report at target size:
+  [`docs/benchmarks/target-size.md`](./docs/benchmarks/target-size.md)
+- Threat model and pen-test checklist:
+  [`docs/security/threat-model.md`](./docs/security/threat-model.md),
+  [`docs/security/pentest-checklist.md`](./docs/security/pentest-checklist.md)
+- Compliance pack (data flow, Art. 30 record, TOMs, deletion concept, roles, DPIA template,
+  transparency notice): [`docs/compliance/`](./docs/compliance/)
 
 ## Security
 

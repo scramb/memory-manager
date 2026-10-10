@@ -1,4 +1,4 @@
-.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster
+.PHONY: fmt lint test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -100,6 +100,13 @@ loadtest-cluster:
 	LOADTEST_NOTES=$(LOADTEST_NOTES) LOADTEST_KILL_AFTER=$(LOADTEST_KILL_AFTER) \
 		LOADTEST_SHARED_STATE=$(LOADTEST_SHARED_STATE) K6_IMAGE=$(K6_IMAGE) \
 		scripts/loadtest-cluster.sh
+# Upgrades from the last published 0.1.x image (ghcr.io/scramb/memory-manager,
+# UPGRADE_FROM default: the version .release-please-manifest.json records) to
+# the current image built from this worktree, including the migrate-to-Postgres
+# and export-back-to-Git round trip against a throwaway database on mm-pg
+# (#277, WP-34) - see scripts/upgrade-smoke.sh.
+upgrade-smoke: image db-up
+	scripts/upgrade-smoke.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
 # vault-init one-shot seeding a local vault remote. See README.md.

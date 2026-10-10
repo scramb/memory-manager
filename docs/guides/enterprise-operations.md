@@ -292,8 +292,8 @@ already uses, targeting the `HelmRelease` instead:
 
 The schema migrates forward on its own at process start either way
 (`deploy/README.md`'s own "Rollout" note); a release that needs a manual step says so in its own
-release notes. A dedicated guide for the v0.2.0 upgrade itself is tracked separately (WP-34), not
-covered here.
+release notes. Upgrading an existing `0.1.x` deployment onto this profile for the first time is
+covered in [`upgrade-0.2.md`](./upgrade-0.2.md), not repeated here.
 
 ## 9. Observability
 
@@ -327,7 +327,6 @@ retention after deprovisioning.
 
 ## Not included
 
-- The v0.2.0 upgrade guide (WP-34).
 - Compliance templates for data flow, records of processing and TOMs (WP-33).
 - Alertmanager routing for the `PrometheusRule` alerts above (operator-specific, #265).
 - Installing Grafana, its sidecar, Prometheus or the Prometheus Operator itself.
