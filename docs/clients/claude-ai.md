@@ -14,6 +14,10 @@ and OIDC login, and wrote notes, which became commits authored by `claude-ai`.
 
 ## Setup
 
+`memory-manager connect claude-ai --url <url>` prints the four steps below with your own URL
+filled in — claude.ai has no local config file for a `connect` command to merge into, so this
+is the manual flow itself, not a shortcut around it.
+
 ### Global
 
 Before connecting:

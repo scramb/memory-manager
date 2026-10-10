@@ -16,6 +16,14 @@ on **2026-10-07** against memory-manager **0.1.2**. Command syntax also recorded
 
 ## Setup
 
+`memory-manager connect claude-code --url <url>` merges an HTTP entry into `~/.claude.json`
+(`.mcp.json` with `--scope project`) for you — it prints a diff, backs up the file it changes,
+and is a no-op if the server is already configured the way it would write it; pass
+`--transport stdio`, `--token-env <VAR>`/`--inline-token`, or `--with-instructions` for the
+`.claude/rules/memory-manager.md` file described below (`docs/research/clients/claude-code.md`
+for the exact file format this relies on). The manual `claude mcp add` steps below do the same
+thing through Claude Code's own CLI instead.
+
 ### Global
 
 stdio, against a local checkout or an installed binary. Before connecting, the server needs:
