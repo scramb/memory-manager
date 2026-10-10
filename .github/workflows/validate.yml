@@ -158,6 +158,8 @@ jobs:
       # instead of relying only on the `ignore_missing_imports` override.
       - name: Install the otel extra
         run: uv sync --extra otel
+      - name: Check instructions_generated.py is current (#127)
+        run: uv run memory-manager instructions generate --check
       - name: make check
         run: make check
       - name: make eval

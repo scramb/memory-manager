@@ -358,8 +358,8 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-36 — Usage rules from one source · F-02 · Branch: `wp/36-memory-guide` · PR: open
 
-- [ ] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
-- [ ] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones ⛔ blocked by #127
+- [x] #127 `docs/memory-guide.md` is the single source of the server instructions and the `memory_guide` prompt
+- [ ] #128 `instructions generate` writes a short form and per-client instruction files, and CI rejects stale ones
 
 ### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: #304
 
@@ -369,7 +369,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 - [ ] #130 Compatibility profiles for default, claude.ai and Claude Code exist as data in `compat/`
 - [ ] #131 Each MCP request runs under the profile chosen by override, clientInfo or default ⛔ blocked by #130
-- [ ] #132 Every tool carries MCP annotations and the core usage rules in its description ⛔ blocked by #127
+- [ ] #132 Every tool carries MCP annotations and the core usage rules in its description
 - [ ] #133 A schema linter fails CI when a tool violates a supported profile's limits ⛔ blocked by #130
 
 ### WP-39 — Personal tokens · F-02 · Branch: `wp/39-personal-tokens` · PR: open

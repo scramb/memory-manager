@@ -20,6 +20,11 @@ token that does not meet that rule;
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
+`instructions generate [--check]` renders `mcp/instructions_generated.py` from
+`docs/memory-guide.md`, the single source for the server `instructions` and the
+`memory_guide` prompt (#127, `guide/generate.py`); `--check` exits 1 instead of
+writing when the committed file is stale, and is what `make lint`/CI run.
+
 `worker` runs `worker.py`'s periodic singleton jobs, plus the `jobs` outbox
 consumer (#218, `worker.consume_jobs`), as a separate process (#217,
 ADR-0009 §4) - refuses `STORAGE_BACKEND=git`, the backend that still runs
@@ -84,6 +89,8 @@ from memory_manager.db.migrate import migrate
 from memory_manager.doctor import DoctorReport, run_doctor
 from memory_manager.eval import EvalReport, compare, load_golden, run_eval
 from memory_manager.exporter import ExportError, Manifest, export_postgres, export_vault
+from memory_manager.guide import GuideFormatError
+from memory_manager.guide.generate import build as build_instructions_module
 from memory_manager.http import GracefulShutdownServer, build_authenticator, create_app
 from memory_manager.importers import ImportReport, dedupe_against_vault, run_import
 from memory_manager.importers.chatgpt import ChatGPTFormatError
@@ -123,6 +130,9 @@ _DEFAULT_GOLDEN = Path("eval/golden.yaml")
 _DEFAULT_EVAL_VAULT = Path("examples/vault")
 _DEFAULT_BASELINE = Path("eval/baseline.json")
 _DEFAULT_EVAL_K = 5
+
+_DEFAULT_GUIDE = Path("docs/memory-guide.md")
+_DEFAULT_INSTRUCTIONS_OUT = Path("src/memory_manager/mcp/instructions_generated.py")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _ALLOW_UNAUTHENTICATED_ENV = "MM_ALLOW_UNAUTHENTICATED"
@@ -194,6 +204,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 return _run_migrate_git_to_postgres_dry_run(args.vault, args.map or [])
             return asyncio.run(_run_migrate_git_to_postgres_apply(args.vault, args.map or []))
+        parser.print_help()
+        return 1
+
+    if args.command == "instructions":
+        if args.instructions_target == "generate":
+            return _run_instructions_generate(args.check, args.guide, args.out)
         parser.print_help()
         return 1
 
@@ -445,6 +461,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="report the mapping and every note that would be imported, writing nothing",
     )
 
+    instructions_parser = subparsers.add_parser(
+        "instructions", help="render mcp/instructions_generated.py from docs/memory-guide.md"
+    )
+    instructions_subparsers = instructions_parser.add_subparsers(dest="instructions_target")
+    instructions_generate_parser = instructions_subparsers.add_parser(
+        "generate", help="render the generated module from the Markdown source (#127)"
+    )
+    instructions_generate_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if --out is stale instead of writing it (no file is touched)",
+    )
+    instructions_generate_parser.add_argument(
+        "--guide", type=Path, default=_DEFAULT_GUIDE, help="path to the Markdown source"
+    )
+    instructions_generate_parser.add_argument(
+        "--out",
+        type=Path,
+        default=_DEFAULT_INSTRUCTIONS_OUT,
+        help="path to the generated Python module",
+    )
+
     serve_parser = subparsers.add_parser("serve", help="run the MCP server")
     serve_parser.add_argument(
         "--stdio",
@@ -530,6 +568,27 @@ def _run_hash_password() -> int:
         print("hash-password: no password read from stdin", file=sys.stderr)
         return 2
     print(hash_password(password))
+    return 0
+
+
+def _run_instructions_generate(check: bool, guide: Path, out: Path) -> int:
+    try:
+        module_source = build_instructions_module(guide)
+    except FileNotFoundError:
+        print(f"{guide} does not exist", file=sys.stderr)
+        return 2
+    except GuideFormatError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if check:
+        current = out.read_text(encoding="utf-8") if out.exists() else None
+        if current == module_source:
+            return 0
+        print(f"{out} is stale; run `memory-manager instructions generate`", file=sys.stderr)
+        return 1
+
+    out.write_text(module_source, encoding="utf-8")
     return 0
 
 
