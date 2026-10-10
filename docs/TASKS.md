@@ -363,7 +363,7 @@ Goal: compatibility profiles, schema linter, usage rules from one source, person
 
 ### WP-37 — Client docs skeleton · F-02 · Branch: `wp/37-client-docs` · PR: open
 
-- [ ] #129 `docs/clients` has a page template, the approved support matrix and pages for claude.ai and Claude Code
+- [x] #129 `docs/clients` has a page template, the approved support matrix and pages for claude.ai and Claude Code
 
 ### WP-38 — Compatibility profiles · F-02 · Branch: `wp/38-compat-profiles` · PR: open
 
