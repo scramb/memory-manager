@@ -76,9 +76,9 @@ spec:
           # whole node, briefly took down other Pods' liveness probes with
           # it - docs/benchmarks/target-size.md). 18Gi is sized from this
           # task's own measurement, after the windowing fix, at the fixed
-          # 1M-note/5M-chunk target size: `memory.current` plateaued at
-          # ~12.9 GiB (anon 8.6 GiB + file 2.5 GiB + kernel 1.8 GiB,
-          # `/sys/fs/cgroup/memory.stat`) through the whole chunk-loading
+          # 1M-note/5M-chunk target size: the container's cgroup memory
+          # usage plateaued at ~12.9 GiB (anon 8.6 GiB + file 2.5 GiB +
+          # kernel 1.8 GiB, per the cgroup v2 stat file) through the whole chunk-loading
           # phase, not growing further - that baseline (holding all 1M
           # `_Row`s plus 8 spawned worker processes for the run's own
           # duration) is unrelated to the windowing bug and was simply
