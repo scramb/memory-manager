@@ -1,0 +1,67 @@
+name: nightly-openwebui
+# #151 (WP-44, F-02, M13): does the filter mode help a small, local 7-8B model
+# (via Ollama) give usable answers - tests/e2e/clients/test_openwebui_small_model.py's
+# own measurement, against the fictional examples/vault. Far too slow for every PR
+# (a full run pulls a ~4.7 GB model and drives ~50 real chat completions against a
+# CPU-only model, roughly an hour on this project's own dev hardware - see
+# docs/benchmarks/openwebui-small-model.md), so this runs nightly and on demand, plus
+# a narrow, path-filtered `pull_request` trigger limited to the benchmark's own files
+# (so it actually runs once, on the PR that introduces or changes it - `workflow_dispatch`
+# alone would need this file already on `main` first).
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - deploy/openwebui/examples-vault-overlay.yml
+      - scripts/openwebui-seed-examples.sh
+      - tests/e2e/clients/small_model_questions.yaml
+      - tests/e2e/clients/test_openwebui_small_model.py
+      - tests/e2e/openwebui_driver.py
+      - .github/workflows/nightly-openwebui.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  small-model-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # `podman compose` (not `docker compose` - this project's own compose
+      # engine, Makefile/scripts/openwebui-up.sh) picks whichever provider it
+      # finds first otherwise; forcing `podman-compose` keeps the container
+      # names (`mm-openwebui_<service>_1`) this test's own subprocess helpers
+      # assume, the same reasoning scripts/openwebui-up.sh's own header
+      # comment gives for not relying on podman-compose's default selection.
+      PODMAN_COMPOSE_PROVIDER: podman-compose
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (a pulled model plus several container images)
+        uses: jlumbroso/free-disk-space@v2.0.0
+      - name: Install podman-compose
+        run: pip install podman-compose==1.3.0
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - name: Small-model filter benchmark (#151)
+        env:
+          MM_E2E_OPENWEBUI_SMALL_MODEL: "1"
+        run: uv run pytest tests/e2e/clients/test_openwebui_small_model.py -v -s
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwebui-small-model-results
+          path: tests/e2e/clients/.small-model-results/
+          if-no-files-found: ignore
+          # tests/e2e/clients/.small-model-results/ is a dot-directory - v4+'s own
+          # default (upload-artifact README, "Uploading Hidden Files") would silently
+          # skip it ("No files were found with the provided path") even though the
+          # test wrote it.
+          include-hidden-files: true

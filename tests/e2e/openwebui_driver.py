@@ -132,6 +132,16 @@ class ChatToolCallResult:
         )
 
 
+@dataclass(frozen=True)
+class TextChatResult:
+    """What `OpenWebUiDriver.run_text_chat` (#151, WP-44's own small-model benchmark)
+    read back: the answer text, plus the persisted assistant message's own `usage`
+    dict verbatim, when present (`run_text_chat`'s own docstring)."""
+
+    content: str
+    usage: dict[str, object] | None
+
+
 class OpenWebUiDriver:
     """Drives one Open WebUI instance through the oauth_2.1 (DCR) dance
     against one memory-manager instance, as the *first* (hence admin) user."""
@@ -602,6 +612,114 @@ class OpenWebUiDriver:
         if isinstance(content, str) and content:
             return content
         return _output_text(assistant_message.get("output"))
+
+    async def list_model_ids(self) -> list[str]:
+        """`GET /api/models` - every model id Open WebUI currently reports, combining
+        every configured provider (Ollama included once its `OLLAMA_BASE_URL` answers).
+        A fast precondition check (#151, WP-44's own small-model benchmark): if the
+        pinned model tag never shows up here, a caller can fail fast with a clear reason
+        instead of a slow real-model chat call hanging against a model Open WebUI never
+        found."""
+        response = await self._client.get(f"{self._webui_url}/api/models")
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"listing models failed: {response.status_code} {response.text}"
+            )
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            raise OpenWebUiDriverError(f"/api/models returned no 'data' list: {body}")
+        return [str(item["id"]) for item in data if isinstance(item, dict) and "id" in item]
+
+    async def run_text_chat(
+        self,
+        *,
+        model_id: str,
+        message: str,
+        temperature: float | None = None,
+        seed: int | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> TextChatResult:
+        """One plain-text turn against a real model (#151, WP-44's own small-model
+        benchmark) - `run_scripted_text_chat`'s own twin: same request/read-back shape
+        (that method's own docstring explains both), but against a real model instead
+        of the deterministic stub, with optional, OpenAI-style generation params
+        (`temperature`/`seed`/`max_tokens`) passed through verbatim on the completion
+        request body - Open WebUI's own `/api/chat/completions` forwards whichever of
+        these the active backend understands - and an optional per-call `httpx` timeout
+        override, since one real, CPU-bound 7-8B completion can run for minutes, unlike
+        the scripted stub's instant reply.
+
+        Returns the answer together with the persisted assistant message's own `usage`
+        dict (confirmed live, v0.11.4: for the `ollama` backend this carries Ollama's
+        own `eval_count`/`eval_duration` alongside the OpenAI-shaped `prompt_tokens`/
+        `completion_tokens`) - `None` if that key is absent, e.g. a different backend."""
+        new_chat_response = await self._client.post(
+            f"{self._webui_url}/api/v1/chats/new",
+            json={
+                "chat": {
+                    "models": [model_id],
+                    "history": {"messages": {}, "currentId": None},
+                    "messages": [],
+                    "title": "New Chat",
+                    "timestamp": int(time.time() * 1000),
+                }
+            },
+        )
+        if new_chat_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chats/new failed: {new_chat_response.status_code} {new_chat_response.text}"
+            )
+        chat_id = new_chat_response.json().get("id", "")
+        if not chat_id:
+            raise OpenWebUiDriverError(f"chats/new returned no chat id: {new_chat_response.json()}")
+
+        user_message_id = str(uuid.uuid4())
+        assistant_message_id = str(uuid.uuid4())
+        completion_body: dict[str, object] = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": message}],
+            "stream": True,
+            "chat_id": chat_id,
+            "id": assistant_message_id,
+            "user_message": {"id": user_message_id, "role": "user", "content": message},
+        }
+        if temperature is not None:
+            completion_body["temperature"] = temperature
+        if seed is not None:
+            completion_body["seed"] = seed
+        if max_tokens is not None:
+            completion_body["max_tokens"] = max_tokens
+
+        completion_response = await self._client.post(
+            f"{self._webui_url}/api/chat/completions",
+            json=completion_body,
+            timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
+        if completion_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chat completion failed: {completion_response.status_code} "
+                f"{completion_response.text}"
+            )
+
+        chat_detail_response = await self._client.get(f"{self._webui_url}/api/v1/chats/{chat_id}")
+        if chat_detail_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"reading the chat back failed: {chat_detail_response.status_code} "
+                f"{chat_detail_response.text}"
+            )
+        chat_detail = chat_detail_response.json() or {}
+        messages = (chat_detail.get("chat") or {}).get("history", {}).get("messages", {})
+        assistant_message = messages.get(assistant_message_id) or {}
+        content = assistant_message.get("content")
+        text = (
+            content
+            if isinstance(content, str) and content
+            else _output_text(assistant_message.get("output"))
+        )
+        usage = assistant_message.get("usage")
+        return TextChatResult(content=text, usage=usage if isinstance(usage, dict) else None)
 
 
 def _read_password(args: argparse.Namespace) -> str:
