@@ -30,8 +30,8 @@ once it exists (#161), or `not possible` where the matrix says so.
 | Cursor | Partial | reported: static `Authorization` header dropped when the server advertises OAuth | manual GUI | [research](../research/clients/cursor.md) |
 | Google Antigravity | Partial | sources mostly secondary | manual GUI | [research](../research/clients/antigravity.md) |
 | ChatGPT | Partial | write actions only on Business/Enterprise/Edu; mobile unclear; secondary sources | manual GUI | [research](../research/clients/chatgpt.md) |
-| Gemini Enterprise | Partial ⛔ O18 | no DCR; ≤ 100 actions | manual GUI | [research](../research/clients/gemini-app.md) |
-| Gemini app (consumer) | Not possible (reliably) | revisit at M16 | not possible | [research](../research/clients/gemini-app.md) |
+| Gemini Enterprise | Partial | no DCR; ≤ 100 actions; pre-registered client only (ADR-0015, `oauth-client create`), live unverified | manual GUI | [page](../clients/gemini-enterprise.md) |
+| Gemini app (consumer) | Not possible (reliably) | US/18+/personal/English only; token exchange reportedly broken [secondary]; revisit triggers on the page | not possible | [page](../clients/gemini-app.md) |
 | Claude Code (headless CLI) | Full | — (verified) | headless harness (O21) | `memory-manager connect claude-code` / `doctor --client claude-code`; [page](../clients/claude-code.md) |
 | Codex CLI (headless) | Full (cloud agent unverified) | reported MCP call cancellation under `codex exec` | headless harness (O21) | [research](../research/clients/codex.md) |
 | Gemini CLI (headless) | Full | names ≤ 63 chars, `additionalProperties` stripped; free tier status unclear | headless harness (O21) | [research](../research/clients/gemini.md) |
@@ -82,7 +82,12 @@ Deviations from a scope row's level or caveat, approved in
 - **Open WebUI** — the tool must be enabled per chat; redo S1 whenever the chat changes.
 - **Cursor** — reported: a static `Authorization` header is dropped when the server advertises
   OAuth [secondary]; check this explicitly during S2.
-- **Gemini Enterprise** — not tested — blocked by #197, until #197 lands.
+- **Gemini Enterprise** — not tested — needs a Gemini Enterprise tenant
+  ([`../clients/gemini-enterprise.md`](../clients/gemini-enterprise.md)). S2: the Authorization
+  URL Parameters field must carry `&resource=<URL-encoded resource>` (RFC 8707; this server
+  rejects `/authorize` without it), PKCE must be enabled (S256 only), and Scopes must be exactly
+  `memory:read memory:write`, never `offline_access`. S4/S5: expect the Git commit author to read
+  `claude-code`, not `gemini-enterprise`, until #322 lands.
 - **claude.ai** — `doctor --client claude-ai` fails by design at its first step ("config found");
   check the connection in claude.ai's Settings → Connectors instead
   ([`../clients/claude-ai.md`](../clients/claude-ai.md) → Troubleshooting).
@@ -121,8 +126,8 @@ retroactively into an older one.
 | Cursor | Partial | – | – | – | – | – | – | – | – | – | – |
 | Google Antigravity | Partial | – | – | – | – | – | – | – | – | – | – |
 | ChatGPT | Partial | – | – | – | – | – | – | – | – | – | – |
-| Gemini Enterprise | Partial ⛔ O18 | – | – | – | – | – | – | – | – | – | – |
-| Gemini app (consumer) | Not possible (reliably) | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | – | – | – | revisit #198 |
+| Gemini Enterprise | Partial | – | – | – | – | – | – | – | – | – | – |
+| Gemini app (consumer) | Not possible (reliably) | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | not tested — documented as not possible | – | – | – | see [`../clients/gemini-app.md`](../clients/gemini-app.md) for the reason and revisit triggers |
 | Claude Code (headless CLI) | Full | – | – | – | – | – | – | – | – | – | – |
 | Codex CLI (headless) | Full (cloud agent unverified) | – | – | – | – | – | – | – | – | – | – |
 | Gemini CLI (headless) | Full | – | – | – | – | – | – | – | – | – | – |
