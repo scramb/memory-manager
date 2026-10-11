@@ -49,6 +49,19 @@ _MCP_PATH = "/mcp"
 _RESOURCE = f"{_PUBLIC_URL}{_MCP_PATH}"
 _REDIRECT_URI = "https://gemini.example.test/callback"
 _OTHER_REDIRECT_URI = "https://gemini.example.test/callback-other"
+
+#: Gemini Enterprise's own fixed redirect URI (#322, [GE] in
+#: `docs/research/clients/gemini-app.md`) - a Google product URL, not an operator value.
+_GEMINI_ENTERPRISE_REDIRECT_URI = "https://vertexaisearch.cloud.google.com/oauth-redirect"
+
+#: Redirect URIs that merely contain `_GEMINI_ENTERPRISE_REDIRECT_URI`'s host, either as
+#: a longer hostname or as a path component on an unrelated host - neither is the exact
+#: parsed host `_client_label_for` compares against, so both must still fall back to the
+#: `claude-code` label (#322).
+_GEMINI_ENTERPRISE_LOOKALIKE_REDIRECT_URIS = [
+    "https://vertexaisearch.cloud.google.com.evil.example/oauth-redirect",
+    "https://evil.example/vertexaisearch.cloud.google.com/oauth-redirect",
+]
 _SUBJECT = "alice"
 _NAMESPACES = ["personal"]
 
@@ -225,6 +238,95 @@ async def test_registered_client_code_flow_reaches_a_tool_call(
         async with _authed_mcp_client(app, config, access_token) as mcp_client:
             tools = await mcp_client.list_tools()
             assert tools.tools
+
+
+# --- Gemini Enterprise commit-author label (#322) --------------------------------
+
+
+async def test_registered_client_with_the_gemini_enterprise_redirect_is_labelled_gemini_enterprise(
+    bare_remote: Path, tmp_path: Path, test_database_url: str, pool: asyncpg.Pool
+) -> None:
+    """#322: a pre-registered client whose redirect URI host matches Gemini Enterprise's
+    fixed callback exactly gets the `gemini-enterprise` client label, not the
+    `claude-code` fallback every other unrecognized client gets."""
+    cipher = ClientSecretCipher(_CLIENT_SECRET_KEY)
+    client_id, secret = await create_registered_client(
+        pool,
+        "gemini-enterprise",
+        redirect_uris=[_GEMINI_ENTERPRISE_REDIRECT_URI],
+        cipher=cipher,
+    )
+
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=FakeAuthenticator()) as (_app, client):
+        code_verifier, code_challenge = _pkce_pair()
+        code = await _code_for(
+            client,
+            client_id=client_id,
+            code_challenge=code_challenge,
+            redirect_uri=_GEMINI_ENTERPRISE_REDIRECT_URI,
+        )
+        token_data = _token_request(
+            code=code,
+            redirect_uri=_GEMINI_ENTERPRISE_REDIRECT_URI,
+            client_id=client_id,
+            code_verifier=code_verifier,
+        )
+        token_response = await client.post("/token", data={**token_data, "client_secret": secret})
+        assert token_response.status_code == 200, token_response.text
+
+    label = await pool.fetchval(
+        "select client_label from oauth_tokens where client_id = $1 and kind = 'access'",
+        client_id,
+    )
+    assert label == "gemini-enterprise"
+
+
+@pytest.mark.parametrize("lookalike_redirect_uri", _GEMINI_ENTERPRISE_LOOKALIKE_REDIRECT_URIS)
+async def test_registered_client_with_a_gemini_enterprise_lookalike_host_is_not_labelled(
+    bare_remote: Path,
+    tmp_path: Path,
+    test_database_url: str,
+    pool: asyncpg.Pool,
+    lookalike_redirect_uri: str,
+) -> None:
+    """#322: `_client_label_for` compares the exact parsed redirect host, never a
+    substring - a redirect URI that merely contains Gemini Enterprise's host, either as
+    a longer hostname or as a path component on an unrelated host, still falls back to
+    the `claude-code` label."""
+    cipher = ClientSecretCipher(_CLIENT_SECRET_KEY)
+    client_id, secret = await create_registered_client(
+        pool,
+        "gemini-enterprise-lookalike",
+        redirect_uris=[lookalike_redirect_uri],
+        cipher=cipher,
+    )
+
+    config = _config()
+    environ = _environ(bare_remote, tmp_path, test_database_url)
+    async with _running_app(environ, config, authenticator=FakeAuthenticator()) as (_app, client):
+        code_verifier, code_challenge = _pkce_pair()
+        code = await _code_for(
+            client,
+            client_id=client_id,
+            code_challenge=code_challenge,
+            redirect_uri=lookalike_redirect_uri,
+        )
+        token_data = _token_request(
+            code=code,
+            redirect_uri=lookalike_redirect_uri,
+            client_id=client_id,
+            code_verifier=code_verifier,
+        )
+        token_response = await client.post("/token", data={**token_data, "client_secret": secret})
+        assert token_response.status_code == 200, token_response.text
+
+    label = await pool.fetchval(
+        "select client_label from oauth_tokens where client_id = $1 and kind = 'access'",
+        client_id,
+    )
+    assert label == "claude-code"
 
 
 async def test_registered_client_token_rejects_a_wrong_or_missing_secret(

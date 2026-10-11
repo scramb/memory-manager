@@ -111,6 +111,38 @@ class TestCommitFile:
         assert author.name == "openwebui"
         assert author.email == "openwebui@memory-manager.invalid"
 
+    def test_gemini_enterprise_is_a_known_client(self) -> None:
+        """#322: Gemini Enterprise's `_client_label_for` label must be an `author_for`
+        client `queue.py`'s write path can commit as, or every Gemini Enterprise write
+        would raise."""
+        author = author_for("gemini-enterprise")
+        assert author.name == "gemini-enterprise"
+        assert author.email == "gemini-enterprise@memory-manager.invalid"
+
+    def test_gemini_enterprise_write_commits_with_its_own_author(
+        self, vault_config: VaultConfig, bare_remote: Path
+    ) -> None:
+        """#322: a write attributed to `gemini-enterprise` actually reaches the vault's
+        Git history under that author, the same way `claude-code`/`human` do above."""
+        repo = Repo(vault_config)
+        repo.ensure_clone()
+
+        sha = repo.commit_file(
+            "personal/fact/a.md", b"first\n", author_for("gemini-enterprise"), "add a"
+        )
+        repo.push()
+
+        log = _log(bare_remote)
+        assert log == [
+            (
+                sha,
+                "gemini-enterprise",
+                "gemini-enterprise@memory-manager.invalid",
+                "memory-manager",
+                "memory-manager@memory-manager.invalid",
+            )
+        ]
+
 
 class TestPush:
     def test_push_rejected_when_remote_moved_ahead(

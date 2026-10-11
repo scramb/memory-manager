@@ -148,6 +148,15 @@ ENTRA_GRAPH_UNAVAILABLE_MARKER = "entra refresh check: graph is temporarily unav
 #: identity a write through that client's tokens uses (`mcp/server.py`'s `current_client`).
 _CLAUDE_AI_HOSTS = frozenset({"claude.ai", "claude.com"})
 
+#: Gemini Enterprise's own fixed redirect URI host (#322, `docs/research/clients/
+#: gemini-app.md` [GE]: `https://vertexaisearch.cloud.google.com/oauth-redirect`), a
+#: Google product URL rather than an operator value - an operator who registers a
+#: confidential client (#197) for Gemini Enterprise registers exactly this host, so
+#: `_client_label_for` can trust it the same way it trusts `_CLAUDE_AI_HOSTS`: a
+#: registered redirect URI is server-side data, set by the operator at `oauth-client
+#: create` time, never supplied by the client at request time.
+_GEMINI_ENTERPRISE_HOST = "vertexaisearch.cloud.google.com"
+
 #: Open WebUI's DCR `client_name` (`docs/research/clients/openwebui.md`'s spike, #142,
 #: `open_webui/utils/oauth.py` v0.11.4, L517-538) - `_client_label_for` only trusts this
 #: together with `_OPENWEBUI_CALLBACK_PATH_RE` below, since a `client_name` alone is an
@@ -707,17 +716,22 @@ class MemoryManagerOAuthProvider(
 
 def _client_label_for(client: OAuthClientInformationFull) -> str:
     """`"claude-ai"` if any registered redirect URI points at claude.ai/claude.com,
-    `"openwebui"` if the client registered as `client_name="Open WebUI"` with a redirect
-    URI shaped like its own `/oauth/clients/<id>/callback` callback, else `"claude-code"`
-    (`vault.repo.author_for`'s three machine-client identities, #36 step 7 / #143).
+    `"gemini-enterprise"` if one points at Gemini Enterprise's fixed redirect host
+    (`_GEMINI_ENTERPRISE_HOST`, #322), `"openwebui"` if the client registered as
+    `client_name="Open WebUI"` with a redirect URI shaped like its own
+    `/oauth/clients/<id>/callback` callback, else `"claude-code"` (`vault.repo.
+    author_for`'s machine-client identities, #36 step 7 / #143 / #322).
 
-    The claude.ai host check keeps priority: a client's `client_name` is unauthenticated,
-    client-supplied input, so it only ever narrows the fallback branch, never the one
-    already tied to a redirect host.
+    The claude.ai and Gemini Enterprise host checks keep priority over the Open WebUI
+    one: a client's `client_name` is unauthenticated, client-supplied input, so it only
+    ever narrows the fallback branch, never one already tied to a redirect host.
     """
     for redirect_uri in client.redirect_uris or ():
         if urlsplit(str(redirect_uri)).hostname in _CLAUDE_AI_HOSTS:
             return "claude-ai"
+    for redirect_uri in client.redirect_uris or ():
+        if urlsplit(str(redirect_uri)).hostname == _GEMINI_ENTERPRISE_HOST:
+            return "gemini-enterprise"
     if client.client_name == _OPENWEBUI_CLIENT_NAME:
         for redirect_uri in client.redirect_uris or ():
             if _OPENWEBUI_CALLBACK_PATH_RE.match(urlsplit(str(redirect_uri)).path):

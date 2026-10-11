@@ -113,13 +113,11 @@ not confirmed.
   server's authorization server requires PKCE (S256) on every authorization request; a Business
   edition tenant may not be able to complete the flow at all. Unconfirmed — no Business tenant to
   test against.
-- **Writes commit as `claude-code`, not as `gemini-enterprise`.** memory-manager's client-label
-  resolution (`src/memory_manager/compat/select.py`) only maps a handful of known
-  `clientInfo.name` values to a compatibility profile; an unrecognized name — Gemini Enterprise's
-  own name is not sourced — falls back to the default profile, and the commit-author fallback
-  (`src/memory_manager/mcp/server.py`'s `_DEFAULT_CLIENT`) defaults to `"claude-code"`. Every note
-  a Gemini Enterprise user writes is attributed to `claude-code` in the vault's Git history until
-  this is fixed; tracked in #322.
+- **Writes commit as `gemini-enterprise`.** `_client_label_for`
+  (`src/memory_manager/auth/provider.py`) recognizes the registered client's redirect URI host,
+  `vertexaisearch.cloud.google.com` — fixed by Google, never supplied by the client itself — and
+  attributes every write made through it to `gemini-enterprise`, both in the audit log and as the
+  commit author in the vault's Git history (#322).
 - **No compatibility profile registered for this client.** There is no live connection to source
   a `clientInfo.name` from, the vendor-documented action cap (≤ 100) is far above memory-manager's
   8 tools, and the token-endpoint auth method Gemini Enterprise actually sends is unknown — a
@@ -150,7 +148,6 @@ the authorization server is embedded).
 | `invalid_scope` | Scopes field contains `offline_access` or any scope other than `memory:read`/`memory:write` | set Scopes to exactly `memory:read memory:write` |
 | `invalid_client`, or `/token` responds "Missing client_id" | the registered auth method does not match what Gemini Enterprise sends, or the client id/secret was mistyped | re-check against `memory-manager oauth-client list`; re-create with `--auth-method client_secret_basic` if Basic auth is confirmed needed |
 | PKCE-related rejection at `/authorize` or `/token` | PKCE not enabled in the console form, or the authorization server received `code_challenge_method=plain` | enable "Enable PKCE Support"; this server only accepts S256 |
-| notes from Gemini Enterprise appear authored by `claude-code` in Git | known limitation, not a misconfiguration (see "Known limits") | tracked in #322; no workaround today |
 
 `doctor --client gemini-enterprise` is not available for this client — there is no local config
 file on the memory-manager side for `doctor` to check, and no tenant here to verify the live

@@ -518,6 +518,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [x] #196 The decision on pre-registered OAuth clients for Gemini Enterprise is recorded
 - [x] #197 Operators can register confidential OAuth clients in the authorization server
 - [x] #198 Gemini Enterprise is documented within its limits and the consumer Gemini app is documented as not possible
+- [x] #322 Writes made through Gemini Enterprise are attributed to the gemini-enterprise client label
 
 ### WP-58 — Manual client checklist · F-02 · Branch: `wp/58-client-checklist` · PR: open
 
