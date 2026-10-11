@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Overlay for #151 (WP-44): seeds the stack's vault "remote" with the
+# fictional `examples/vault` instead of the base file's own single welcome
+# note, so the small-model filter benchmark
+# (tests/e2e/clients/test_openwebui_small_model.py) has a vault its question
+# set (tests/e2e/clients/small_model_questions.yaml) can be scored against.
+# Apply together with the base file and the `ollama` profile - see that
+# test module's own docstring for the full `make openwebui-up`/`ollama`
+# command line, or by hand:
+#
+#   podman compose -f "$(pwd)/deploy/openwebui/docker-compose.yml" \
+#     -f "$(pwd)/deploy/openwebui/examples-vault-overlay.yml" \
+#     -p mm-openwebui --profile ollama up -d
+#
+# `vault-init`'s own `volumes:` are overridden by *target* path, not
+# replaced wholesale (confirmed live against podman-compose 1.3, the same
+# way oidc-git-overlay.yml's own header comment found for `ports:`): the
+# base file's `/compose-init.sh` mount is replaced with this overlay's own
+# seeding script (`scripts/openwebui-seed-examples.sh`, same reasoning as
+# `scripts/upgrade-smoke.sh`'s "seed a throwaway remote with a copy of
+# examples/vault" step - raw `git add`/`commit`/`push`, never `memory-
+# manager import markdown`, which would regenerate frontmatter the question
+# set's own `source_path`s depend on staying unchanged), while its
+# `vault-remote:/data/remote.git` mount is left untouched; the new
+# `/examples` mount is added alongside both.
+services:
+  vault-init:
+    volumes:
+      - ../../scripts/openwebui-seed-examples.sh:/compose-init.sh:ro
+      - ../../examples/vault:/examples:ro
+
+  memory-manager:
+    environment:
+      # Load-bearing (#151): a personal token's own namespaces in "git" mode
+      # are bounded by its owner's `LOGIN_NAMESPACES` (`cli.py`'s own
+      # ADR-0012 check), not by what `--namespace` asks for. The base file's
+      # `LOGIN_NAMESPACES: demo` would otherwise leave the benchmark's one
+      # personal token unable to read any of `examples/vault`'s own
+      # `personal`/`work`/`shared` namespaces, and the filter would inject
+      # nothing at all.
+      LOGIN_NAMESPACES: "*"
+
+  open-webui:
+    environment:
+      # Raised from Open WebUI's own default (300s): a 7-8B model on a host
+      # with no AVX/AVX2 (docs/benchmarks/openwebui-small-model.md "Hardware
+      # and software") can take several minutes for one completion: the
+      # default would otherwise abort every chat call this benchmark makes
+      # with a client-side timeout well before Ollama itself replies.
+      AIOHTTP_CLIENT_TIMEOUT: "900"
+      # Without this, `/api/models` never lists anything from the `ollama`
+      # compose profile (the base env file's own template comments this
+      # same variable out by default) - an explicit `environment:` override
+      # always wins over the generated `.env`'s commented-out default, so
+      # this works whether or not a given checkout's own copy sets it too.
+      ENABLE_OLLAMA_API: "true"

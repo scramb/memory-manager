@@ -63,6 +63,32 @@ _PUBLIC_READ_ACCESS_GRANTS: list[dict[str, str]] = [
 _INTERSTITIAL_CONTINUE_RE = re.compile(r'<a class="button" href="([^"]+)">')
 
 
+def _output_text(output: object) -> str:
+    """`get_output_text` (`utils/misc.py`, v0.11.4), reimplemented here since
+    this module cannot import Open WebUI's own backend package: every
+    `output` item of type `"message"`, its `content` parts' own `"text"`
+    fields concatenated, non-empty entries joined with `"\\n"` - the
+    `output`-side counterpart to a plain `content` string (#150,
+    `run_scripted_text_chat`'s own read-back)."""
+    if not isinstance(output, list):
+        return ""
+    texts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        parts = item.get("content")
+        if not isinstance(parts, list):
+            continue
+        text = "".join(
+            str(part.get("text"))
+            for part in parts
+            if isinstance(part, dict) and part.get("text") is not None
+        )
+        if text and not text.isspace():
+            texts.append(text)
+    return "\n".join(texts)
+
+
 class OpenWebUiDriverError(RuntimeError):
     """Any step of the driven flow did not end up where it should have -
     carries the response body (never a secret: this module never prints a
@@ -104,6 +130,16 @@ class ChatToolCallResult:
             for part in item.get("output", [])
             if part.get("type") == "input_text"
         )
+
+
+@dataclass(frozen=True)
+class TextChatResult:
+    """What `OpenWebUiDriver.run_text_chat` (#151, WP-44's own small-model benchmark)
+    read back: the answer text, plus the persisted assistant message's own `usage`
+    dict verbatim, when present (`run_text_chat`'s own docstring)."""
+
+    content: str
+    usage: dict[str, object] | None
 
 
 class OpenWebUiDriver:
@@ -319,6 +355,113 @@ class OpenWebUiDriver:
         if response.status_code != httpx.codes.OK:
             raise OpenWebUiDriverError(f"signin failed: {response.status_code} {response.text}")
 
+    async def install_filter(
+        self, *, function_id: str, name: str, content: str, description: str
+    ) -> None:
+        """`POST /api/v1/functions/create` (#150, `routers/functions.py:200-262`,
+        admin-only): installs `content` (a single file's source text, ADR-0011)
+        as Function `function_id` - which must satisfy `str.isidentifier()`
+        and is lowercased server-side (`routers/functions.py:207-213`), so
+        callers should already pass a lowercase identifier. A brand-new
+        function starts both inactive and non-global
+        (`models/functions.py`'s own `FunctionModel.is_active`/`is_global`
+        default `False`) - `activate_filter` below flips both."""
+        response = await self._client.post(
+            f"{self._webui_url}/api/v1/functions/create",
+            json={
+                "id": function_id,
+                "name": name,
+                "content": content,
+                "meta": {"description": description, "manifest": {}},
+            },
+        )
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"filter installation failed: {response.status_code} {response.text}"
+            )
+
+    async def activate_filter(self, *, function_id: str) -> None:
+        """`POST /id/{id}/toggle` then `POST /id/{id}/toggle/global`
+        (admin-only) - both endpoints *toggle* the current value
+        (`routers/functions.py:288-371`), so each is called exactly once
+        here, right after `install_filter`'s own fresh (inactive,
+        non-global) function. Raises unless both responses come back with
+        `is_active`/`is_global` `True`, the one live check that these two
+        calls actually activated the filter rather than toggling some
+        unrelated, pre-existing state."""
+        active_response = await self._client.post(
+            f"{self._webui_url}/api/v1/functions/id/{function_id}/toggle"
+        )
+        if active_response.status_code != httpx.codes.OK or not active_response.json().get(
+            "is_active"
+        ):
+            raise OpenWebUiDriverError(
+                f"activating the filter failed: {active_response.status_code} "
+                f"{active_response.text}"
+            )
+
+        global_response = await self._client.post(
+            f"{self._webui_url}/api/v1/functions/id/{function_id}/toggle/global"
+        )
+        if global_response.status_code != httpx.codes.OK or not global_response.json().get(
+            "is_global"
+        ):
+            raise OpenWebUiDriverError(
+                f"making the filter global failed: {global_response.status_code} "
+                f"{global_response.text}"
+            )
+
+    async def update_filter_valves(self, *, function_id: str, valves: dict[str, object]) -> None:
+        """`POST /id/{id}/valves/update` (admin-only, any user) - the
+        `Filter.Valves` fields set for every chat (`routers/functions.py:
+        517-561`)."""
+        response = await self._client.post(
+            f"{self._webui_url}/api/v1/functions/id/{function_id}/valves/update", json=valves
+        )
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"updating the filter's valves failed: {response.status_code} {response.text}"
+            )
+
+    async def update_filter_user_valves(
+        self, *, function_id: str, valves: dict[str, object]
+    ) -> None:
+        """`POST /id/{id}/valves/user/update`, run on *this* driver's own
+        session (a verified user, never admin-only) - the `Filter.
+        UserValves` fields for the signed-in user alone. Only works once
+        the filter is active (`routers/functions.py:618-668`: a 400
+        otherwise), so this must run after `activate_filter`."""
+        response = await self._client.post(
+            f"{self._webui_url}/api/v1/functions/id/{function_id}/valves/user/update", json=valves
+        )
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"updating the filter's user valves failed: {response.status_code} {response.text}"
+            )
+
+    async def disable_builtin_memories(self) -> None:
+        """`GET` then `POST /api/v1/auths/admin/config` (admin-only,
+        `routers/auths.py:1204-1296`): reads the full `AdminConfig` back and
+        posts it with only `ENABLE_MEMORIES` flipped to `False` - the
+        endpoint has no "patch just this field" shape, every `POST` expects
+        the whole object (#150, `docs/research/clients/openwebui.md`
+        "Built-in memory")."""
+        get_response = await self._client.get(f"{self._webui_url}/api/v1/auths/admin/config")
+        if get_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"reading the admin config failed: {get_response.status_code} {get_response.text}"
+            )
+        config = get_response.json()
+        config["ENABLE_MEMORIES"] = False
+        post_response = await self._client.post(
+            f"{self._webui_url}/api/v1/auths/admin/config", json=config
+        )
+        if post_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"disabling built-in memories failed: {post_response.status_code} "
+                f"{post_response.text}"
+            )
+
     async def run_scripted_tool_chat(
         self, *, model_id: str, server_id: str, message: str
     ) -> ChatToolCallResult:
@@ -396,6 +539,187 @@ class OpenWebUiDriver:
             assistant_message_id=assistant_message_id,
             function_call_outputs=function_call_outputs,
         )
+
+    async def run_scripted_text_chat(self, *, model_id: str, message: str) -> str:
+        """One plain-text turn (#150), deliberately with no `tool_ids`: a
+        filter's `inlet`/`outlet` still runs (`utils/filter.py`'s
+        `process_filter_function` is unconditional - there is no "only with
+        tools" branch), but the model itself never enters Open WebUI's
+        native MCP tool loop, so a script need not worry about `#144`'s own
+        one-tool-call-per-chat finding here. Same synchronous, `200 null`
+        shape as `run_scripted_tool_chat` (see that method's own docstring)
+        - the assistant's actual text is read back from `GET
+        /api/v1/chats/{chat_id}`, `content` if set, else
+        `_output_text(output)` (`utils/middleware.py:4129`'s own
+        `m.get('content') or get_output_text(m.get('output'))`, mirrored
+        here since this module cannot import Open WebUI's backend package).
+
+        The request also carries a top-level `user_message` with its own
+        `id` (`main.py:1231,1521-1526`: `form_data.pop('user_message',
+        ...)`, then persisted only `if user_message.get('id')`) - needed
+        for the outlet's own report (#150's optional round trip) to land on
+        a message Open WebUI actually saved, harmless for a plain inlet-only
+        chat otherwise."""
+        new_chat_response = await self._client.post(
+            f"{self._webui_url}/api/v1/chats/new",
+            json={
+                "chat": {
+                    "models": [model_id],
+                    "history": {"messages": {}, "currentId": None},
+                    "messages": [],
+                    "title": "New Chat",
+                    "timestamp": int(time.time() * 1000),
+                }
+            },
+        )
+        if new_chat_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chats/new failed: {new_chat_response.status_code} {new_chat_response.text}"
+            )
+        chat_id = new_chat_response.json().get("id", "")
+        if not chat_id:
+            raise OpenWebUiDriverError(f"chats/new returned no chat id: {new_chat_response.json()}")
+
+        user_message_id = str(uuid.uuid4())
+        assistant_message_id = str(uuid.uuid4())
+        completion_response = await self._client.post(
+            f"{self._webui_url}/api/chat/completions",
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": message}],
+                "stream": True,
+                "chat_id": chat_id,
+                "id": assistant_message_id,
+                "user_message": {"id": user_message_id, "role": "user", "content": message},
+            },
+        )
+        if completion_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chat completion failed: {completion_response.status_code} "
+                f"{completion_response.text}"
+            )
+
+        chat_detail_response = await self._client.get(f"{self._webui_url}/api/v1/chats/{chat_id}")
+        if chat_detail_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"reading the chat back failed: {chat_detail_response.status_code} "
+                f"{chat_detail_response.text}"
+            )
+        chat_detail = chat_detail_response.json() or {}
+        messages = (chat_detail.get("chat") or {}).get("history", {}).get("messages", {})
+        assistant_message = messages.get(assistant_message_id) or {}
+        content = assistant_message.get("content")
+        if isinstance(content, str) and content:
+            return content
+        return _output_text(assistant_message.get("output"))
+
+    async def list_model_ids(self) -> list[str]:
+        """`GET /api/models` - every model id Open WebUI currently reports, combining
+        every configured provider (Ollama included once its `OLLAMA_BASE_URL` answers).
+        A fast precondition check (#151, WP-44's own small-model benchmark): if the
+        pinned model tag never shows up here, a caller can fail fast with a clear reason
+        instead of a slow real-model chat call hanging against a model Open WebUI never
+        found."""
+        response = await self._client.get(f"{self._webui_url}/api/models")
+        if response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"listing models failed: {response.status_code} {response.text}"
+            )
+        body = response.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            raise OpenWebUiDriverError(f"/api/models returned no 'data' list: {body}")
+        return [str(item["id"]) for item in data if isinstance(item, dict) and "id" in item]
+
+    async def run_text_chat(
+        self,
+        *,
+        model_id: str,
+        message: str,
+        temperature: float | None = None,
+        seed: int | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> TextChatResult:
+        """One plain-text turn against a real model (#151, WP-44's own small-model
+        benchmark) - `run_scripted_text_chat`'s own twin: same request/read-back shape
+        (that method's own docstring explains both), but against a real model instead
+        of the deterministic stub, with optional, OpenAI-style generation params
+        (`temperature`/`seed`/`max_tokens`) passed through verbatim on the completion
+        request body - Open WebUI's own `/api/chat/completions` forwards whichever of
+        these the active backend understands - and an optional per-call `httpx` timeout
+        override, since one real, CPU-bound 7-8B completion can run for minutes, unlike
+        the scripted stub's instant reply.
+
+        Returns the answer together with the persisted assistant message's own `usage`
+        dict (confirmed live, v0.11.4: for the `ollama` backend this carries Ollama's
+        own `eval_count`/`eval_duration` alongside the OpenAI-shaped `prompt_tokens`/
+        `completion_tokens`) - `None` if that key is absent, e.g. a different backend."""
+        new_chat_response = await self._client.post(
+            f"{self._webui_url}/api/v1/chats/new",
+            json={
+                "chat": {
+                    "models": [model_id],
+                    "history": {"messages": {}, "currentId": None},
+                    "messages": [],
+                    "title": "New Chat",
+                    "timestamp": int(time.time() * 1000),
+                }
+            },
+        )
+        if new_chat_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chats/new failed: {new_chat_response.status_code} {new_chat_response.text}"
+            )
+        chat_id = new_chat_response.json().get("id", "")
+        if not chat_id:
+            raise OpenWebUiDriverError(f"chats/new returned no chat id: {new_chat_response.json()}")
+
+        user_message_id = str(uuid.uuid4())
+        assistant_message_id = str(uuid.uuid4())
+        completion_body: dict[str, object] = {
+            "model": model_id,
+            "messages": [{"role": "user", "content": message}],
+            "stream": True,
+            "chat_id": chat_id,
+            "id": assistant_message_id,
+            "user_message": {"id": user_message_id, "role": "user", "content": message},
+        }
+        if temperature is not None:
+            completion_body["temperature"] = temperature
+        if seed is not None:
+            completion_body["seed"] = seed
+        if max_tokens is not None:
+            completion_body["max_tokens"] = max_tokens
+
+        completion_response = await self._client.post(
+            f"{self._webui_url}/api/chat/completions",
+            json=completion_body,
+            timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
+        if completion_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"chat completion failed: {completion_response.status_code} "
+                f"{completion_response.text}"
+            )
+
+        chat_detail_response = await self._client.get(f"{self._webui_url}/api/v1/chats/{chat_id}")
+        if chat_detail_response.status_code != httpx.codes.OK:
+            raise OpenWebUiDriverError(
+                f"reading the chat back failed: {chat_detail_response.status_code} "
+                f"{chat_detail_response.text}"
+            )
+        chat_detail = chat_detail_response.json() or {}
+        messages = (chat_detail.get("chat") or {}).get("history", {}).get("messages", {})
+        assistant_message = messages.get(assistant_message_id) or {}
+        content = assistant_message.get("content")
+        text = (
+            content
+            if isinstance(content, str) and content
+            else _output_text(assistant_message.get("output"))
+        )
+        usage = assistant_message.get("usage")
+        return TextChatResult(content=text, usage=usage if isinstance(usage, dict) else None)
 
 
 def _read_password(args: argparse.Namespace) -> str:

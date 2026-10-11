@@ -52,6 +52,17 @@ _GENERIC_TEMPLATE = (
     "<!-- END memory-manager instructions -->\n"
 )
 
+_OPENWEBUI_TEMPLATE = (
+    _HEADER + "\n"
+    "Durable facts, preferences and decisions about the user live in the memory-manager "
+    "vault, reached through the `memory_*` tools — native MCP if the admin configured it, "
+    "otherwise the `tool_memory.py` Python tool.\n"
+    "\n"
+    "<!-- BEGIN memory-manager instructions -->\n"
+    f"{_BODY_PLACEHOLDER}\n"
+    "<!-- END memory-manager instructions -->\n"
+)
+
 
 @dataclass(frozen=True)
 class ClientTarget:
@@ -76,6 +87,11 @@ TARGETS: dict[str, ClientTarget] = {
         output="integrations/generic/AGENTS.md",
         section="instructions",
         template=_GENERIC_TEMPLATE,
+    ),
+    "openwebui": ClientTarget(
+        output="integrations/openwebui/system_prompt.md",
+        section="short",
+        template=_OPENWEBUI_TEMPLATE,
     ),
 }
 
