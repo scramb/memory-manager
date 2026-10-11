@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: upgrade
+#
+# Upgrade smoke tests (#202, WP-59): proves 0.2.0 -> this worktree's own
+# code (`make upgrade-smoke-1.0`, scripts/upgrade-smoke-1.0.sh) and 0.1.x
+# -> 0.2.0 (scripts/upgrade-smoke.sh, #277/WP-34) against real images, a
+# real Postgres and the migrate-to-Postgres/export-back-to-Git round trip.
+# Path-filtered the same way as e2e-kind.yml: only the inputs that can
+# actually change what either script exercises re-run it on every push,
+# plus workflow_dispatch for an on-demand run (e.g. before an rc tag,
+# docs/releasing.md "Cutting a release").
+on:
+  pull_request:
+    paths:
+      - src/memory_manager/db/**
+      - src/memory_manager/auth/**
+      - src/memory_manager/storage/**
+      - Dockerfile
+      - pyproject.toml
+      - uv.lock
+      - scripts/upgrade-smoke*.sh
+      - scripts/lib/upgrade-smoke.sh
+      - .github/workflows/upgrade.yml
+  push:
+    branches: [main]
+    paths:
+      - src/memory_manager/db/**
+      - src/memory_manager/auth/**
+      - src/memory_manager/storage/**
+      - Dockerfile
+      - pyproject.toml
+      - uv.lock
+      - scripts/upgrade-smoke*.sh
+      - scripts/lib/upgrade-smoke.sh
+      - .github/workflows/upgrade.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    # Generous but bounded: six containers started/stopped in sequence
+    # across both scripts, each waiting up to 30s for /healthz, plus two
+    # image builds.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - name: 0.2.0 -> current (both storage backends, #202)
+        run: make upgrade-smoke-1.0
+      - name: Build memory-manager:dev (scripts/upgrade-smoke.sh's own default CURRENT_IMAGE)
+        run: make image
+      - name: 0.1.x -> 0.2.0 (#277)
+        run: UPGRADE_FROM=0.2.0 scripts/upgrade-smoke.sh

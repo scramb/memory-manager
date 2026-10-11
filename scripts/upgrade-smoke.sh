@@ -45,22 +45,20 @@
 #      deterministic renaming this script already introduced on purpose.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
+
+# Engine detection, /healthz polling, MCP tool calls and the mm-pg
+# throwaway-database helpers (#202, WP-59) - shared with
+# scripts/upgrade-smoke-1.0.sh, see that file for its own 0.2.0 -> 1.0
+# upgrade path.
+source "${REPO_ROOT}/scripts/lib/upgrade-smoke.sh"
 
 UPGRADE_FROM="${UPGRADE_FROM:-$(jq -r '.["."]' .release-please-manifest.json)}"
 OLD_IMAGE="ghcr.io/scramb/memory-manager:${UPGRADE_FROM}"
 CURRENT_IMAGE="${CURRENT_IMAGE:-memory-manager:dev}"
 PORT="${UPGRADE_SMOKE_PORT:-18095}"
 
-if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
-  ENGINE="$CONTAINER_ENGINE"
-elif command -v podman >/dev/null 2>&1; then
-  ENGINE=podman
-elif command -v docker >/dev/null 2>&1; then
-  ENGINE=docker
-else
-  echo "FAIL: neither podman nor docker found on PATH" >&2
-  exit 1
-fi
+mm_detect_engine
 
 ADMIN_URL="${MM_TEST_DATABASE_URL:-postgresql://mm:mm@localhost:55432/mm}"
 DB_NAME="mm_upgrade_smoke"
@@ -74,13 +72,6 @@ chmod 0777 "$DATA"
 
 CONTAINER_NAME=""
 
-drop_database() {
-  podman exec mm-pg psql -U mm -d mm -v ON_ERROR_STOP=1 \
-    -c "select pg_terminate_backend(pid) from pg_stat_activity where datname = '${DB_NAME}' and pid <> pg_backend_pid();" \
-    -c "drop database if exists ${DB_NAME};" \
-    >/dev/null 2>&1 || true
-}
-
 cleanup() {
   if [[ -n "$CONTAINER_NAME" ]]; then
     "$ENGINE" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -90,67 +81,10 @@ cleanup() {
   # user cannot unlink them directly.
   "$ENGINE" run --rm --user 0:0 --entrypoint rm \
     --volume "${WORKDIR}:/cleanup" "$CURRENT_IMAGE" -rf /cleanup/data >/dev/null 2>&1 || true
-  drop_database
+  mm_pg_drop_database "$DB_NAME"
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
-
-wait_healthz() {
-  local status=""
-  for _ in $(seq 1 30); do
-    if status=$(curl --silent --show-error --output /dev/null \
-        --write-out '%{http_code}' "http://127.0.0.1:${PORT}/healthz" 2>/dev/null); then
-      [[ "$status" == "200" ]] && return 0
-    fi
-    sleep 1
-  done
-  echo "FAIL: GET /healthz did not return 200 within 30s (got ${status:-<none>})" >&2
-  "$ENGINE" logs "$CONTAINER_NAME" >&2 || true
-  return 1
-}
-
-mcp_body() {
-  # $1 tool name, $2 arguments (already valid JSON)
-  jq -n --arg tool "$1" --argjson arguments "$2" \
-    '{jsonrpc: "2.0", id: 1, method: "tools/call", params: {name: $tool, arguments: $arguments}}'
-}
-
-# A response may come back as a plain JSON body or as a one-event SSE
-# stream ("event: message\ndata: {...}\n\n") depending on how the MCP SDK
-# picked between the Accept header's two offered media types; unwrap the
-# latter down to its one `data:` line before anything tries to `jq` it.
-mcp_unwrap() {
-  if jq -e . >/dev/null 2>&1 <<<"$1"; then
-    printf '%s' "$1"
-  else
-    sed -n 's/^data: //p' <<<"$1" | tail -n1
-  fi
-}
-
-mcp_call() {
-  # $1 base url, $2 tool name, $3 arguments json
-  local raw
-  raw=$(curl --silent --show-error --fail \
-    --header 'Content-Type: application/json' \
-    --header 'Accept: application/json, text/event-stream' \
-    --data "$(mcp_body "$2" "$3")" \
-    "$1/mcp")
-  mcp_unwrap "$raw"
-}
-
-require_ok() {
-  # $1 response json, $2 label for the error message
-  #
-  # Not `.result.isError // "null"`: jq's `//` falls back on `false` too,
-  # not just `null`/absent, so that would always take the "null" branch for
-  # the one value (`false`) this check actually wants to recognize.
-  local is_error
-  is_error=$(jq -r 'if .result == null then "no-result" else (.result.isError // false) end' <<<"$1")
-  if [[ "$is_error" != "false" ]]; then
-    echo "FAIL: $2 returned an error: $1" >&2
-    exit 1
-  fi
-}
 
 NOTE1_PATH="personal/fact/upgrade-smoke-note-1.md"
 NOTE1_BODY=$'---\ntitle: Upgrade smoke note 1\ndescription: Written through the old image, before the upgrade.\ntype: fact\n---\nWritten by scripts/upgrade-smoke.sh against the old image, before switching to the current one.\n'
@@ -192,21 +126,21 @@ CONTAINER_NAME="mm-upgrade-smoke-old-$$"
   --env VAULT_REMOTE=file:///data/remote.git \
   --env MM_ALLOW_UNAUTHENTICATED=1 \
   "$OLD_IMAGE" >/dev/null
-wait_healthz
+mm_wait_healthz "$PORT" "$CONTAINER_NAME"
 echo "OK: old image is up"
 
 OLD_URL="http://127.0.0.1:${PORT}"
 
-resp1=$(mcp_call "$OLD_URL" memory_write \
+resp1=$(mm_mcp_call "$OLD_URL" memory_write \
   "$(jq -n --arg path "$NOTE1_PATH" --arg content "$NOTE1_BODY" \
     '{path: $path, content: $content, if_version: "new"}')")
-require_ok "$resp1" "memory_write ${NOTE1_PATH} on the old image"
+mm_require_ok "$resp1" "memory_write ${NOTE1_PATH} on the old image"
 VERSION1=$(jq -r '.result.structuredContent.version' <<<"$resp1")
 
-resp2=$(mcp_call "$OLD_URL" memory_write \
+resp2=$(mm_mcp_call "$OLD_URL" memory_write \
   "$(jq -n --arg path "$NOTE2_PATH" --arg content "$NOTE2_BODY" \
     '{path: $path, content: $content, if_version: "new"}')")
-require_ok "$resp2" "memory_write ${NOTE2_PATH} on the old image"
+mm_require_ok "$resp2" "memory_write ${NOTE2_PATH} on the old image"
 VERSION2=$(jq -r '.result.structuredContent.version' <<<"$resp2")
 
 echo "OK: wrote ${NOTE1_PATH} (${VERSION1:0:12}...) and ${NOTE2_PATH} (${VERSION2:0:12}...) through the old image"
@@ -225,14 +159,14 @@ CONTAINER_NAME="mm-upgrade-smoke-current-$$"
   --env VAULT_REMOTE=file:///data/remote.git \
   --env MM_ALLOW_UNAUTHENTICATED=1 \
   "$CURRENT_IMAGE" >/dev/null
-wait_healthz
+mm_wait_healthz "$PORT" "$CONTAINER_NAME"
 echo "OK: current image is up, on the same vault the old image just wrote to"
 
 CURRENT_URL="http://127.0.0.1:${PORT}"
 
-read_resp=$(mcp_call "$CURRENT_URL" memory_read \
+read_resp=$(mm_mcp_call "$CURRENT_URL" memory_read \
   "$(jq -n --arg p1 "$NOTE1_PATH" --arg p2 "$NOTE2_PATH" '{items: [$p1, $p2]}')")
-require_ok "$read_resp" "memory_read on the current image"
+mm_require_ok "$read_resp" "memory_read on the current image"
 
 unchanged=$(jq --arg p1 "$NOTE1_PATH" --arg v1 "$VERSION1" --arg p2 "$NOTE2_PATH" --arg v2 "$VERSION2" '
   .result.structuredContent.result as $items
@@ -251,23 +185,9 @@ CONTAINER_NAME=""
 # --- 4. migrate git-to-postgres: dry run, then for real ---------------------
 
 echo "waiting for mm-pg..."
-ready=0
-for _ in $(seq 1 30); do
-  if podman exec mm-pg pg_isready -U mm >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$ready" -ne 1 ]]; then
-  echo "FAIL: mm-pg did not become ready (see 'make db-up')" >&2
-  exit 1
-fi
+mm_pg_wait_ready
 
-podman exec mm-pg psql -U mm -d mm -v ON_ERROR_STOP=1 \
-  -c "drop database if exists ${DB_NAME};" \
-  -c "create database ${DB_NAME} owner mm;" \
-  >/dev/null
+mm_pg_create_database "$DB_NAME" mm
 
 MAP_ARGS=(--map personal=user:oid-example --map work=project:work --map shared=org:org)
 

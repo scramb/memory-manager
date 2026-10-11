@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down contract-snapshot reference-docs
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke upgrade-smoke-1.0 openwebui-up openwebui-down contract-snapshot reference-docs
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -154,6 +154,22 @@ loadtest-cluster:
 # (#277, WP-34) - see scripts/upgrade-smoke.sh.
 upgrade-smoke: image db-up
 	scripts/upgrade-smoke.sh
+
+# Upgrades from the fixed last 0.x release (0.2.0, F-01 WP-34) to this
+# worktree's own current image, on both storage backends - Git with a
+# Postgres index/auth database, and STORAGE_BACKEND=postgres, including an
+# Entra-login simulation and the tools/list contract-snapshot comparison
+# (#202, WP-59) - see scripts/upgrade-smoke-1.0.sh. Builds its own
+# `memory-manager:upgrade-smoke` tag (the script's own CURRENT_IMAGE
+# default) instead of `make image`'s `memory-manager:dev` - this must
+# never rebuild or retag :dev, which another lane may be running
+# containers against.
+upgrade-smoke-1.0: db-up
+	podman build -t memory-manager:upgrade-smoke \
+		--build-arg MM_GIT_SHA=$$(git rev-parse HEAD) \
+		--build-arg MM_VERSION=$$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/') \
+		.
+	scripts/upgrade-smoke-1.0.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
 # vault-init one-shot seeding a local vault remote. See README.md.

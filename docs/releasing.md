@@ -148,10 +148,16 @@ cosign verify \
 - **Pre-release / release candidate**: push a tag by hand, e.g.
   `git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1`. `release.yml`
   runs the same pipeline and marks the GitHub release `--prerelease`.
+- Before the rc tag, run `gh workflow run upgrade.yml` and wait for it to
+  go green - it proves the upgrade path (`.github/workflows/upgrade.yml`,
+  `scripts/upgrade-smoke.sh`/`scripts/upgrade-smoke-1.0.sh`) against the
+  exact code the tag will publish.
 
 Upgrading an existing `0.1.x` deployment to `0.2.0`?
 [`docs/guides/upgrade-0.2.md`](./guides/upgrade-0.2.md) covers what changes, staying on the Git
-backend, moving to Postgres and rolling back.
+backend, moving to Postgres and rolling back. Upgrading an existing `0.2.0` deployment to
+`1.0.0-rc`? [`docs/guides/upgrade-1.0.md`](./guides/upgrade-1.0.md) covers what changes and how
+it is tested.
 
 Release-please's own commits (the "chore(release)" PR) and Dependabot's
 commits carry no `Signed-off-by:` trailer - `.github/workflows/dco.yml`

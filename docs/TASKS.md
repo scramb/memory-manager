@@ -536,7 +536,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 - [x] #200 The tool contract, config format, note format and CLI are documented as stable reference
 - [x] #201 A contract snapshot test fails on breaking changes to the tool contract
 - [x] #315 The compatibility policy states whether the text content channel of tool results is stable
-- [ ] #202 An upgrade guide from the last 0.x release exists and its migrations are tested ⛔ blocked by #199, #280 (F-01 WP-34)
+- [x] #202 An upgrade guide from the last 0.x release exists and its migrations are tested
 
 ### WP-60 — Security review for the release candidate · F-02 · Branch: `wp/60-security-rc` · PR: open
 

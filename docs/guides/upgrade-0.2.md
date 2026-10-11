@@ -217,6 +217,7 @@ All of the following are inert unless `LOGIN_MODE=entra`, which itself **require
 
 ## Not included
 
-- Upgrading to `1.0` (F-02, [#202](https://github.com/scramb/memory-manager/issues/202)).
+- Upgrading to `1.0`: see [`upgrade-1.0.md`](./upgrade-1.0.md) (F-02,
+  [#202](https://github.com/scramb/memory-manager/issues/202)).
 - The README enterprise section
   ([#279](https://github.com/scramb/memory-manager/issues/279)).
