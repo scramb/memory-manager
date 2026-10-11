@@ -1,6 +1,6 @@
 # Open WebUI as a memory-manager client
 
-Retrieved: 2026-10-07 · Tested version: none (desk research; latest release v0.11.4)
+Retrieved: 2026-10-07, live spike 2026-10-10 (#142, WP-42) · Tested version: 0.11.4
 
 Method: `docs.openwebui.com` is not reachable from the research environment, so the documentation was read from its source repository (`open-webui/docs`, `main` at commit `f687d16`, 2026-10-07). The pages are the same Markdown that the site renders; links below point at the published site. Behaviour was cross-checked against the Open WebUI source at tag `v0.11.4` (commit `8bd8b4f`, which is also `main` on the retrieval date). Code references are given as `path` at `v0.11.4`. Anything not confirmed by docs or code is marked **unverified**.
 
@@ -124,6 +124,19 @@ Related: `ENABLE_OAUTH_TOKEN_EXCHANGE` (with `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIEN
 | v0.10.2 / v0.10.1 / v0.10.0 | 2026-07-01 / 06-29 / 06-29 | Memory rework, MCP OAuth scope and resource settings |
 | v0.9.6 … v0.9.0 | 2026-06-01 … 04-20 | `{{USER_EMAIL}}` and `{{USER_ROLE}}`, `MCP_INITIALIZE_TIMEOUT` |
 
+**Re-verified 2026-10-10** for the pinned local stack (#141, WP-42,
+`deploy/openwebui/docker-compose.yml`): v0.11.4 is still the latest release
+(GitHub releases API, published 2026-09-21, tag commit `8bd8b4f`). The
+`0.11.4` and `v0.11.4` image tags on `ghcr.io/open-webui/open-webui` share
+one index digest, `sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f`;
+the previous two minors for a later version matrix (WP-46) are 0.10.2 and
+0.9.6. The OCI image carries **no** `HEALTHCHECK` of its own (the compose
+file defines one), but does carry `curl` and `jq`; its `/health` endpoint
+returns `{"status": true}`. Pulling it is about 1.65 GB. Ollama is pinned
+at `docker.io/ollama/ollama:0.40.2` for the same stack's opt-in `ollama`
+profile. Source: GitHub releases API and `ghcr.io` manifest, both retrieved
+2026-10-10.
+
 - **Cadence:** a new minor version every 1–2 months (0.9.0 Apr → 0.10.0 Jun → 0.11.0 Jul), with frequent patch releases. Pre-1.0 minors contain breaking changes.
 - **Images:**
   - `ghcr.io/open-webui/open-webui:vX.Y.Z` (also `-cuda` and `-ollama`)
@@ -147,15 +160,356 @@ Open WebUI connects to our server as an admin-configured **MCP (Streamable HTTP)
 
 Recommendation for evaluation, not a decision: **A** is the only option that fits the current auth model without an ADR. We still need to check that our AS's DCR handles Open WebUI's registration request (`client_secret_post`, redirect `/oauth/clients/<id>/callback`). B and C would be separate decisions to make via ADR. An Open WebUI filter calling our HTTP API is a further non-MCP path (identity from `__user__` or `__oauth_token__`), but it needs a REST surface and a trust model, so it is out of scope for v1.
 
+## Spike results (2026-10-10)
+
+Driven live against the pinned stack (#141/#142,
+`deploy/openwebui/docker-compose.yml`, `scripts/openwebui-up.sh`,
+`tests/e2e/openwebui_driver.py`) with memory-manager's embedded AS
+(ADR-0004) enabled: `LOGIN_MODE=password`, `PORT=18081`,
+`PUBLIC_URL=http://localhost:18081`. Tested version: 0.11.4 throughout
+this section; every claim below is either an observed, reproduced result
+or a code citation, never recall.
+
+### Networking: a shared network namespace, not a DNS name
+
+The SDK's own issuer check (`.venv/.../mcp/server/auth/routes.py`
+`validate_issuer_url`, `v2.3.0` as installed) only accepts `https` or
+`localhost`/`127.0.0.1`/`[::1]` - the compose DNS name `memory-manager`
+fails it, and Open WebUI's **backend**, not only the browser, must reach
+`PUBLIC_URL` directly (DCR, token exchange). The fix verified live:
+`open-webui` joins memory-manager's own network namespace
+(`network_mode: "service:memory-manager"`; podman-compose 1.3 turns this
+into `--network=container:<name>`, confirmed against
+`podman_compose.py`'s `get_net_args_from_network_mode`), memory-manager
+listens on `PORT=18081` inside that shared namespace, and both services'
+host-facing ports are published on memory-manager's own `ports:` list
+(`127.0.0.1:18081:18081`, `127.0.0.1:3000:8080`). Verified:
+
+- `curl -s localhost:18081/.well-known/oauth-protected-resource` from the
+  host → `{"resource":"http://localhost:18081/mcp", ...}`.
+- `podman exec mm-openwebui_open-webui_1 curl -fsS
+  http://localhost:18081/.well-known/oauth-authorization-server` → 200
+  with a full AS metadata document (same loopback, from inside
+  open-webui's shared namespace).
+- `podman exec mm-openwebui_open-webui_1 getent hosts scripted-model` →
+  resolves (`10.89.1.6 scripted-model.dns.podman`) - the shared namespace
+  still carries the project's own DNS, so open-webui's existing
+  `OPENAI_API_BASE_URLS=http://scripted-model:8091/v1` keeps working
+  unchanged.
+
+**Production consequence (#154):** with a real `https://` `PUBLIC_URL`
+this whole workaround disappears (`validate_issuer_url` passes `https`
+unconditionally) - ordinary same-cluster service DNS is enough, and no
+network-namespace sharing is needed. What stays true in both cases: Open
+WebUI's **backend**, not just a user's browser, must have egress to
+`PUBLIC_URL` (DCR and token exchange are server-to-server), so a
+production NetworkPolicy must allow it, not only ingress from users'
+browsers.
+
+### DCR and the per-user OAuth flow: both work, unmodified
+
+`tests/e2e/openwebui_driver.py connect` (signup as the first/admin user →
+`POST /api/v1/configs/oauth/clients/register?type=mcp` → `POST
+/api/v1/configs/tool_servers` with `auth_type=oauth_2.1` → `GET
+/oauth/clients/mcp:<id>/authorize`, following redirects through
+memory-manager's `/login?pending=...` form, the admin password, and back
+to Open WebUI's own callback) **completed end to end with no `?error=`**,
+confirming ADR-0011's load-bearing assumption and closing the note's
+previous top open question. Observed (never a token or secret value, only
+shapes - `oauth_clients.client_info`/`oauth_tokens`/`oauth_pending` in
+memory-manager's own Postgres, `user`/`oauth_session` in Open WebUI's
+SQLite):
+
+| Code finding (already established) | Live confirmation |
+|---|---|
+| DCR: `client_name='Open WebUI'`, redirect `{WEBUI_URL}/oauth/clients/mcp:<id>/callback`, `token_endpoint_auth_method=client_secret_post` default (`utils/oauth.py#L503-L645`) | `oauth_clients.client_info` carries exactly this: `client_name="Open WebUI"`, `redirect_uris=["http://localhost:3000/oauth/clients/mcp:memmgr/callback"]`, `token_endpoint_auth_method="client_secret_post"`, and a `client_secret` is present (encrypted at rest, ADR-0004 addendum) |
+| PKCE S256, `resource` from PRM verbatim on `/authorize` (`utils/oauth.py#L862-L877`, `#L776-L797`) | `oauth_pending` (kind `authorize`): `params->>'resource' = 'http://localhost:18081/mcp'` (byte-for-byte the PRM `resource`), a `code_challenge` is set |
+| Discovery via anonymous `initialize` + `WWW-Authenticate` (`utils/oauth.py#L390-L466`) | memory-manager's access log: `POST /mcp` → `401`, immediately followed by `GET /.well-known/oauth-protected-resource/mcp` → `200`, both **before** any `/authorize` call - triggered by saving the tool-server connection, not by a user's own consent click |
+| `client_id` path segment `mcp:<server_id>` is Open WebUI's own lookup key, not the AS-issued `client_id` (unverified before this spike) | Confirmed: the AS-issued `client_id` in `oauth_clients`/`oauth_tokens` is a UUID (`9d3acf46-...`); `mcp:memmgr` only ever appears in Open WebUI's own URLs (`/oauth/clients/mcp:memmgr/{authorize,callback}`) and its SQLite `oauth_session.provider` column |
+| `oauth_session` stores the per-user token server-side, keyed by provider (module docstring, "Auth and identity forwarding") | `oauth_session` (Open WebUI SQLite): one row, `provider='mcp:memmgr'`, `user_id` = the signed-in user, `token` present (460 bytes, encrypted - length only read, never the content) |
+
+### M2 confirmed live: Open WebUI is mislabeled `"claude-code"` in our own audit trail
+
+`_client_label_for` (`src/memory_manager/auth/provider.py:641-647`) labels
+a registered client `"claude-ai"` only if a redirect URI's host is in
+`_CLAUDE_AI_HOSTS`, else `"claude-code"` - there is no third label.
+Live: `oauth_tokens.client_label = 'claude-code'` for the Open WebUI
+connection just completed (redirect host `localhost`, not a claude.ai
+host). This is **not** a WP-42 blocker (ADR-0011 does not depend on the
+label), but every audit entry and `token list` row for an Open WebUI user
+will read "claude-code" until #143/#144 add a real label - tracked there,
+not fixed here.
+
+### UserValves and filter token access (#142's own scope)
+
+A throwaway probe `Filter` function (installed via `POST
+/api/v1/functions/create`, exercised through one `/api/chat/completions`
+turn, then deleted via `DELETE /api/v1/functions/id/<id>/delete` - the
+code never left `/tmp`, per this task's Blast-Radius) observed, live:
+
+- `__user__` is a flat dict with (among others) `id`, `email`, `role`,
+  `oauth`, `settings` and `valves` as top-level keys - confirming
+  "Functions/Filters/Valves"'s existing claim.
+- Setting a `UserValves` field through `POST
+  /api/v1/functions/id/<id>/valves/user/update` round-trips, **in
+  plaintext**, as `user.settings->'functions'->'valves'->'<function_id>'`
+  in Open WebUI's own database (confirmed by reading the row directly:
+  `{"functions": {"valves": {"probe_wp42": {"marker": "hello-from-probe"}}}}`)
+  - `ENABLE_VALVE_ENCRYPTION` was not set (default `false`, `env.py:767`),
+    matching the code finding; the Fernet-encrypted case
+    (`ENABLE_VALVE_ENCRYPTION=true`) was not re-run live in this spike
+    (a second `openwebui-data` volume lifecycle for one already-settled
+    code citation), so that half stays a code finding
+    (`utils/valves.py#L13-L25`), not a live one.
+  - The same resolved `UserValves` instance is *also* available as
+    `__user__["valves"]` (a typed object, `marker='hello-from-probe'`
+    observed directly) - the two paths coexist: `__user__["valves"]` is
+    the per-function, already-resolved view; `__user__["settings"]` is
+    the raw, persisted JSON every other function (and, unencrypted, every
+    DB reader) can see too.
+- `__oauth_token__` was `None` in both `inlet` and `outlet` for the user
+  who just completed the `mcp:memmgr` OAuth connection - confirming
+  `get_system_oauth_token` filters out `mcp:` sessions
+  (`utils/tools.py`/`utils/middleware.py#L3796-L3826`).
+- The undocumented internal path **does** reach the MCP token:
+  `__request__.app.state.oauth_client_manager.get_oauth_token(__user__["id"], "mcp:memmgr")`
+  returned a non-`None` value inside `inlet` (checked as a boolean only,
+  never logged) - confirming code finding 4's "undocumented" internal API
+  actually works, not merely that it exists in source.
+
+### Owner hints for #143/#144/#155 (not decided here)
+
+- **(a)** A filter could fetch the MCP token through the internal API
+  above instead of requiring a personal token pasted into `UserValves`
+  (ADR-0011 Option A's "Filter" half) - demonstrated reachable, not
+  evaluated as a design option; ADR-0011 already reserves that choice to
+  the owner.
+- **(b)** UserValves are plaintext by default and readable by every
+  function with access to `__user__["settings"]`, confirmed live above -
+  docs for #155 must say plainly that `ENABLE_VALVE_ENCRYPTION=true` is
+  required before any function stores something sensitive in a
+  `UserValves` field (a personal memory-manager token, for instance).
+
+### Predicted AS mismatches for #143/#144 (ADR-0004/ADR-0009 vs. Open WebUI's client)
+
+| # | Mismatch | Status |
+|---|---|---|
+| M1 | Issuer/network: our SDK rejects a non-`https`, non-loopback issuer | **Resolved for this spike** by the shared network namespace above; **#154** (Helm/production) needs `https://` instead, not this workaround |
+| M2 | `_client_label_for` has no "Open WebUI" label | **Resolved in #143** - `_client_label_for` now also returns `"openwebui"` for a DCR client registered as `client_name="Open WebUI"` with a `/oauth/clients/<id>/callback` redirect (`provider.py`'s `_OPENWEBUI_CLIENT_NAME`/`_OPENWEBUI_CALLBACK_PATH_RE`), confirmed live by `tests/auth/test_openwebui_client.py` |
+| M3 | Refresh-token replay detection revokes the whole family (`provider.py:519-527`) on reuse, while Open WebUI refreshes without a lock 5 minutes before expiry on every request (`utils/oauth.py#L1060-L1180`) | **Owner decision 2026-10-10: option A** - rotation with family revocation stays for every client (ADR-0004 unchanged); no grace window (RFC 9700 §4.14.2 and OAuth 2.1 draft-16 §4.3.1 require replay detection only for public clients and mention no tolerance). An affected Open WebUI user occasionally reconnects; revisit with a grace window only if operation shows it. `tests/auth/test_openwebui_client.py` observes the sequential-replay outcome |
+| M4 | A server-side preflight `GET /authorize` (no redirect follow) could leave an orphan `oauth_pending` row per admin click, and every Open WebUI user shares one egress IP against our `oauth_limiter` (`http.py:160,1005-1007`) | **Partially confirmed**: the anonymous-`initialize`-plus-discovery preflight on `/mcp` (above) is real and happens on every connection save, but this spike's own `/authorize` call always completed (no abandoned `oauth_pending` row observed after a successful run); the shared-egress-IP rate-limit bucket is unchanged by #143 - its keying/sizing is **tracked in #154/#155** |
+| M5 | `LOGIN_MODE=password` has exactly one subject (`login_password.py#L100-L104`) | **Resolved in #313** - see "#313: two real subjects per backend, via the mock IdP" below; #143's own two-user test (`tests/auth/test_openwebui_client.py`) had already covered this at the unit level with `FakeAuthenticator.subject`/`namespaces` |
+| M6 | `store.revoke_token_row`/`exchange_refresh_token`'s check-then-act (load the refresh token, check `revoked`, only then write `revoked_at`) is a narrower concurrency gap than M3's *sequential* replay: two genuinely simultaneous `/token` refresh calls presenting the same refresh token could both pass the check before either writes, minting two valid pairs from one token without tripping replay detection | **fixed in #310** - `revoke_token_row` is now a conditional, atomic `UPDATE ... WHERE revoked_at IS NULL RETURNING ...`, run in the same transaction as the winner's new pair (`exchange_refresh_token`); a losing concurrent caller is treated exactly like a replay (family revoked, `invalid_grant`). `tests/auth/test_oauth_flow.py::test_concurrent_refresh_with_the_same_token_exactly_one_succeeds` exercises the real race against Postgres |
+
+None of the above broke ADR-0011's load-bearing assumption (the AS
+accepting Open WebUI's DCR request and completing the per-user OAuth
+dance) - no STOP/Gate condition from this task's contract was triggered.
+
+### #314: a scripted native MCP tool call, deterministic and read back
+
+Driven live against the same pinned stack with the admin user `connect`
+already completed (above): `tests/e2e/openwebui_driver.py chat` ran one
+turn through `tests/e2e/stubs/scripted_model.py`'s own
+`live-script.json` (a throwaway file written into the already read-only
+mounted `tests/e2e/stubs` directory for this run only, then removed - it
+never belongs to the deliverable, the driver/stub code does), scripted to
+call `memmgr_memory_search` and then give a text reply. Tested version:
+0.11.4 throughout.
+
+- **`url` vs `path` (load-bearing fix):** `connect_mcp_server`
+  (`utils/middleware.py`) builds the Streamable HTTP client from
+  `mcp_server_connection.get('url', '')` **verbatim** and never reads
+  `path` at all - confirmed by reading the function, not inferred.
+  `url=http://localhost:18081` (the resource server's origin alone, the
+  spike's own `configure_tool_server` shape before this fix) makes every
+  tool-server request `POST /` - memory-manager's own router has no route
+  there, so the SDK (or Starlette underneath it) answers `404`, logged at
+  debug level only (`connect_mcp_server`'s `except Exception: log.debug`),
+  and the chat simply ends with no tools and no visible error anywhere a
+  caller would look first. `url=http://localhost:18081/mcp` fixed it
+  live, confirmed by memory-manager's own access log showing
+  `"POST /mcp HTTP/1.1" 200` (initialize, `tools/list` and `tools/call`
+  in sequence) instead of a `404` on `/`. `ToolServerConnection.path` is
+  still sent (`"mcp"`, a required Pydantic field, v0.11.4), but is dead
+  weight for MCP connections - OpenAPI connections are the only ones that
+  still read it.
+- **`stream: true` + `chat_id` + `id`, no `session_id` (load-bearing
+  shape):** `main.py`'s `chat_completion` only takes the per-model
+  fan-out/WebSocket branch when `metadata.get('session_id') and
+  metadata.get('chat_id')` are both set; omitting `session_id` routes a
+  single-model request straight into the synchronous `process_chat` call
+  instead. With `stream: false` the response carries `tool_calls` verbatim
+  with no further processing - confirmed live: the stub's scripted
+  `tool_calls` turn came back unexecuted, `finish_reason: "tool_calls"`,
+  nothing written to the chat. With `stream: true` plus `chat_id`/`id`,
+  `process_chat_response` takes `streaming_chat_response_handler`'s
+  `if event_emitter:` branch (an event emitter only needs `chat_id` +
+  `message_id`, never `session_id` - a `event_caller`, which direct/client
+  tools and the Pyodide interpreter need, is the one thing that does
+  require `session_id`, and MCP tools never use it) and runs the full
+  native tool loop there, synchronously awaited.
+- **The `200 null` response (and why `GET /chats/{id}` is the only way to
+  read the result back):** `streaming_chat_response_handler`'s own inner
+  `response_handler` coroutine has no `return` statement, so `return await
+  response_handler(...)` yields `None`, which `chat_completion`'s
+  "Legacy/direct: single model, synchronous" branch returns as-is;
+  FastAPI serializes that as a `200` response with the literal JSON body
+  `null`. Confirmed live - `tests/e2e/openwebui_driver.py chat`'s
+  `/api/chat/completions` call returns `200`/`null` every time, and the
+  tool result only ever shows up in the subsequent `GET
+  /api/v1/chats/{chat_id}` call, under
+  `chat.history.messages[<assistant id>].output`, as one or more
+  `{"type": "function_call_output", "call_id": ..., "output": [{"type":
+  "input_text", "text": ...}], "status": "completed"}` items -
+  `streaming_chat_response_handler`'s own DB write (inside the awaited
+  `response_handler`) happens *before* the `200 null` response returns,
+  so no polling or retry was needed to read it straight back in the same
+  script.
+- **`access_grants` must be set on the very first `configure_tool_server`
+  call:** `set_tool_servers_config` (`routers/configs.py`) replaces
+  `tool_server.connections` wholesale and re-registers the OAuth client
+  from scratch on every `POST`, there is no "patch just the grants"
+  endpoint - so a driver that configures the connection once without
+  `config.access_grants` and tries to add it later would have to redo the
+  whole DCR dance. `has_connection_access`
+  (`utils/access_control/__init__.py`) already falls back to "private,
+  admin-only" without any grants, so the single admin user this task's
+  own Definition of Done needs was never actually blocked by the missing
+  grants - this fix matters once #144 adds a second, non-admin user, not
+  for #314 itself.
+- **Live result:** `function_call_outputs` on the read-back assistant
+  message carried exactly one `function_call_output` item, `status:
+  "completed"`, `output: [{"type": "input_text", "text": "{\n
+  \"results\": [],\n  \"mode\": \"fulltext\"\n}"}]` (the scripted-model's
+  memory vault is empty in this stack, so an empty hit list is the
+  correct answer) - **not** "Tool … not found" or any other failure
+  shape, confirming #314's own Definition of Done.
+
+### #313: two real subjects per backend, via the mock IdP
+
+M5 above ("Predicted AS mismatches") tracked this as open: `LOGIN_MODE=
+password` has exactly one subject, so a second *real* one needs
+`LOGIN_MODE=oidc` (git backend) or `LOGIN_MODE=entra` (postgres backend,
+since `me` only exists there, ADR-0008) plus a mock IdP. Both now exist as
+overlays on top of `deploy/openwebui/docker-compose.yml` -
+`oidc-git-overlay.yml` and `postgres-entra-overlay.yml`, brought up with
+`scripts/openwebui-up.sh <overlay path>` (or `make openwebui-up
+OPENWEBUI_EXTRA_COMPOSE_FILES=...`) - driven live, each reached two
+distinct `oauth_tokens.subject` rows for memory-manager's own embedded AS:
+
+- **git/OIDC**: `tests/mock_idp` joins memory-manager's own network
+  namespace (same loopback-issuer reasoning as `open-webui` above) and now
+  advertises a `userinfo_endpoint`, backed by a plain `access_token ->
+  (tid, oid)` map recorded on every authorization-code grant -
+  `auth.login_oidc.OidcAuthenticator` calls it and reads `sub` back as
+  `oid` verbatim (deliberately *not* the ID token's own pairwise `sub`,
+  which exists only for the Entra claim shape). Two mock users plus one
+  `openwebui-git-client` OIDC client were registered through the mock's
+  own `/_mock/` control API (`_register_entra_client`/`_create_entra_user`/
+  `_select_signin`'s own shapes in `tests/e2e/test_erasure.py`), and
+  `tests/e2e/openwebui_driver.py`'s existing `_complete_login_page`
+  interstitial hook - unmodified - carried each one through memory-manager's
+  `/login` all the way to the mock's `/authorize` and back, since it
+  already stops following redirects the moment `/login` is left behind.
+  Verified directly against Postgres: two `oauth_tokens` rows,
+  `subject` = `openwebui-git-user-a`/`openwebui-git-user-b`.
+- **postgres/Entra**: the same mock, same network-namespace trick, a
+  `db-role-init` one-shot (`psql -f`, waited for by
+  `scripts/openwebui-up.sh`'s own new phase 1b, *before* memory-manager
+  ever starts) creates `DATABASE_APP_ROLE=mm_app` and grants it to the
+  base file's own `POSTGRES_USER=mm` - `db.rls.check_app_role`'s startup
+  membership check needs exactly that. Two mock users (role
+  `Memory.User`) signed in the same way; verified directly against
+  Postgres: two `oauth_tokens` rows (`openwebui-pg-user-a`/`-b`) and two
+  `users` rows with those same `oid`s and `tid=openwebui-pg`.
+- Every IdP-specific value (issuer, tenant id, client id/secret, the OIDC
+  subject allowlist, the namespace map) lives in a generated, gitignored
+  `deploy/openwebui/.env-oidc-entra`, not in either overlay's own YAML -
+  not only because the client secrets are genuinely sensitive, but because
+  an OIDC issuer's own multi-segment shape is a token
+  `scripts/check-deploy-placeholders.sh` cannot tell apart from an
+  operator's own hostname (confirmed live: it rejected the literal before
+  this move, and passes afterwards).
+- `scripts/openwebui-up.sh` now takes any number of extra compose file
+  arguments and reads back which services actually exist in the merged
+  config (`compose ... config --services`) rather than hard-coding one
+  fixed list - an overlay's own one-shots/long-running services are waited
+  for the same way the base file's always were. `make openwebui-down`
+  takes the same `OPENWEBUI_EXTRA_COMPOSE_FILES` make variable. The
+  default, overlay-free stack (`make openwebui-up`) was re-verified
+  unchanged after all of the above.
+- One cosmetic, non-fatal finding: podman-compose 1.3 re-attempts creating
+  an already-running `postgres` as `db-role-init`'s/`memory-manager`'s own
+  `depends_on` dependency even when `postgres` is not in the `up` command's
+  own argument list, logging a harmless "container name ... already in
+  use" line - the stack still reaches `OK: all services healthy` every
+  time (confirmed across several from-clean runs); this script's own
+  polling loop is what actually decides pass/fail, never that command's
+  exit status.
+
+### #144: `scripted_model.py`'s turn index never reaches 2 under the
+### Responses-API tool loop - one tool call per chat, not several in a row
+
+Driven live against both overlays (`tests/e2e/clients/test_openwebui.py`,
+`-k isolation`), scripting two tool calls in one chat (`memory_write` then
+`memory_search`, as the module docstring's original shape had it) reliably
+reproduced a `500` from `POST /api/chat/completions`, every time, both
+backends:
+
+- `scripted_model.py`'s `_turn_index` counts `role == "assistant"` entries
+  in the request's own `messages` list - the shape #314's own *single*
+  scripted tool call never exercised past one round trip. Live inspection
+  of `messages` on each successive call (a throwaway `print`, reverted,
+  never shipped) showed Open WebUI 0.11.4's Responses-API tool loop
+  (`utils/middleware.py`'s `while tool_calls: ...`) appending exactly one
+  `"assistant"` entry for the *whole* turn, then one `"tool"` entry per
+  executed call, on every iteration - never a second `"assistant"` entry.
+  `_turn_index` therefore gets stuck at `1` forever once a script has more
+  than one tool-call turn: the stub keeps replaying script index 1 (the
+  *second* scripted turn) instead of ever reaching the final `{"content":
+  ...}` turn that would end the loop.
+- Open WebUI's own loop has no backoff between iterations (`tool_call_
+  iterations`, apparently unbounded here) - it re-dials `connect_mcp_server`
+  and re-issues the same `tools/call` roughly every 28ms. `RATE_LIMIT_
+  MCP_BURST` (default 30, `config.py`) is what actually stops it live,
+  with a `429` on the 31st `POST /mcp` - which Open WebUI's own request
+  task then answers with a plain `500` (`asyncio.exceptions.CancelledError`
+  inside `streaming_chat_response_handler`), not any clean per-item error
+  shape a caller could branch on. `RATE_LIMIT_OAUTH_BURST` (already raised
+  by both overlays) is a different limiter and does not help here.
+- **Fix, within this task's own scope:** one tool call per chat, never
+  two in a row - `tests/e2e/clients/test_openwebui.py`'s own `_run_single_
+  tool_call` opens a fresh chat (fresh `messages`, `turn_index` starts at
+  `0` again) for every scripted tool call, confirmed live to pass for both
+  backends. `scripted_model.py` itself is unchanged - its own `_turn_index`
+  scheme is still correct for the one-tool-call-per-chat shape #314 already
+  proved, and fixing the counter to track something Open WebUI actually
+  increments (if that exists at all for this code path) is **not** this
+  task's own Blast-Radius.
+- **Relevant for #146/#150/#156:** any future script driving *more than
+  one* tool-calling round through Open WebUI 0.11.4's current code must
+  either stay one-tool-call-per-chat (this task's own workaround) or give
+  `scripted_model.py` a different turn-tracking signal first - scripting
+  two-plus rounds in one chat will reproduce the same stuck-at-1 loop,
+  not a model/version-specific flake.
+
 ## Open questions
 
-- Does our DCR endpoint accept `token_endpoint_auth_method=client_secret_post` with `client_name='Open WebUI'`? This needs a live test against v0.11.4.
-- Are OAuth 2.1 modes offered for **OpenAPI** connections, or only for MCP? (unverified)
-- Which auth modes do user-level direct OpenAPI servers support? (unverified)
-- What tool name length or schema features does each model provider accept with the `<server_id>_` prefix? We should keep server ids and tool names short. (unverified)
-- In which version was `FORWARD_USER_INFO_HEADER_JWT_SECRET` introduced? It is present at v0.11.4 but has no CHANGELOG entry. (unverified)
-- For B with Entra: does adding a custom API scope to `MICROSOFT_OAUTH_SCOPE` break Open WebUI features that call Graph with that token? (unverified)
-- For `system_oauth`, which token does Open WebUI pick when a user has several OAuth sessions or providers? The code prefers the `oauth_session_id` cookie and falls back to the most recent session.
+None of the following blocks WP-42 … WP-46: ADR-0011 already picked
+Option A (per-user OAuth 2.1 for tools, personal tokens for the filter),
+which is the one path this spike had to prove and did (see "Spike
+results" above). Every remaining question below belongs to a path ADR-0011
+left for a later ADR (B, C) or to a provider-specific detail no planned
+WP depends on; each line says why.
+
+- **Resolved, live:** does our DCR endpoint accept `token_endpoint_auth_method=client_secret_post` with `client_name='Open WebUI'`? Yes - Tested version: 0.11.4, see "Spike results" above (`tests/e2e/openwebui_driver.py connect` completed with no `?error=`).
+- Are OAuth 2.1 modes offered for **OpenAPI** connections, or only for MCP? (still unverified) - blocks WP-4x: no, Option A only ever uses the MCP connection; OpenAPI is not part of any WP-42 … WP-46 task.
+- Which auth modes do user-level direct OpenAPI servers support? (still unverified) - blocks WP-4x: no, same reason.
+- What tool name length or schema features does each model provider accept with the `<server_id>_` prefix? (still unverified) - blocks WP-4x: no for WP-42 (this spike kept `server_id` to 6 characters, `memmgr`, well under the 47-character budget the existing "MCP support" table already derived); a concrete provider-by-provider limit is only relevant once #146/#150 run real models against real providers.
+- In which version was `FORWARD_USER_INFO_HEADER_JWT_SECRET` introduced? (still unverified) - blocks WP-4x: no, it is ADR-0011 Option C's mechanism, explicitly deferred to its own future ADR.
+- For B with Entra: does adding a custom API scope to `MICROSOFT_OAUTH_SCOPE` break Open WebUI features that call Graph with that token? (still unverified) - blocks WP-4x: no, Option B (`system_oauth`) is deferred to ADR-0006 §8's resource-server mode, not part of WP-42 … WP-46.
+- For `system_oauth`, which token does Open WebUI pick when a user has several OAuth sessions or providers? (code-level answer only: prefers the `oauth_session_id` cookie, falls back to the most recent session) - blocks WP-4x: no, same reason as the previous line.
+- M3 (refresh-token replay vs. Open WebUI's lock-free early refresh) and M4's shared-egress-IP rate-limit bucket - both code findings only (see "Predicted AS mismatches" above); not re-opened as questions here, but #143/#144 must read that table before changing `provider.py`/`http.py`.
 
 ## Sources
 
@@ -178,5 +532,14 @@ Recommendation for evaluation, not a decision: **A** is the only option that fit
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/utils/middleware.py
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/env.py
 - https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/memories.py
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/configs.py (spike, 2026-10-10: `/oauth/clients/register`, `/tool_servers`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/functions.py (spike, 2026-10-10: `/create`, `/id/{id}/update`, `/id/{id}/valves/user/update`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/auths.py (spike, 2026-10-10: `/signup`, `/add`, `/signin`, `create_session_response`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/routers/chats.py (spike, 2026-10-10: `/new`, `GET /{id}`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/models/chats.py (spike, 2026-10-10: `ChatForm`, `ChatResponse`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/main.py (spike, 2026-10-10: `/api/chat/completions`, `chat_completion`, `process_chat`)
+- https://github.com/open-webui/open-webui/blob/v0.11.4/backend/open_webui/utils/access_control/__init__.py (spike, 2026-10-10: `has_access`, `has_connection_access`)
+- memory-manager's own `.venv` at `mcp==2.3.0` (`uv.lock`): `mcp/server/auth/routes.py` `validate_issuer_url` (spike, 2026-10-10)
+- `podman_compose.py` (Debian package `podman-compose` 1.3.0, `/usr/lib/python3/dist-packages/podman_compose.py`): `get_net_args_from_network_mode` (spike, 2026-10-10)
 - https://github.com/open-webui/mcpo
 - https://github.com/open-webui/helm-charts/blob/main/charts/open-webui/Chart.yaml

@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -10,6 +10,20 @@ LOADTEST_REPLICAS ?= 1
 LOADTEST_KILL_AFTER ?=
 LOADTEST_SHARED_STATE ?= postgres
 LOADTEST_EMBEDDINGS ?= none
+
+# Open WebUI local stack (#141, WP-42) - see docs/research/clients/openwebui.md
+# "Versions and deployment" for how this was pinned and re-verified.
+OPENWEBUI_VERSION ?= 0.11.4
+export OPENWEBUI_VERSION
+
+# #313 (WP-42): extra compose files (relative to the repo root, space-
+# separated) layered on top of deploy/openwebui/docker-compose.yml - e.g.
+# `make openwebui-up OPENWEBUI_EXTRA_COMPOSE_FILES="deploy/openwebui/oidc-git-overlay.yml"`.
+# Empty by default, so a plain `make openwebui-up`/`make openwebui-down`
+# keeps today's behaviour unchanged. `openwebui-down` needs the *same*
+# value a matching `openwebui-up` call used - see docker-compose.yml's own
+# "mock-idp"/"db-role-init" services, which otherwise never get torn down.
+OPENWEBUI_EXTRA_COMPOSE_FILES ?=
 
 fmt:
 	uv run ruff format .
@@ -133,3 +147,16 @@ up:
 
 down:
 	podman compose down -v
+
+# Local Open WebUI stack (#141, WP-42): memory-manager, Postgres/pgvector, a
+# scripted stub chat model and Open WebUI itself, pinned at OPENWEBUI_VERSION
+# - see deploy/openwebui/docker-compose.yml and scripts/openwebui-up.sh.
+# Ollama (the `ollama` compose profile) is left out of both - opt-in only,
+# see docker-compose.yml's header comment.
+openwebui-up:
+	scripts/openwebui-up.sh $(OPENWEBUI_EXTRA_COMPOSE_FILES)
+
+openwebui-down:
+	podman compose -f "$$(pwd)/deploy/openwebui/docker-compose.yml" \
+		$(foreach f,$(OPENWEBUI_EXTRA_COMPOSE_FILES),-f "$$(pwd)/$(f)") \
+		-p mm-openwebui --profile ollama down -v

@@ -31,7 +31,12 @@ deletes) a refresh token on its first use, so a second presentation of the
 exact same token is recognized here as a replay - not a "token not found" -
 and revokes the whole `family_id` (every access and refresh token the grant
 has ever produced), per ADR-0004's "rotating refresh with family
-revocation".
+revocation". This also covers two concurrent presentations of the same
+token (#310): `revoke_token_row`'s `UPDATE ... WHERE revoked_at IS NULL`
+is the actual decision point, not the `token.revoked` flag read earlier at
+`load_refresh_token` time, so exactly one of the two concurrent callers gets
+`True` back and issues the new pair; the other gets `False` and is treated
+here exactly like a replay, including the family revocation.
 
 `get_client` also carries CIMD (#38): when `cimd_fetcher` is given and
 `client_id` is an https URL, the SDK's registered-client lookup
@@ -58,6 +63,7 @@ intersected with the supported set rather than trusted outright.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -65,6 +71,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import asyncpg
+import asyncpg.pool
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
@@ -92,6 +99,13 @@ _logger = logging.getLogger(__name__)
 
 _REFRESH_TOKEN_PREFIX = "mmr_"  # noqa: S105 - a format marker, not a credential
 _TOKEN_ENTROPY_BYTES = 32
+
+#: A pool or a caller-held connection - the same `_Queryable` idiom `auth.store`/
+#: `memory_manager.search` already use. `_issue`'s own `conn` parameter below takes
+#: this: `exchange_refresh_token` passes the connection of its own transaction (#310),
+#: everyone else (the authorization-code exchange, which has no analogous race) just
+#: lets it default to `self._pool`.
+_Queryable = asyncpg.Pool | asyncpg.pool.PoolConnectionProxy | asyncpg.Connection
 
 _DEFAULT_SCOPES = (READ_SCOPE, WRITE_SCOPE)
 
@@ -133,6 +147,19 @@ ENTRA_GRAPH_UNAVAILABLE_MARKER = "entra refresh check: graph is temporarily unav
 #: Claude Code's loopback redirect; `_client_label_for` reads this to decide the committer
 #: identity a write through that client's tokens uses (`mcp/server.py`'s `current_client`).
 _CLAUDE_AI_HOSTS = frozenset({"claude.ai", "claude.com"})
+
+#: Open WebUI's DCR `client_name` (`docs/research/clients/openwebui.md`'s spike, #142,
+#: `open_webui/utils/oauth.py` v0.11.4, L517-538) - `_client_label_for` only trusts this
+#: together with `_OPENWEBUI_CALLBACK_PATH_RE` below, since a `client_name` alone is an
+#: unauthenticated, client-supplied string any DCR caller could send.
+_OPENWEBUI_CLIENT_NAME = "Open WebUI"
+
+#: The path shape of Open WebUI's own OAuth callback, `/oauth/clients/<id>/callback`
+#: (`<id>` is Open WebUI's own connection key, for example `mcp:memmgr` - unrelated to
+#: our AS-issued `client_id`). Matched against a registered redirect URI's path, never
+#: against the scheme/host (`_CLAUDE_AI_HOSTS`'s claude.ai/claude.com check already
+#: covers that distinction and keeps priority over this one).
+_OPENWEBUI_CALLBACK_PATH_RE = re.compile(r"^/oauth/clients/[^/]+/callback$")
 
 
 class _AuthorizationCode(AuthorizationCode):
@@ -567,20 +594,42 @@ class MemoryManagerOAuthProvider(
                         error="invalid_grant", error_description=ENTRA_GRAPH_UNAVAILABLE_MARKER
                     )
 
-        await store.revoke_token_row(self._pool, token.token, "refresh")
-        return await self._issue(
-            client_id=client.client_id,
-            subject=token.subject,
-            namespaces=token.namespaces,
-            scopes=scopes or token.scopes,
-            resource=token.resource,
-            family_id=token.family_id,
-            client_label=token.client_label,
-            user_oid=token.user_oid,
-            roles=token.roles,
-            # Carried forward unchanged, never recomputed - the family's session start
-            # (ADR-0006 §5's `ENTRA_MAX_SESSION`, #216) must survive every rotation.
-            family_started_at=token.family_started_at,
+        # #310: rotation and issuance of the new pair share one transaction, so the row
+        # lock `revoke_token_row`'s `UPDATE` takes on the old refresh token is held until
+        # the new pair's `save_token` calls below have committed too - not just until the
+        # `UPDATE` itself returns. A concurrent loser's own `revoke_token_row` call blocks
+        # on that same row and only unblocks once this transaction commits or rolls back,
+        # so by the time it falls through to `revoke_family` below, the winner's new pair
+        # already exists to be caught by it (see `store.revoke_token_row`'s docstring).
+        async with self._pool.acquire() as conn, conn.transaction():
+            won = await store.revoke_token_row(conn, token.token, "refresh")
+            if won:
+                return await self._issue(
+                    client_id=client.client_id,
+                    subject=token.subject,
+                    namespaces=token.namespaces,
+                    scopes=scopes or token.scopes,
+                    resource=token.resource,
+                    family_id=token.family_id,
+                    client_label=token.client_label,
+                    user_oid=token.user_oid,
+                    roles=token.roles,
+                    # Carried forward unchanged, never recomputed - the family's session
+                    # start (ADR-0006 §5's `ENTRA_MAX_SESSION`, #216) must survive every
+                    # rotation.
+                    family_started_at=token.family_started_at,
+                    conn=conn,
+                )
+        # Lost the race against a concurrent refresh of this same token - it was revoked
+        # between our `load_refresh_token` and this conditional `UPDATE` (`token.revoked`
+        # above was still `False` when we loaded it: `revoke_token_row`'s `revoked_at is
+        # null` guard is the only thing that actually decides a winner, at the database
+        # level). Treated exactly like a replay: the whole family is now distrusted,
+        # including the pair the winner's transaction just committed.
+        await store.revoke_family(self._pool, token.family_id)
+        raise TokenError(
+            error="invalid_grant",
+            error_description="refresh token was already used; the grant has been revoked",
         )
 
     # ---- access -------------------------------------------------------------
@@ -614,7 +663,13 @@ class MemoryManagerOAuthProvider(
         user_oid: str | None = None,
         roles: list[str] | None = None,
         family_started_at: datetime | None = None,
+        conn: _Queryable | None = None,
     ) -> OAuthToken:
+        """`conn` defaults to `self._pool` - `exchange_refresh_token` passes its own
+        transaction's connection instead (#310), so these `save_token` calls land in the
+        same transaction as the `revoke_token_row` that decided this caller won the race,
+        keeping that row's lock held until the new pair is committed too."""
+        conn_or_pool = conn if conn is not None else self._pool
         access = OAUTH_ACCESS_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         refresh = _REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_ENTROPY_BYTES)
         # ADR-0006 §5, #216: "Entra mode only" - a token with no `user_oid` is a
@@ -626,7 +681,7 @@ class MemoryManagerOAuthProvider(
             (refresh, "refresh", _REFRESH_TOKEN_TTL),
         ):
             await store.save_token(
-                self._pool,
+                conn_or_pool,
                 token,
                 kind=kind,
                 client_id=client_id,
@@ -651,9 +706,20 @@ class MemoryManagerOAuthProvider(
 
 
 def _client_label_for(client: OAuthClientInformationFull) -> str:
-    """`"claude-ai"` if any registered redirect URI points at claude.ai/claude.com, else
-    `"claude-code"` (`vault.repo.author_for`'s two machine-client identities, #36 step 7)."""
+    """`"claude-ai"` if any registered redirect URI points at claude.ai/claude.com,
+    `"openwebui"` if the client registered as `client_name="Open WebUI"` with a redirect
+    URI shaped like its own `/oauth/clients/<id>/callback` callback, else `"claude-code"`
+    (`vault.repo.author_for`'s three machine-client identities, #36 step 7 / #143).
+
+    The claude.ai host check keeps priority: a client's `client_name` is unauthenticated,
+    client-supplied input, so it only ever narrows the fallback branch, never the one
+    already tied to a redirect host.
+    """
     for redirect_uri in client.redirect_uris or ():
         if urlsplit(str(redirect_uri)).hostname in _CLAUDE_AI_HOSTS:
             return "claude-ai"
+    if client.client_name == _OPENWEBUI_CLIENT_NAME:
+        for redirect_uri in client.redirect_uris or ():
+            if _OPENWEBUI_CALLBACK_PATH_RE.match(urlsplit(str(redirect_uri)).path):
+                return "openwebui"
     return "claude-code"

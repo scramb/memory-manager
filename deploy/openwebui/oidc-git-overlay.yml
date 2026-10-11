@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Overlay for #313 (WP-42): proves the git backend's OIDC login
+# (`LOGIN_MODE=oidc`) against the mock IdP (`tests/mock_idp`), instead of
+# docker-compose.yml's own default `LOGIN_MODE=password` (which M5 in
+# docs/research/clients/openwebui.md's "Spike results" notes has exactly
+# one subject). Apply together with the base file - `scripts/openwebui-up.sh`
+# does this when given this overlay's path as an argument, or by hand:
+#
+#   podman compose -f "$(pwd)/deploy/openwebui/docker-compose.yml" \
+#     -f "$(pwd)/deploy/openwebui/oidc-git-overlay.yml" -p mm-openwebui up -d
+#
+# `mock-idp` joins memory-manager's own network namespace, the same
+# reasoning docker-compose.yml's own `open-webui` service already gives for
+# sharing it (the SDK's issuer check only accepts `https` or loopback - see
+# that file's "Networking" comment) - its host-facing port is published on
+# memory-manager's own `ports:` list instead (podman rejects declaring
+# `ports:` together with `network_mode`), appended to that list (confirmed
+# live: podman-compose 1.3 appends, not replaces, a service's own `ports:`
+# across `-f` files).
+#
+# The actual IdP values (issuer, client id/secret, the subject allowlist,
+# the namespace map) live in `.env-oidc-entra`, generated once by
+# `scripts/openwebui-up.sh` next to this file (never committed) - not
+# because any of them but the client secret is sensitive, but because the
+# issuer URL's own multi-segment shape (`tests/mock_idp/app.py`'s own
+# `_issuer`) is a literal `scripts/check-deploy-placeholders.sh` reads
+# indistinguishably from an operator hostname and rejects (it only reads
+# `*.yaml`/`*.yml`/`*.md`/`*.tpl` under `deploy/`, so a file with neither
+# suffix never reaches that check at all).
+services:
+  mock-idp:
+    build: ../..
+    image: memory-manager:dev
+    network_mode: "service:memory-manager"
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "10001:10001"
+    working_dir: /opt
+    # Run from the already-built memory-manager image (ADR-0001's venv
+    # already carries Starlette/uvicorn) rather than a second image -
+    # `tests/mock_idp` mounted read-only at `/opt/mock_idp` so this imports
+    # as the top-level package `mock_idp` (`python3 -m mock_idp`); the
+    # standalone kind-E2E image (`tests/mock_idp/Containerfile`) instead
+    # mounts the whole `tests` tree and runs the package under its original,
+    # dotted import path - a module path written out with its separator dot
+    # in plain text here would be exactly the kind of token the placeholder
+    # check cannot tell apart from an operator hostname, so this overlay
+    # avoids it by mounting under a different, dot-free name instead.
+    command: ["python3", "-m", "mock_idp", "--host", "0.0.0.0", "--port", "18082"]
+    environment:
+      # Both the browser/driver and memory-manager's own backend reach the
+      # issuer through this same loopback origin (docker-compose.yml's own
+      # "Networking" reasoning, shared namespace) - without this override
+      # the mock derives its issuer from each request's own `Host` header,
+      # which differs between the two callers.
+      MOCK_IDP_ISSUER_BASE: http://localhost:18082
+    volumes:
+      - ../../tests/mock_idp:/opt/mock_idp:ro
+      - ../../scripts/http-healthcheck.py:/healthcheck.py:ro
+    depends_on:
+      memory-manager:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python3", "/healthcheck.py", "http://127.0.0.1:18082/_mock/health"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  memory-manager:
+    environment:
+      LOGIN_MODE: oidc
+      # Raised from the embedded AS's own default (docs/research/clients/
+      # openwebui.md's M4): two users' worth of DCR preflight + consent +
+      # token calls, all from Open WebUI's one shared egress IP, comes
+      # close to the default burst within one `RATE_LIMIT_OAUTH_BURST`
+      # window.
+      RATE_LIMIT_OAUTH_BURST: "20"
+    env_file:
+      - path: .env-oidc-entra
+        required: true
+    ports:
+      - "127.0.0.1:18082:18082"
+
+  open-webui:
+    environment:
+      # Without this, a non-admin user's chat gets "Model not found"
+      # (docs/research/clients/openwebui.md's own Open WebUI finding) -
+      # the admin-only default model-access list never includes a second,
+      # just-added local user.
+      BYPASS_MODEL_ACCESS_CONTROL: "true"

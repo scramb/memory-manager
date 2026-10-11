@@ -25,3 +25,26 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Open WebUI local stack (#141, WP-42) - scripts/openwebui-up.sh creates
+# this with a random WEBUI_SECRET_KEY on first run; never committed (it is
+# the per-deployment secret OAuth tokens get encrypted with, see
+# deploy/openwebui/docker-compose.yml's header comment).
+deploy/openwebui/.env
+
+# Same stack's own AS secrets (#142): an argon2id admin password hash plus
+# a Fernet client-secret encryption key, and the plaintext admin password
+# the headless e2e driver logs in with - never committed, see
+# deploy/openwebui/docker-compose.yml's header comment.
+deploy/openwebui/.env-memory-manager
+deploy/openwebui/.admin-password
+
+# oidc-git-overlay.yml/postgres-entra-overlay.yml's own secrets (#313,
+# WP-42): the mock IdP's client secrets plus the issuer/authority/tenant
+# values that go with them - never committed, see either overlay's own
+# header comment.
+deploy/openwebui/.env-oidc-entra
+
+# Live e2e run artefact (WP-42): scripted_model.py writes the captured
+# live-mode script here for replay; never committed, see tests/e2e/stubs/scripted_model.py.
+tests/e2e/stubs/live-script.json
