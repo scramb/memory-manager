@@ -71,6 +71,7 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import asyncpg
 import mcp_types
@@ -127,6 +128,10 @@ from memory_manager.importers.chatgpt import collect as collect_chatgpt
 from memory_manager.importers.claude import ClaudeFormatError
 from memory_manager.importers.claude import collect as collect_claude
 from memory_manager.importers.markdown import collect as collect_markdown
+from memory_manager.importers.openwebui import OpenWebUIFormatError
+from memory_manager.importers.openwebui import collect as collect_openwebui
+from memory_manager.importers.openwebui import collect_from_memories as collect_openwebui_memories
+from memory_manager.importers.openwebui import fetch_memories as fetch_openwebui_memories
 from memory_manager.index.embeddings import provider_from_config
 from memory_manager.index.indexer import Indexer, IndexStats, VaultNotesSource
 from memory_manager.mcp.authz import READ_SCOPE, WRITE_SCOPE
@@ -251,6 +256,16 @@ def main(argv: list[str] | None = None) -> int:
                     namespace=args.namespace,
                     type_=args.type,
                     from_conversations=args.from_conversations,
+                    apply=args.apply,
+                )
+            )
+        if args.import_source == "openwebui":
+            return asyncio.run(
+                _run_import_openwebui(
+                    args.url,
+                    args.file,
+                    namespace=args.namespace,
+                    api_key_env=args.api_key_env,
                     apply=args.apply,
                 )
             )
@@ -590,6 +605,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "calls from it, instead of a plain text memory list",
     )
     chatgpt_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually write notes (default is a dry run that writes nothing)",
+    )
+
+    openwebui_parser = import_subparsers.add_parser(
+        "openwebui", help="import a user's built-in Open WebUI memories (GET /api/v1/memories/)"
+    )
+    openwebui_source_group = openwebui_parser.add_mutually_exclusive_group(required=True)
+    openwebui_source_group.add_argument(
+        "--url",
+        default=None,
+        help="the Open WebUI base URL - its live GET /api/v1/memories/ is fetched",
+    )
+    openwebui_source_group.add_argument(
+        "--file",
+        type=Path,
+        default=None,
+        help="a saved GET /api/v1/memories/ response, instead of a live --url fetch",
+    )
+    openwebui_parser.add_argument(
+        "--namespace", required=True, help="namespace every imported note is filed under"
+    )
+    openwebui_parser.add_argument(
+        "--api-key-env",
+        default="OPENWEBUI_API_KEY",
+        metavar="VAR",
+        help="env var carrying the Open WebUI API key (--url only, default: %(default)s)",
+    )
+    openwebui_parser.add_argument(
         "--apply",
         action="store_true",
         help="actually write notes (default is a dry run that writes nothing)",
@@ -1031,6 +1076,86 @@ async def _run_import_chatgpt(
     report.duplicates = duplicates + report.duplicates
     _print_import_report(report, apply=apply)
     return 1 if (apply and report.rejected) else 0
+
+
+async def _run_import_openwebui(
+    url: str | None, file: Path | None, *, namespace: str, api_key_env: str, apply: bool
+) -> int:
+    """`memory-manager import openwebui`: `--url` (a live fetch) or `--file` (a saved
+    `GET /api/v1/memories/` response) - argparse's mutually exclusive, required group
+    already guarantees exactly one of the two is set.
+
+    `--url` only ever speaks `https`, or `http` to a loopback host
+    (`_is_loopback`, reused from `serve --http`'s own bind check) - a bearer
+    token over plain `http` to anything else would be sent in the clear.
+    Follows no redirect (`openwebui.fetch_memories`), so the token can never
+    end up sent to a different host than the one it was meant for.
+    """
+    if url is not None:
+        scheme_error = _check_openwebui_url(url)
+        if scheme_error is not None:
+            print(scheme_error, file=sys.stderr)
+            return 2
+
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            print(
+                f"import openwebui: {api_key_env} is required (and must not be empty) - "
+                "set it to the Open WebUI API key, or pass --api-key-env to name a "
+                "different variable",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
+            data = await fetch_openwebui_memories(url, api_key)
+            items, pre_rejected = collect_openwebui_memories(data, namespace=namespace)
+        except OpenWebUIFormatError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    elif file is not None:
+        if not file.is_file():
+            print(f"'{file}' is not a file", file=sys.stderr)
+            return 2
+        try:
+            items, pre_rejected = collect_openwebui(file, namespace=namespace)
+        except OpenWebUIFormatError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    else:
+        # Unreachable through the CLI (argparse's mutually exclusive, required
+        # --url/--file group already guarantees exactly one is set) - kept as a
+        # real check rather than an `assert` so this stays correct even if a
+        # future caller builds `_run_import_openwebui` outside that group.
+        print("import openwebui: pass --url or --file", file=sys.stderr)
+        return 2
+
+    try:
+        async with open_storage(os.environ) as storage:
+            kept_items, duplicates = await dedupe_against_vault(items, storage)
+            report = await run_import(kept_items, storage, apply=apply)
+    except (VaultConfigError, BlocklistConfigError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    report.rejected = pre_rejected + report.rejected
+    report.duplicates = duplicates + report.duplicates
+    _print_import_report(report, apply=apply)
+    return 1 if (apply and report.rejected) else 0
+
+
+def _check_openwebui_url(url: str) -> str | None:
+    """`None` if `url` is safe for the live `--url` fetch, an error message otherwise."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"import openwebui: --url must be http or https, got {parsed.scheme or url!r}"
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname or ""):
+        return (
+            f"import openwebui: --url {url!r} uses http for a non-loopback host "
+            f"{parsed.hostname!r} - the API key would be sent in the clear; use https, "
+            "or a loopback host (127.0.0.1/::1/localhost) for http"
+        )
+    return None
 
 
 def _print_import_report(report: ImportReport, *, apply: bool) -> None:

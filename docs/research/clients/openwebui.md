@@ -105,15 +105,18 @@ Related: `ENABLE_OAUTH_TOKEN_EXCHANGE` (with `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIEN
   - By default memories are injected into the system context, with budgets `MEMORIES_USER_CHAR_LIMIT` / `MEMORIES_CONTEXT_CHAR_LIMIT` (2000 characters each).
   - With `ENABLE_MEMORY_BACKGROUND_REVIEW` (default off), the chat model periodically reviews the conversation and edits memories.
 - **Native memory tools**, available with native function calling, are `add_memory`, `update_memory`, `replace_memory_content`, `delete_memory`, `search_memories`, `list_memories`, `list_memory_paths` and `read_memory_path`. They are switched on per model through *Workspace > Models > Builtin Tools > Memory*, which is enabled by default. The rework into persistent and contextual memories came in v0.10.0, and the "Memory System Context" toggle in v0.10.2.
-- **API** (router prefix `/api/v1/memories`, from `routers/memories.py`):
-  - `GET /` lists the caller's memories, which serves as an export.
+- **API** (router prefix `/api/v1/memories`, from `routers/memories.py`), live-verified against a running v0.11.4 instance on 2026-10-10 (#152):
+  - `GET /` lists the caller's memories as `list[MemoryModel]` (`routers/memories.py:57-65`, `models/memories.py:31-42`), with no pagination (`models/memories.py:117-124`) - the whole list comes back in one response. Each entry is `{"id": "<uuid4>", "user_id": "<uuid>", "type": "user"|"context", "path": null|"projects/x", "content": "...", "meta": {...}|null, "updated_at": <epoch seconds>, "created_at": <epoch seconds>}`; the default `type` on creation is `context`. A trailing slash (`/api/v1/memories/` vs `/api/v1/memories`) returns 200 either way, with no redirect.
   - `POST /add`, `/update`, `/query`, `/search`, `/paths`, `/path`, `/reindex` and `/reset`.
   - `DELETE /delete/user` and `DELETE /{id}`, plus `POST /{id}/update`.
-  - There is no dedicated export endpoint (**unverified** beyond this list).
-- **Disable** in one of three ways:
-  - Globally with `ENABLE_MEMORIES=false` (Admin > General > Features > Memories). This hides the tab, blocks the API, stops injection and removes the tools; v0.11.4 fixed leaks behind this switch.
-  - Per role or group with `USER_PERMISSIONS_FEATURES_MEMORIES=false`. Admins are exempt.
-  - Injection only, keeping the tools, with `ENABLE_MEMORY_SYSTEM_CONTEXT=false`.
+  - Errors on `GET /`: no `Authorization` header or an invalid API key both → 401; `ENABLE_API_KEYS` off (default `False`, `config.py:2454`) → 403 "Use of API key is not enabled in the environment."; a non-admin caller whose role lacks `features.api_keys` → 403 (`utils/auth.py:530-536`); `ENABLE_MEMORIES` off → 404 (`routers/memories.py:35-46`); a non-admin caller whose role lacks `features.memories` → 403.
+  - There is no dedicated export endpoint, and no export button in the UI - confirmed, not just absent from this list.
+- **Disable or fence**, live-verified against a running v0.11.4 instance on 2026-10-11 (#153, `docs/clients/openwebui.md` "How this was verified"):
+  - Globally with `ENABLE_MEMORIES=false` (Admin > General > Features > Memories, `routers/auths.py:128` `ADMIN_CONFIG_KEYS`). 404s the whole `/api/v1/memories/*` API for every role including admin (`routers/memories.py:35-41`), stops system-context injection (`utils/middleware.py:2686-2697`) and removes the eight native tools (`utils/tools.py:657-674`); v0.11.4 fixed leaks behind this switch (CHANGELOG #30228/#30309).
+  - Per role or group with `USER_PERMISSIONS_FEATURES_MEMORIES=false` (`features.memories` on `UserPermissions`, `routers/users.py:259,411-436`). Groups are **additive only** (`has_permission`, `utils/access_control/__init__.py:75-108`): a group whose own permission is `true` can grant access on top of a `false` default, but a group set to `false` can never revoke a `true` default. Admins bypass this check entirely (`routers/memories.py:43`, `utils/tools.py:571-573`), so fencing by group only ever narrows non-admin access.
+  - Per model, as **two independent tool switches**, not one disable: `meta.capabilities.memory=false` turns off both injection and the native tools for that model (`model_allows_memory`/`get_model_capability`, `utils/memory.py:286`, `utils/tools.py:533-534`); `meta.builtinTools.memory=false` (Workspace > Models > Builtin Tools > Memory) turns off only the native tools, injection is unaffected (`is_builtin_tool_enabled`, `utils/tools.py:538-540,657-674`).
+  - Injection only, keeping the tools, with `ENABLE_MEMORY_SYSTEM_CONTEXT=false` (`utils/middleware.py:2686-2698`).
+  - `ENABLE_MEMORY_BACKGROUND_REVIEW` has no admin UI and no `AdminConfig` field at all - only `GET /api/v1/configs/namespace/memories` to read it and `POST /api/v1/configs/import` to write it (`routers/configs.py:100-126`).
 
 ## Versions and deployment
 
