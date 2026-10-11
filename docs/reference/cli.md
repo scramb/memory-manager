@@ -150,6 +150,24 @@ Options:
 | `--namespace` | yes | — | — | namespace every imported note is filed under |
 | `--type` | no | `"reference"` | `user`, `feedback`, `project`, `reference`, `fact` | note type used when a file's frontmatter does not set a valid one |
 
+### `openwebui`
+
+import a user's built-in Open WebUI memories (GET /api/v1/memories/)
+
+Options:
+
+| Flag | Required | Default | Choices | Help |
+|---|---|---|---|---|
+| `--api-key-env VAR` | no | `"OPENWEBUI_API_KEY"` | — | env var carrying the Open WebUI API key (--url only, default: %(default)s) |
+| `--apply` | no | `false` | — | actually write notes (default is a dry run that writes nothing) |
+| `--file` | no | — | — | a saved GET /api/v1/memories/ response, instead of a live --url fetch |
+| `--namespace` | yes | — | — | namespace every imported note is filed under |
+| `--url` | no | — | — | the Open WebUI base URL - its live GET /api/v1/memories/ is fetched |
+
+Mutually exclusive:
+
+- `--file` / `--url`
+
 ## `instructions`
 
 render mcp/instructions_generated.py and client instruction files from docs/memory-guide.md
