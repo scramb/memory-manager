@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.1](https://github.com/scramb/memory-manager/compare/v0.2.0...v0.2.1) (2026-10-11)
+
+
+### Features
+
+* **auth:** add personal tokens bounded by their owner and self-service on /account ([#308](https://github.com/scramb/memory-manager/issues/308)) ([4018330](https://github.com/scramb/memory-manager/commit/40183303412c1398f702b45e58238731d92593b8)), closes [#134](https://github.com/scramb/memory-manager/issues/134) [#135](https://github.com/scramb/memory-manager/issues/135)
+* **auth:** connect Gemini Enterprise through pre-registered OAuth clients ([#337](https://github.com/scramb/memory-manager/issues/337)) ([b52d3e6](https://github.com/scramb/memory-manager/commit/b52d3e6d422e8c90eace9fe5befeeb7b1d88325c)), closes [#197](https://github.com/scramb/memory-manager/issues/197) [#198](https://github.com/scramb/memory-manager/issues/198) [#322](https://github.com/scramb/memory-manager/issues/322)
+* **auth:** connect Open WebUI users with their own OAuth tokens ([#319](https://github.com/scramb/memory-manager/issues/319)) ([45c0368](https://github.com/scramb/memory-manager/commit/45c0368fdb14bccd4f9fdb884384dcf7856e29eb)), closes [#141](https://github.com/scramb/memory-manager/issues/141) [#142](https://github.com/scramb/memory-manager/issues/142) [#143](https://github.com/scramb/memory-manager/issues/143) [#310](https://github.com/scramb/memory-manager/issues/310) [#313](https://github.com/scramb/memory-manager/issues/313) [#314](https://github.com/scramb/memory-manager/issues/314) [#144](https://github.com/scramb/memory-manager/issues/144)
+* **cli:** add connect and doctor --client for Claude Code and claude.ai ([#312](https://github.com/scramb/memory-manager/issues/312)) ([f735762](https://github.com/scramb/memory-manager/commit/f73576228bc20b011a2f7e97558118e053997733)), closes [#137](https://github.com/scramb/memory-manager/issues/137) [#138](https://github.com/scramb/memory-manager/issues/138)
+* **cli:** import Open WebUI memories and document fencing the built-in memory ([#320](https://github.com/scramb/memory-manager/issues/320)) ([e5d87df](https://github.com/scramb/memory-manager/commit/e5d87df5274a5953ddc038fa8876869ad5b43789)), closes [#152](https://github.com/scramb/memory-manager/issues/152) [#153](https://github.com/scramb/memory-manager/issues/153)
+* **mcp:** add client compatibility profiles, tool annotations and compat lint ([#309](https://github.com/scramb/memory-manager/issues/309)) ([5ab3ecb](https://github.com/scramb/memory-manager/commit/5ab3ecb63b7c742bc86344ea206c888930bca5f9)), closes [#130](https://github.com/scramb/memory-manager/issues/130) [#131](https://github.com/scramb/memory-manager/issues/131) [#132](https://github.com/scramb/memory-manager/issues/132) [#133](https://github.com/scramb/memory-manager/issues/133) [#305](https://github.com/scramb/memory-manager/issues/305) [#306](https://github.com/scramb/memory-manager/issues/306)
+* **mcp:** define the 1.x compatibility policy and enforce the stable contract ([#321](https://github.com/scramb/memory-manager/issues/321)) ([5b537ca](https://github.com/scramb/memory-manager/commit/5b537ca5e2a1fcfc94300442bfcfd18c4778893d)), closes [#199](https://github.com/scramb/memory-manager/issues/199) [#200](https://github.com/scramb/memory-manager/issues/200) [#201](https://github.com/scramb/memory-manager/issues/201) [#202](https://github.com/scramb/memory-manager/issues/202) [#315](https://github.com/scramb/memory-manager/issues/315)
+* **mcp:** generate the usage rules and client instruction files from docs/memory-guide.md ([#307](https://github.com/scramb/memory-manager/issues/307)) ([e858fd6](https://github.com/scramb/memory-manager/commit/e858fd63472d6bf2379a720e584eddf8015712e6)), closes [#127](https://github.com/scramb/memory-manager/issues/127) [#128](https://github.com/scramb/memory-manager/issues/128)
+
+
+### Documentation
+
+* **docs:** add the client docs skeleton with the approved support matrix ([#304](https://github.com/scramb/memory-manager/issues/304)) ([a59ba3a](https://github.com/scramb/memory-manager/commit/a59ba3a2185fb0276b9258050ebff29edb6d1e13)), closes [#129](https://github.com/scramb/memory-manager/issues/129)
+* **docs:** add the manual client checklist to the release process ([#318](https://github.com/scramb/memory-manager/issues/318)) ([04d12ce](https://github.com/scramb/memory-manager/commit/04d12cef7254cfd63693fa0eeadf1fd39ad0f606)), closes [#160](https://github.com/scramb/memory-manager/issues/160) [#193](https://github.com/scramb/memory-manager/issues/193)
+* **docs:** bring the README up to the v0.2.0 state ([#303](https://github.com/scramb/memory-manager/issues/303)) ([e31e049](https://github.com/scramb/memory-manager/commit/e31e0492ef668f3319cabd023bd634cb62aff9cf))
+* **docs:** hand off the session after F-01 and v0.2.0 ([#302](https://github.com/scramb/memory-manager/issues/302)) ([843f34f](https://github.com/scramb/memory-manager/commit/843f34f419948611a925692d26e73c9985a705f8)), closes [#280](https://github.com/scramb/memory-manager/issues/280)
+* **docs:** mark F-01 done with the v0.2.0 release ([#300](https://github.com/scramb/memory-manager/issues/300)) ([d1f5c49](https://github.com/scramb/memory-manager/commit/d1f5c49be6a7814e92e9b7baa8072fdd7959ef7a)), closes [#280](https://github.com/scramb/memory-manager/issues/280)
+
 ## [0.2.0](https://github.com/scramb/memory-manager/compare/v0.1.4...v0.2.0) (2026-10-10)
 
 
