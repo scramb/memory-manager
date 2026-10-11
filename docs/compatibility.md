@@ -34,13 +34,15 @@ From 1.0.0 the server follows [SemVer 2.0.0](https://semver.org/): `MAJOR.MINOR.
 | Helm values | `values.schema.json` | [`../charts/memory-manager/values.schema.json`](../charts/memory-manager/values.schema.json) |
 | Image and chart tags | `ghcr.io/scramb/memory-manager:X.Y.Z`/`:X.Y`/`:latest` (stable releases only); the chart `oci://ghcr.io/scramb/charts/memory-manager` in lockstep with the app version | [`./releasing.md`](./releasing.md) |
 
+**Result channel:** a tool result carries two channels. `structuredContent` always matches the tool's `outputSchema` (a list result renders as `{"result": [...]}`) and is the Stable result contract covered by "MCP tools" above. The text `content` channel is a rendering the MCP SDK builds from `structuredContent`, not a second contract: it splits a list result into one `TextContent` block per element, so `memory_read` returns one bare JSON object for a single note but several blocks for several, while `memory_search` and the write tools always render one block holding the whole object. That rendering is Operational (below), not Stable — its shape may change between releases without notice.
+
 A breaking change to the Helm values is, by definition, a product major: the chart version and the app version move together (`Chart.yaml`), so there is no such thing as a Helm-only breaking release.
 
 The `message` text of a structured error, and the plain-text error raised through the second `ToolError` channel (invalid arguments, scope/namespace checks, quota errors) are explicitly **not** covered — only the `error` kinds listed above are. `message` wording changes freely.
 
 ### Operational — announced in release notes, no deprecation period
 
-Metric names and labels (`mm_*`), dashboards and alerts, audit-export fields, the log format, the `/account` HTML, and human-readable CLI output (as opposed to `--json` output). These change when they need to for operational reasons; a release that changes one says so in its release notes, but there is no deprecation cycle first.
+Metric names and labels (`mm_*`), dashboards and alerts, audit-export fields, the log format, the `/account` HTML, human-readable CLI output (as opposed to `--json` output), and the text `content` channel of a tool result (as opposed to `structuredContent`, Stable above). These change when they need to for operational reasons; a release that changes one says so in its release notes, but there is no deprecation cycle first.
 
 ### Internal — no compatibility promise
 
@@ -68,7 +70,7 @@ For anything in the Stable tier:
 - making an annotation more permissive (e.g. `readOnlyHint` `true` → `false`)
 - dropping support for an MCP protocol revision the server currently speaks
 
-**Client duty:** a client that only reads the fields and values it knows about keeps working across minors. Concretely: tolerate unknown result fields, unknown structured error kinds, and unknown enum values — do not fail on something new and unrecognised; either handle it generically or ignore it.
+**Client duty:** a client that only reads the fields and values it knows about keeps working across minors. Concretely: tolerate unknown result fields, unknown structured error kinds, and unknown enum values — do not fail on something new and unrecognised; either handle it generically or ignore it. Prefer `structuredContent` over the text `content` channel: it always matches the tool's documented `outputSchema`, while the text rendering is Operational and its shape may change without notice.
 
 **Note format across a rollback:** a newer minor may add an optional frontmatter field. That is additive for servers at or after that minor, but an older server rejects unknown frontmatter keys outright ([ADR-0005](./adr/0005-note-format.md)). A rollback to an older minor after such a field has been written is therefore **not guaranteed** to work — the older server will refuse notes carrying the new field.
 

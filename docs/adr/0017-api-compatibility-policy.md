@@ -73,6 +73,10 @@ Checked against the guardrails:
 - The runtime deprecation signals promised here (tool description prefix, log warning, CLI warning, env var warning) do not exist yet; a deprecation announced before they ship relies on the register and release notes alone.
 - Classifying genuinely new surface into the right tier is a judgement call at review time; this ADR gives the boundary, not an exhaustive list for all time.
 
+### Addendum 2026-10-11 (#315)
+
+A tool result carries two channels, and only one of them is Stable. `structuredContent` always matches the tool's `outputSchema` and is the Stable result contract already covered by "MCP tools" above. The text `content` channel is the MCP SDK's own rendering of `structuredContent`, not a second contract — it splits a list result into one `TextContent` block per element (`mcp/server/mcpserver/utilities/func_metadata.py:644-650` in MCP SDK 2.3.0), so `memory_read` returns a bare JSON object for one note but several blocks for several, while `memory_search` and the write tools always render one block. That inconsistency is exactly why the text channel is Operational, not Stable: clients should read `structuredContent` and tolerate the text rendering changing shape. Docs only, owner decision on #315; no code change.
+
 ## Reversibility
 
 Cheap to tighten (moving something from Operational to Stable, or shortening nothing — the deprecation period can only ever be loosened for already-deprecated surface, not shortened, without breaking a promise already made). Expensive to loosen: reclassifying a Stable surface as Operational, or shortening the deprecation period, breaks the promise this ADR makes to everyone who already relied on it, and would need its own ADR with its own announcement.
