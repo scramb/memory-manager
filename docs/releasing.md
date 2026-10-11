@@ -136,6 +136,13 @@ cosign verify \
 
 ## Cutting a release
 
+- Before merging the release-please PR or pushing a pre-release tag,
+  fill the client checklist section for the version being released:
+  copy [`./release/client-checklist.md`](./release/client-checklist.md)'s
+  `## Template` section under its `## Releases` section and record the
+  manual client acceptance steps (S1–S6) for this run. The release PR
+  body itself carries a reminder of this step, via `pull-request-footer`
+  in `release-please-config.json`.
 - **Stable**: merge the open "chore(release): x.y.z" PR from
   release-please. That tags, releases and triggers `release.yml`.
 - **Pre-release / release candidate**: push a tag by hand, e.g.
