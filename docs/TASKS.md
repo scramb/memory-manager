@@ -418,7 +418,7 @@ Goal: see [F-02](./features/F-02-client-integrations.md) → Milestones. · Due:
 ### WP-45 — Open WebUI memory import · F-02 · Branch: `wp/45-openwebui-import` · PR: open
 
 - [x] #152 `memory-manager import openwebui` imports a user's built-in Open WebUI memories
-- [ ] #153 The docs explain how to disable or fence Open WebUI's built-in memory ⛔ blocked by #142
+- [x] #153 The docs explain how to disable or fence Open WebUI's built-in memory
 
 ### WP-46 — Open WebUI deployment, docs and release · F-02 · Branch: `wp/46-openwebui-release` · PR: open
 

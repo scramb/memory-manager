@@ -111,10 +111,12 @@ Related: `ENABLE_OAUTH_TOKEN_EXCHANGE` (with `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIEN
   - `DELETE /delete/user` and `DELETE /{id}`, plus `POST /{id}/update`.
   - Errors on `GET /`: no `Authorization` header or an invalid API key both → 401; `ENABLE_API_KEYS` off (default `False`, `config.py:2454`) → 403 "Use of API key is not enabled in the environment."; a non-admin caller whose role lacks `features.api_keys` → 403 (`utils/auth.py:530-536`); `ENABLE_MEMORIES` off → 404 (`routers/memories.py:35-46`); a non-admin caller whose role lacks `features.memories` → 403.
   - There is no dedicated export endpoint, and no export button in the UI - confirmed, not just absent from this list.
-- **Disable** in one of three ways:
-  - Globally with `ENABLE_MEMORIES=false` (Admin > General > Features > Memories). This hides the tab, blocks the API, stops injection and removes the tools; v0.11.4 fixed leaks behind this switch.
-  - Per role or group with `USER_PERMISSIONS_FEATURES_MEMORIES=false`. Admins are exempt.
-  - Injection only, keeping the tools, with `ENABLE_MEMORY_SYSTEM_CONTEXT=false`.
+- **Disable or fence**, live-verified against a running v0.11.4 instance on 2026-10-11 (#153, `docs/clients/openwebui.md` "How this was verified"):
+  - Globally with `ENABLE_MEMORIES=false` (Admin > General > Features > Memories, `routers/auths.py:128` `ADMIN_CONFIG_KEYS`). 404s the whole `/api/v1/memories/*` API for every role including admin (`routers/memories.py:35-41`), stops system-context injection (`utils/middleware.py:2686-2697`) and removes the eight native tools (`utils/tools.py:657-674`); v0.11.4 fixed leaks behind this switch (CHANGELOG #30228/#30309).
+  - Per role or group with `USER_PERMISSIONS_FEATURES_MEMORIES=false` (`features.memories` on `UserPermissions`, `routers/users.py:259,411-436`). Groups are **additive only** (`has_permission`, `utils/access_control/__init__.py:75-108`): a group whose own permission is `true` can grant access on top of a `false` default, but a group set to `false` can never revoke a `true` default. Admins bypass this check entirely (`routers/memories.py:43`, `utils/tools.py:571-573`), so fencing by group only ever narrows non-admin access.
+  - Per model, as **two independent tool switches**, not one disable: `meta.capabilities.memory=false` turns off both injection and the native tools for that model (`model_allows_memory`/`get_model_capability`, `utils/memory.py:286`, `utils/tools.py:533-534`); `meta.builtinTools.memory=false` (Workspace > Models > Builtin Tools > Memory) turns off only the native tools, injection is unaffected (`is_builtin_tool_enabled`, `utils/tools.py:538-540,657-674`).
+  - Injection only, keeping the tools, with `ENABLE_MEMORY_SYSTEM_CONTEXT=false` (`utils/middleware.py:2686-2698`).
+  - `ENABLE_MEMORY_BACKGROUND_REVIEW` has no admin UI and no `AdminConfig` field at all - only `GET /api/v1/configs/namespace/memories` to read it and `POST /api/v1/configs/import` to write it (`routers/configs.py:100-126`).
 
 ## Versions and deployment
 
