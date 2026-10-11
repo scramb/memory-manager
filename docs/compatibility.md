@@ -20,16 +20,16 @@ From 1.0.0 the server follows [SemVer 2.0.0](https://semver.org/): `MAJOR.MINOR.
 
 | Surface | Covers | Source |
 |---|---|---|
-| MCP tools | Names, parameters, result fields, annotations: `memory_index`, `memory_read`, `memory_search`, `memory_write`, `memory_edit`, `memory_supersede`, `memory_promote`, `memory_archive` | [`../src/memory_manager/mcp/server.py`](../src/memory_manager/mcp/server.py) |
-| Structured error kinds | The `error` field of a tool result's structured error (`isError` content channel 1): `VersionConflict`, `WriteConflict`, `NotFound`, `InvalidNote`, `SecretRejected`, `EditMismatch`, `BlocklistRejected`, `WriteFailed`, `PathRejected`, `NoteFormatError`, `NoteInvalid` | [`../src/memory_manager/storage/base.py`](../src/memory_manager/storage/base.py), [`../src/memory_manager/mcp/errors.py`](../src/memory_manager/mcp/errors.py) |
-| `memory_guide` prompt | The prompt's name (not its wording) | [`../src/memory_manager/mcp/server.py`](../src/memory_manager/mcp/server.py) |
+| MCP tools | Names, parameters, result fields, annotations: `memory_index`, `memory_read`, `memory_search`, `memory_write`, `memory_edit`, `memory_supersede`, `memory_promote`, `memory_archive` | [`../src/memory_manager/mcp/server.py`](../src/memory_manager/mcp/server.py), [reference](./reference/tools.md) |
+| Structured error kinds | The `error` field of a tool result's structured error (`isError` content channel 1): `VersionConflict`, `WriteConflict`, `NotFound`, `InvalidNote`, `SecretRejected`, `EditMismatch`, `BlocklistRejected`, `WriteFailed`, `PathRejected`, `NoteFormatError`, `NoteInvalid` | [`../src/memory_manager/storage/base.py`](../src/memory_manager/storage/base.py), [`../src/memory_manager/mcp/errors.py`](../src/memory_manager/mcp/errors.py), [reference](./reference/tools.md) |
+| `memory_guide` prompt | The prompt's name (not its wording) | [`../src/memory_manager/mcp/server.py`](../src/memory_manager/mcp/server.py), [reference](./reference/tools.md) |
 | Compatibility profiles | Profile names and how one is selected: the `?profile=` query parameter, the `MM-Client-Profile` header, `serve --stdio --profile` | [ADR-0010](./adr/0010-client-compatibility-profiles.md) |
 | OAuth scopes | `memory:read`, `memory:write` | [ADR-0004](./adr/0004-auth-model.md) |
 | HTTP paths | `/mcp` (configurable via `MCP_PATH`), `/healthz`, `/readyz`, `/metrics`, `/hooks/vault`, `/.well-known/oauth-protected-resource` (incl. its path-suffixed variant), `/.well-known/oauth-authorization-server`, `/register`, `/token`, `/authorize`, `/login`, `/oidc/callback`, `/account` (`/account/login`, `/account/logout`) | [`../src/memory_manager/http.py`](../src/memory_manager/http.py) |
-| Config | Env vars with their defaults, and the config file formats they point at: `BLOCKLIST_FILE` (TOML), `ERASURE_LOG_REPLAY_FILE`, `LOGIN_NAMESPACE_MAP` | [`../src/memory_manager/config.py`](../src/memory_manager/config.py) |
-| Note format | Frontmatter fields, path layout, `export` output | [ADR-0005](./adr/0005-note-format.md) |
-| CLI | Commands and flags | [`../src/memory_manager/cli.py`](../src/memory_manager/cli.py) |
-| Exit codes | The distinction between `0` (success) and non-zero (failure) — **not** which specific non-zero value a given failure returns; those are inconsistent across commands today | [`../src/memory_manager/cli.py`](../src/memory_manager/cli.py) |
+| Config | Env vars with their defaults, and the config file formats they point at: `BLOCKLIST_FILE` (TOML), `ERASURE_LOG_REPLAY_FILE`, `LOGIN_NAMESPACE_MAP` | [`../src/memory_manager/config.py`](../src/memory_manager/config.py), [reference](./reference/config.md) |
+| Note format | Frontmatter fields, path layout, `export` output | [ADR-0005](./adr/0005-note-format.md), [reference](./reference/note-format.md) |
+| CLI | Commands and flags | [`../src/memory_manager/cli.py`](../src/memory_manager/cli.py), [reference](./reference/cli.md) |
+| Exit codes | The distinction between `0` (success) and non-zero (failure) — **not** which specific non-zero value a given failure returns; those are inconsistent across commands today | [`../src/memory_manager/cli.py`](../src/memory_manager/cli.py), [reference](./reference/cli.md) |
 | `doctor --client --json` | The field names of the JSON report | [`../src/memory_manager/cli.py`](../src/memory_manager/cli.py) |
 | Helm values | `values.schema.json` | [`../charts/memory-manager/values.schema.json`](../charts/memory-manager/values.schema.json) |
 | Image and chart tags | `ghcr.io/scramb/memory-manager:X.Y.Z`/`:X.Y`/`:latest` (stable releases only); the chart `oci://ghcr.io/scramb/charts/memory-manager` in lockstep with the app version | [`./releasing.md`](./releasing.md) |

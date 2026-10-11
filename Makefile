@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down contract-snapshot
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down contract-snapshot reference-docs
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -31,6 +31,7 @@ fmt:
 
 lint:
 	uv run memory-manager instructions generate --all --check
+	uv run python tests/reference_docs.py --check
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run mypy
@@ -58,6 +59,13 @@ conformance-golden:
 # the deliberate pre-major act that overrides that refusal.
 contract-snapshot:
 	MM_CONTRACT_UPDATE=1 uv run pytest tests/contract
+
+# Renders docs/reference/{tools,cli}.md from the real server/CLI (#200, ADR-0017,
+# tests/reference_docs.py) - `make lint`'s own `--check` run points a reader with a
+# stale page here. config.md/note-format.md are hand-written and only drift-checked,
+# never written by this target.
+reference-docs:
+	uv run python tests/reference_docs.py
 
 test:
 ifdef PKG
