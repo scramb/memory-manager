@@ -20,6 +20,13 @@ token that does not meet that rule;
 L1, #37) - it never takes the password as an argument (it would then show
 up in shell history and `ps`), only ever reading it from stdin.
 
+`oauth-client create|list|revoke` (ADR-0015, #197) pre-register a confidential OAuth
+client for an integration with neither DCR nor CIMD (Gemini Enterprise is the first,
+#196) - `create` needs both `DATABASE_URL` and `OAUTH_CLIENT_SECRET_KEY` (the
+authorization server's own Fernet key: a client registered with a different key can never
+be decrypted back by the server that has to authenticate it) and prints the client id and
+secret once, to stdout and stderr respectively - the secret is never shown again.
+
 `connect claude-code`/`connect claude-ai` merge the memory-manager server into Claude Code's
 own config, or print the claude.ai custom-connector setup steps, without clobbering what is
 already there (#137, `clients/connect.py`).
@@ -82,6 +89,16 @@ from memory_manager.auth import login
 from memory_manager.auth.graph import GraphClient
 from memory_manager.auth.login_password import hash_password
 from memory_manager.auth.owner_rights import intersect_namespaces
+from memory_manager.auth.registered_clients import (
+    AUTH_METHOD_BASIC,
+    AUTH_METHODS,
+    DEFAULT_AUTH_METHOD,
+    RegisteredClientError,
+)
+from memory_manager.auth.registered_clients import create as create_registered_client
+from memory_manager.auth.registered_clients import list_clients as list_registered_clients
+from memory_manager.auth.registered_clients import revoke as revoke_registered_client
+from memory_manager.auth.store import ClientSecretCipher
 from memory_manager.auth.tokens import (
     ALL_NAMESPACES,
     KIND_PERSONAL,
@@ -350,6 +367,34 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.subcommand == "revoke":
             return asyncio.run(_run_token_revoke(args.name))
+        parser.print_help()
+        return 1
+
+    if args.command == "oauth-client":
+        if args.oauth_client_subcommand in ("create", "list", "revoke"):
+            try:
+                secret_key = _require_env("OAUTH_CLIENT_SECRET_KEY")
+            except _MissingEnvironment as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            try:
+                cipher = ClientSecretCipher(secret_key)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        if args.oauth_client_subcommand == "create":
+            return asyncio.run(
+                _run_oauth_client_create(
+                    args.name,
+                    redirect_uris=args.redirect_uris,
+                    auth_method=args.auth_method,
+                    cipher=cipher,
+                )
+            )
+        if args.oauth_client_subcommand == "list":
+            return asyncio.run(_run_oauth_client_list())
+        if args.oauth_client_subcommand == "revoke":
+            return asyncio.run(_run_oauth_client_revoke(args.client_id))
         parser.print_help()
         return 1
 
@@ -796,6 +841,52 @@ def _build_parser() -> argparse.ArgumentParser:
 
     token_revoke_parser = token_subparsers.add_parser("revoke", help="revoke a token by name")
     token_revoke_parser.add_argument("name", help="the token's name, as passed to 'token create'")
+
+    oauth_client_parser = subparsers.add_parser(
+        "oauth-client",
+        help="pre-register a confidential OAuth client for an integration with neither DCR "
+        "nor CIMD (ADR-0015, #197); needs DATABASE_URL and OAUTH_CLIENT_SECRET_KEY set to "
+        "the authorization server's own Fernet key - a different key produces a client the "
+        "server can never decrypt back",
+    )
+    oauth_client_subparsers = oauth_client_parser.add_subparsers(dest="oauth_client_subcommand")
+
+    oauth_client_create_parser = oauth_client_subparsers.add_parser(
+        "create",
+        help="register a client and print its id and secret once - the secret is never shown again",
+    )
+    oauth_client_create_parser.add_argument("name", help="a human-readable name for the client")
+    oauth_client_create_parser.add_argument(
+        "--redirect-uri",
+        dest="redirect_uris",
+        action="append",
+        required=True,
+        help="repeatable; the exact redirect URI(s) the client is allowed to use "
+        "(absolute https, or http on a loopback host per RFC 8252)",
+    )
+    oauth_client_create_parser.add_argument(
+        "--auth-method",
+        dest="auth_method",
+        default=DEFAULT_AUTH_METHOD,
+        choices=AUTH_METHODS,
+        help=f"the client's /token authentication method, one of {AUTH_METHODS!r}, default "
+        f"{DEFAULT_AUTH_METHOD!r} - note that {AUTH_METHOD_BASIC!r} still requires client_id "
+        "in the /token request body, not only in the Authorization header (the SDK's own "
+        "ClientAuthenticator reads it from there first, regardless of auth method)",
+    )
+
+    oauth_client_subparsers.add_parser(
+        "list", help="list every pre-registered client's metadata (never its secret)"
+    )
+
+    oauth_client_revoke_parser = oauth_client_subparsers.add_parser(
+        "revoke",
+        help="revoke a pre-registered client, its issued tokens, pending "
+        "authorizations and authorization codes",
+    )
+    oauth_client_revoke_parser.add_argument(
+        "client_id", help="the client's id, as printed by 'oauth-client create'"
+    )
 
     subparsers.add_parser(
         "hash-password",
@@ -1439,6 +1530,71 @@ async def _run_token_revoke(name: str) -> int:
         print(f"no active token named {name!r}", file=sys.stderr)
         return 2
     print(f"revoked {name!r}")
+    return 0
+
+
+async def _run_oauth_client_create(
+    name: str, *, redirect_uris: list[str], auth_method: str, cipher: ClientSecretCipher
+) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        try:
+            client_id, secret = await create_registered_client(
+                pool, name, redirect_uris=redirect_uris, cipher=cipher, auth_method=auth_method
+            )
+        except RegisteredClientError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    finally:
+        await pool.close()
+
+    print(f"{client_id}\t{secret}")
+    print(
+        f"^ client {client_id!r} created with auth_method={auth_method!r} "
+        f"redirect_uris={redirect_uris!r} - store the secret now, it will not be shown again",
+        file=sys.stderr,
+    )
+    return 0
+
+
+async def _run_oauth_client_list() -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        clients = await list_registered_clients(pool)
+    finally:
+        await pool.close()
+
+    for info in clients:
+        status = "revoked" if info.revoked_at is not None else "active"
+        print(
+            f"{info.client_id}\tname={info.client_name}\tstatus={status}\t"
+            f"auth_method={info.token_endpoint_auth_method}\t"
+            f"redirect_uris={','.join(info.redirect_uris)}\t"
+            f"created_at={info.created_at.isoformat()}"
+        )
+    return 0
+
+
+async def _run_oauth_client_revoke(client_id: str) -> int:
+    pool = await _open_migrated_pool()
+    if pool is None:
+        return 2
+
+    try:
+        revoked_tokens = await revoke_registered_client(pool, client_id)
+    finally:
+        await pool.close()
+
+    if revoked_tokens is None:
+        print(f"no active pre-registered client {client_id!r}", file=sys.stderr)
+        return 2
+    print(f"revoked {client_id!r} ({revoked_tokens} token(s) revoked)")
     return 0
 
 

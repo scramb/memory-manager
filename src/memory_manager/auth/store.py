@@ -16,6 +16,21 @@ when a refresh token is replayed. `cleanup_expired`/`cleanup_stale_clients`
 are the only functions that actually `DELETE`, and only once a row is well
 past being useful to anyone.
 
+`oauth_clients.registered_by`/`revoked_at` (`migrations/0026_preregistered_clients.sql`,
+#197) are a second, independent lifecycle for a client row, alongside DCR/CIMD:
+`registered_by` is `NULL` for every DCR- or CIMD-registered client (unchanged - neither
+sets it), the fixed marker `"cli"` for one `auth.registered_clients.create` inserts for an
+operator (ADR-0015) - never personal data, the same "name the tool, not the caller"
+convention `auth.tokens`' own `created_by` already follows. `get_client` treats a row with
+`revoked_at` set exactly like an unknown `client_id`, so a revoked pre-registered client
+fails `/authorize`/`/token` the same way a never-registered one does. `save_client`'s own
+`on conflict` clause only overwrites a row whose `registered_by` is still `NULL` - a DCR/CIMD
+`client_id` can therefore never collide with and silently replace an operator's own
+registration (practically impossible already, since neither shape a DCR/CIMD `client_id`
+takes is one `auth.registered_clients.create` ever generates - see that module's docstring).
+`cleanup`'s client sweep never removes a row with `registered_by` set, revoked or not:
+revocation is `auth.registered_clients.revoke`'s job, not the age-based sweep's.
+
 One exception to "hashed, never plaintext": a confidential DCR client's
 `client_secret` (RFC 7591 §3.2.1 - the SDK's `register.py` mints one by
 default, for every client that does not explicitly request
@@ -208,12 +223,20 @@ async def save_client(
     client_info: dict[str, object],
     *,
     cipher: ClientSecretCipher,
+    registered_by: str | None = None,
 ) -> None:
-    """Insert or update a DCR-registered client's stored metadata (`OAuthClientInformationFull`).
+    """Insert or update a client's stored metadata (`OAuthClientInformationFull`).
 
     `client_info[_CLIENT_SECRET_FIELD]` - if present, a public client (`token_endpoint_auth_method:
     "none"`) has none - is encrypted with `cipher` before it ever reaches `json.dumps`; every other
     field is stored as plain JSON (see this module's docstring for why the secret alone needs this).
+
+    `registered_by` is `None` for every DCR/CIMD caller (unchanged); `auth.registered_clients.
+    create` is the only caller that ever passes the fixed marker `"cli"` (#197). The
+    `on conflict` clause only overwrites a row whose stored `registered_by` is still `NULL` -
+    once a row belongs to an operator's registration, nothing calling this with
+    `registered_by=None` (a DCR re-registration under a colliding `client_id`, or a CIMD
+    refresh) can silently replace it.
     """
     info = dict(client_info)
     secret = info.get(_CLIENT_SECRET_FIELD)
@@ -221,25 +244,29 @@ async def save_client(
         info[_CLIENT_SECRET_FIELD] = cipher.encrypt(secret)
     await pool.execute(
         """
-        insert into oauth_clients (client_id, client_info)
-        values ($1, $2)
+        insert into oauth_clients (client_id, client_info, registered_by)
+        values ($1, $2, $3)
         on conflict (client_id) do update set client_info = excluded.client_info
+        where oauth_clients.registered_by is null
         """,
         client_id,
         json.dumps(info),
+        registered_by,
     )
 
 
 async def get_client(
     pool: asyncpg.Pool, client_id: str, *, cipher: ClientSecretCipher
 ) -> dict[str, object] | None:
-    """The stored `client_info` for `client_id`, decrypted, or `None` if never registered."""
-    raw = await pool.fetchval(
-        "select client_info from oauth_clients where client_id = $1", client_id
+    """The stored `client_info` for `client_id`, decrypted, or `None` if never registered or
+    revoked (`registered_by`/`revoked_at`, `auth.registered_clients.revoke`, #197) - a revoked
+    pre-registered client is indistinguishable from one that never existed."""
+    row = await pool.fetchrow(
+        "select client_info, revoked_at from oauth_clients where client_id = $1", client_id
     )
-    if raw is None:
+    if row is None or row["revoked_at"] is not None:
         return None
-    info: dict[str, object] = json.loads(raw)
+    info: dict[str, object] = json.loads(row["client_info"])
     secret = info.get(_CLIENT_SECRET_FIELD)
     if isinstance(secret, str):
         info[_CLIENT_SECRET_FIELD] = cipher.decrypt(secret)
@@ -521,9 +548,12 @@ async def cleanup(pool: asyncpg.Pool) -> CleanupStats:
     own `expires_at`, both minutes-scale); tokens are kept for `_TOKEN_CLEANUP_GRACE` past
     their own `expires_at` - replay detection (`revoke_family` on a reused refresh token)
     only needs the row to still exist, not to live forever, but purging it the instant it
-    expires would erase the evidence an operator might still want to look at. A DCR-registered
-    client older than `_CLIENT_CLEANUP_AGE` with no token referencing it is swept last, so a
-    client whose last token this same run just deleted is still eligible in the same pass.
+    expires would erase the evidence an operator might still want to look at. A DCR/CIMD
+    client (`registered_by is null`) older than `_CLIENT_CLEANUP_AGE` with no token
+    referencing it is swept last, so a client whose last token this same run just deleted is
+    still eligible in the same pass. A client with `registered_by` set (#197) is never part
+    of this sweep at all, revoked or not - `auth.registered_clients.revoke` is its own
+    lifecycle, not an age-based one.
 
     Account sessions (`account/sessions.py`, #228) are swept by their own absolute
     `expires_at`, deleted the instant it passes - unlike a refresh token, an expired
@@ -549,6 +579,7 @@ async def cleanup(pool: asyncpg.Pool) -> CleanupStats:
     clients = await pool.fetchval(
         "with deleted as ("
         "delete from oauth_clients c where c.created_at <= now() - $1::interval "
+        "and c.registered_by is null "
         "and not exists (select 1 from oauth_tokens t where t.client_id = c.client_id) "
         "returning 1"
         ") select count(*) from deleted",

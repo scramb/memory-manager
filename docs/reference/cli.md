@@ -206,6 +206,41 @@ Options:
 | `--map <git-ns>=<kind>:<key>[:<alias>]` (repeatable) | no | — | — | repeatable; maps one top-level Git namespace to a Postgres namespace (kind: user\|group\|project\|org); every namespace in the vault needs one |
 | `--vault` | no | — | — | path to the vault root (defaults to $VAULT_DIR) |
 
+## `oauth-client`
+
+pre-register a confidential OAuth client for an integration with neither DCR nor CIMD (ADR-0015, #197); needs DATABASE_URL and OAUTH_CLIENT_SECRET_KEY set to the authorization server's own Fernet key - a different key produces a client the server can never decrypt back
+
+### `create`
+
+register a client and print its id and secret once - the secret is never shown again
+
+Positional arguments:
+
+| Flag | Required | Default | Choices | Help |
+|---|---|---|---|---|
+| `name` | yes | — | — | a human-readable name for the client |
+
+Options:
+
+| Flag | Required | Default | Choices | Help |
+|---|---|---|---|---|
+| `--auth-method` | no | `"client_secret_post"` | `client_secret_basic`, `client_secret_post` | the client's /token authentication method, one of ('client_secret_basic', 'client_secret_post'), default 'client_secret_post' - note that 'client_secret_basic' still requires client_id in the /token request body, not only in the Authorization header (the SDK's own ClientAuthenticator reads it from there first, regardless of auth method) |
+| `--redirect-uri` (repeatable) | yes | — | — | repeatable; the exact redirect URI(s) the client is allowed to use (absolute https, or http on a loopback host per RFC 8252) |
+
+### `list`
+
+list every pre-registered client's metadata (never its secret)
+
+### `revoke`
+
+revoke a pre-registered client, its issued tokens, pending authorizations and authorization codes
+
+Positional arguments:
+
+| Flag | Required | Default | Choices | Help |
+|---|---|---|---|---|
+| `client_id` | yes | — | — | the client's id, as printed by 'oauth-client create' |
+
 ## `reindex`
 
 bring the Postgres index in step with the vault
