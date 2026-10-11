@@ -87,7 +87,7 @@ Related: `ENABLE_OAUTH_TOKEN_EXCHANGE` (with `OAUTH_TOKEN_EXCHANGE_TRUSTED_CLIEN
   - `inlet(body)`: once per user turn.
   - `request(body)`: before **every** model call, including tool-loop hops. It was added in v0.11.2.
   - `stream(event)`: per streamed chunk.
-  - `outlet(body)`: after the response. For pure API callers it only runs through `/api/chat/completed`.
+  - `outlet(body)`: after the response. Outdated as of v0.11.4 (#150, confirmed against the live source): `/api/chat/completed` is deprecated - a kept-for-compatibility wrapper around `chat_completed_handler`, docstring "Deprecated: outlet filters now run inline during chat completion" (`main.py:2090-2093`) - outlet filters now run **inline**, right after the chat completion, inside `outlet_filter_handler` (`utils/middleware.py:4050`), for every caller including pure API ones.
 - Filters can be global or per model, always-on or toggleable (`self.toggle = True`), and ordered by priority.
 - **Valves** hold admin config and **UserValves** hold per-user config. UserValves are read through `__user__["valves"]`.
 - Reserved arguments a filter can declare:
@@ -495,6 +495,112 @@ backends:
   `scripted_model.py` a different turn-tracking signal first - scripting
   two-plus rounds in one chat will reproduce the same stuck-at-1 loop,
   not a model/version-specific flake.
+
+### #150: the filter, installed live through Open WebUI's own Function API,
+### injects a relevant note and stays within its budget
+
+Driven live against both overlays
+(`tests/e2e/clients/test_openwebui.py::test_filter_injects_relevant_notes_within_budget`),
+installing `integrations/openwebui/filter_memory.py` itself as an Open WebUI
+Function rather than driving it indirectly through a native MCP tool call.
+Tested version: 0.11.4 throughout.
+
+- **Function API order (load-bearing):** `POST /api/v1/functions/create`
+  (`routers/functions.py:200-262`) needs `id` (must satisfy
+  `str.isidentifier()`, lowercased server-side), `name`, `content` and
+  `meta.manifest` (an empty `{}` is accepted - the real frontmatter gets
+  parsed from `content` itself). A brand-new function comes back with
+  `is_active: false, is_global: false` every time
+  (`models/functions.py`'s own `FunctionModel` defaults) - confirmed live,
+  not just read from source: `POST /id/{id}/toggle` then `POST
+  /id/{id}/toggle/global`, each called exactly once, were needed to reach
+  `true`/`true`, and each response's own body already carries the new
+  value, so no separate `GET` was needed to confirm it.
+- **`UserValves` need an active filter first:** `POST
+  /id/{id}/valves/user/update` 400s with `"Function is not active"`
+  (`routers/functions.py:627-633`) until `activate_filter` has run - the
+  admin valves (`POST /id/{id}/valves/update`) have no such check and can
+  be set at any time, before or after activation.
+- **A fresh client is never the admin, even right after `signup_admin`
+  (load-bearing finding for this task itself):** `_provision`'s own admin
+  `httpx.AsyncClient` is closed at the end of that function, taking its
+  session cookie with it - a *second*, fresh client used later in the same
+  test for the filter's own admin steps gets `401 {"detail": "Not
+  authenticated"}` on every admin-only call, `install_filter` included.
+  `_StackContext` now carries `admin_email`/`admin_password` (generated
+  once in `_provision`, previously discarded) so a later block can
+  `driver.sign_in(...)` as the admin again, on its own client, the same way
+  `test_isolation` already does for `A`/`B`.
+- **A personal token's owner must already have a `users` row on
+  `postgres` (ADR-0006 §7, confirmed live, not just read from
+  `auth/tokens.py`):** `memory-manager token create --owner <oid> --role
+  Memory.User ... ` for an `oid` that has never signed in yet fails with
+  `ValueError("owner_oid ... is not in users ...")` - on the `postgres`
+  overlay this ran true for `A`/`B` until each one's own OAuth consent
+  (`_consent`, which signs the mock IdP's Entra login all the way through)
+  ran *before* `_create_personal_token`, not after. The `git` backend has
+  no such check (`auth.tokens.create_token(enterprise=False)`), but the
+  test orders both backends the same way for one code path.
+- **Where a plain-text (no `tool_ids`) assistant reply is read back:**
+  exactly the same `200 null` + `GET /api/v1/chats/{chat_id}` shape #314
+  already found for a tool-calling turn (`streaming_chat_response_handler`'s
+  own `response_handler` has no `return`) - confirmed live for a chat with
+  no `tool_ids` at all, filter-only. The assistant message's `content` is
+  non-empty whenever the model actually set it (this stub always does), so
+  `run_scripted_text_chat` reads `content` first and only falls back to
+  `get_output_text(output)` (`utils/middleware.py:4129`'s own `m.get(
+  'content') or get_output_text(m.get('output'))`, reimplemented in
+  `openwebui_driver._output_text` since this module cannot import Open
+  WebUI's backend package) for the shape a Responses-API tool-loop turn
+  would have used instead.
+- **`inlet` runs for a plain-text chat exactly as for a tool-calling one:**
+  no `tool_ids` at all does not skip filters - `process_filter_function`
+  is unconditional. The scripted model's own `{"echo_system": true}` turn
+  (#150, `scripted_model.py`) answers with the system message's own text
+  verbatim, so the assistant's reply *is* the filter's injected block,
+  nothing else - `a_text == "<memory-context>...</memory-context>"`
+  exactly, confirmed live (no separate Open WebUI default system prompt
+  text appeared either side of it in this stack's own model configuration).
+- **Budget tuning that worked, live, both backends:** one short, tightly
+  on-topic note (title+body sharing three distinct query words) plus four
+  longer, loosely related filler notes (sharing exactly one query word
+  each, padded well past the relevant note's own length) with
+  `Valves.token_budget = 300` (1200 characters) reliably injected the
+  relevant note's own marker and trimmed out at least one filler marker
+  every run - consistent with `_build_block`'s own rank-order-then-stop-at-
+  budget shape and the hint that `ts_rank_cd`'s length normalisation favours
+  the shorter, denser match. Not meant as a general ranking benchmark
+  (#151's own job) - only evidence that trimming is observable at a
+  plausible budget against the real search path on both backends.
+- **Isolation held under a shared marker:** `B`'s own question repeated
+  `A`'s exact marker string verbatim (`"What's my coffee order? (markers
+  ... and ...)"`) - the injected block still carried only `B`'s own note,
+  confirmed live on both backends, same access-control path #144 already
+  proved for native MCP tool calls.
+- **Whole-module run, no `RATE_LIMIT_OAUTH_BURST` issue:** running the
+  whole file (`test_isolation` then `test_filter_injects_relevant_notes_
+  within_budget`, both parametrised `git`/`postgres`) reused one stack per
+  backend (pytest's own fixture-grouping for a module-scoped parametrized
+  fixture) rather than bringing one up per test - four OAuth consents per
+  backend in total (two from `test_isolation`, two more from the filter
+  test, `A`/`B` each), comfortably under the raised `RATE_LIMIT_OAUTH_
+  BURST=20` both overlays already set for #313. No separate-modules
+  workaround was needed.
+- **Outlet round trip green on the first live attempt (#150's own
+  "optional" step):** `A` sent "remember that my lucky number is 42,
+  marker ..." (no `?`, so `_detect_trigger` fires) as a plain-text
+  `run_scripted_text_chat` turn, with a top-level `user_message` carrying
+  its own `id` so Open WebUI actually persists it
+  (`main.py:1231,1521-1526`). The assistant's reply carried `outlet`'s own
+  `_write_new_note` confirmation line verbatim ("remembered it (new note
+  `<namespace>/fact/<slug>.md`)"), appended after the model's own "Okay."
+  reply (`_append_report`, module docstring), and a follow-up
+  `memory_search` for the marker, over the same raw MCP bearer call this
+  task already uses to seed notes, found exactly one hit whose own title
+  carried the marker - confirmed on both backends, same stack, same test
+  (`outlet_enabled`/`write_namespace` set once in the admin valves, global,
+  harmless for `B`'s own plain questions since `_detect_trigger` never
+  fires on those).
 
 ## Open questions
 

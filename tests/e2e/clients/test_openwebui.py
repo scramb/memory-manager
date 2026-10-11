@@ -77,6 +77,7 @@ import httpx
 import pytest
 
 from e2e.openwebui_driver import OpenWebUiDriver, OpenWebUiDriverError
+from integrations.openwebui.filter_memory import SHORT
 from memory_manager.auth.login_oidc import CALLBACK_PATH
 from memory_manager.config import canonical_resource_url
 
@@ -93,6 +94,9 @@ _PROJECT = "mm-openwebui"
 _SERVER_ID = "memmgr"
 _MODEL_ID = "scripted-model"
 _MOCK_IDP_URL = "http://localhost:18082"
+_RESOURCE_SERVER_URL = "http://localhost:18081"
+_MCP_URL = f"{_RESOURCE_SERVER_URL}/mcp"
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 # Both overlays put memory-manager's own `PUBLIC_URL` at 18081 (docker-compose.yml's own
 # "Networking" comment) - the same `canonical_resource_url`/`CALLBACK_PATH` memory-manager's
 # own `OidcAuthenticator.from_env`/`EntraAuthenticator.from_env` build their `redirect_uri`
@@ -105,6 +109,17 @@ _SCRIPT_PATH = _REPO_ROOT / "tests" / "e2e" / "stubs" / "live-script.json"
 
 _UP_TIMEOUT_SECONDS = 900.0
 _DOWN_TIMEOUT_SECONDS = 180.0
+
+# --- #150: the filter installed as an Open WebUI Function, and the personal tokens its
+# per-user UserValves need --------------------------------------------------------------
+
+_FILTER_FUNCTION_ID = "memmgr_filter"
+_FILTER_PATH = _REPO_ROOT / "integrations" / "openwebui" / "filter_memory.py"
+#: Tuned live against the pinned stack (#150, docs/research/clients/openwebui.md): large
+#: enough that the one relevant note's own entry always fits, small enough that not every
+#: filler note fits alongside it - see `test_filter_injects_relevant_notes_within_budget`.
+_FILTER_TOKEN_BUDGET = 300
+_TOKEN_SCOPES = ("memory:read", "memory:write")
 
 _PODMAN = shutil.which("podman") or "podman"
 _MAKE = shutil.which("make") or "make"
@@ -161,6 +176,8 @@ class _StackContext:
     (mock IdP client/users, Open WebUI admin + DCR + two local accounts) is done."""
 
     config: _BackendConfig
+    admin_email: str
+    admin_password: str
     user_a_email: str
     user_a_password: str
     user_b_email: str
@@ -343,6 +360,82 @@ async def _select_signin(config: _BackendConfig, *, oid: str) -> None:
         )
 
 
+async def _consent(
+    driver: OpenWebUiDriver, config: _BackendConfig, *, oid: str, email: str, password: str
+) -> None:
+    """The per-user consent block `test_isolation` and `test_filter_injects_relevant_notes_
+    within_budget` below both need (module docstring's own bullet on `run_oauth_flow`):
+    points the mock IdP's single pending-signin pointer at `oid`, signs this driver's own
+    session in, and runs the per-user MCP OAuth consent - unmodified from #314/#144, since
+    `_complete_login_page`'s own interstitial hook already drives straight through without
+    ever needing a password at memory-manager's own `/login`."""
+    await _select_signin(config, oid=oid)
+    await driver.sign_in(email=email, password=password)
+    consent = await driver.run_oauth_flow(server_id=_SERVER_ID, password=password)
+    if not consent.authorize_followed_to_webui:
+        raise OpenWebUiDriverError(
+            f"OAuth consent for {oid!r} did not return to Open WebUI: {consent}"
+        )
+
+
+def _create_personal_token(name: str, *, oid: str) -> str:
+    """`memory-manager token create` inside the running `memory-manager` container (#150) -
+    a personal token for `UserValves.token`, scoped `memory:read`+`memory:write` (the second
+    scope is only this test's own need to seed/read notes directly over MCP, never the
+    filter's - its `inlet` only ever reads). The plaintext is the command's own first stdout
+    line (`cli.py`'s `_run_token_create`: `print(plaintext)` to stdout, the human-readable
+    summary - never logged or asserted on, CLAUDE.md "token hashes only" - to stderr)."""
+    args = [
+        _PODMAN,
+        "exec",
+        _container("memory-manager"),
+        "memory-manager",
+        "token",
+        "create",
+        name,
+        "--kind",
+        "personal",
+        "--owner",
+        oid,
+        "--role",
+        _MEMORY_USER_ROLE,
+        "--expires-days",
+        "1",
+    ]
+    for scope in _TOKEN_SCOPES:
+        args += ["--scope", scope]
+    result = _run(args)
+    if result.returncode != 0:
+        raise RuntimeError(f"token create failed (exit {result.returncode}): {result.stderr}")
+    lines = result.stdout.splitlines()
+    assert lines and lines[0], f"token create printed no plaintext line: {result.stdout!r}"
+    return lines[0]
+
+
+async def _mcp_call_tool(
+    client: httpx.AsyncClient, token: str, name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """One raw `tools/call` against the live stack's own MCP endpoint
+    (`tests/e2e/test_replicas.py`'s own `_call_tool` pattern, :225-242) - used only to
+    seed/inspect notes directly here, never through Open WebUI's own native tool loop (the
+    filter test below never drives a tool call through Open WebUI at all, only its `inlet`'s
+    own direct HTTP call to this same endpoint)."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+    headers = {**_MCP_HEADERS, "Authorization": f"Bearer {token}"}
+    response = await client.post(_MCP_URL, json=body, headers=headers)
+    assert response.status_code == httpx.codes.OK, response.text
+    payload = response.json()
+    assert "error" not in payload, payload
+    result = payload["result"]
+    assert isinstance(result, dict) and not result.get("isError"), result
+    return result
+
+
 # --- one-time stack setup (admin signup, DCR, two local Open WebUI accounts) -------------
 
 
@@ -356,14 +449,13 @@ async def _provision(config: _BackendConfig) -> _StackContext:
         await _create_mock_user(mock_idp, config, oid=config.oid_a)
         await _create_mock_user(mock_idp, config, oid=config.oid_b)
 
+    admin_email, admin_password = "admin@example.test", secrets.token_urlsafe(24)
     user_a_email, user_a_password = "user-a@example.test", secrets.token_urlsafe(24)
     user_b_email, user_b_password = "user-b@example.test", secrets.token_urlsafe(24)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as admin_client:
         admin_driver = OpenWebUiDriver(admin_client)
-        await admin_driver.signup_admin(
-            name="admin", email="admin@example.test", password=secrets.token_urlsafe(24)
-        )
+        await admin_driver.signup_admin(name="admin", email=admin_email, password=admin_password)
         await admin_driver.register_oauth_client(server_id=_SERVER_ID)
         await admin_driver.configure_tool_server(server_id=_SERVER_ID)
         await admin_driver.add_user(name="user a", email=user_a_email, password=user_a_password)
@@ -371,6 +463,8 @@ async def _provision(config: _BackendConfig) -> _StackContext:
 
     return _StackContext(
         config=config,
+        admin_email=admin_email,
+        admin_password=admin_password,
         user_a_email=user_a_email,
         user_a_password=user_a_password,
         user_b_email=user_b_email,
@@ -408,6 +502,15 @@ def _note_content(*, fact_token: str) -> str:
         "---\n"
         f"The fact token is {fact_token}.\n"
     )
+
+
+def _note_path(namespace: str | None, slug: str) -> str:
+    """The real, stored path for a note written as a user whose `git`-backend login
+    namespace is `namespace` (`<namespace>/fact/<slug>.md`), or, on the `postgres` backend
+    (`namespace is None` - it has no such map, ADR-0008's own `me`), the caller's own
+    personal namespace via the `me` alias - `mcp/namespaces.py`'s own docstring: "a client
+    must always say `me`, never the namespace id-derived alias"."""
+    return f"{namespace}/fact/{slug}.md" if namespace is not None else f"me/fact/{slug}.md"
 
 
 def _write_live_script(turns: list[dict[str, Any]]) -> None:
@@ -469,28 +572,20 @@ async def test_isolation(openwebui_stack: _StackContext) -> None:
     config = openwebui_stack.config
     fact_token = f"mmisolation{secrets.token_hex(8)}"
     slug = f"isolation-{secrets.token_hex(6)}"
-    write_path = (
-        f"{config.namespace_a}/fact/{slug}.md"
-        if config.namespace_a is not None
-        else f"me/fact/{slug}.md"
-    )
+    write_path = _note_path(config.namespace_a, slug)
 
     try:
         # --- A: write a fact, then search for it (positive control) ---------------------
-        await _select_signin(config, oid=config.oid_a)
         a_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
         try:
             a_driver = OpenWebUiDriver(a_client)
-            await a_driver.sign_in(
-                email=openwebui_stack.user_a_email, password=openwebui_stack.user_a_password
+            await _consent(
+                a_driver,
+                config,
+                oid=config.oid_a,
+                email=openwebui_stack.user_a_email,
+                password=openwebui_stack.user_a_password,
             )
-            consent = await a_driver.run_oauth_flow(
-                server_id=_SERVER_ID, password=openwebui_stack.user_a_password
-            )
-            if not consent.authorize_followed_to_webui:
-                raise OpenWebUiDriverError(
-                    f"A's OAuth consent did not return to Open WebUI: {consent}"
-                )
 
             write_output = await _run_single_tool_call(
                 a_driver,
@@ -542,20 +637,16 @@ async def test_isolation(openwebui_stack: _StackContext) -> None:
             assert owner_oid == config.oid_a, owner_oid
 
         # --- B: search finds nothing, reading A's real stored path errors or is empty ---
-        await _select_signin(config, oid=config.oid_b)
         b_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
         try:
             b_driver = OpenWebUiDriver(b_client)
-            await b_driver.sign_in(
-                email=openwebui_stack.user_b_email, password=openwebui_stack.user_b_password
+            await _consent(
+                b_driver,
+                config,
+                oid=config.oid_b,
+                email=openwebui_stack.user_b_email,
+                password=openwebui_stack.user_b_password,
             )
-            consent = await b_driver.run_oauth_flow(
-                server_id=_SERVER_ID, password=openwebui_stack.user_b_password
-            )
-            if not consent.authorize_followed_to_webui:
-                raise OpenWebUiDriverError(
-                    f"B's OAuth consent did not return to Open WebUI: {consent}"
-                )
 
             b_search_output = await _run_single_tool_call(
                 b_driver,
@@ -584,5 +675,210 @@ async def test_isolation(openwebui_stack: _StackContext) -> None:
             # backends), so accept either shape rather than assume one.
             read_items = [read_payload] if isinstance(read_payload, dict) else read_payload
             assert not read_items or all("error" in item for item in read_items), read_payload
+    finally:
+        _SCRIPT_PATH.unlink(missing_ok=True)
+
+
+# --- #150: the filter, installed live, injects relevant notes within its budget --------
+
+
+def _relevant_note_content(*, marker: str) -> str:
+    """A short, tightly-focused note (#150: `ts_rank_cd`'s length normalisation rewards
+    this over a longer filler note that merely shares one word) sharing three distinct
+    words with `_coffee_question`'s own query text: "coffee", "order" and `marker` itself."""
+    return (
+        "---\n"
+        f"title: Coffee order {marker}\n"
+        "description: WP-44 filter fixture - the one note the question below should surface.\n"
+        "type: fact\n"
+        "---\n"
+        f"The user's coffee order is a flat white with oat milk, marker {marker}.\n"
+    )
+
+
+def _filler_note_content(*, filler_marker: str) -> str:
+    """A longer, unrelated note sharing exactly one word ("coffee") with `_coffee_question`'s
+    query - padded well past the relevant note's own length, `ts_rank_cd`'s normalisation
+    (#150) should rank it below the single, tight match."""
+    return (
+        "---\n"
+        f"title: Filler note {filler_marker}\n"
+        "description: WP-44 filter fixture filler note - shares only one word with the "
+        "question below, never the user's actual order.\n"
+        "type: fact\n"
+        "---\n"
+        "This note is unrelated filler, padded with extra words so it stays noticeably "
+        f"longer than the relevant note. Coffee gets a single, passing mention here "
+        f"(filler marker {filler_marker}), but nothing about the user's actual coffee "
+        "order is ever recorded in this note - it exists only to pad out the vault with "
+        "text that should not end up in the injected context block once the character "
+        "budget for the block runs out.\n"
+    )
+
+
+def _coffee_question(*, marker: str) -> str:
+    return f"What's my coffee order? (marker {marker})"
+
+
+async def test_filter_injects_relevant_notes_within_budget(
+    openwebui_stack: _StackContext,
+) -> None:
+    """#150's own acceptance test: the filter, installed live through Open WebUI's own
+    Function API (ADR-0011), injects the one relevant note into the chat's system message,
+    trims out at least one less-relevant filler note once the character budget runs out, and
+    never injects anything of A's into B's own chat - even when B's own question literally
+    repeats A's marker."""
+    config = openwebui_stack.config
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as admin_client:
+            admin_driver = OpenWebUiDriver(admin_client)
+            await admin_driver.sign_in(
+                email=openwebui_stack.admin_email, password=openwebui_stack.admin_password
+            )
+            await admin_driver.install_filter(
+                function_id=_FILTER_FUNCTION_ID,
+                name="memory-manager filter",
+                content=_FILTER_PATH.read_text(encoding="utf-8"),
+                description="memory-manager inlet/outlet filter (#150 live check)",
+            )
+            await admin_driver.activate_filter(function_id=_FILTER_FUNCTION_ID)
+            write_namespace = config.namespace_a if config.namespace_a is not None else "me"
+            await admin_driver.update_filter_valves(
+                function_id=_FILTER_FUNCTION_ID,
+                valves={
+                    "server_url": _MCP_URL,
+                    "token_budget": _FILTER_TOKEN_BUDGET,
+                    # #150's own optional step: the outlet round trip below only ever
+                    # triggers on A's explicit "remember ..." turn, never on B's plain
+                    # questions, so turning it on globally here does not affect B at all.
+                    "outlet_enabled": True,
+                    "write_namespace": write_namespace,
+                },
+            )
+            await admin_driver.disable_builtin_memories()
+
+        # --- A: consent first (postgres needs a `users` row before a token can name this
+        # owner), then seed one relevant note plus several fillers, then ask about it ----
+        marker = f"mmfiltera{secrets.token_hex(6)}"
+        filler_markers = [f"mmfillerb{index}{secrets.token_hex(4)}" for index in range(4)]
+
+        a_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+        try:
+            a_driver = OpenWebUiDriver(a_client)
+            await _consent(
+                a_driver,
+                config,
+                oid=config.oid_a,
+                email=openwebui_stack.user_a_email,
+                password=openwebui_stack.user_a_password,
+            )
+            token_a = _create_personal_token(f"filter-a-{secrets.token_hex(4)}", oid=config.oid_a)
+
+            async with httpx.AsyncClient(timeout=15.0) as mcp_client:
+                await _mcp_call_tool(
+                    mcp_client,
+                    token_a,
+                    "memory_write",
+                    {
+                        "path": _note_path(config.namespace_a, f"coffee-{secrets.token_hex(6)}"),
+                        "content": _relevant_note_content(marker=marker),
+                        "if_version": "new",
+                    },
+                )
+                for filler_marker in filler_markers:
+                    await _mcp_call_tool(
+                        mcp_client,
+                        token_a,
+                        "memory_write",
+                        {
+                            "path": _note_path(
+                                config.namespace_a, f"filler-{secrets.token_hex(6)}"
+                            ),
+                            "content": _filler_note_content(filler_marker=filler_marker),
+                            "if_version": "new",
+                        },
+                    )
+
+            await a_driver.update_filter_user_valves(
+                function_id=_FILTER_FUNCTION_ID, valves={"token": token_a}
+            )
+
+            _write_live_script([{"echo_system": True}])
+            a_text = await a_driver.run_scripted_text_chat(
+                model_id=_MODEL_ID, message=_coffee_question(marker=marker)
+            )
+
+            # --- #150's own optional step: one outlet round trip (a "remember ..."
+            # turn, never a question - `_detect_trigger` never triggers on one) --------
+            remember_marker = f"mmremember{secrets.token_hex(6)}"
+            _write_live_script([{"content": "Okay."}])
+            remember_text = await a_driver.run_scripted_text_chat(
+                model_id=_MODEL_ID,
+                message=f"remember that my lucky number is 42, marker {remember_marker}",
+            )
+        finally:
+            await a_client.aclose()
+
+        assert a_text.count("<memory-context>") == 1, a_text
+        assert a_text.startswith("<memory-context>") and a_text.endswith("</memory-context>"), (
+            a_text
+        )
+        assert len(a_text) <= _FILTER_TOKEN_BUDGET * 4, a_text
+        assert SHORT.splitlines()[0] in a_text, a_text
+        assert marker in a_text, a_text  # the relevant note surfaced
+        assert any(filler_marker not in a_text for filler_marker in filler_markers), a_text
+
+        assert "remembered it" in remember_text, remember_text
+        async with httpx.AsyncClient(timeout=15.0) as mcp_client:
+            search_result = await _mcp_call_tool(
+                mcp_client, token_a, "memory_search", {"query": remember_marker}
+            )
+        remember_hits = search_result["structuredContent"]["results"]
+        assert len(remember_hits) == 1, remember_hits
+        assert remember_marker in remember_hits[0]["title"], remember_hits
+
+        # --- B: consent first (same ordering reason as A above), a different note, a
+        # question repeating A's own marker ----------------------------------------------
+        b_marker = f"mmfilterb{secrets.token_hex(6)}"
+
+        b_client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+        try:
+            b_driver = OpenWebUiDriver(b_client)
+            await _consent(
+                b_driver,
+                config,
+                oid=config.oid_b,
+                email=openwebui_stack.user_b_email,
+                password=openwebui_stack.user_b_password,
+            )
+            token_b = _create_personal_token(f"filter-b-{secrets.token_hex(4)}", oid=config.oid_b)
+
+            async with httpx.AsyncClient(timeout=15.0) as mcp_client:
+                await _mcp_call_tool(
+                    mcp_client,
+                    token_b,
+                    "memory_write",
+                    {
+                        "path": _note_path(config.namespace_b, f"coffee-{secrets.token_hex(6)}"),
+                        "content": _relevant_note_content(marker=b_marker),
+                        "if_version": "new",
+                    },
+                )
+
+            await b_driver.update_filter_user_valves(
+                function_id=_FILTER_FUNCTION_ID, valves={"token": token_b}
+            )
+
+            _write_live_script([{"echo_system": True}])
+            b_text = await b_driver.run_scripted_text_chat(
+                model_id=_MODEL_ID,
+                message=f"What's my coffee order? (markers {b_marker} and {marker})",
+            )
+        finally:
+            await b_client.aclose()
+
+        assert b_marker in b_text, b_text  # B's own positive control
+        assert marker not in b_text, b_text  # never A's note, not even on a shared question
     finally:
         _SCRIPT_PATH.unlink(missing_ok=True)

@@ -153,6 +153,56 @@ class TestChatCompletionsNonStreaming:
         assert response.json()["choices"][0]["message"]["content"] == "This is a scripted reply."
 
 
+class TestChatCompletionsEchoSystem:
+    """`{"echo_system": true}` (#150): answers with the text of every
+    `role == "system"` message in the request, so a test can assert on
+    exactly what a filter's `inlet` inserted there."""
+
+    async def test_joins_every_system_message_string_content_in_order(self) -> None:
+        app = create_app([{"echo_system": True}])
+        messages = [
+            {"role": "system", "content": "first system message"},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "second system message"},
+        ]
+        async with _make_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": messages}
+            )
+
+        assert response.json()["choices"][0]["message"]["content"] == (
+            "first system message\nsecond system message"
+        )
+
+    async def test_reads_a_list_of_text_content_parts(self) -> None:
+        app = create_app([{"echo_system": True}])
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "part one "},
+                    {"type": "image", "url": "ignored"},
+                    {"type": "text", "text": "part two"},
+                ],
+            }
+        ]
+        async with _make_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": messages}
+            )
+
+        assert response.json()["choices"][0]["message"]["content"] == "part one part two"
+
+    async def test_no_system_message_gives_an_empty_string(self) -> None:
+        app = create_app([{"echo_system": True}])
+        async with _make_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"model": _MODEL_ID, "messages": _no_assistant_turns()}
+            )
+
+        assert response.json()["choices"][0]["message"]["content"] == ""
+
+
 class TestChatCompletionsScriptPath:
     """`--script`/`script_path` (#314): re-read on every request, not once at
     startup - a live run may mount the script file after the stub is
@@ -265,4 +315,23 @@ class TestChatCompletionsStreaming:
         final_event = events[-2]
         assert final_event is not None
         assert final_event["choices"][0]["finish_reason"] == "tool_calls"
+        assert events[-1] is None  # the "[DONE]" sentinel
+
+    async def test_an_echo_system_turn_streams_the_joined_system_text(self) -> None:
+        app = create_app([{"echo_system": True}])
+        messages = [
+            {"role": "system", "content": "first"},
+            {"role": "system", "content": [{"type": "text", "text": "second"}]},
+        ]
+        async with _make_client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": _MODEL_ID, "messages": messages, "stream": True},
+            )
+
+        events = _parse_sse_events(response.text)
+
+        assert events[0]["choices"][0]["delta"] == {"role": "assistant"}
+        assert events[1]["choices"][0]["delta"] == {"content": "first\nsecond"}
+        assert events[2]["choices"][0]["finish_reason"] == "stop"
         assert events[-1] is None  # the "[DONE]" sentinel
