@@ -49,7 +49,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -128,8 +128,11 @@ _ULID_RE = re.compile(r"(?<![0-9A-Za-z])[0-7][0-9A-HJKMNP-TV-Z]{25}(?![0-9A-Za-z
 _DATETIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?")
 
 #: A bare `YYYY-MM-DD` date left over once every full timestamp above is already gone -
-#: only masked when it actually equals *today* (a fixed seed date, e.g. the seeded
-#: note's own `2025-06-01`, must stay literal and visible in the golden).
+#: only masked when it actually equals *today in UTC* (the server's own notion of
+#: "today", `src/memory_manager/mcp/server.py` memory_supersede, `storage/rules.py`;
+#: matching the local date here would leave `valid_to` unmasked whenever the local
+#: timezone's calendar date differs from UTC's, e.g. #316) - a fixed seed date, e.g.
+#: the seeded note's own `2025-06-01`, must stay literal and visible in the golden.
 _BARE_DATE_RE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
 
 #: Dict keys whose value is swapped wholesale (regardless of its shape) rather than
@@ -149,7 +152,7 @@ class _Normalizer:
 
     def __init__(self) -> None:
         self._tables: dict[str, dict[str, int]] = {"version": {}, "commit": {}, "ulid": {}}
-        self._today = date.today().isoformat()
+        self._today = datetime.now(UTC).date().isoformat()
 
     def _assign(self, category: str, raw: str) -> str:
         table = self._tables[category]
