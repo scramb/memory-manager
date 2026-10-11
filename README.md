@@ -164,6 +164,8 @@ Read on:
 
 - Upgrading an existing v0.1 deployment to v0.2 and the enterprise profile:
   [`docs/guides/upgrade-0.2.md`](./docs/guides/upgrade-0.2.md)
+- Upgrading an existing v0.2 deployment to v1.0:
+  [`docs/guides/upgrade-1.0.md`](./docs/guides/upgrade-1.0.md)
 - Running the enterprise profile end to end (Entra, Flux rollout, scaling, backups/restore):
   [`docs/guides/enterprise-operations.md`](./docs/guides/enterprise-operations.md)
 - What happens to a user's access and memory on role removal, offboarding and restore:

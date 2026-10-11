@@ -5,7 +5,7 @@
 > lives exclusively in `docs/TASKS.md`.
 > Source of truth for tasks: GitHub issues in `scramb/memory-manager`; `docs/TASKS.md` is the readable mirror.
 
-Last updated: 2026-10-10 (F-01 done with v0.2.0) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
+Last updated: 2026-10-11 (API compatibility policy, ADR-0017) · Development rules: [`CLAUDE.md`](../CLAUDE.md)
 
 ## Goal
 
@@ -107,6 +107,7 @@ Note file `<namespace>/<type>/<slug>.md` with frontmatter `id` (ULID), `title`, 
 | Agent runtimes | own agent identity and namespace, server-side write policy with approval queue; MCP integration only in v1 | runtime guards, native plugins | the write guard sits outside the agent's prompt | [ADR-0013](./adr/0013-agent-identity.md), [ADR-0014](./adr/0014-agent-integration-tier.md) |
 | Clients without DCR/CIMD | operator-registered confidential OAuth clients | Entra routing, unsupported | per-user identity for Gemini Enterprise without resource-server mode | [ADR-0015](./adr/0015-preregistered-oauth-clients.md) |
 | Vector index (Postgres mode) | `halfvec(1024)`, B-tree on namespace, `chunks` list-partitioned by namespace kind, HNSW only for group/project/org | flat `vector` HNSW, `halfvec(3072)` | a third of the index size, and selective namespace filters stay exact and fast | [ADR-0016](./adr/0016-vector-index.md) |
+| API stability (1.x) | SemVer 2.0.0 over a tiered public surface (Stable/Operational/Internal, [`./compatibility.md`](./compatibility.md)); a Stable surface is removed only in the next major, after a deprecation of at least one minor release and 90 days | narrower scope (tools/config/notes/CLI only) or broader (incl. metrics/audit fields); shorter deprecation windows (one or two minors) | a minor must always be a safe upgrade for self-hosters and automated clients | [ADR-0017](./adr/0017-api-compatibility-policy.md) |
 | Documentation | plain Markdown on GitHub, `docs/README.md` as index | MkDocs Material | no extra tooling | — (owner 2026-10-08) |
 | Client E2E in CI | Open WebUI and agent runtimes against a scripted stub model; CLI clients checked manually with a local harness | model API keys in CI (for now) | no secrets or spend in CI; a CI token with a spend limit may follow, then the harness (#161) runs the CLI checks in CI | — (owner 2026-10-08) |
 | Scaling | stateless Streamable HTTP, no sticky sessions; shared state in Valkey if configured, else Postgres | stateful sessions, Valkey mandatory | any replica serves any request; no extra service for small setups | [ADR-0009](./adr/0009-stateless-replicas.md) |
@@ -190,6 +191,7 @@ F-01 (M8–M11) is built before F-02 (M12–M17) starts (O32).
 | O35 | Break-glass read surface | — decided: read-only viewer on `/account`, MCP unchanged (ADR-0008 addendum) | — | owner ✔ 2026-10-08 |
 | O36 | `otel` extra in the published image | — decided: shipped, like `valkey` (ADR-0009 addendum) | — | owner ✔ 2026-10-08 |
 | O37 | Capacity for the target-size load test | — decided: the existing operator cluster as it is; the report is not a sizing commitment | — | owner ✔ 2026-10-08 |
+| O38 | API compatibility for 1.x | — decided: SemVer over three tiers (Stable/Operational/Internal), removal only in the next major after ≥ 1 minor and 90 days, deprecations via register + release notes + runtime signals ([ADR-0017](./adr/0017-api-compatibility-policy.md)) | — | owner ✔ 2026-10-11 |
 
 **Owner-accepted deviation on O24 (#271, 2026-10-09/10):** the target-size run (WP-32) runs on a single-node kind cluster on the implementer's own node, not an operator cluster — see [`docs/benchmarks/target-size.md`](./benchmarks/target-size.md) for the method and [F-01's feature file](./features/F-01-enterprise-scale.md) for the same note. The report is not a sizing commitment, same as O24/O37 already say. Both `postgres` and `valkey` shared-state runs completed (each once plus one retry) and measured real numbers that miss F-01's latency targets by one to two orders of magnitude, even after #296's fix — documented honestly per owner decision 2026-10-10 (status `done`, not a Gate; follow-up: #297) — the deviation stands regardless of that outcome.
 

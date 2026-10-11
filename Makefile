@@ -1,4 +1,4 @@
-.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke openwebui-up openwebui-down
+.PHONY: fmt lint compat-lint conformance conformance-golden test check eval eval-baseline db-up db-down valkey-up valkey-down image smoke up down loadtest-smoke loadtest-cluster upgrade-smoke upgrade-smoke-1.0 openwebui-up openwebui-down contract-snapshot reference-docs
 
 MM_TEST_DATABASE_URL ?= postgresql://mm:mm@localhost:55432/mm
 export MM_TEST_DATABASE_URL
@@ -31,6 +31,7 @@ fmt:
 
 lint:
 	uv run memory-manager instructions generate --all --check
+	uv run python tests/reference_docs.py --check
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run mypy
@@ -51,6 +52,20 @@ conformance:
 
 conformance-golden:
 	MM_CONFORMANCE_UPDATE=1 uv run pytest tests/conformance/profiles
+
+# Records tests/contract/snapshot.json to the real server's current tool contract
+# (#201, ADR-0010, ADR-0017) - refuses to write over a breaking change; see
+# tests/contract_snapshot.py's module docstring for MM_CONTRACT_UPDATE=breaking,
+# the deliberate pre-major act that overrides that refusal.
+contract-snapshot:
+	MM_CONTRACT_UPDATE=1 uv run pytest tests/contract
+
+# Renders docs/reference/{tools,cli}.md from the real server/CLI (#200, ADR-0017,
+# tests/reference_docs.py) - `make lint`'s own `--check` run points a reader with a
+# stale page here. config.md/note-format.md are hand-written and only drift-checked,
+# never written by this target.
+reference-docs:
+	uv run python tests/reference_docs.py
 
 test:
 ifdef PKG
@@ -139,6 +154,22 @@ loadtest-cluster:
 # (#277, WP-34) - see scripts/upgrade-smoke.sh.
 upgrade-smoke: image db-up
 	scripts/upgrade-smoke.sh
+
+# Upgrades from the fixed last 0.x release (0.2.0, F-01 WP-34) to this
+# worktree's own current image, on both storage backends - Git with a
+# Postgres index/auth database, and STORAGE_BACKEND=postgres, including an
+# Entra-login simulation and the tools/list contract-snapshot comparison
+# (#202, WP-59) - see scripts/upgrade-smoke-1.0.sh. Builds its own
+# `memory-manager:upgrade-smoke` tag (the script's own CURRENT_IMAGE
+# default) instead of `make image`'s `memory-manager:dev` - this must
+# never rebuild or retag :dev, which another lane may be running
+# containers against.
+upgrade-smoke-1.0: db-up
+	podman build -t memory-manager:upgrade-smoke \
+		--build-arg MM_GIT_SHA=$$(git rev-parse HEAD) \
+		--build-arg MM_VERSION=$$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/') \
+		.
+	scripts/upgrade-smoke-1.0.sh
 
 # Full quickstart stack (#42, WP-12): memory-manager + Postgres, with the
 # vault-init one-shot seeding a local vault remote. See README.md.
