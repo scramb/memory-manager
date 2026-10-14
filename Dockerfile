@@ -5,7 +5,7 @@
 # openssh-client, vault on a volume at /data).
 
 # --- builder --------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 # Pinned uv release (Dependabot bumps this tag); only the static binary is
 # taken from this stage, nothing else of it ends up in the final image.
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable --extra valkey --extra otel
 
 # --- runtime ----------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ARG MM_GIT_SHA=unknown
 ARG MM_VERSION=0.0.0
