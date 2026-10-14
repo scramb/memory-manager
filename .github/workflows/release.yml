@@ -82,7 +82,7 @@ jobs:
           echo "Releasing version '$VERSION' from tag '${GITHUB_REF_NAME}' (prerelease=$PRERELEASE)"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
