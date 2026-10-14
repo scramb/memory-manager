@@ -35,7 +35,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "types-PyYAML>=6.0",
-    "asyncpg-stubs>=0.31.3",
+    "asyncpg-stubs>=0.32.0",
     "redis>=8.1",
 ]
 
