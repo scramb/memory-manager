@@ -29,7 +29,7 @@ valkey = [
 
 [dependency-groups]
 dev = [
-    "ruff>=0.8",
+    "ruff>=0.17.2",
     "mypy>=1.13",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
