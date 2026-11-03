@@ -21,7 +21,7 @@ memory-manager = "memory_manager.cli:main"
 [project.optional-dependencies]
 otel = [
     "opentelemetry-exporter-otlp>=1.45.1",
-    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-sdk>=1.45.2",
 ]
 valkey = [
     "redis>=8.1",
