@@ -32,13 +32,29 @@ Endpoints:
 - `GET /healthz`: liveness, matching `loadtest/embedding_stub.py`'s shape.
 
 Script format (`--script`/`SCRIPTED_MODEL_SCRIPT`, a JSON file): a list of
-turn objects, each either
+turn objects, each one of
 
     {"tool_calls": [{"name": "memory_search", "arguments": {"query": "..."}}]}
 
 or
 
     {"content": "a final assistant reply"}
+
+or (#150)
+
+    {"echo_system": true}
+
+`echo_system` answers with the text of every `role == "system"` message in
+the request's own `messages`, joined in order with `"\n"` - never looked at
+for anything else, so a test can assert on exactly what a filter's `inlet`
+actually inserted there (ADR-0011's "note content is data, not instructions"
+guardrail again: this still never *decides* anything from a message's
+content, it only mirrors it back verbatim). Each system message's own
+`content` is read the same way `_last_user_text` elsewhere in this project's
+Open WebUI integration reads a user turn's: a plain string as-is, a list of
+content parts by joining the `"text"` parts (`"type": "text"`), or `""` for
+anything else (`None`, a missing `content` key, ...). No system message at
+all answers with `""`, same as an empty script turn would.
 
 A turn index past the end of the script, no `--script` at all, or (#314) a
 `--script` path whose file does not exist *at request time*, falls back to
@@ -116,6 +132,33 @@ def _turn_for(script: Sequence[Mapping[str, Any]], index: int) -> Mapping[str, A
     if 0 <= index < len(script):
         return script[index]
     return _DEFAULT_TURN
+
+
+def _message_text(content: Any) -> str:
+    """One message's own `content`, as plain text (module docstring, #150):
+    a string verbatim, the `"text"` parts of a content-part list joined, or
+    `""` for anything else (`None`, a missing key, ...)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "".join(part for part in parts if isinstance(part, str) and part)
+    return ""
+
+
+def _echo_system_text(messages: Sequence[Mapping[str, Any]]) -> str:
+    """The `"echo_system"` turn's own reply (module docstring, #150): every
+    `role == "system"` message's text, in the order they appear in
+    `messages`, joined with `"\\n"` - `""` if there is none."""
+    return "\n".join(
+        _message_text(message.get("content"))
+        for message in messages
+        if message.get("role") == "system"
+    )
 
 
 def _current_script(
@@ -241,6 +284,9 @@ def create_app(
         turn_index = _turn_index(messages)
         turn = _turn_for(_current_script(script, script_path), turn_index)
         tool_calls = turn.get("tool_calls")
+        text_content = (
+            _echo_system_text(messages) if turn.get("echo_system") else str(turn.get("content", ""))
+        )
 
         completion_id = f"chatcmpl-{turn_index}"
         created = int(time.time())
@@ -251,16 +297,14 @@ def create_app(
                     completion_id, created, model_id, turn_index, tool_calls
                 )
             else:
-                generator = _stream_text_turn(
-                    completion_id, created, model_id, str(turn.get("content", ""))
-                )
+                generator = _stream_text_turn(completion_id, created, model_id, text_content)
             return StreamingResponse(generator, media_type="text/event-stream")
 
         if tool_calls:
             message = _tool_call_message(turn_index, tool_calls)
             finish_reason = "tool_calls"
         else:
-            message = {"role": "assistant", "content": str(turn.get("content", ""))}
+            message = {"role": "assistant", "content": text_content}
             finish_reason = "stop"
 
         return JSONResponse(

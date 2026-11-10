@@ -48,3 +48,9 @@ deploy/openwebui/.env-oidc-entra
 # Live e2e run artefact (WP-42): scripted_model.py writes the captured
 # live-mode script here for replay; never committed, see tests/e2e/stubs/scripted_model.py.
 tests/e2e/stubs/live-script.json
+
+# Small-model filter benchmark results (#151, WP-44) - a local run's own
+# results.json/results.md (MM_SMALL_MODEL_RESULTS_DIR default), never
+# committed; the measured numbers go into docs/benchmarks/
+# openwebui-small-model.md by hand instead.
+tests/e2e/clients/.small-model-results/

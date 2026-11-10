@@ -182,7 +182,7 @@ Options:
 |---|---|---|---|---|
 | `--all` | no | `false` | — | additionally render every client's instruction file |
 | `--check` | no | `false` | — | exit 1 if any rendered file is stale instead of writing it (no file is touched) |
-| `--client` | no | — | `claude-code`, `generic` | additionally render this one client's instruction file |
+| `--client` | no | — | `claude-code`, `generic`, `openwebui` | additionally render this one client's instruction file |
 | `--guide` | no | `docs/memory-guide.md` | — | path to the Markdown source |
 | `--out` | no | `src/memory_manager/mcp/instructions_generated.py` | — | path to the generated Python module (unaffected by --client/--all) |
 

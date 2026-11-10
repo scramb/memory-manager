@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Question set for #151 (WP-44, F-02): "does the filter mode help a small
+# local model give usable answers" - scored by
+# tests/e2e/clients/test_openwebui_small_model.py against the fictional
+# `examples/vault` (same fixture eval/golden.yaml uses for recall@5/MRR).
+#
+# Each entry: {id, question, lang: de|en, expected_any: [...], source_path}.
+# - `question`: natural-language, asked in `lang` - memory-manager's search
+#   uses Postgres's 'simple' tsvector config (no cross-language stemming,
+#   search.py's own `_HEADLINE_SQL`), so a question must share literal
+#   tokens with its note's own language to have a chance of surfacing it;
+#   eval/golden.yaml's own q01 ("Welchen Editor nutzt Mara aktuell?") is the
+#   same phrasing style this file follows.
+# - `expected_any`: one or more case-insensitive substrings (umlaut-folded
+#   by the test's own scoring), ANY of which counts as the fact being
+#   present in a chat answer - never a verbatim substring of `question`
+#   itself (checked once by the test module at collection time), so a model
+#   cannot "pass" by merely echoing the question back.
+# - `source_path`: the one `examples/vault` note the fact is drawn from
+#   (title/description only, or a short body phrase a `ts_headline` snippet
+#   - MaxWords=35 - would plausibly include, `search.py:631`): what the
+#   filter's inlet can actually inject, never something only a human skim
+#   of the whole vault would know.
+#
+# Two supersede cases (q23/q24): the *current* note is the only one that can
+# ever surface - search.py excludes any note past its own `valid_to`
+# (search.py:405/489/576), and both `*-2025.md`/`*-v1.md` superseded notes
+# are already in the past relative to any run of this question set.
+#
+# Frozen once scored the first time (owner decision 2026-10-11, harness):
+# never tuned after a measurement to make a threshold pass.
+
+- id: q01
+  question: "Wann hat Mara Geburtstag?"
+  lang: de
+  expected_any: ["14. Maerz", "14. März"]
+  source_path: personal/fact/birthday.md
+
+- id: q02
+  question: "In welchem Hamburger Stadtteil wohnt Mara?"
+  lang: de
+  expected_any: ["Ottensen"]
+  source_path: personal/fact/lives-in-hamburg.md
+
+- id: q03
+  question: "Welche Fahrradmarke faehrt Mara zur Arbeit?"
+  lang: de
+  expected_any: ["Riese-und-Mueller", "Riese und Mueller", "Riese-und-Müller"]
+  source_path: personal/fact/owns-a-bike.md
+
+- id: q04
+  question: "What languages does Mara speak?"
+  lang: en
+  expected_any: ["native German", "German speaker"]
+  source_path: personal/fact/speaks-german-and-english.md
+
+- id: q05
+  question: "Wer ist Maras Manager bei Nordlicht GmbH?"
+  lang: de
+  expected_any: ["Tobias Rahn"]
+  source_path: work/fact/manager-is-tobias.md
+
+- id: q06
+  question: "In welchem Hamburger Stadtteil liegt das Buero von Nordlicht GmbH?"
+  lang: de
+  expected_any: ["Hafencity"]
+  source_path: work/fact/office-location.md
+
+- id: q07
+  question: "Which database does Nordlicht GmbH's backend use?"
+  lang: en
+  expected_any: ["PostgreSQL"]
+  source_path: work/fact/tech-stack.md
+
+- id: q08
+  question: "In welchem Jahr wurde Nordlicht GmbH gegruendet?"
+  lang: de
+  expected_any: ["2016"]
+  source_path: shared/fact/company-founded.md
+
+- id: q09
+  question: "Wie viele Mitarbeitende hat Nordlicht GmbH ungefaehr?"
+  lang: de
+  expected_any: ["40 Mitarbeitende", "rund 40", "etwa 40", "ca. 40"]
+  source_path: shared/fact/employee-count.md
+
+- id: q10
+  question: "What is the name of Nordlicht GmbH's internal analytics platform?"
+  lang: en
+  expected_any: ["Leuchtturm"]
+  source_path: shared/fact/product-names.md
+
+- id: q11
+  question: "What is the name of Nordlicht GmbH's internal ops/deployment dashboard?"
+  lang: en
+  expected_any: ["Kompass"]
+  source_path: shared/fact/product-names.md
+
+- id: q12
+  question: "Wie heisst Maras Lieblingscafe am Hafen?"
+  lang: de
+  expected_any: ["Kaffeeroesterei Elbblick", "Elbblick", "Kaffeerösterei Elbblick"]
+  source_path: personal/reference/favorite-coffee-shop.md
+
+- id: q13
+  question: "Wie heisst Maras Katze?"
+  lang: de
+  expected_any: ["Keks"]
+  source_path: personal/reference/cat-keks.md
+
+- id: q14
+  question: "Which Daniel Kehlmann novel is on Mara's favorite book list?"
+  lang: en
+  expected_any: ["Die Vermessung der Welt"]
+  source_path: personal/reference/favorite-book-list.md
+
+- id: q15
+  question: "How does Mara want Claude to format its answers?"
+  lang: en
+  expected_any: ["bullet points", "concise answers", "no filler"]
+  source_path: personal/user/communication-style.md
+
+- id: q16
+  question: "Gegen welches Lebensmittel ist Mara allergisch?"
+  lang: de
+  expected_any: ["Haselnuss", "Haselnuesse", "Haselnüsse"]
+  source_path: personal/user/dietary-notes.md
+
+- id: q17
+  question: "Zu welchen Tageszeiten ist Mara laut ihren Notizen am produktivsten?"
+  lang: de
+  expected_any: ["9 bis 13", "20 bis 22", "vormittags"]
+  source_path: personal/user/timezone-and-hours.md
+
+- id: q18
+  question: "Um wie viel Uhr ist das taegliche Standup von Maras Team?"
+  lang: de
+  expected_any: ["9:30"]
+  source_path: work/user/standup-time.md
+
+- id: q19
+  question: "During which hours does Mara mute Slack notifications?"
+  lang: en
+  expected_any: ["9:00-18:00", "9-18", "9:00 to 18:00", "9:00-18:00 CET"]
+  source_path: work/user/slack-notification-prefs.md
+
+- id: q20
+  question: "Who is the backend engineer leading Leuchtturm's backend on Mara's team?"
+  lang: en
+  expected_any: ["Jonas Bergmann"]
+  source_path: work/reference/team-roster.md
+
+- id: q21
+  question: "On which day of the week does the backend on-call handoff happen?"
+  lang: en
+  expected_any: ["Monday", "Mondays"]
+  source_path: work/reference/oncall-rotation.md
+
+- id: q22
+  question: "After what time on Fridays are deploys not allowed at Nordlicht GmbH?"
+  lang: en
+  expected_any: ["16:00"]
+  source_path: shared/user/team-working-agreement.md
+
+- id: q23
+  question: "Welchen Editor nutzt Mara aktuell fuer Go-Code?"
+  lang: de
+  expected_any: ["Neovim", "LazyVim"]
+  source_path: personal/user/editor-preference.md
+
+- id: q24
+  question: "How do API clients authenticate as of September 2026?"
+  lang: en
+  expected_any: ["OAuth2", "client-credentials"]
+  source_path: shared/reference/api-auth-guide.md
